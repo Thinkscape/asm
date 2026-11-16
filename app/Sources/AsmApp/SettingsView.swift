@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 enum SettingsPane: String, CaseIterable, Identifiable, Hashable {
@@ -29,6 +30,8 @@ enum SettingsPane: String, CaseIterable, Identifiable, Hashable {
 struct SettingsView: View {
     let model: AppModel
     @State private var selection: SettingsPane? = .vaults
+    @State private var window = WindowRef()
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         NavigationSplitView {
@@ -40,8 +43,21 @@ struct SettingsView: View {
         } detail: {
             SettingsDetail(model: model, pane: selection ?? .vaults)
         }
+        // Every pane shares this toolbar item. A pane without toolbar items (Hosts,
+        // Proxy, Settings) would otherwise remove the window toolbar, shrinking the title
+        // bar: the traffic lights and the sidebar jump when switching panes.
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    ActivationPolicyController.shared.openRegularWindow { openWindow(id: "activity") }
+                } label: {
+                    Label("Activity Log", systemImage: "list.bullet.rectangle")
+                }
+                .help("Show the activity log")
+            }
+        }
         .frame(minWidth: 820, minHeight: 520)
-        .background(RegularWindowMarker())
+        .background(RegularWindowMarker { window.window = $0 })
         .onChange(of: model.unlockingVaultID, initial: true) { _, id in
             if id != nil { selection = .vaults }
         }
@@ -51,10 +67,20 @@ struct SettingsView: View {
         .sheet(item: Binding(
             get: { model.unlockingVault },
             set: { if $0 == nil { model.unlockingVaultID = nil } }
-        )) { vault in
+        ), onDismiss: {
+            // The sheet may have been opened from the menu bar before this window was key;
+            // when it ends, AppKit does not hand key status back to this window.
+            if let window = window.window { ActivationPolicyController.shared.focus(window) }
+        }) { vault in
             UnlockVaultSheet(model: model, vault: vault)
         }
     }
+}
+
+/// Weak reference to the window a view lives in.
+@MainActor
+final class WindowRef {
+    weak var window: NSWindow?
 }
 
 private struct SettingsDetail: View {

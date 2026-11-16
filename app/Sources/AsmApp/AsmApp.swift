@@ -41,6 +41,26 @@ final class ActivationPolicyController {
         update(closing: nil)
     }
 
+    /// Opens a Settings or Activity Log window from the menu bar (or a menu command) and
+    /// brings it forward. The app becomes regular *before* it asks to be activated: an
+    /// accessory app's activation request is not reliably honoured, and switching the
+    /// policy afterwards leaves its windows looking inactive.
+    func openRegularWindow(_ open: () -> Void) {
+        if NSApp.activationPolicy() != .regular {
+            NSApp.setActivationPolicy(.regular)
+        }
+        open()
+        NSApp.activate()
+    }
+
+    /// Makes `window` the key window of the active app again (after a sheet ends, the
+    /// key window is otherwise whatever AppKit picks, e.g. the menu bar panel).
+    func focus(_ window: NSWindow) {
+        guard window.isVisible else { return }
+        NSApp.activate()
+        window.makeKeyAndOrderFront(nil)
+    }
+
     private func windowChanged(_ window: NSWindow?, closing: Bool) {
         guard let window, windows.contains(window) else { return }
         update(closing: closing ? window : nil)
@@ -56,17 +76,32 @@ final class ActivationPolicyController {
     }
 }
 
-/// Background view that registers its window with `ActivationPolicyController`.
+/// Background view that registers its window with `ActivationPolicyController` and
+/// hands it to `onWindow` (for views that need to refocus their window).
 struct RegularWindowMarker: NSViewRepresentable {
+    var onWindow: (NSWindow) -> Void = { _ in }
+
     final class MarkerView: NSView {
+        var onWindow: (NSWindow) -> Void = { _ in }
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            if let window { ActivationPolicyController.shared.track(window) }
+            if let window {
+                ActivationPolicyController.shared.track(window)
+                onWindow(window)
+            }
         }
     }
 
-    func makeNSView(context: Context) -> MarkerView { MarkerView() }
-    func updateNSView(_ nsView: MarkerView, context: Context) {}
+    func makeNSView(context: Context) -> MarkerView {
+        let view = MarkerView()
+        view.onWindow = onWindow
+        return view
+    }
+
+    func updateNSView(_ nsView: MarkerView, context: Context) {
+        nsView.onWindow = onWindow
+    }
 }
 
 @MainActor
@@ -124,8 +159,7 @@ struct ActivityLogCommands: Commands {
     var body: some Commands {
         CommandGroup(after: .windowArrangement) {
             Button("Show Activity Log") {
-                openWindow(id: "activity")
-                NSApp.activate()
+                ActivationPolicyController.shared.openRegularWindow { openWindow(id: "activity") }
             }
             .keyboardShortcut("l")
         }

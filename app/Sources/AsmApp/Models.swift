@@ -195,6 +195,10 @@ struct PairingCodeItem: Identifiable, Equatable, Sendable {
     var maxUses: Int?
     /// `active`, `expired` or `used up`.
     var status: String
+    /// Normalised CIDR ranges a pairing host's address must be in; empty = any address.
+    var allowedNetworks: [String]
+
+    var networksLine: String { allowedNetworks.isEmpty ? "any" : allowedNetworks.joined(separator: ", ") }
 }
 
 enum LeaseMode: String, Equatable, Sendable {

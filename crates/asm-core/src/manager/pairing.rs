@@ -1,6 +1,8 @@
 //! Host pairing: interactive commit/reveal (popup with a verification code) and unattended
 //! pairing codes (no popup).
 
+use std::net::IpAddr;
+
 use asm_proto::crypto::{ct_eq, hex_decode_array, new_token, new_uuid_v4, sha256};
 use asm_proto::pairing::{
     NONCE_LEN, UnattendedCode, format_pairing_code, new_nonce, pairing_code, verify_commit,
@@ -11,10 +13,11 @@ use asm_proto::wire::{HostInfo, PairRequest, PairResponse, RevealRequest};
 use serde_json::json;
 
 use super::activity::{self, Category, Event};
+use super::netinfo::network_allows;
 use super::requests::{Book, Detail, Fail, Pending, REVEAL_SECS};
 use super::{Core, TOPIC_HOSTS, TOPIC_REQUESTS, lock, now};
 use crate::error::{CoreError, Result};
-use crate::store::{HostRecord, Store};
+use crate::store::{CodeUse, HostRecord, Store};
 
 /// At most this many open pairing attempts per remote address, and in total.
 const MAX_PER_ADDRESS: usize = 1;
@@ -215,9 +218,26 @@ pub(crate) fn poll_attempt(
     })
 }
 
+/// Outcome of [`pair_with_code`] for a code that is otherwise valid.
+#[derive(Debug)]
+pub(crate) enum CodePairing {
+    Paired {
+        host_id: String,
+        token: String,
+        label: String,
+    },
+    /// The code is limited to `networks` and the peer address is outside all of them;
+    /// nothing changed (the code keeps its uses).
+    WrongNetwork {
+        label: String,
+        networks: Vec<String>,
+    },
+}
+
 /// Unattended pairing: check the code against the certificate and the store (atomically
-/// counting one use) and create the host. Every rejection is `unauthorized`. Returns the
-/// host id, its token and the code's label.
+/// checking the peer address `ip`, as observed on the TCP connection, against the code's
+/// networks and counting one use) and create the host. A bad, expired, used-up or revoked
+/// code is `unauthorized`.
 pub(crate) fn pair_with_code(
     store: &Store,
     cert_sha256: &[u8; 32],
@@ -225,12 +245,13 @@ pub(crate) fn pair_with_code(
     info: HostInfo,
     ip: &str,
     t: i64,
-) -> Result<(String, String, String)> {
+) -> Result<CodePairing> {
     let rejected = || CoreError::unauthorized("pairing code rejected");
     let code = UnattendedCode::parse(code).map_err(|_| rejected())?;
     if !code.matches_cert(cert_sha256) {
         return Err(rejected());
     }
+    let peer = ip.parse::<IpAddr>().ok().map(|a| a.to_canonical());
     let token = new_token();
     let host = HostRecord {
         id: new_uuid_v4(),
@@ -241,9 +262,22 @@ pub(crate) fn pair_with_code(
         last_seen: Some(t),
         revoked_at: None,
     };
-    match store.consume_pairing_code(&code.secret_sha256(), t, &host, &sha256(token.as_bytes()))? {
-        Some(label) => Ok((host.id, token, label)),
-        None => Err(rejected()),
+    match store.consume_pairing_code(
+        &code.secret_sha256(),
+        t,
+        &host,
+        &sha256(token.as_bytes()),
+        |networks| network_allows(networks, peer),
+    )? {
+        CodeUse::Paired { label } => Ok(CodePairing::Paired {
+            host_id: host.id,
+            token,
+            label,
+        }),
+        CodeUse::WrongNetwork { label, networks } => {
+            Ok(CodePairing::WrongNetwork { label, networks })
+        }
+        CodeUse::Rejected => Err(rejected()),
     }
 }
 
@@ -255,19 +289,45 @@ impl Core {
         if let Some(code) = req.pairing_code.as_deref().filter(|c| !c.trim().is_empty()) {
             let hostname = req.host_info.hostname.clone();
             let info = serde_json::to_value(&req.host_info).unwrap_or_default();
-            let (host_id, token, label) =
-                pair_with_code(&self.store, &self.cert.sha256, code, req.host_info, ip, t)?;
-            self.log(
-                Event::new(
-                    Category::Pairing,
-                    "paired_with_code",
-                    format!("{hostname} paired with pairing code \"{label}\""),
-                )
-                .host(Some(&host_id))
-                .detail(json!({ "code_label": label, "address": ip, "host_info": info })),
-            );
-            self.notify(TOPIC_HOSTS);
-            return Ok(PairResponse::Approved { host_id, token });
+            match pair_with_code(&self.store, &self.cert.sha256, code, req.host_info, ip, t)? {
+                CodePairing::Paired {
+                    host_id,
+                    token,
+                    label,
+                } => {
+                    self.log(
+                        Event::new(
+                            Category::Pairing,
+                            "paired_with_code",
+                            format!("{hostname} paired with pairing code \"{label}\""),
+                        )
+                        .host(Some(&host_id))
+                        .detail(json!({ "code_label": label, "address": ip, "host_info": info })),
+                    );
+                    self.notify(TOPIC_HOSTS);
+                    return Ok(PairResponse::Approved { host_id, token });
+                }
+                CodePairing::WrongNetwork { label, networks } => {
+                    self.log(
+                        Event::new(
+                            Category::Pairing,
+                            "code_rejected_network",
+                            format!(
+                                "{hostname} at {ip} presented pairing code \"{label}\" from outside its allowed networks"
+                            ),
+                        )
+                        .detail(json!({
+                            "code_label": label,
+                            "address": ip,
+                            "allowed_networks": networks,
+                            "host_info": info,
+                        })),
+                    );
+                    return Err(CoreError::unauthorized(
+                        "pairing code not valid from this address",
+                    ));
+                }
+            }
         }
         self.expire_requests(t);
         let r = start_attempt(
@@ -514,7 +574,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("asm.db")).unwrap();
         let code = UnattendedCode::generate(&CERT);
-        let rec = |id: &str, expires_at, max_uses| PairingCodeRecord {
+        let rec = |id: &str, expires_at, max_uses, networks: &[&str]| PairingCodeRecord {
             id: id.into(),
             label: "ci".into(),
             created_at: 0,
@@ -522,12 +582,13 @@ mod tests {
             max_uses,
             uses: 0,
             revoked_at: None,
+            networks: networks.iter().map(|n| n.to_string()).collect(),
         };
         store
-            .insert_pairing_code(&rec("c1", Some(1000), Some(1)), &code.secret_sha256())
+            .insert_pairing_code(&rec("c1", Some(1000), Some(1), &[]), &code.secret_sha256())
             .unwrap();
         let s = code.to_string();
-        let unauthorized = |r: Result<(String, String, String)>| {
+        let unauthorized = |r: Result<CodePairing>| {
             assert_eq!(r.unwrap_err().code, asm_proto::ErrorCode::Unauthorized)
         };
 
@@ -544,9 +605,15 @@ mod tests {
         ));
         // Expired.
         unauthorized(pair_with_code(&store, &CERT, &s, info("a"), "ip", 1000));
-        // Valid once, then used up.
-        let (host_id, token, label) =
-            pair_with_code(&store, &CERT, &s, info("a"), "ip", 10).unwrap();
+        // Valid once (no networks: any address, even an unparseable one), then used up.
+        let CodePairing::Paired {
+            host_id,
+            token,
+            label,
+        } = pair_with_code(&store, &CERT, &s, info("a"), "ip", 10).unwrap()
+        else {
+            panic!("not paired")
+        };
         assert_eq!(label, "ci");
         let h = store
             .host_by_token(&sha256(token.as_bytes()))
@@ -557,5 +624,48 @@ mod tests {
         // Unknown secret with the right fingerprint.
         let other = UnattendedCode::generate(&CERT).to_string();
         unauthorized(pair_with_code(&store, &CERT, &other, info("c"), "ip", 11));
+
+        // Limited to networks: the observed peer address decides; a mismatch keeps the use.
+        let limited = UnattendedCode::generate(&CERT);
+        store
+            .insert_pairing_code(
+                &rec("c2", None, Some(1), &["10.0.0.0/8", "fd00::/8"]),
+                &limited.secret_sha256(),
+            )
+            .unwrap();
+        let l = limited.to_string();
+        for peer in ["192.0.2.1", "::ffff:192.0.2.1", "fe80::1", "ip"] {
+            match pair_with_code(&store, &CERT, &l, info("d"), peer, 12).unwrap() {
+                CodePairing::WrongNetwork { label, networks } => {
+                    assert_eq!(label, "ci");
+                    assert_eq!(networks, ["10.0.0.0/8", "fd00::/8"]);
+                }
+                other => panic!("{peer}: {other:?}"),
+            }
+        }
+        let uses = |id: &str| {
+            store
+                .list_pairing_codes()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap()
+                .uses
+        };
+        assert_eq!(uses("c2"), 0, "a network mismatch does not use up the code");
+        assert!(matches!(
+            pair_with_code(&store, &CERT, &l, info("d"), "::ffff:10.1.2.3", 12).unwrap(),
+            CodePairing::Paired { .. }
+        ));
+        assert_eq!(uses("c2"), 1);
+
+        let v6 = UnattendedCode::generate(&CERT);
+        store
+            .insert_pairing_code(&rec("c3", None, None, &["fd00::/8"]), &v6.secret_sha256())
+            .unwrap();
+        assert!(matches!(
+            pair_with_code(&store, &CERT, &v6.to_string(), info("e"), "fd12::7", 12).unwrap(),
+            CodePairing::Paired { .. }
+        ));
     }
 }

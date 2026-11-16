@@ -249,8 +249,7 @@ struct ActivityView: View {
 
     private func showLease(_ leaseID: String, secret: String) {
         model.showLease(leaseID, secret: secret)
-        openWindow(id: "settings")
-        NSApp.activate()
+        ActivationPolicyController.shared.openRegularWindow { openWindow(id: "settings") }
     }
 }
 

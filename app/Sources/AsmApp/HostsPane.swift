@@ -75,6 +75,11 @@ struct HostsPane: View {
                             .monospacedDigit()
                     }
                     TableColumn("Status") { code in Text(verbatim: code.status) }
+                    TableColumn("Allowed networks") { code in
+                        Text(verbatim: code.networksLine)
+                            .foregroundStyle(code.allowedNetworks.isEmpty ? .secondary : .primary)
+                            .help(Text(verbatim: code.networksLine))
+                    }
                 }
                 .frame(minHeight: 110, maxHeight: 180)
             }
@@ -208,10 +213,28 @@ private struct PairingCodeSheet: View {
     @State private var label = ""
     @State private var expiry: UInt64 = 86_400
     @State private var maxUses: UInt32 = 1
+    /// Comma- or newline-separated CIDR ranges or addresses; empty = any address.
+    @State private var networks = ""
+    @State private var subnets: [String] = []
     /// `asm pair <host>:<port> <code>`, built by the core; shown once.
     @State private var command: String?
     @State private var error: String?
     @State private var working = false
+
+    private var networkEntries: [String] {
+        networks
+            .split(whereSeparator: { $0 == "," || $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// The core's message for the first invalid entry, if any.
+    private var networkError: String? {
+        for entry in networkEntries {
+            if case let .failure(failure) = CoreBridge.checkNetwork(entry) { return failure.message }
+        }
+        return nil
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -247,6 +270,26 @@ private struct PairingCodeSheet: View {
                     } footer: {
                         Text("Hosts that pair with this code skip the approval popup.")
                     }
+                    Section {
+                        TextField("Allowed networks", text: $networks, prompt: Text(verbatim: "10.0.0.0/8, 100.64.0.0/10"), axis: .vertical)
+                            .lineLimit(1...4)
+                        let suggestions = subnets.filter { !networkEntries.contains($0) }
+                        if !suggestions.isEmpty {
+                            LabeledContent("Suggestions") {
+                                Menu("Add from this Mac") {
+                                    ForEach(suggestions, id: \.self) { subnet in
+                                        Button { addNetwork(subnet) } label: { Text(verbatim: subnet) }
+                                    }
+                                }
+                                .fixedSize()
+                            }
+                        }
+                        if let networkError {
+                            Text(verbatim: networkError).foregroundStyle(.red).font(.callout)
+                        }
+                    } footer: {
+                        Text("CIDR ranges or addresses, separated by commas or new lines. Pairing succeeds only from an address in one of them, as seen by this Mac. Leave empty to allow any address.")
+                    }
                 }
                 if let error {
                     Text(verbatim: error).foregroundStyle(.red)
@@ -259,14 +302,22 @@ private struct PairingCodeSheet: View {
                     Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                     Button("Generate", action: generate)
                         .keyboardShortcut(.defaultAction)
-                        .disabled(label.trimmingCharacters(in: .whitespaces).isEmpty || working)
+                        .disabled(label.trimmingCharacters(in: .whitespaces).isEmpty || networkError != nil || working)
                 } else {
                     Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
                 }
             }
             .padding()
         }
-        .frame(width: 520, height: 320)
+        .frame(width: 520, height: command == nil ? 440 : 320)
+        .task {
+            subnets = await Task.detached(priority: .utility) { CoreBridge.subnetSuggestions() }.value
+        }
+    }
+
+    private func addNetwork(_ subnet: String) {
+        let trimmed = networks.trimmingCharacters(in: .whitespacesAndNewlines)
+        networks = trimmed.isEmpty ? subnet : "\(trimmed), \(subnet)"
     }
 
     private func generate() {
@@ -274,9 +325,10 @@ private struct PairingCodeSheet: View {
         let label = label.trimmingCharacters(in: .whitespaces)
         let expirySecs: UInt64? = expiry == 0 ? nil : expiry
         let uses: UInt32? = maxUses == 0 ? nil : maxUses
+        let networks = networkEntries
         Task {
             do {
-                command = try await model.createPairingCode(label: label, expirySecs: expirySecs, maxUses: uses)
+                command = try await model.createPairingCode(label: label, expirySecs: expirySecs, maxUses: uses, networks: networks)
                 error = nil
             } catch {
                 self.error = error.localizedDescription

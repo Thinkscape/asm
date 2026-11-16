@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS pairing_codes(
     expires_at  INTEGER,
     max_uses    INTEGER,
     uses        INTEGER NOT NULL DEFAULT 0,
-    revoked_at  INTEGER
+    revoked_at  INTEGER,
+    networks    TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS requests(
     id          TEXT PRIMARY KEY,
@@ -129,6 +130,22 @@ pub struct PairingCodeRecord {
     pub max_uses: Option<u32>,
     pub uses: u32,
     pub revoked_at: Option<i64>,
+    /// Allowed peer networks (normalised CIDRs); `[]` = any address.
+    pub networks: Vec<String>,
+}
+
+/// Outcome of presenting a pairing code ([`Store::consume_pairing_code`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeUse {
+    /// One use counted and the host inserted; the code's label.
+    Paired { label: String },
+    /// A valid code presented from outside its networks; nothing changed.
+    WrongNetwork {
+        label: String,
+        networks: Vec<String>,
+    },
+    /// Unknown, expired, used-up or revoked; nothing changed.
+    Rejected,
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +331,14 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
         tx.commit()?;
     }
+    let has_networks = conn
+        .prepare("SELECT 1 FROM pragma_table_info('pairing_codes') WHERE name = 'networks'")?
+        .exists([])?;
+    if !has_networks {
+        conn.execute_batch(
+            "ALTER TABLE pairing_codes ADD COLUMN networks TEXT NOT NULL DEFAULT '[]';",
+        )?;
+    }
     let has_activity = conn
         .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'activity'")?
         .exists([])?;
@@ -336,6 +361,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         tx.commit()?;
     }
     Ok(())
+}
+
+/// `pairing_codes.networks` (a JSON array of CIDR strings). Unreadable text yields a
+/// list that matches no address, so a damaged row never widens the allow-list.
+fn networks_column(text: &str) -> Vec<String> {
+    serde_json::from_str(text).unwrap_or_else(|_| vec![String::from("invalid")])
 }
 
 /// A row to append to the activity log. `at` is RFC 3339 UTC (`2026-11-16T12:34:56Z`).
@@ -531,9 +562,17 @@ impl Store {
 
     pub fn insert_pairing_code(&self, c: &PairingCodeRecord, secret_hash: &[u8; 32]) -> Result<()> {
         self.db().execute(
-            "INSERT INTO pairing_codes(id, label, secret_hash, created_at, expires_at, max_uses, uses, revoked_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0, NULL)",
-            params![c.id, c.label, &secret_hash[..], c.created_at, c.expires_at, c.max_uses],
+            "INSERT INTO pairing_codes(id, label, secret_hash, created_at, expires_at, max_uses, uses, revoked_at, networks)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0, NULL, ?7)",
+            params![
+                c.id,
+                c.label,
+                &secret_hash[..],
+                c.created_at,
+                c.expires_at,
+                c.max_uses,
+                serde_json::to_string(&c.networks)?
+            ],
         )?;
         Ok(())
     }
@@ -541,7 +580,7 @@ impl Store {
     pub fn list_pairing_codes(&self) -> Result<Vec<PairingCodeRecord>> {
         let db = self.db();
         let mut st = db.prepare(
-            "SELECT id, label, created_at, expires_at, max_uses, uses, revoked_at FROM pairing_codes
+            "SELECT id, label, created_at, expires_at, max_uses, uses, revoked_at, networks FROM pairing_codes
              WHERE revoked_at IS NULL ORDER BY created_at",
         )?;
         let rows = st.query_map([], |r| {
@@ -553,6 +592,7 @@ impl Store {
                 max_uses: r.get(4)?,
                 uses: r.get(5)?,
                 revoked_at: r.get(6)?,
+                networks: networks_column(&r.get::<_, String>(7)?),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -566,33 +606,39 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Atomically check a pairing code (hash, expiry, remaining uses, not revoked), count one
-    /// use, and insert the new host. Returns the code's label, or `None` (nothing changed)
-    /// when the code is rejected.
+    /// Atomically check a pairing code (hash, expiry, remaining uses, not revoked, then
+    /// `network_ok` on its allowed networks), count one use, and insert the new host.
+    /// Nothing changes unless the answer is [`CodeUse::Paired`]; in particular a network
+    /// mismatch does not use up the code.
     pub fn consume_pairing_code(
         &self,
         secret_hash: &[u8; 32],
         now: i64,
         host: &HostRecord,
         token_hash: &[u8; 32],
-    ) -> Result<Option<String>> {
+        network_ok: impl FnOnce(&[String]) -> bool,
+    ) -> Result<CodeUse> {
         let mut db = self.db();
         let tx = db.transaction()?;
-        let row: Option<(String, Vec<u8>, String)> = tx
+        let row: Option<(String, Vec<u8>, String, String)> = tx
             .query_row(
-                "SELECT id, secret_hash, label FROM pairing_codes
+                "SELECT id, secret_hash, label, networks FROM pairing_codes
                  WHERE secret_hash = ?1 AND revoked_at IS NULL
                    AND (expires_at IS NULL OR expires_at > ?2)
                    AND (max_uses IS NULL OR uses < max_uses)",
                 params![&secret_hash[..], now],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((id, stored, label)) = row else {
-            return Ok(None);
+        let Some((id, stored, label, networks)) = row else {
+            return Ok(CodeUse::Rejected);
         };
         if !asm_proto::crypto::ct_eq(&stored, secret_hash) {
-            return Ok(None);
+            return Ok(CodeUse::Rejected);
+        }
+        let networks = networks_column(&networks);
+        if !network_ok(&networks) {
+            return Ok(CodeUse::WrongNetwork { label, networks });
         }
         tx.execute(
             "UPDATE pairing_codes SET uses = uses + 1 WHERE id = ?1",
@@ -600,7 +646,7 @@ impl Store {
         )?;
         insert_host_row(&tx, host, token_hash)?;
         tx.commit()?;
-        Ok(Some(label))
+        Ok(CodeUse::Paired { label })
     }
 
     // ---- request history ----
@@ -1151,6 +1197,7 @@ mod tests {
     fn pairing_code_consumption_is_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(&dir.path().join("asm.db")).unwrap();
+        let any = |_: &[String]| true;
         let hash = [7u8; 32];
         let code = PairingCodeRecord {
             id: "c1".into(),
@@ -1160,24 +1207,24 @@ mod tests {
             max_uses: Some(1),
             uses: 0,
             revoked_at: None,
+            networks: vec![],
         };
         s.insert_pairing_code(&code, &hash).unwrap();
-        assert!(
-            s.consume_pairing_code(&[8u8; 32], 200, &host("h0"), &[0u8; 32])
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            s.consume_pairing_code(&[8u8; 32], 200, &host("h0"), &[0u8; 32], any)
+                .unwrap(),
+            CodeUse::Rejected
         );
         assert_eq!(
-            s.consume_pairing_code(&hash, 200, &host("h1"), &[1u8; 32])
-                .unwrap()
-                .as_deref(),
-            Some("ci"),
+            s.consume_pairing_code(&hash, 200, &host("h1"), &[1u8; 32], any)
+                .unwrap(),
+            CodeUse::Paired { label: "ci".into() },
             "answers the code's label"
         );
-        assert!(
-            s.consume_pairing_code(&hash, 201, &host("h2"), &[2u8; 32])
-                .unwrap()
-                .is_none(),
+        assert_eq!(
+            s.consume_pairing_code(&hash, 201, &host("h2"), &[2u8; 32], any)
+                .unwrap(),
+            CodeUse::Rejected,
             "used up"
         );
         assert!(s.host_by_token(&[1u8; 32]).unwrap().is_some());
@@ -1186,27 +1233,98 @@ mod tests {
         let code2 = PairingCodeRecord {
             id: "c2".into(),
             max_uses: None,
-            ..code
+            ..code.clone()
         };
         s.insert_pairing_code(&code2, &[9u8; 32]).unwrap();
-        assert!(
-            s.consume_pairing_code(&[9u8; 32], 1000, &host("h3"), &[3u8; 32])
-                .unwrap()
-                .is_none(),
+        assert_eq!(
+            s.consume_pairing_code(&[9u8; 32], 1000, &host("h3"), &[3u8; 32], any)
+                .unwrap(),
+            CodeUse::Rejected,
             "expired"
         );
-        assert!(
-            s.consume_pairing_code(&[9u8; 32], 999, &host("h4"), &[4u8; 32])
-                .unwrap()
-                .is_some()
-        );
+        assert!(matches!(
+            s.consume_pairing_code(&[9u8; 32], 999, &host("h4"), &[4u8; 32], any)
+                .unwrap(),
+            CodeUse::Paired { .. }
+        ));
         assert!(s.revoke_pairing_code("c2", 999).unwrap());
-        assert!(
-            s.consume_pairing_code(&[9u8; 32], 999, &host("h5"), &[5u8; 32])
-                .unwrap()
-                .is_none(),
+        assert_eq!(
+            s.consume_pairing_code(&[9u8; 32], 999, &host("h5"), &[5u8; 32], any)
+                .unwrap(),
+            CodeUse::Rejected,
             "revoked"
         );
+
+        // A network mismatch changes nothing: the use is not counted, no host is added.
+        let code3 = PairingCodeRecord {
+            id: "c3".into(),
+            networks: vec!["10.0.0.0/8".into()],
+            ..code
+        };
+        s.insert_pairing_code(&code3, &[6u8; 32]).unwrap();
+        let listed = s.list_pairing_codes().unwrap();
+        let c3 = listed.iter().find(|c| c.id == "c3").unwrap();
+        assert_eq!(c3.networks, ["10.0.0.0/8"]);
+        assert_eq!(
+            s.consume_pairing_code(&[6u8; 32], 200, &host("h6"), &[6u8; 32], |n| {
+                assert_eq!(n, ["10.0.0.0/8"]);
+                false
+            })
+            .unwrap(),
+            CodeUse::WrongNetwork {
+                label: "ci".into(),
+                networks: vec!["10.0.0.0/8".into()]
+            }
+        );
+        assert!(s.get_host("h6").unwrap().is_none());
+        let c3 = s
+            .list_pairing_codes()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == "c3")
+            .unwrap();
+        assert_eq!(c3.uses, 0);
+        assert!(matches!(
+            s.consume_pairing_code(&[6u8; 32], 200, &host("h7"), &[7u8; 32], any)
+                .unwrap(),
+            CodeUse::Paired { .. }
+        ));
+    }
+
+    #[test]
+    fn migrates_pairing_codes_without_networks_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        {
+            // The `pairing_codes` table as created by builds before network allow-lists.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE pairing_codes(
+                    id          TEXT PRIMARY KEY,
+                    label       TEXT NOT NULL,
+                    secret_hash BLOB NOT NULL UNIQUE,
+                    created_at  INTEGER NOT NULL,
+                    expires_at  INTEGER,
+                    max_uses    INTEGER,
+                    uses        INTEGER NOT NULL DEFAULT 0,
+                    revoked_at  INTEGER
+                );
+                INSERT INTO pairing_codes VALUES('c1', 'old', x'07', 100, NULL, NULL, 2, NULL);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let codes = s.list_pairing_codes().unwrap();
+        assert_eq!(codes.len(), 1);
+        assert_eq!((codes[0].label.as_str(), codes[0].uses), ("old", 2));
+        assert!(
+            codes[0].networks.is_empty(),
+            "existing codes allow any address"
+        );
+        drop(s);
+        // Opening again is a no-op.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.list_pairing_codes().unwrap().len(), 1);
     }
 
     #[test]

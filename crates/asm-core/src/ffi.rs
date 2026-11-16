@@ -411,6 +411,8 @@ pub struct PairingCodeInfo {
     pub uses: u32,
     pub max_uses: Option<u32>,
     pub status: PairingCodeStatus,
+    /// Normalised CIDR ranges the pairing host's address must be in; `[]` = any address.
+    pub allowed_networks: Vec<String>,
 }
 
 /// A newly generated pairing code; `code` is shown once and never stored.
@@ -583,6 +585,20 @@ pub fn hint_suggestions() -> Vec<String> {
     crate::manager::netinfo::local_names()
 }
 
+/// The networks this Mac is attached to (`192.168.1.0/24`, `100.64.0.0/10` for
+/// Tailscale, `fd12:3456::/64`), as suggestions for pairing-code networks.
+#[uniffi::export]
+pub fn subnet_suggestions() -> Vec<String> {
+    crate::manager::netinfo::local_subnets()
+}
+
+/// Validate and normalise one pairing-code network entry (`10.1.2.3/8` → `10.0.0.0/8`,
+/// a bare address → `/32` or `/128`); `invalid` names the entry.
+#[uniffi::export]
+pub fn check_network(entry: String) -> FfiResult<String> {
+    Ok(crate::manager::netinfo::check_network(&entry)?)
+}
+
 /// The running manager.
 #[derive(uniffi::Object)]
 pub struct Manager {
@@ -682,16 +698,19 @@ impl Manager {
         Ok(self.core.rename_host(&host_id, &name)?)
     }
 
-    /// `expiry_secs: None` = never; `max_uses: None` = unlimited.
+    /// `expiry_secs: None` = never; `max_uses: None` = unlimited; `allowed_networks`:
+    /// CIDR ranges or addresses the pairing host's observed address must be in (`[]` =
+    /// any); an invalid entry → `invalid` naming it.
     pub fn create_pairing_code(
         &self,
         label: String,
         expiry_secs: Option<u64>,
         max_uses: Option<u32>,
+        allowed_networks: Vec<String>,
     ) -> FfiResult<CreatedPairingCode> {
         Ok(self
             .core
-            .create_pairing_code(&label, expiry_secs, max_uses)?)
+            .create_pairing_code(&label, expiry_secs, max_uses, &allowed_networks)?)
     }
 
     pub fn list_pairing_codes(&self) -> Vec<PairingCodeInfo> {

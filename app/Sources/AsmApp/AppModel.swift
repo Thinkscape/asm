@@ -259,8 +259,10 @@ final class AppModel {
         return error
     }
 
-    func createPairingCode(label: String, expirySecs: UInt64?, maxUses: UInt32?) async throws -> String {
-        let code = try await call { try $0.createPairingCode(label: label, expirySecs: expirySecs, maxUses: maxUses) }
+    func createPairingCode(label: String, expirySecs: UInt64?, maxUses: UInt32?, networks: [String]) async throws -> String {
+        let code = try await call {
+            try $0.createPairingCode(label: label, expirySecs: expirySecs, maxUses: maxUses, networks: networks)
+        }
         await refresh("hosts")
         return code
     }

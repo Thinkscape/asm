@@ -696,14 +696,18 @@ impl Core {
             uses: c.uses,
             max_uses: c.max_uses,
             status,
+            allowed_networks: c.networks,
         }
     }
 
+    /// `allowed_networks`: CIDR ranges or bare addresses the pairing host's observed
+    /// address must be in (`[]` = any); validated and normalised here.
     pub fn create_pairing_code(
         &self,
         label: &str,
         expiry_secs: Option<u64>,
         max_uses: Option<u32>,
+        allowed_networks: &[String],
     ) -> Result<ffi::CreatedPairingCode> {
         let label = label.trim().to_string();
         if label.is_empty() || label.chars().count() > 100 || label.chars().any(char::is_control) {
@@ -712,6 +716,7 @@ impl Core {
         if max_uses == Some(0) {
             return Err(CoreError::invalid("max uses must be at least 1"));
         }
+        let networks = super::netinfo::parse_networks(allowed_networks)?;
         let t = now();
         let code = UnattendedCode::generate(&self.cert.sha256);
         let rec = PairingCodeRecord {
@@ -722,6 +727,7 @@ impl Core {
             max_uses,
             uses: 0,
             revoked_at: None,
+            networks,
         };
         self.store
             .insert_pairing_code(&rec, &code.secret_sha256())?;

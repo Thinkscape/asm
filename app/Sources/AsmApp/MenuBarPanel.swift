@@ -13,9 +13,13 @@ struct MenuBarLabel: View {
     }
 }
 
-/// The 360 pt window shown from the menu bar item.
+/// The 360 pt window shown from the menu bar item. Every button that opens another
+/// window closes it first: the panel otherwise stays on screen above that window (it
+/// never became key, so it never sees the click that would dismiss it) and can take the
+/// key window status back from it.
 struct MenuBarPanel: View {
     let model: AppModel
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -29,14 +33,17 @@ struct MenuBarPanel: View {
             }
             let locked = model.lockedVaults
             if !locked.isEmpty {
-                LockedVaultsSection(locked: locked, unlock: { model.unlockingVaultID = $0 })
+                LockedVaultsSection(locked: locked, unlock: { model.unlockingVaultID = $0 }, dismissPanel: { dismiss() })
                 Divider()
             }
-            PendingSection(pending: model.pending, open: model.openApproval(for:))
+            PendingSection(pending: model.pending) { id in
+                dismiss()
+                model.openApproval(for: id)
+            }
             Divider()
             RecentSection(recent: model.recent)
             Divider()
-            MenuBarFooter()
+            MenuBarFooter(dismissPanel: { dismiss() })
         }
         .padding(12)
         .frame(width: 360)
@@ -47,6 +54,7 @@ struct MenuBarPanel: View {
 private struct LockedVaultsSection: View {
     let locked: [VaultItem]
     let unlock: (String) -> Void
+    let dismissPanel: () -> Void
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -57,9 +65,9 @@ private struct LockedVaultsSection: View {
                     Text("\(Text(verbatim: vault.name)) is locked").lineLimit(1).truncationMode(.middle)
                     Spacer(minLength: 4)
                     Button("Unlock…") {
+                        dismissPanel()
                         unlock(vault.id)
-                        openWindow(id: "settings")
-                        NSApp.activate()
+                        ActivationPolicyController.shared.openRegularWindow { openWindow(id: "settings") }
                     }
                     .controlSize(.small)
                 }
@@ -165,18 +173,19 @@ private struct RecentRow: View {
 }
 
 private struct MenuBarFooter: View {
+    let dismissPanel: () -> Void
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         HStack {
             Button("Settings…") {
-                openWindow(id: "settings")
-                NSApp.activate()
+                dismissPanel()
+                ActivationPolicyController.shared.openRegularWindow { openWindow(id: "settings") }
             }
             .keyboardShortcut(",")
             Button("Show Log…") {
-                openWindow(id: "activity")
-                NSApp.activate()
+                dismissPanel()
+                ActivationPolicyController.shared.openRegularWindow { openWindow(id: "activity") }
             }
             .keyboardShortcut("l")
             Spacer()

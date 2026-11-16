@@ -378,10 +378,54 @@ fn headless_end_to_end() {
         secrets: tmp.path().join("secrets"),
     };
 
-    // Unattended pairing.
-    let code = m
-        .create_pairing_code("e2e".into(), Some(3600), Some(1))
+    // Pairing-code networks: invalid entries are refused at creation.
+    match m.create_pairing_code("bad".into(), None, None, vec!["10.0.0.0/33".into()]) {
+        Err(asm_core::ManagerError::Failed { code, message }) => {
+            assert_eq!(code, "invalid");
+            assert!(message.contains("10.0.0.0/33"), "{message}");
+        }
+        other => panic!("invalid network accepted: {other:?}"),
+    }
+    // A code limited to another network is refused from 127.0.0.1 and keeps its use.
+    let elsewhere = m
+        .create_pairing_code(
+            "elsewhere".into(),
+            Some(3600),
+            Some(1),
+            vec!["192.0.2.0/24".into()],
+        )
         .unwrap();
+    assert_eq!(elsewhere.info.allowed_networks, ["192.0.2.0/24"]);
+    let o = env.run(&["pair", &api, &elsewhere.code], None);
+    assert_eq!(o.code, 6, "pair from outside: {}{}", o.stdout, o.stderr);
+    assert!(
+        o.stderr
+            .contains("pairing code not valid from this address"),
+        "{}",
+        o.stderr
+    );
+    assert!(m.list_hosts().is_empty());
+    let listed = m
+        .list_pairing_codes()
+        .into_iter()
+        .find(|c| c.id == elsewhere.info.id)
+        .unwrap();
+    assert_eq!(
+        listed.uses, 0,
+        "a network mismatch does not use up the code"
+    );
+    m.revoke_pairing_code(elsewhere.info.id.clone()).unwrap();
+
+    // Unattended pairing with a code limited to loopback.
+    let code = m
+        .create_pairing_code(
+            "e2e".into(),
+            Some(3600),
+            Some(1),
+            vec!["127.0.0.1/8".into()],
+        )
+        .unwrap();
+    assert_eq!(code.info.allowed_networks, ["127.0.0.0/8"]);
     let o = env.run(&["pair", &api, &code.code], None);
     assert_eq!(o.code, 0, "pair: {}{}", o.stdout, o.stderr);
     assert!(o.stdout.contains("paired: "), "{}", o.stdout);
@@ -676,6 +720,7 @@ fn headless_end_to_end() {
     for (category, kind) in [
         ("vaults", "added"),
         ("pairing", "paired_with_code"),
+        ("pairing", "code_rejected_network"),
         ("pairing", "requested"),
         ("pairing", "approved"),
         ("pairing", "renamed"),

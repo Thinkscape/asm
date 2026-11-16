@@ -55,6 +55,22 @@ final class CoreBridge: @unchecked Sendable {
         AsmCore.hintSuggestions()
     }
 
+    /// The Mac's own subnets, as pairing-code network suggestions.
+    static func subnetSuggestions() -> [String] {
+        AsmCore.subnetSuggestions()
+    }
+
+    /// One pairing-code network entry, normalised; the core's message when invalid.
+    static func checkNetwork(_ entry: String) -> Result<String, AppError> {
+        do {
+            return .success(try mapped { try AsmCore.checkNetwork(entry: entry) })
+        } catch let error as AppError {
+            return .failure(error)
+        } catch {
+            return .failure(AppError(message: error.localizedDescription))
+        }
+    }
+
     // MARK: Requests
 
     func snapshot() throws -> (pending: [PendingItem], recent: [RecentItem]) {
@@ -118,8 +134,10 @@ final class CoreBridge: @unchecked Sendable {
     }
 
     /// Returns the `asm pair …` command holding the new code (shown once).
-    func createPairingCode(label: String, expirySecs: UInt64?, maxUses: UInt32?) throws -> String {
-        try Self.mapped { try manager.createPairingCode(label: label, expirySecs: expirySecs, maxUses: maxUses) }.command
+    func createPairingCode(label: String, expirySecs: UInt64?, maxUses: UInt32?, networks: [String]) throws -> String {
+        try Self.mapped {
+            try manager.createPairingCode(label: label, expirySecs: expirySecs, maxUses: maxUses, allowedNetworks: networks)
+        }.command
     }
 
     func listPairingCodes() throws -> [PairingCodeItem] {
@@ -372,7 +390,8 @@ private extension PairingCodeItem {
         }
         self.init(
             id: c.id, label: c.label, createdAt: c.createdAt, expiresAt: c.expiresAt,
-            uses: Int(c.uses), maxUses: c.maxUses.map(Int.init), status: status
+            uses: Int(c.uses), maxUses: c.maxUses.map(Int.init), status: status,
+            allowedNetworks: c.allowedNetworks
         )
     }
 }
