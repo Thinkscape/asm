@@ -6,6 +6,7 @@ struct HostsPane: View {
     @State private var hostSelection: String?
     @State private var codeSelection: String?
     @State private var revokingHost: HostItem?
+    @State private var renamingHost: HostItem?
     @State private var revokingCode: PairingCodeItem?
     @State private var generating = false
     @State private var error: String?
@@ -15,6 +16,10 @@ struct HostsPane: View {
             HStack {
                 Text("Paired hosts").font(.headline)
                 Spacer()
+                Button("Rename…") {
+                    renamingHost = model.hosts.first { $0.id == hostSelection }
+                }
+                .disabled(hostSelection == nil)
                 Button("Revoke…") {
                     revokingHost = model.hosts.first { $0.id == hostSelection }
                 }
@@ -24,6 +29,7 @@ struct HostsPane: View {
                 EmptyStateLine(text: "No paired hosts. Run asm pair on an agent machine.")
             } else {
                 Table(model.hosts, selection: $hostSelection) {
+                    TableColumn("Name") { host in Text(verbatim: host.name) }
                     TableColumn("Hostname") { host in Text(verbatim: host.info.hostname) }
                     TableColumn("OS") { host in Text(verbatim: host.osLine) }
                     TableColumn("Addresses") { host in Text(verbatim: host.addressLine).help(Text(verbatim: host.addressLine)) }
@@ -34,6 +40,10 @@ struct HostsPane: View {
                         .width(50)
                 }
                 .contextMenu(forSelectionType: String.self) { ids in
+                    Button("Rename…") {
+                        renamingHost = model.hosts.first { $0.id == ids.first }
+                    }
+                    .disabled(ids.count != 1)
                     Button("Revoke…", role: .destructive) {
                         revokingHost = model.hosts.first { $0.id == ids.first }
                     }
@@ -77,8 +87,11 @@ struct HostsPane: View {
         .sheet(isPresented: $generating) {
             PairingCodeSheet(model: model)
         }
+        .sheet(item: $renamingHost) { host in
+            RenameHostSheet(model: model, host: host)
+        }
         .confirmationDialog(
-            "Revoke host “\(revokingHost?.info.hostname ?? "")”?",
+            "Revoke host “\(revokingHost?.name ?? "")”?",
             isPresented: Binding(get: { revokingHost != nil }, set: { if !$0 { revokingHost = nil } }),
             presenting: revokingHost
         ) { host in
@@ -111,6 +124,62 @@ private struct LastSeenCell: View {
             Text(date, format: .relative(presentation: .named))
         } else {
             Text("never").foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct RenameHostSheet: View {
+    let model: AppModel
+    let host: HostItem
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String
+    @State private var error: String?
+    @State private var working = false
+
+    init(model: AppModel, host: HostItem) {
+        self.model = model
+        self.host = host
+        _name = State(initialValue: host.name)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    TextField(text: $name, prompt: Text(verbatim: host.info.hostname)) {
+                        Text("Friendly name")
+                    }
+                    .onSubmit(save)
+                } footer: {
+                    Text("Shown wherever this host appears. Leave empty to use its hostname, \(Text(verbatim: host.info.hostname)). At most 64 characters.")
+                }
+                if let error {
+                    Text(verbatim: error).foregroundStyle(.red)
+                }
+            }
+            .formStyle(.grouped)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Rename", action: save)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(working)
+            }
+            .padding()
+        }
+        .frame(width: 420, height: 200)
+    }
+
+    private func save() {
+        guard !working else { return }
+        working = true
+        Task {
+            if let failure = await model.renameHost(host.id, name: name) {
+                error = failure
+            } else {
+                dismiss()
+            }
+            working = false
         }
     }
 }

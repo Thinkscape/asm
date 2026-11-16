@@ -12,13 +12,13 @@ use asm_proto::rules::validate_agent_text;
 use asm_proto::wire::LeaseMode;
 
 use super::{
-    Core, TOPIC_HOSTS, TOPIC_LEASES, TOPIC_PROXY, TOPIC_SETTINGS, TOPIC_VAULTS, effective_config,
-    lock, now, to_system_time,
+    Core, TOPIC_HOSTS, TOPIC_LEASES, TOPIC_PROXY, TOPIC_REQUESTS, TOPIC_SETTINGS, TOPIC_VAULTS,
+    effective_config, lock, now, to_system_time,
 };
 use crate::error::{CoreError, Result};
 use crate::ffi;
 use crate::proxy::ProxyConfig;
-use crate::store::{PairingCodeRecord, VaultRecord};
+use crate::store::{PairingCodeRecord, Store, VaultRecord};
 use crate::vault::registry::{Registry, VaultEntry};
 use crate::vault::{BitwardenSecrets, VaultConfig, VaultStatus, bitwarden, creds};
 
@@ -356,6 +356,14 @@ impl Core {
 
     // ---- hosts ----
 
+    /// Friendly-name lookup for host ids (revoked hosts included), cached per call site.
+    pub(crate) fn host_names(&self) -> HostNames<'_> {
+        HostNames {
+            store: &self.store,
+            cache: HashMap::new(),
+        }
+    }
+
     pub fn list_hosts(&self) -> Vec<ffi::HostRecord> {
         let t = now();
         let mut active: HashMap<String, u32> = HashMap::new();
@@ -378,6 +386,7 @@ impl Core {
                     })
                     .collect(),
                 active_leases: active.get(&h.id).copied().unwrap_or(0),
+                name: h.label().to_string(),
                 host_id: h.id,
                 info: h.info.into(),
                 observed_address: h.address,
@@ -405,6 +414,24 @@ impl Core {
         self.sync_proxy(false);
         self.notify(TOPIC_HOSTS);
         self.notify(TOPIC_LEASES);
+        Ok(())
+    }
+
+    /// Set a host's friendly name (rules of [`super::pairing::host_name`]; empty = its
+    /// reported hostname).
+    pub fn rename_host(&self, host_id: &str, name: &str) -> Result<()> {
+        let host = self
+            .store
+            .get_host(host_id)?
+            .filter(|h| h.revoked_at.is_none())
+            .ok_or_else(|| CoreError::not_found("no such host"))?;
+        let name = super::pairing::host_name(name, &host.info.hostname)?;
+        if !self.store.rename_host(host_id, &name)? {
+            return Err(CoreError::not_found("no such host"));
+        }
+        self.notify(TOPIC_HOSTS);
+        self.notify(TOPIC_LEASES);
+        self.notify(TOPIC_REQUESTS);
         Ok(())
     }
 
@@ -495,23 +522,13 @@ impl Core {
     pub fn list_leases(&self) -> Vec<ffi::LeaseInfo> {
         let t = now();
         let suspended = self.suspended();
-        let mut labels: HashMap<String, String> = HashMap::new();
+        let mut names = self.host_names();
         self.store
             .list_leases()
             .unwrap_or_default()
             .into_iter()
             .map(|l| {
-                let host_label = labels
-                    .entry(l.host_id.clone())
-                    .or_insert_with(|| {
-                        self.store
-                            .get_host(&l.host_id)
-                            .ok()
-                            .flatten()
-                            .map(|h| h.info.hostname)
-                            .unwrap_or_default()
-                    })
-                    .clone();
+                let (host_label, hostname) = names.get(&l.host_id).cloned().unwrap_or_default();
                 let status = l.status(t);
                 ffi::LeaseInfo {
                     suspended: status == asm_proto::wire::LeaseStatus::Active
@@ -521,6 +538,7 @@ impl Core {
                     lease_id: l.id,
                     host_id: l.host_id,
                     host_label,
+                    hostname,
                     vault_id: l.vault_id,
                     vault_name: l.vault_name,
                     name: l.name,
@@ -702,5 +720,24 @@ impl Core {
         self.set_settings(s)?;
         self.notify(TOPIC_SETTINGS);
         Ok(())
+    }
+}
+
+/// See [`Core::host_names`]. `get` answers `(friendly name, reported hostname)`.
+pub(crate) struct HostNames<'a> {
+    store: &'a Store,
+    cache: HashMap<String, Option<(String, String)>>,
+}
+
+impl HostNames<'_> {
+    pub(crate) fn get(&mut self, host_id: &str) -> Option<&(String, String)> {
+        let store = self.store;
+        self.cache
+            .entry(host_id.to_string())
+            .or_insert_with(|| {
+                let h = store.get_host(host_id).ok().flatten()?;
+                Some((h.label().to_string(), h.info.hostname))
+            })
+            .as_ref()
     }
 }

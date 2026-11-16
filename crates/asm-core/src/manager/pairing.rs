@@ -5,6 +5,7 @@ use asm_proto::crypto::{ct_eq, hex_decode_array, new_token, new_uuid_v4, sha256}
 use asm_proto::pairing::{
     NONCE_LEN, UnattendedCode, format_pairing_code, new_nonce, pairing_code, verify_commit,
 };
+use asm_proto::rules::validate_agent_text;
 use asm_proto::wire::{HostInfo, PairRequest, PairResponse, RevealRequest};
 
 use super::requests::{Book, Detail, Fail, Pending, REVEAL_SECS};
@@ -15,6 +16,25 @@ use crate::store::{HostRecord, Store};
 /// At most this many open pairing attempts per remote address, and in total.
 const MAX_PER_ADDRESS: usize = 1;
 const MAX_TOTAL: usize = 5;
+
+/// Longest friendly host name, in Unicode scalar values.
+const MAX_HOST_NAME: usize = 64;
+
+/// A host's friendly name as the operator typed it: trimmed, empty = `hostname`, at most
+/// 64 characters, no control or bidi characters (`invalid`).
+pub(crate) fn host_name(raw: &str, hostname: &str) -> Result<String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Ok(hostname.to_string());
+    }
+    validate_agent_text("name", name)?;
+    if name.chars().count() > MAX_HOST_NAME {
+        return Err(CoreError::invalid(format!(
+            "name must be at most {MAX_HOST_NAME} characters"
+        )));
+    }
+    Ok(name.to_string())
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum PairState {
@@ -201,6 +221,7 @@ pub(crate) fn pair_with_code(
     let token = new_token();
     let host = HostRecord {
         id: new_uuid_v4(),
+        name: info.hostname.clone(),
         info,
         address: ip.to_string(),
         paired_at: t,
@@ -261,28 +282,38 @@ impl Core {
         poll_attempt(&mut lock(&self.book), pair_id, poll_token)
     }
 
-    /// Operator approved a pairing popup: create the host and hand its token to the poller.
-    pub(crate) fn approve_pair(&self, p: &Pending) -> std::result::Result<(), Fail> {
+    /// Operator approved a pairing popup: create the host (named `name`, see [`host_name`])
+    /// and hand its token to the poller.
+    pub(crate) fn approve_pair(&self, p: &Pending, name: &str) -> std::result::Result<(), Fail> {
         let Detail::Pair { info, address, .. } = &p.detail else {
             return Err(Fail::Keep(CoreError::invalid("not a pairing request")));
         };
+        let name = host_name(name, &info.hostname).map_err(Fail::Keep)?;
         let t = now();
         let token = new_token();
         let host = HostRecord {
             id: new_uuid_v4(),
             info: info.clone(),
+            name,
             address: address.clone(),
             paired_at: t,
             last_seen: Some(t),
             revoked_at: None,
         };
         self.store.insert_host(&host, &sha256(token.as_bytes()))?;
-        if let Some(a) = lock(&self.book).pairs.get_mut(&p.id) {
+        let mut b = lock(&self.book);
+        // History of this request names the new host.
+        if let Some(q) = b.pending.iter_mut().find(|q| q.id == p.id) {
+            q.host_id = Some(host.id.clone());
+            q.host_label = host.name.clone();
+        }
+        if let Some(a) = b.pairs.get_mut(&p.id) {
             a.state = PairState::Approved {
                 host_id: host.id.clone(),
                 token,
             };
         }
+        drop(b);
         self.notify(TOPIC_HOSTS);
         Ok(())
     }
@@ -302,6 +333,20 @@ mod tests {
             hostname: name.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn friendly_host_names() {
+        assert_eq!(host_name("  Build box  ", "nuk1").unwrap(), "Build box");
+        assert_eq!(host_name("   ", "nuk1").unwrap(), "nuk1");
+        assert_eq!(host_name(&"é".repeat(64), "h").unwrap().chars().count(), 64);
+        assert!(host_name(&"é".repeat(65), "h").is_err());
+        assert!(host_name("box\u{7}", "h").is_err());
+        assert!(host_name("box\u{202E}", "h").is_err());
+        assert_eq!(
+            host_name("a\u{202E}", "h").unwrap_err().code,
+            asm_proto::ErrorCode::Invalid
+        );
     }
 
     fn awaiting(r: PairResponse) -> (String, String, [u8; NONCE_LEN]) {

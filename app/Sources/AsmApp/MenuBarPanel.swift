@@ -83,7 +83,7 @@ private struct PendingSection: View {
                     Button {
                         open(item.id)
                     } label: {
-                        PendingRow(kind: item.kind, host: item.hostLabel, summary: item.summary, createdAt: item.createdAt)
+                        PendingRow(kind: item.kind, host: item.hostLabel, hostname: item.hostname, summary: item.summary, createdAt: item.createdAt)
                     }
                     .buttonStyle(.plain)
                 }
@@ -94,7 +94,9 @@ private struct PendingSection: View {
 
 private struct PendingRow: View {
     let kind: RequestKind
+    /// Friendly name; `hostname` follows in parentheses when it differs.
     let host: String
+    let hostname: String
     let summary: String
     let createdAt: Date
 
@@ -103,7 +105,7 @@ private struct PendingRow: View {
             Image(systemName: kind.symbol).frame(width: 18).foregroundStyle(.tint)
             VStack(alignment: .leading, spacing: 1) {
                 Text(verbatim: summary).lineLimit(1).truncationMode(.middle)
-                Text("\(kind.title) · \(Text(verbatim: host))").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text("\(kind.title) · \(Text(verbatim: hostLine))").font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 4)
             Text(createdAt, style: .relative).font(.caption).foregroundStyle(.secondary).monospacedDigit()
@@ -111,6 +113,10 @@ private struct PendingRow: View {
         .padding(.vertical, 3)
         .padding(.horizontal, 4)
         .contentShape(Rectangle())
+    }
+
+    private var hostLine: String {
+        hostname.isEmpty || hostname == host ? host : "\(host) (\(hostname))"
     }
 }
 

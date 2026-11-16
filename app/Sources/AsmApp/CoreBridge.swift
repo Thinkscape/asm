@@ -65,7 +65,7 @@ final class CoreBridge: @unchecked Sendable {
     func resolve(id: String, decision: DecisionItem) throws {
         let core: Decision = switch decision {
         case let .deny(reason): .deny(reason: reason)
-        case .approvePair: .approvePair
+        case let .approvePair(name): .approvePair(name: name)
         case let .approveGet(raw, durationSecs, hosts): .approveGet(mode: raw ? .raw : .sentinel, durationSecs: durationSecs, hosts: hosts)
         case let .approveWrite(vaultID, collectionID): .approveWrite(vaultId: vaultID, collectionId: collectionID)
         }
@@ -106,6 +106,10 @@ final class CoreBridge: @unchecked Sendable {
 
     func revokeHost(_ id: String) throws {
         try Self.mapped { try manager.revokeHost(hostId: id) }
+    }
+
+    func renameHost(_ id: String, name: String) throws {
+        try Self.mapped { try manager.renameHost(hostId: id, name: name) }
     }
 
     /// Returns the `asm pair …` command holding the new code (shown once).
@@ -263,7 +267,8 @@ private extension PendingItem {
         }
         self.init(
             id: r.id, kind: RequestKind(r.kind), createdAt: r.createdAt, expiresAt: r.expiresAt,
-            hostLabel: r.hostLabel, agent: r.agent, summary: r.summary, error: r.error, detail: detail
+            hostLabel: r.hostLabel, hostname: r.hostInfo?.hostname ?? "", agent: r.agent, summary: r.summary,
+            error: r.error, detail: detail
         )
     }
 }
@@ -331,7 +336,7 @@ private extension VaultDraft {
 private extension HostItem {
     init(_ h: HostRecord) {
         self.init(
-            id: h.hostId, info: HostInfoItem(h.info), observedAddress: h.observedAddress,
+            id: h.hostId, name: h.name, info: HostInfoItem(h.info), observedAddress: h.observedAddress,
             agents: h.agents.map { AgentSeenItem(agent: $0.agent, lastSeen: $0.lastSeen) },
             pairedAt: h.pairedAt, lastSeen: h.lastSeen, activeLeases: Int(h.activeLeases)
         )
@@ -360,7 +365,7 @@ private extension LeaseItem {
         case .revoked: .revoked
         }
         self.init(
-            id: l.leaseId, hostLabel: l.hostLabel, source: l.vaultName, name: l.name,
+            id: l.leaseId, hostLabel: l.hostLabel, hostname: l.hostname, source: l.vaultName, name: l.name,
             mode: l.mode == .raw ? .raw : .sentinel, hosts: l.hosts, createdAt: l.createdAt,
             expiresAt: l.expiresAt, status: status, suspended: l.suspended, rawDelivered: l.rawDelivered
         )

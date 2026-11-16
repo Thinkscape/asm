@@ -55,7 +55,25 @@ impl AutoApprover {
         let _g = self.busy.lock().unwrap();
         for p in m.snapshot().pending {
             let decision = match &p.detail {
-                RequestDetail::Pair { .. } => Decision::ApprovePair,
+                RequestDetail::Pair { .. } => {
+                    // A bad name is refused and leaves the request pending with the error.
+                    match m.resolve_request(
+                        p.id.clone(),
+                        Decision::ApprovePair {
+                            name: "bad\u{202E}name".into(),
+                        },
+                    ) {
+                        Err(asm_core::ManagerError::Failed { code, .. }) => {
+                            assert_eq!(code, "invalid")
+                        }
+                        other => panic!("bad name accepted: {other:?}"),
+                    }
+                    let still = m.snapshot().pending.into_iter().find(|q| q.id == p.id);
+                    assert!(still.is_some_and(|q| q.error.is_some()));
+                    Decision::ApprovePair {
+                        name: "  e2e friendly  ".into(),
+                    }
+                }
                 RequestDetail::Get { reason, .. } if reason.contains("deny-me") => Decision::Deny {
                     reason: "provide a better reason".into(),
                 },
@@ -367,7 +385,14 @@ fn headless_end_to_end() {
     let o = env.run(&["pair", &api, &code.code], None);
     assert_eq!(o.code, 0, "pair: {}{}", o.stdout, o.stderr);
     assert!(o.stdout.contains("paired: "), "{}", o.stdout);
-    assert_eq!(m.list_hosts().len(), 1);
+    let hosts = m.list_hosts();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(
+        hosts[0].name, hosts[0].info.hostname,
+        "unattended pairing names the host after its hostname"
+    );
+    let first_host = hosts[0].host_id.clone();
+    let first_hostname = hosts[0].info.hostname.clone();
     assert_eq!(
         approver.approvals.load(Ordering::SeqCst),
         0,
@@ -562,6 +587,55 @@ fn headless_end_to_end() {
         !log.contains(REAL_1) && !log.contains(REAL_2),
         "proxy log leaks a value"
     );
+
+    // Interactive pairing: the popup's friendly name becomes the host's name.
+    let env2 = Env {
+        cli: env.cli.clone(),
+        config: tmp.path().join("config2"),
+        secrets: tmp.path().join("secrets2"),
+    };
+    let o = env2.run(&["pair", &api], None);
+    assert_eq!(o.code, 0, "interactive pair: {}{}", o.stdout, o.stderr);
+    let named = m
+        .list_hosts()
+        .into_iter()
+        .find(|h| h.host_id != first_host)
+        .expect("second host listed");
+    assert_eq!(named.name, "e2e friendly");
+    assert!(
+        m.snapshot()
+            .recent
+            .iter()
+            .any(|r| r.host_label == "e2e friendly"),
+        "recent pairing request shows the chosen name"
+    );
+
+    // Renaming shows everywhere the host is named; empty = back to the hostname.
+    m.rename_host(first_host.clone(), "Agent box".into())
+        .unwrap();
+    let leases = m.list_leases();
+    assert!(leases.iter().any(|l| l.host_id == first_host));
+    assert!(
+        leases
+            .iter()
+            .filter(|l| l.host_id == first_host)
+            .all(|l| l.host_label == "Agent box" && l.hostname == first_hostname)
+    );
+    assert!(
+        m.snapshot()
+            .recent
+            .iter()
+            .any(|r| r.host_label == "Agent box"),
+        "recent requests follow the rename"
+    );
+    assert!(m.rename_host(first_host.clone(), "x\u{7}".into()).is_err());
+    m.rename_host(first_host.clone(), " ".into()).unwrap();
+    let h = m
+        .list_hosts()
+        .into_iter()
+        .find(|h| h.host_id == first_host)
+        .unwrap();
+    assert_eq!(h.name, first_hostname);
 
     m.shutdown();
 }

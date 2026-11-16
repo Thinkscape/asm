@@ -61,10 +61,10 @@ impl From<asm_proto::wire::LeaseMode> for LeaseMode {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum Decision {
     /// `""` = no reason.
-    Deny {
-        reason: String,
-    },
-    ApprovePair,
+    Deny { reason: String },
+    /// `name`: the host's friendly name; trimmed, `""` = the reported hostname, at most 64
+    /// characters, no control or bidi characters (else `invalid`, request stays pending).
+    ApprovePair { name: String },
     /// `duration_secs: None` = unlimited; `hosts` for sentinel leases (`["*"]` = any host).
     ApproveGet {
         mode: LeaseMode,
@@ -222,6 +222,7 @@ pub struct PendingRequest {
     pub expires_at: SystemTime,
     /// `None` for pairing requests.
     pub host_id: Option<String>,
+    /// The host's current friendly name; for pairing requests the reported hostname.
     pub host_label: String,
     /// Host info of the requesting host (for pairing: the info it sent).
     pub host_info: Option<HostInfo>,
@@ -246,6 +247,7 @@ pub struct RecentRequest {
     pub id: String,
     pub kind: RequestKind,
     pub summary: String,
+    /// The host's current friendly name (pairing requests: the name chosen, or the hostname).
     pub host_label: String,
     pub outcome: RequestOutcome,
     pub deny_reason: Option<String>,
@@ -371,6 +373,8 @@ pub struct AgentSeen {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct HostRecord {
     pub host_id: String,
+    /// Friendly name (the reported hostname unless the operator chose another).
+    pub name: String,
     pub info: HostInfo,
     pub observed_address: String,
     pub agents: Vec<AgentSeen>,
@@ -427,7 +431,10 @@ impl From<asm_proto::wire::LeaseStatus> for LeaseStatus {
 pub struct LeaseInfo {
     pub lease_id: String,
     pub host_id: String,
+    /// The host's friendly name.
     pub host_label: String,
+    /// The host's reported hostname.
+    pub hostname: String,
     pub vault_id: String,
     pub vault_name: String,
     pub name: String,
@@ -610,6 +617,11 @@ impl Manager {
 
     pub fn revoke_host(&self, host_id: String) -> FfiResult<()> {
         Ok(self.core.revoke_host(&host_id)?)
+    }
+
+    /// Set a host's friendly name (rules of `Decision::ApprovePair`; `""` = its hostname).
+    pub fn rename_host(&self, host_id: String, name: String) -> FfiResult<()> {
+        Ok(self.core.rename_host(&host_id, &name)?)
     }
 
     /// `expiry_secs: None` = never; `max_uses: None` = unlimited.

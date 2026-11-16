@@ -240,6 +240,14 @@ final class AppModel {
         return error
     }
 
+    func renameHost(_ id: String, name: String) async -> String? {
+        let error = await perform { try $0.renameHost(id, name: name) }
+        await refresh("hosts")
+        await refresh("leases")
+        await refresh("requests")
+        return error
+    }
+
     func createPairingCode(label: String, expirySecs: UInt64?, maxUses: UInt32?) async throws -> String {
         let code = try await call { try $0.createPairingCode(label: label, expirySecs: expirySecs, maxUses: maxUses) }
         await refresh("hosts")

@@ -220,7 +220,7 @@ private struct CertificateSection: View {
         } header: {
             Text("CA certificate")
         } footer: {
-            Text("Agents trust this CA through asm proxy-info. Keep its key private: it can impersonate any HTTPS site to clients that trust it.")
+            Text("Agents trust this CA through asm proxy-env. Keep its key private: it can impersonate any HTTPS site to clients that trust it.")
         }
     }
 }

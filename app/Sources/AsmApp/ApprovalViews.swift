@@ -12,6 +12,7 @@ struct ApprovalRoot: View {
                 ApprovalHeader(
                     kind: request.kind,
                     hostLabel: request.hostLabel,
+                    hostname: request.hostname,
                     agent: request.agent,
                     createdAt: request.createdAt,
                     expiresAt: request.expiresAt,
@@ -42,7 +43,9 @@ struct ApprovalRoot: View {
 
 private struct ApprovalHeader: View {
     let kind: RequestKind
+    /// Friendly name of the host; `hostname` is shown beside it when it differs.
     let hostLabel: String
+    let hostname: String
     let agent: String
     let createdAt: Date
     let expiresAt: Date
@@ -76,6 +79,9 @@ private struct ApprovalHeader: View {
             }
             HStack(spacing: 4) {
                 Text(verbatim: hostLabel).fontWeight(.medium)
+                if !hostname.isEmpty && hostname != hostLabel {
+                    Text(verbatim: "(\(hostname))").foregroundStyle(.secondary)
+                }
                 if !agent.isEmpty {
                     Text("·").foregroundStyle(.secondary)
                     Text(verbatim: agent).foregroundStyle(.secondary)
@@ -220,8 +226,51 @@ private struct PairApproval: View {
     let code: String
     let armed: Bool
     let resolve: (DecisionItem) -> Void
+    @State private var name: String
+    @FocusState private var nameFocused: Bool
+
+    init(info: HostInfoItem, observedAddress: String, code: String, armed: Bool, resolve: @escaping (DecisionItem) -> Void) {
+        self.info = info
+        self.observedAddress = observedAddress
+        self.code = code
+        self.armed = armed
+        self.resolve = resolve
+        _name = State(initialValue: info.hostname)
+    }
+
+    /// Same rules as the core (`invalid` there keeps the request pending): at most 64
+    /// characters, no control or bidi characters; empty = the hostname.
+    private var nameProblem: String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.unicodeScalars.contains(where: { $0.properties.generalCategory == .control || (0x202A...0x202E).contains($0.value) || (0x2066...0x2069).contains($0.value) }) {
+            return "The name contains a control or text-direction character."
+        }
+        if trimmed.unicodeScalars.count > 64 {
+            return "The name can have at most 64 characters."
+        }
+        return nil
+    }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Friendly name").font(.caption).foregroundStyle(.secondary)
+            TextField(text: $name, prompt: Text(verbatim: info.hostname)) {
+                Text("Friendly name")
+            }
+            .labelsHidden()
+            .textFieldStyle(.roundedBorder)
+            .focused($nameFocused)
+            .onSubmit(approve)
+            if let nameProblem {
+                Text(verbatim: nameProblem).font(.caption).foregroundStyle(.red)
+            }
+        }
+        .onAppear {
+            if NSApp.keyWindow is ApprovalPanel { focusName() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            if note.object is ApprovalPanel { focusName() }
+        }
         Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 4) {
             InfoRow(label: "Hostname", value: info.hostname)
             InfoRow(label: "User", value: info.username)
@@ -245,9 +294,25 @@ private struct PairApproval: View {
         .padding(.vertical, 8)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
         ApprovalActions(cannedReasons: [], deny: { resolve(.deny(reason: $0)) }) {
-            Button("Approve") { resolve(.approvePair) }
-                .keyboardShortcut(.defaultAction)
-                .disabled(!armed)
+            // While the name field has focus, Return goes to its `onSubmit` only (one approval).
+            Button("Approve", action: approve)
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(nameFocused ? nil : .defaultAction)
+                .disabled(!armed || nameProblem != nil)
+        }
+    }
+
+    private func approve() {
+        guard armed, nameProblem == nil else { return }
+        resolve(.approvePair(name: name))
+    }
+
+    /// Focus the name field and select its text, so typing replaces the hostname.
+    private func focusName() {
+        nameFocused = true
+        DispatchQueue.main.async {
+            guard NSApp.keyWindow is ApprovalPanel else { return }
+            NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
         }
     }
 }

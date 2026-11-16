@@ -407,7 +407,7 @@ impl Core {
             created: t,
             expires: t + lifetime,
             host_id: Some(host.id.clone()),
-            host_label: host.info.hostname.clone(),
+            host_label: host.label().to_string(),
             host_info: Some(host.info.clone()),
             agent: agent.to_string(),
             resolving: false,
@@ -572,7 +572,7 @@ impl Core {
             id,
             kind: "get".into(),
             host_id: Some(host.id.clone()),
-            host_label: host.info.hostname.clone(),
+            host_label: host.label().to_string(),
             summary: format!("get {} (existing lease)", secret.display),
             status: "approved".into(),
             deny_reason: None,
@@ -878,7 +878,7 @@ impl Core {
             let ok = matches!(
                 (&b.pending[i].detail, &decision),
                 (_, ffi::Decision::Deny { .. })
-                    | (Detail::Pair { .. }, ffi::Decision::ApprovePair)
+                    | (Detail::Pair { .. }, ffi::Decision::ApprovePair { .. })
                     | (Detail::Get(_), ffi::Decision::ApproveGet { .. })
                     | (Detail::Update(_), ffi::Decision::ApproveWrite { .. })
                     | (Detail::Add(_), ffi::Decision::ApproveWrite { .. })
@@ -902,7 +902,9 @@ impl Core {
         // Phase 2: do the work without holding the book.
         let outcome: std::result::Result<Option<RequestResult>, Fail> = match (&p.detail, decision)
         {
-            (Detail::Pair { .. }, _) => self.approve_pair(&p).map(|_| None),
+            (Detail::Pair { .. }, ffi::Decision::ApprovePair { name }) => {
+                self.approve_pair(&p, &name).map(|_| None)
+            }
             (
                 Detail::Get(g),
                 ffi::Decision::ApproveGet {
@@ -1227,9 +1229,16 @@ impl Core {
         self.expire_requests(now());
         let default_duration = self.settings().lease_default_secs;
         let pending: Vec<Pending> = lock(&self.book).pending.clone();
+        // Labels follow renames: look up the host's current name.
+        let mut names = self.host_names();
         let pending = pending
             .into_iter()
-            .map(|p| pending_to_ffi(p, default_duration))
+            .map(|mut p| {
+                if let Some((label, _)) = p.host_id.as_deref().and_then(|id| names.get(id)) {
+                    p.host_label = label.clone();
+                }
+                pending_to_ffi(p, default_duration)
+            })
             .collect();
         let recent = self
             .store
@@ -1248,7 +1257,12 @@ impl Core {
                     id: h.id,
                     kind: kind_from_str(&h.kind),
                     summary: h.summary,
-                    host_label: h.host_label,
+                    host_label: h
+                        .host_id
+                        .as_deref()
+                        .and_then(|id| names.get(id))
+                        .map(|(label, _)| label.clone())
+                        .unwrap_or(h.host_label),
                     outcome,
                     deny_reason: h.deny_reason,
                     resolved_at: to_system_time(h.resolved_at),

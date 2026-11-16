@@ -37,7 +37,9 @@ struct LeasesPane: View {
                 EmptyStateLine(text: emptyText)
             } else {
                 Table(visible, selection: $selection, sortOrder: $sortOrder) {
-                    TableColumn("Host", value: \.hostLabel) { lease in Text(verbatim: lease.hostLabel) }
+                    TableColumn("Host", value: \.hostLabel) { lease in
+                        Text(verbatim: lease.hostLabel).help(Text(verbatim: lease.hostname))
+                    }
                     TableColumn("Source", value: \.source) { lease in Text(verbatim: lease.source) }
                     TableColumn("Secret", value: \.name) { lease in Text(verbatim: lease.name) }
                     TableColumn("Mode", value: \.modeLine) { lease in
@@ -109,6 +111,7 @@ struct LeasesPane: View {
             .filter { lease in
                 filter.includes(lease.status) && (query.isEmpty
                     || lease.hostLabel.localizedCaseInsensitiveContains(query)
+                    || lease.hostname.localizedCaseInsensitiveContains(query)
                     || lease.source.localizedCaseInsensitiveContains(query)
                     || lease.name.localizedCaseInsensitiveContains(query))
             }

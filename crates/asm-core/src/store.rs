@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS hosts(
     id         TEXT PRIMARY KEY,
     token_hash BLOB NOT NULL UNIQUE,
     info       TEXT NOT NULL,
+    name       TEXT NOT NULL DEFAULT '',
     address    TEXT NOT NULL,
     paired_at  INTEGER NOT NULL,
     last_seen  INTEGER,
@@ -98,11 +99,24 @@ pub struct VaultRecord {
 pub struct HostRecord {
     pub id: String,
     pub info: HostInfo,
+    /// Friendly name chosen by the operator (the reported hostname by default).
+    pub name: String,
     /// Remote address observed when pairing.
     pub address: String,
     pub paired_at: i64,
     pub last_seen: Option<i64>,
     pub revoked_at: Option<i64>,
+}
+
+impl HostRecord {
+    /// What the UI calls this host: its friendly name, else the reported hostname.
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.info.hostname
+        } else {
+            &self.name
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +215,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -285,8 +300,49 @@ impl Store {
     }
 }
 
-/// Raw `hosts` row: id, info JSON, address, paired_at, last_seen, revoked_at.
-type HostRow = (String, String, String, i64, Option<i64>, Option<i64>);
+/// Bring a database created by an earlier build up to the current schema.
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_name = conn
+        .prepare("SELECT 1 FROM pragma_table_info('hosts') WHERE name = 'name'")?
+        .exists([])?;
+    if !has_name {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE hosts ADD COLUMN name TEXT NOT NULL DEFAULT '';
+             UPDATE hosts SET name = coalesce(json_extract(info, '$.hostname'), '');",
+        )?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn insert_host_row(db: &Connection, h: &HostRecord, token_hash: &[u8; 32]) -> Result<()> {
+    db.execute(
+        "INSERT INTO hosts(id, token_hash, info, name, address, paired_at, last_seen, revoked_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+        params![
+            h.id,
+            &token_hash[..],
+            serde_json::to_string(&h.info)?,
+            h.name,
+            h.address,
+            h.paired_at,
+            h.last_seen
+        ],
+    )?;
+    Ok(())
+}
+
+/// Raw `hosts` row: id, info JSON, name, address, paired_at, last_seen, revoked_at.
+type HostRow = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Option<i64>,
+);
 
 impl Store {
     // ---- hosts ----
@@ -299,14 +355,16 @@ impl Store {
             r.get(3)?,
             r.get(4)?,
             r.get(5)?,
+            r.get(6)?,
         ))
     }
 
     fn host_build(t: HostRow) -> Result<HostRecord> {
-        let (id, info, address, paired_at, last_seen, revoked_at) = t;
+        let (id, info, name, address, paired_at, last_seen, revoked_at) = t;
         Ok(HostRecord {
             id,
             info: serde_json::from_str(&info)?,
+            name,
             address,
             paired_at,
             last_seen,
@@ -315,19 +373,7 @@ impl Store {
     }
 
     pub fn insert_host(&self, h: &HostRecord, token_hash: &[u8; 32]) -> Result<()> {
-        self.db().execute(
-            "INSERT INTO hosts(id, token_hash, info, address, paired_at, last_seen, revoked_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-            params![
-                h.id,
-                &token_hash[..],
-                serde_json::to_string(&h.info)?,
-                h.address,
-                h.paired_at,
-                h.last_seen
-            ],
-        )?;
-        Ok(())
+        insert_host_row(&self.db(), h, token_hash)
     }
 
     /// The non-revoked host whose token hashes to `token_hash` (compared in constant time).
@@ -335,10 +381,10 @@ impl Store {
         let db = self.db();
         let row = db
             .query_row(
-                "SELECT id, info, address, paired_at, last_seen, revoked_at, token_hash FROM hosts
+                "SELECT id, info, name, address, paired_at, last_seen, revoked_at, token_hash FROM hosts
                  WHERE token_hash = ?1 AND revoked_at IS NULL",
                 [&token_hash[..]],
-                |r| Ok((Self::host_from_row(r)?, r.get::<_, Vec<u8>>(6)?)),
+                |r| Ok((Self::host_from_row(r)?, r.get::<_, Vec<u8>>(7)?)),
             )
             .optional()?;
         match row {
@@ -353,7 +399,7 @@ impl Store {
         let db = self.db();
         let t = db
             .query_row(
-                "SELECT id, info, address, paired_at, last_seen, revoked_at FROM hosts WHERE id = ?1",
+                "SELECT id, info, name, address, paired_at, last_seen, revoked_at FROM hosts WHERE id = ?1",
                 [id],
                 Self::host_from_row,
             )
@@ -364,7 +410,7 @@ impl Store {
     pub fn list_hosts(&self) -> Result<Vec<HostRecord>> {
         let db = self.db();
         let mut st = db.prepare(
-            "SELECT id, info, address, paired_at, last_seen, revoked_at FROM hosts
+            "SELECT id, info, name, address, paired_at, last_seen, revoked_at FROM hosts
              WHERE revoked_at IS NULL ORDER BY paired_at",
         )?;
         let rows = st.query_map([], Self::host_from_row)?;
@@ -381,6 +427,15 @@ impl Store {
             params![id, now],
         )?;
         Ok(())
+    }
+
+    /// Returns false when the host does not exist or is revoked.
+    pub fn rename_host(&self, id: &str, name: &str) -> Result<bool> {
+        let n = self.db().execute(
+            "UPDATE hosts SET name = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            params![id, name],
+        )?;
+        Ok(n > 0)
     }
 
     /// Returns false when the host does not exist or is already revoked.
@@ -481,18 +536,7 @@ impl Store {
             "UPDATE pairing_codes SET uses = uses + 1 WHERE id = ?1",
             [&id],
         )?;
-        tx.execute(
-            "INSERT INTO hosts(id, token_hash, info, address, paired_at, last_seen, revoked_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-            params![
-                host.id,
-                &token_hash[..],
-                serde_json::to_string(&host.info)?,
-                host.address,
-                host.paired_at,
-                host.last_seen
-            ],
-        )?;
+        insert_host_row(&tx, host, token_hash)?;
         tx.commit()?;
         Ok(true)
     }
@@ -714,11 +758,57 @@ mod tests {
                 hostname: "box".into(),
                 ..Default::default()
             },
+            name: "box".into(),
             address: "10.0.0.2".into(),
             paired_at: 100,
             last_seen: None,
             revoked_at: None,
         }
+    }
+
+    #[test]
+    fn migrates_hosts_without_name_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        {
+            // The `hosts` table as created by builds before friendly names.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE hosts(
+                    id         TEXT PRIMARY KEY,
+                    token_hash BLOB NOT NULL UNIQUE,
+                    info       TEXT NOT NULL,
+                    address    TEXT NOT NULL,
+                    paired_at  INTEGER NOT NULL,
+                    last_seen  INTEGER,
+                    revoked_at INTEGER
+                );",
+            )
+            .unwrap();
+            let info = HostInfo {
+                hostname: "old-box".into(),
+                ..Default::default()
+            };
+            c.execute(
+                "INSERT INTO hosts VALUES('h1', x'01', ?1, '10.0.0.9', 50, 60, NULL)",
+                [serde_json::to_string(&info).unwrap()],
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let h = s.get_host("h1").unwrap().expect("row kept");
+        assert_eq!(h.info.hostname, "old-box");
+        assert_eq!(h.name, "old-box", "name backfilled from the hostname");
+        assert_eq!(h.address, "10.0.0.9");
+        assert_eq!((h.paired_at, h.last_seen), (50, Some(60)));
+        assert!(s.rename_host("h1", "Build box").unwrap());
+        assert_eq!(s.list_hosts().unwrap()[0].label(), "Build box");
+        s.insert_host(&host("h2"), &[2u8; 32]).unwrap();
+        assert_eq!(s.get_host("h2").unwrap().unwrap().name, "box");
+        drop(s);
+        // Opening again is a no-op.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.list_hosts().unwrap().len(), 2);
     }
 
     #[test]

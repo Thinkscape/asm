@@ -77,7 +77,10 @@ struct PendingItem: Identifiable, Equatable, Sendable {
     var kind: RequestKind
     var createdAt: Date
     var expiresAt: Date
+    /// The host's friendly name (pairing requests: the reported hostname).
     var hostLabel: String
+    /// The requesting machine's reported hostname.
+    var hostname: String
     var agent: String
     var summary: String
     var error: String?
@@ -159,6 +162,8 @@ struct AgentSeenItem: Equatable, Sendable {
 
 struct HostItem: Identifiable, Equatable, Sendable {
     var id: String
+    /// Friendly name (the reported hostname unless renamed).
+    var name: String
     var info: HostInfoItem
     var observedAddress: String
     var agents: [AgentSeenItem]
@@ -195,7 +200,10 @@ enum LeaseStatus: String, Equatable, Sendable {
 
 struct LeaseItem: Identifiable, Equatable, Sendable {
     var id: String
+    /// The host's friendly name.
     var hostLabel: String
+    /// The host's reported hostname.
+    var hostname: String
     var source: String
     var name: String
     var mode: LeaseMode
@@ -264,7 +272,7 @@ struct GeneralSettingsItem: Equatable, Sendable {
 /// The approval popup's choice for one request.
 enum DecisionItem: Sendable {
     case deny(reason: String)
-    case approvePair
+    case approvePair(name: String)
     case approveGet(raw: Bool, durationSecs: UInt64?, hosts: [String])
     case approveWrite(vaultID: String, collectionID: String?)
 }
