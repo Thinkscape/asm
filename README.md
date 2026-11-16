@@ -259,7 +259,7 @@ Pushing a tag `vX.Y.Z` (matching the version in `Cargo.toml` and `app/Bundle/Inf
 - builds the static Linux CLIs (x86_64, aarch64) and the universal macOS CLI, as tarballs and `.deb`/`.rpm`/`.apk`/Arch packages;
 - builds the app on the `xcode-27` runner, signed with the `APPLE_CERT_P12` certificate if that secret is set and ad hoc otherwise, and zips it. This job is allowed to fail: the release then ships without the app;
 - publishes a GitHub release with `SHA256SUMS`;
-- updates `Formula/asm.rb` and `Casks/asm-manager.rb` in `Thinkscape/homebrew-asm` when the `HOMEBREW_TAP_TOKEN` secret is set (stable tags only). The templates are in [`packaging/homebrew/`](packaging/homebrew/).
+- updates `Formula/asm.rb` and `Casks/asm-manager.rb` in `Thinkscape/homebrew-asm` when the `HOMEBREW_TAP_DEPLOY_KEY` secret (a write deploy key on the tap) is set (stable tags only). The templates are in [`packaging/homebrew/`](packaging/homebrew/).
 
 ## Repository layout
 

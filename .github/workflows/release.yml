@@ -209,26 +209,27 @@ jobs:
     if: ${{ !cancelled() && needs.release.result == 'success' && needs.version.outputs.prerelease != 'true' }}
     runs-on: ubuntu-latest
     env:
-      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      # Private half of a write deploy key on Thinkscape/homebrew-asm.
+      HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
     steps:
-      - name: Skip without a tap token
-        if: ${{ env.HOMEBREW_TAP_TOKEN == '' }}
-        run: echo "::warning::HOMEBREW_TAP_TOKEN is not set; Thinkscape/homebrew-asm was not updated"
+      - name: Skip without a tap deploy key
+        if: ${{ env.HOMEBREW_TAP_DEPLOY_KEY == '' }}
+        run: echo "::warning::HOMEBREW_TAP_DEPLOY_KEY is not set; Thinkscape/homebrew-asm was not updated"
       - uses: actions/checkout@v7
-        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ env.HOMEBREW_TAP_DEPLOY_KEY != '' }}
       - uses: actions/checkout@v7
-        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ env.HOMEBREW_TAP_DEPLOY_KEY != '' }}
         with:
           repository: Thinkscape/homebrew-asm
-          token: ${{ env.HOMEBREW_TAP_TOKEN }}
+          ssh-key: ${{ env.HOMEBREW_TAP_DEPLOY_KEY }}
           path: tap
       - uses: actions/download-artifact@v8
-        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ env.HOMEBREW_TAP_DEPLOY_KEY != '' }}
         with:
           name: sha256sums
           path: sums
       - name: Render and push the formula and cask
-        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        if: ${{ env.HOMEBREW_TAP_DEPLOY_KEY != '' }}
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
