@@ -1,0 +1,13 @@
+[package]
+name = "asm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "asm"
+path = "src/main.rs"
+
+[dependencies]
+asm-proto.workspace = true
+clap.workspace = true

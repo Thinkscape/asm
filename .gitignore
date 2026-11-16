@@ -1,0 +1,6 @@
+/target
+/dist
+/tmp
+/app/.build
+/app/AsmCoreFFI.xcframework
+/app/Sources/AsmCore/
