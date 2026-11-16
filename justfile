@@ -1,6 +1,9 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-identity := env_var_or_default("ASM_CODESIGN_IDENTITY", "Apple Development: abodera@gmail.com (73U2H3E7G9)")
+# Code-signing identity: $ASM_CODESIGN_IDENTITY, else the first "Apple Development" identity
+# in the keychain (a stable identity keeps keychain "Always Allow" grants across rebuilds),
+# else ad hoc ("-").
+identity := env_var_or_default("ASM_CODESIGN_IDENTITY", `security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' | head -1 | grep . || echo -`)
 proxy_version := "0.56.0-asm.1"
 app := "dist/Agents Secrets Manager.app"
 
@@ -83,6 +86,23 @@ skill:
     cp skill/asm/SKILL.md dist/skill/asm/SKILL.md
 
 dist: app cli skill
+
+# Release assets for the CLI as CI builds them: tarballs, .deb/.rpm/.apk/Arch packages and
+# SHA256SUMS in dist/release (needs nfpm: brew install nfpm)
+packages: cli
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "asm-cli") | .version')
+    rm -rf dist/release
+    for t in linux-x86_64 linux-aarch64 macos-universal; do
+        packaging/package-cli.sh "$t" "dist/cli/asm-$t" "$version" dist/release
+    done
+    cd dist/release && shasum -a 256 -- * > SHA256SUMS
+
+# Lint the GitHub workflows and shell scripts (brew install actionlint shellcheck)
+lint-ci:
+    actionlint
+    shellcheck scripts/install.sh packaging/package-cli.sh packaging/homebrew/render.sh
 
 test:
     cargo test --workspace

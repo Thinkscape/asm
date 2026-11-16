@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-macos:
+    name: cargo test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: third_party/iron-proxy/go.mod
+          cache-dependency-path: third_party/iron-proxy/go.sum
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: Swatinem/rust-cache@v2
+      # The headless end-to-end test (crates/asm-core/tests/e2e.rs) drives the patched
+      # iron-proxy from dist/bin/iron-proxy and skips itself when it is missing.
+      - name: Build patched iron-proxy
+        run: just proxy
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  rust-linux:
+    name: cargo test (Linux, CLI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # asm-core is macOS-only; the CLI and the shared crate are what runs on Linux.
+      - name: cargo test -p asm-proto -p asm-cli
+        run: cargo test --locked -p asm-proto -p asm-cli
+
+  iron-proxy:
+    name: go test (iron-proxy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: third_party/iron-proxy
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: third_party/iron-proxy/go.mod
+          cache-dependency-path: third_party/iron-proxy/go.sum
+      - name: go test
+        run: go test -race -count=1 ./internal/transform/... ./internal/proxy/...
+
+  cli-linux:
+    name: CLI build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: cargo zigbuild
+        run: cargo zigbuild --locked --release -p asm-cli --target ${{ matrix.target }}
+      - name: Check the binary is static
+        run: |
+          bin=target/${{ matrix.target }}/release/asm
+          file "$bin"
+          file "$bin" | grep -q 'statically linked'

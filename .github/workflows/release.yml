@@ -1,0 +1,245 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        name: Tag matches Cargo.toml and Info.plist
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          cargo=$(awk '/^\[workspace.package\]/{p=1; next} /^\[/{p=0} p && $1 == "version" {gsub(/"/, "", $3); print $3}' Cargo.toml)
+          plist=$(grep -A1 '<key>CFBundleShortVersionString</key>' app/Bundle/Info.plist | sed -n 's:.*<string>\(.*\)</string>.*:\1:p')
+          echo "tag $version, Cargo.toml $cargo, Info.plist $plist"
+          [ "$version" = "$cargo" ] || { echo "::error::tag $TAG does not match Cargo.toml version $cargo"; exit 1; }
+          [ "$version" = "$plist" ] || { echo "::error::tag $TAG does not match Info.plist CFBundleShortVersionString $plist"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          case "$version" in *-*) echo "prerelease=true" ;; *) echo "prerelease=false" ;; esac >> "$GITHUB_OUTPUT"
+
+  cli-linux:
+    name: CLI ${{ matrix.name }}
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-unknown-linux-musl
+          - name: linux-aarch64
+            target: aarch64-unknown-linux-musl
+    env:
+      NFPM_VERSION: 2.49.0
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Install nfpm
+        run: |
+          cd "$RUNNER_TEMP"
+          archive=nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz
+          base=https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}
+          curl -fsSLO "$base/$archive"
+          curl -fsSLO "$base/checksums.txt"
+          grep " $archive\$" checksums.txt | sha256sum -c -
+          tar -xzf "$archive" nfpm
+          sudo install -m 0755 nfpm /usr/local/bin/nfpm
+          nfpm --version
+      - name: Build
+        run: cargo zigbuild --locked --release -p asm-cli --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          bin=target/${{ matrix.target }}/release/asm
+          file "$bin" | grep -q 'statically linked'
+          packaging/package-cli.sh ${{ matrix.name }} "$bin" ${{ needs.version.outputs.version }} dist/release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.name }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  cli-macos:
+    name: CLI macos-universal
+    needs: version
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Build
+        run: |
+          cargo build --locked --release -p asm-cli --target aarch64-apple-darwin
+          cargo build --locked --release -p asm-cli --target x86_64-apple-darwin
+          mkdir -p dist/cli
+          lipo -create target/aarch64-apple-darwin/release/asm target/x86_64-apple-darwin/release/asm \
+            -output dist/cli/asm-macos-universal
+          lipo -info dist/cli/asm-macos-universal
+      - name: Package
+        run: packaging/package-cli.sh macos-universal dist/cli/asm-macos-universal ${{ needs.version.outputs.version }} dist/release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-macos-universal
+          path: dist/release/*
+          if-no-files-found: error
+
+  # The app needs a recent Swift/Xcode (developed with Xcode 27.2, Swift 6.4) and the macOS 27
+  # SDK. If this job fails, the release still ships the CLI and packages without the app zip.
+  app:
+    name: macOS app
+    needs: version
+    runs-on: xcode-27
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select the newest Xcode 27
+        run: |
+          xcode=$(find /Applications -maxdepth 1 -name 'Xcode_27*.app' | sort -V | tail -n 1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+          swift --version
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: third_party/iron-proxy/go.mod
+          cache-dependency-path: third_party/iron-proxy/go.sum
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - name: Import signing certificate
+        id: cert
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERT_P12" ]; then
+            echo "::warning::APPLE_CERT_P12 is not set; the app is signed ad hoc"
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass=$(openssl rand -hex 24)
+          printf '%s' "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$keychain" >/dev/null
+          existing=$(security list-keychains -d user | tr -d '"' | xargs)
+          # shellcheck disable=SC2086 # keychain paths have no spaces on hosted runners
+          security list-keychains -d user -s "$keychain" $existing
+          rm -f "$RUNNER_TEMP/cert.p12"
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk 'NR == 1 && $2 ~ /^[0-9A-F]{40}$/ { print $2 }')
+          [ -n "$identity" ] || { echo "::error::no code-signing identity in APPLE_CERT_P12"; exit 1; }
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+      - name: Build the app (just app)
+        env:
+          ASM_CODESIGN_IDENTITY: ${{ steps.cert.outputs.identity }}
+        run: just app
+      - name: Zip
+        run: |
+          mkdir -p dist/release
+          codesign --verify --deep --strict --verbose=2 "dist/Agents Secrets Manager.app"
+          ditto -c -k --sequesterRsrc --keepParent "dist/Agents Secrets Manager.app" dist/release/Agents-Secrets-Manager-macos.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: app
+          path: dist/release/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: [version, cli-linux, cli-macos, app]
+    # Runs when the app job failed too: the CLI release must not depend on it.
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.cli-linux.result == 'success' && needs.cli-macos.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist/release
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist/release
+        run: |
+          if [ ! -f Agents-Secrets-Manager-macos.zip ]; then
+            echo "::warning::the macOS app build failed or was skipped; releasing the CLI only"
+          fi
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/release/*
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sha256sums
+          path: dist/release/SHA256SUMS
+
+  homebrew:
+    name: Homebrew tap
+    needs: [version, release]
+    if: ${{ !cancelled() && needs.release.result == 'success' && needs.version.outputs.prerelease != 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Skip without a tap token
+        if: ${{ env.HOMEBREW_TAP_TOKEN == '' }}
+        run: echo "::warning::HOMEBREW_TAP_TOKEN is not set; Thinkscape/homebrew-asm was not updated"
+      - uses: actions/checkout@v7
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+      - uses: actions/checkout@v7
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        with:
+          repository: Thinkscape/homebrew-asm
+          token: ${{ env.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - uses: actions/download-artifact@v8
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        with:
+          name: sha256sums
+          path: sums
+      - name: Render and push the formula and cask
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          packaging/homebrew/render.sh "$VERSION" sums/SHA256SUMS tap
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula Casks 2>/dev/null || git add Formula
+          if git diff --cached --quiet; then
+            echo "tap already up to date"
+            exit 0
+          fi
+          git commit -m "asm $VERSION"
+          git push
