@@ -11,3 +11,12 @@ path = "src/main.rs"
 [dependencies]
 asm-proto.workspace = true
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest = { workspace = true, features = ["blocking", "json", "rustls-no-provider"] }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+libc = "0.2"
+
+[dev-dependencies]
+rcgen.workspace = true
+tempfile = "3"
