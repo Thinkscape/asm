@@ -96,6 +96,10 @@ impl Api {
         }
         match ApiError::from_json(&body) {
             Some(e) => Err(e.into()),
+            None if status.is_server_error() => Err(CliError::unreachable(format!(
+                "the manager at {} answered HTTP {status}",
+                self.base
+            ))),
             None => Err(CliError::failure(format!("manager answered HTTP {status}"))),
         }
     }
@@ -108,7 +112,7 @@ impl Api {
                 error_chain(e)
             ))
         } else {
-            CliError::failure(format!(
+            CliError::unreachable(format!(
                 "cannot reach the manager at {}: {}",
                 self.base,
                 error_chain(e)

@@ -212,6 +212,10 @@ final class AppModel {
         try await call { try $0.bitwardenConnect(draft) }
     }
 
+    func vaultCollections(_ id: String) async throws -> [CollectionChoiceItem] {
+        try await call { try $0.vaultCollections(id) }
+    }
+
     func saveVault(_ draft: VaultDraftItem) async -> String? {
         let error = await perform { try $0.saveVault(draft) }
         await refresh("vaults")

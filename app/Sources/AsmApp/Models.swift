@@ -42,6 +42,13 @@ struct CollectionItem: Identifiable, Hashable, Sendable {
     var name: String
 }
 
+/// A collection of a Bitwarden vault being edited; `enabled` = currently exposed.
+struct CollectionChoiceItem: Identifiable, Hashable, Sendable {
+    var id: String
+    var name: String
+    var enabled: Bool
+}
+
 struct AddTargetItem: Identifiable, Equatable, Sendable {
     var id: String { vaultID }
     var vaultID: String

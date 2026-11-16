@@ -46,9 +46,10 @@ enum Command {
         /// Hosts the sentinel will be used with (comma-separated patterns).
         #[arg(long, value_delimiter = ',')]
         hosts: Vec<String>,
-        /// Seconds to wait for the operator.
-        #[arg(long, default_value_t = 120)]
-        wait: u64,
+        /// Stop waiting for the operator after this many seconds (exit 4 while still
+        /// pending). Default: until the request expires on the manager (typically 10 min).
+        #[arg(long)]
+        wait: Option<u64>,
         /// Print the result as JSON.
         #[arg(long)]
         json: bool,
@@ -62,16 +63,18 @@ enum Command {
         /// Field to change (default: password for logins, the only field otherwise).
         #[arg(long)]
         field: Option<String>,
-        /// Seconds to wait for the operator.
-        #[arg(long, default_value_t = 120)]
-        wait: u64,
+        /// Stop waiting for the operator after this many seconds (exit 4 while still
+        /// pending). Default: until the request expires on the manager (typically 10 min).
+        #[arg(long)]
+        wait: Option<u64>,
         name: String,
     },
     /// Add a new secret; the value is read from stdin.
     Add {
-        /// Seconds to wait for the operator.
-        #[arg(long, default_value_t = 120)]
-        wait: u64,
+        /// Stop waiting for the operator after this many seconds (exit 4 while still
+        /// pending). Default: until the request expires on the manager (typically 10 min).
+        #[arg(long)]
+        wait: Option<u64>,
         name: String,
     },
     /// Show the proxy addresses, which one is reachable, and the CA files (information only).

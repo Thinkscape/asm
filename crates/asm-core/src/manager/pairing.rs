@@ -6,6 +6,7 @@ use asm_proto::pairing::{
     NONCE_LEN, UnattendedCode, format_pairing_code, new_nonce, pairing_code, verify_commit,
 };
 use asm_proto::rules::validate_agent_text;
+use asm_proto::time::fmt_unix;
 use asm_proto::wire::{HostInfo, PairRequest, PairResponse, RevealRequest};
 use serde_json::json;
 
@@ -136,7 +137,12 @@ pub(crate) fn reveal_attempt(
     check_poll(a, &req.poll_token)?;
     match a.state {
         PairState::AwaitingReveal => {}
-        PairState::Pending => return Ok(PairResponse::Pending { deny_reason: None }),
+        PairState::Pending => {
+            return Ok(PairResponse::Pending {
+                deny_reason: None,
+                expires_at: Some(fmt_unix(a.expires)),
+            });
+        }
         _ => {
             return Err(CoreError::invalid(
                 "this pairing request is no longer waiting for a reveal",
@@ -172,7 +178,10 @@ pub(crate) fn reveal_attempt(
         },
     };
     book.pending.push(pending);
-    Ok(PairResponse::Pending { deny_reason: None })
+    Ok(PairResponse::Pending {
+        deny_reason: None,
+        expires_at: Some(fmt_unix(t + lifetime)),
+    })
 }
 
 /// `GET /pair/{id}`: the attempt's state; `approved` (with the token) is returned once.
@@ -187,9 +196,10 @@ pub(crate) fn poll_attempt(
         .ok_or_else(|| CoreError::not_found("no such pairing request"))?;
     check_poll(a, poll_token)?;
     Ok(match &a.state {
-        PairState::AwaitingReveal | PairState::Pending => {
-            PairResponse::Pending { deny_reason: None }
-        }
+        PairState::AwaitingReveal | PairState::Pending => PairResponse::Pending {
+            deny_reason: None,
+            expires_at: Some(fmt_unix(a.expires)),
+        },
         PairState::Denied(r) => PairResponse::Denied {
             deny_reason: r.clone(),
         },

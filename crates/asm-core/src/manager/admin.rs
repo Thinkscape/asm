@@ -1,7 +1,7 @@
 //! Operations behind the settings window: vaults, hosts, pairing codes, leases, proxy and
 //! general settings.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use crate::ffi;
 use crate::proxy::ProxyConfig;
 use crate::store::{PairingCodeRecord, Store, VaultRecord};
 use crate::vault::registry::{Registry, VaultEntry};
-use crate::vault::{BitwardenSecrets, VaultConfig, VaultStatus, bitwarden, creds};
+use crate::vault::{BitwardenSecrets, CollectionInfo, VaultConfig, VaultStatus, bitwarden, creds};
 
 fn vault_kind(c: &VaultConfig) -> ffi::VaultKind {
     match c {
@@ -121,7 +121,7 @@ impl Core {
                 "vault names are 1–64 characters without '/'",
             ));
         }
-        let config: VaultConfig = draft.config.into();
+        let mut config: VaultConfig = draft.config.into();
         let existing = self.store.list_vaults()?;
         let current = match &draft.id {
             Some(id) => Some(
@@ -179,6 +179,10 @@ impl Core {
                 }
             }
         }
+        if let VaultConfig::Bitwarden(b) = &mut config {
+            b.collection_names =
+                self.collection_names_for(&id, &b.collections, current.as_ref().map(|c| &c.config));
+        }
         let position = current
             .as_ref()
             .map(|c| c.position)
@@ -199,16 +203,23 @@ impl Core {
                 return Err(e);
             }
         }
-        // Keep the running provider when nothing it depends on changed (e.g. a rename), so
-        // an unlocked Bitwarden vault stays unlocked.
+        // Keep the running provider when nothing it depends on changed (e.g. a rename), or
+        // when it can take the change over in place (Bitwarden exposure), so an unlocked
+        // Bitwarden vault stays unlocked.
         let reuse = current
             .as_ref()
-            .is_some_and(|c| c.config == rec.config && draft.client_secret.is_empty())
-            .then(|| self.registry.get(&id))
-            .flatten();
+            .filter(|_| draft.client_secret.is_empty())
+            .and_then(|c| self.registry.get(&id).map(|v| (c, v)))
+            .filter(|(c, v)| {
+                c.config == rec.config
+                    || v.provider
+                        .reconfigure(&effective_config(&self.settings(), &rec.config))
+            })
+            .map(|(_, v)| v);
         match reuse {
             Some(v) => self.registry.insert(VaultEntry {
                 name: rec.name.clone(),
+                config: rec.config.clone(),
                 ..v
             }),
             None => self.start_vault(&rec),
@@ -397,6 +408,7 @@ impl Core {
         if draft.master_password.is_empty() {
             return Err(CoreError::invalid("enter the master password"));
         }
+        let existing_id = draft.id.clone();
         let vault_id = draft.id.unwrap_or_else(new_uuid_v4);
         let VaultConfig::Bitwarden(cfg) =
             effective_config(&self.settings(), &VaultConfig::Bitwarden(cfg))
@@ -410,7 +422,127 @@ impl Core {
             &BitwardenSecrets { client_secret },
             &draft.master_password,
         )?;
+        lock(&self.connect_names).extend(cols.iter().map(|c| (c.id.clone(), c.name.clone())));
+        if let Some(id) = existing_id {
+            self.refresh_cached_names(&id, &cols);
+        }
         Ok(cols.into_iter().map(Into::into).collect())
+    }
+
+    /// Names for the exposed `enabled` collections of vault `id`: from its running `bw serve`
+    /// when ready, else from recent connects, else from the `previous` config's cache.
+    fn collection_names_for(
+        &self,
+        id: &str,
+        enabled: &[String],
+        previous: Option<&VaultConfig>,
+    ) -> BTreeMap<String, String> {
+        let live = if enabled.is_empty() {
+            Vec::new()
+        } else {
+            self.live_collections(id).unwrap_or_default()
+        };
+        let connected = lock(&self.connect_names);
+        let previous = match previous {
+            Some(VaultConfig::Bitwarden(b)) => Some(&b.collection_names),
+            _ => None,
+        };
+        enabled
+            .iter()
+            .filter_map(|cid| {
+                let name = live
+                    .iter()
+                    .find(|c| &c.id == cid)
+                    .map(|c| c.name.clone())
+                    .or_else(|| connected.get(cid).cloned())
+                    .or_else(|| previous.and_then(|p| p.get(cid).cloned()))?;
+                Some((cid.clone(), name))
+            })
+            .collect()
+    }
+
+    /// Every collection the running provider of vault `id` sees; `None` unless it is ready.
+    fn live_collections(&self, id: &str) -> Option<Vec<CollectionInfo>> {
+        let v = self.registry.get(id)?;
+        if v.provider.status() != VaultStatus::Ready {
+            return None;
+        }
+        v.provider.all_collections().ok()
+    }
+
+    /// After a connect for a stored vault: update the cached names of its exposed collections.
+    fn refresh_cached_names(&self, id: &str, cols: &[CollectionInfo]) {
+        let Ok(Some(mut rec)) = self
+            .store
+            .list_vaults()
+            .map(|vs| vs.into_iter().find(|v| v.id == id))
+        else {
+            return;
+        };
+        let VaultConfig::Bitwarden(b) = &mut rec.config else {
+            return;
+        };
+        let mut names = b.collection_names.clone();
+        for c in cols.iter().filter(|c| b.collections.contains(&c.id)) {
+            names.insert(c.id.clone(), c.name.clone());
+        }
+        if names == b.collection_names {
+            return;
+        }
+        b.collection_names = names;
+        if let Err(e) = self.store.upsert_vault(&rec) {
+            log::warn!("caching collection names: {}", e.message);
+            return;
+        }
+        if let Some(v) = self.registry.get(id) {
+            v.provider
+                .reconfigure(&effective_config(&self.settings(), &rec.config));
+            self.registry.insert(VaultEntry {
+                config: rec.config,
+                ..v
+            });
+        }
+    }
+
+    /// The edit sheet's collection picker; see `Manager::vault_collections`.
+    pub fn vault_collections(&self, id: &str) -> Result<Vec<ffi::CollectionChoice>> {
+        let rec = self
+            .store
+            .list_vaults()?
+            .into_iter()
+            .find(|v| v.id == id)
+            .ok_or_else(|| CoreError::not_found("no such vault"))?;
+        let VaultConfig::Bitwarden(b) = rec.config else {
+            return Err(CoreError::invalid("not a Bitwarden vault"));
+        };
+        let cached = |cid: &String| ffi::CollectionChoice {
+            id: cid.clone(),
+            name: b
+                .collection_names
+                .get(cid)
+                .cloned()
+                .unwrap_or_else(|| cid.clone()),
+            organization_id: None,
+            enabled: true,
+        };
+        let Some(live) = self.live_collections(id) else {
+            return Ok(b.collections.iter().map(cached).collect());
+        };
+        let mut out: Vec<ffi::CollectionChoice> = live
+            .into_iter()
+            .map(|c| ffi::CollectionChoice {
+                enabled: b.collections.contains(&c.id),
+                id: c.id,
+                name: c.name,
+                organization_id: c.organization_id,
+            })
+            .collect();
+        for cid in &b.collections {
+            if !out.iter().any(|c| &c.id == cid) {
+                out.push(cached(cid));
+            }
+        }
+        Ok(out)
     }
 
     pub fn sync_vault(&self, id: &str) -> Result<()> {

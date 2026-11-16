@@ -35,6 +35,7 @@ struct VaultsPane: View {
                     TableColumn("Status") { vault in
                         HStack {
                             VaultStatusCell(state: vault.state)
+                                .fixedSize(horizontal: true, vertical: false)
                             if vault.canUnlock {
                                 Button("Unlock…") { model.unlockingVaultID = vault.id }
                                     .controlSize(.small)
@@ -248,8 +249,36 @@ private struct BitwardenSheet: View {
     @State private var error: String?
     @State private var saving = false
     @State private var loaded = false
+    @State private var loadingCollections = false
+    /// `vaultCollections` answered at least once; later answers keep the user's toggles.
+    @State private var collectionsLoaded = false
+    @State private var unlocking = false
 
     private var isNew: Bool { vault == nil }
+
+    /// The edited vault as the manager reports it now (it may get unlocked while the sheet is open).
+    private var liveVault: VaultItem? {
+        vault.flatMap { edited in model.vaults.first { $0.id == edited.id } }
+    }
+
+    /// A locked vault lists only its enabled collections until it is unlocked.
+    private var showsUnlock: Bool { !connected && liveVault?.canUnlock == true }
+
+    private var collectionsNote: LocalizedStringKey? {
+        if connected { return collections.isEmpty ? "This account has no collections." : nil }
+        if isNew { return "Enter the master password and Connect to list the collections." }
+        if loadingCollections || showsUnlock { return nil }
+        switch liveVault?.state {
+        case .ready: return collectionsLoaded && collections.isEmpty ? "This account has no collections." : nil
+        case .error: return "The vault is unavailable. Enter the master password and Connect to choose other collections."
+        default: return nil
+        }
+    }
+
+    private var masterPasswordPrompt: LocalizedStringKey {
+        if isNew { return "For Connect and to unlock now" }
+        return liveVault?.state == .ready ? "Not needed while the vault is unlocked" : "To unlock or Connect"
+    }
 
     private var draft: VaultDraftItem {
         var config = config
@@ -275,11 +304,11 @@ private struct BitwardenSheet: View {
                 Section {
                     TextField("Client id", text: $config.clientID, prompt: Text(verbatim: "user.…"))
                     SecureField("Client secret", text: $clientSecret, prompt: Text(isNew ? "Required" : "Unchanged"))
-                    SecureField("Master password", text: $masterPassword, prompt: Text("For Connect and to unlock now"))
+                    SecureField("Master password", text: $masterPassword, prompt: Text(masterPasswordPrompt))
                 } header: {
                     Text("Personal API key")
                 } footer: {
-                    Text("The client id and secret are stored in the login keychain. The master password is never stored: it is used for Connect and to unlock the vault now, and is needed again after the app restarts. Find the API key under Settings → Security → Keys in the Bitwarden web vault.")
+                    Text("The client id and secret are stored in the login keychain. The master password is never stored: it is only needed to Connect a new vault and to unlock a locked one, for example after the app restarts. Find the API key under Settings → Security → Keys in the Bitwarden web vault.")
                 }
                 Section("Command-line tool") {
                     TextField("bw path", text: $config.bwPath, prompt: Text(verbatim: model.general.bwPath.isEmpty ? "/opt/homebrew/bin/bw" : model.general.bwPath))
@@ -293,20 +322,27 @@ private struct BitwardenSheet: View {
                                 Task { error = await model.syncVault(vault.id) }
                             }
                         }
-                        if connecting { ProgressView().controlSize(.small) }
+                        if connecting || loadingCollections { ProgressView().controlSize(.small) }
                     }
-                    if collections.isEmpty {
-                        Text(connected ? "This account has no collections." : "Enter the master password and Connect to list the collections.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(collections) { collection in
-                            Toggle(isOn: Binding(
-                                get: { selected.contains(collection.id) },
-                                set: { on in if on { selected.insert(collection.id) } else { selected.remove(collection.id) } }
-                            )) {
-                                Text(verbatim: collection.name)
-                            }
+                    ForEach(collections) { collection in
+                        Toggle(isOn: Binding(
+                            get: { selected.contains(collection.id) },
+                            set: { on in if on { selected.insert(collection.id) } else { selected.remove(collection.id) } }
+                        )) {
+                            Text(verbatim: collection.name)
                         }
+                    }
+                    if showsUnlock {
+                        HStack {
+                            Text("Unlock the vault to choose other collections.")
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Unlock…") { unlocking = true }
+                        }
+                    }
+                    if let collectionsNote {
+                        Text(collectionsNote)
+                            .foregroundStyle(.secondary)
                     }
                     Toggle("Expose items without an organization (personal vault)", isOn: $config.exposePersonal)
                 } header: {
@@ -325,6 +361,12 @@ private struct BitwardenSheet: View {
         }
         .frame(width: 520, height: 640)
         .onAppear(perform: load)
+        .task(id: liveVault?.state) { await loadCollections() }
+        .sheet(isPresented: $unlocking) {
+            if let liveVault {
+                UnlockVaultSheet(model: model, vault: liveVault)
+            }
+        }
     }
 
     private func load() {
@@ -334,6 +376,24 @@ private struct BitwardenSheet: View {
         name = vault.name
         config = existing
         selected = Set(existing.collectionIDs)
+    }
+
+    /// Existing vault: every collection while unlocked, else the enabled ones (no password needed).
+    private func loadCollections() async {
+        guard let id = vault?.id, !connected else { return }
+        loadingCollections = true
+        defer { loadingCollections = false }
+        do {
+            let choices = try await model.vaultCollections(id)
+            guard !connected else { return }
+            collections = choices.map { CollectionItem(id: $0.id, name: $0.name) }
+            if !collectionsLoaded {
+                selected = Set(choices.filter(\.enabled).map(\.id))
+                collectionsLoaded = true
+            }
+        } catch {
+            self.error = error.localizedDescription
+        }
     }
 
     private func connect() {

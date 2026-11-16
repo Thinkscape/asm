@@ -761,5 +761,143 @@ fn headless_end_to_end() {
     assert!(rows.windows(2).all(|w| w[0].id > w[1].id), "newest first");
     assert_eq!(rows[0].id, first_page[0].id);
 
+    // Names switch from bare to vault-prefixed (a second vault with a colliding key):
+    // existing leases keep working and keep their files.
+    let o = env.run(
+        &[
+            "get",
+            "--hosts",
+            "127.0.0.1",
+            "DEMO_TOKEN",
+            "e2e: call the echo server again",
+        ],
+        None,
+    );
+    assert_eq!(o.code, 0, "get while bare: {}{}", o.stdout, o.stderr);
+    let (_, _, old_paths) = parse_get(&o.stdout);
+    assert_eq!(old_paths, vec![env.secrets.join("DEMO_TOKEN")]);
+    let old_sentinel = std::fs::read_to_string(&old_paths[0]).unwrap();
+    assert_eq!(old_sentinel, sentinel2, "the active lease from before");
+    let lease_id = m
+        .list_leases()
+        .into_iter()
+        .find(|l| {
+            l.status == asm_core::ffi::LeaseStatus::Active
+                && l.mode == asm_core::ffi::LeaseMode::Sentinel
+        })
+        .unwrap()
+        .lease_id;
+    let approvals = approver.approvals.load(Ordering::SeqCst);
+
+    let other_file = tmp.path().join("other.env");
+    std::fs::write(&other_file, "DEMO_TOKEN=other-vault-value\n").unwrap();
+    m.save_vault(VaultDraft {
+        id: None,
+        name: "other".into(),
+        config: VaultConfig::EnvFile {
+            path: other_file.to_string_lossy().into_owned(),
+        },
+        client_secret: String::new(),
+        master_password: String::new(),
+    })
+    .expect("add a second .env vault");
+    wait_healthy(&m);
+
+    let o = env.run(&["list"], None);
+    assert_eq!(o.code, 0, "list: {}{}", o.stdout, o.stderr);
+    let listed: Vec<&str> = o.stdout.lines().collect();
+    assert!(
+        listed.contains(&"demo/DEMO_TOKEN") && listed.contains(&"other/DEMO_TOKEN"),
+        "{listed:?}"
+    );
+    assert!(!listed.contains(&"DEMO_TOKEN"), "{listed:?}");
+    assert_eq!(
+        std::fs::read_to_string(&old_paths[0]).unwrap(),
+        old_sentinel,
+        "old files untouched"
+    );
+
+    let (status, body) = via_proxy(proxy_port, &echo_url, &old_sentinel);
+    assert_eq!(status, 200, "old sentinel after the switch: {body}");
+    assert_eq!(
+        seen.lock().unwrap().last().map(String::as_str),
+        Some(REAL_2)
+    );
+
+    // The bare name the lease was taken under still finds it (no new approval).
+    let o = env.run(
+        &["get", "DEMO_TOKEN", "e2e: same lease after the switch"],
+        None,
+    );
+    assert_eq!(
+        o.code, 0,
+        "bare get after the switch: {}{}",
+        o.stdout, o.stderr
+    );
+    let (mode, hosts, paths) = parse_get(&o.stdout);
+    assert_eq!((mode.as_str(), hosts.as_str()), ("sentinel", "127.0.0.1"));
+    assert_eq!(paths, old_paths, "files keep the paths decided at approval");
+    assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), old_sentinel);
+    assert_eq!(
+        approver.approvals.load(Ordering::SeqCst),
+        approvals,
+        "no new approval"
+    );
+
+    let o = env.run(&["list", "--json"], None);
+    assert_eq!(o.code, 0, "list --json: {}{}", o.stdout, o.stderr);
+    let listed: serde_json::Value = serde_json::from_str(&o.stdout).unwrap();
+    let entry = |name: &str| {
+        listed["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("{name} listed"))
+            .clone()
+    };
+    assert_eq!(
+        entry("demo/DEMO_TOKEN")["lease"]["lease_id"],
+        lease_id.as_str()
+    );
+    assert!(entry("other/DEMO_TOKEN")["lease"].is_null());
+
+    // update under the bare name reaches the leased secret too.
+    let o = env.run(&["update", "DEMO_TOKEN"], Some("real-value-789\n"));
+    assert_eq!(
+        o.code, 0,
+        "bare update after the switch: {}{}",
+        o.stdout, o.stderr
+    );
+    assert!(
+        o.stdout.contains("updated demo/DEMO_TOKEN in demo"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        std::fs::read_to_string(&env_file)
+            .unwrap()
+            .contains("DEMO_TOKEN=real-value-789")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&other_file).unwrap(),
+        "DEMO_TOKEN=other-vault-value\n"
+    );
+
+    // Revoking still works: 403 at the proxy, files gone on the next command.
+    m.revoke_lease(lease_id).unwrap();
+    let (status, _) = via_proxy(proxy_port, &echo_url, &old_sentinel);
+    assert_eq!(status, 403);
+    let o = env.run(&["list"], None);
+    assert_eq!(o.code, 0);
+    assert!(!old_paths[0].exists(), "revoked lease files removed");
+    // Without a lease the bare name is ambiguous again.
+    let o = env.run(
+        &["get", "--wait", "5", "DEMO_TOKEN", "e2e: no lease any more"],
+        None,
+    );
+    assert_eq!(o.code, 5, "{}{}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("ambiguous"), "{}", o.stderr);
+
     m.shutdown();
 }

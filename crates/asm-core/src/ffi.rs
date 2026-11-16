@@ -149,6 +149,17 @@ impl From<crate::vault::CollectionInfo> for CollectionInfo {
     }
 }
 
+/// One row of the edit sheet's collection picker (`Manager::vault_collections`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CollectionChoice {
+    pub id: String,
+    /// The collection's name; the cached name (or the id) while the vault is not ready.
+    pub name: String,
+    pub organization_id: Option<String>,
+    /// Currently exposed by the vault.
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum VaultKind {
     Bitwarden,
@@ -330,6 +341,7 @@ impl From<VaultConfig> for crate::vault::VaultConfig {
                 collections: collection_ids,
                 personal: expose_personal,
                 bw_path: bw_path.filter(|p| !p.trim().is_empty()),
+                collection_names: Default::default(),
             }),
             VaultConfig::EnvFile { path } => Self::EnvFile { path },
             VaultConfig::Keychain => Self::Keychain,
@@ -637,6 +649,14 @@ impl Manager {
     /// "Connect" in the Bitwarden sheet: log in with the draft and list collections.
     pub fn bitwarden_connect(&self, draft: VaultDraft) -> FfiResult<Vec<CollectionInfo>> {
         Ok(self.core.bitwarden_connect(draft)?)
+    }
+
+    /// Collections for editing a Bitwarden vault, without a password. Ready: every
+    /// collection the running `bw serve` sees (`enabled` = exposed now), plus exposed ones
+    /// it no longer lists. Locked or failed: only the exposed collections, with the names
+    /// cached at the last save or connect (the id when none is cached).
+    pub fn vault_collections(&self, vault_id: String) -> FfiResult<Vec<CollectionChoice>> {
+        Ok(self.core.vault_collections(&vault_id)?)
     }
 
     pub fn sync_vault(&self, id: String) -> FfiResult<()> {

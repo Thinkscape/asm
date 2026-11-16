@@ -11,6 +11,9 @@ pub struct CliError {
     pub message: String,
     /// The manager's error code when the error came from the API.
     pub code: Option<ErrorCode>,
+    /// The manager could not be reached (network error, or a 5xx without an API error
+    /// body); worth retrying while waiting on a request.
+    pub transient: bool,
 }
 
 impl CliError {
@@ -19,6 +22,14 @@ impl CliError {
             exit,
             message: message.into(),
             code: None,
+            transient: false,
+        }
+    }
+    /// Exit 1: the manager could not be reached; retryable.
+    pub fn unreachable(message: impl Into<String>) -> Self {
+        CliError {
+            transient: true,
+            ..Self::failure(message)
         }
     }
     /// Exit 1: connection or other failure.
@@ -59,7 +70,16 @@ impl CliError {
     pub fn request_lost() -> Self {
         Self::new(EXIT_FAILURE, "request lost; run the command again")
     }
+    /// Exit 1: the manager stayed unreachable until the wait ended; `last` is the last
+    /// connection error (already prefixed `error: `), `next` what to do about it.
+    pub fn lost_contact(last: &str, next: &str) -> Self {
+        Self::new(EXIT_FAILURE, format!("{last}\n{next}"))
+    }
 }
+
+/// `lost_contact` hint for `get`, `update` and `add` (re-running re-attaches).
+pub const RERUN_TO_PICK_UP: &str =
+    "the request may still be pending on the manager: run the same command again to pick it up";
 
 impl From<ApiError> for CliError {
     fn from(e: ApiError) -> Self {

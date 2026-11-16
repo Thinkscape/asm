@@ -23,7 +23,7 @@ use crate::error::{CoreError, Result};
 use crate::ffi;
 use crate::proxy::ProxyEntry;
 use crate::store::{HistoryRecord, HostRecord, LeaseField, LeaseRecord};
-use crate::vault::names::{NamedSecret, VaultListing, base_name_exists, compute_names, lookup};
+use crate::vault::names::{NamedSecret, base_name_exists, compute_names, lookup};
 use crate::vault::{AddTarget, CollectionInfo, VaultConfig, VaultStatus};
 
 /// Resolved host requests stay pollable this long.
@@ -174,6 +174,11 @@ impl Pending {
         }
     }
 
+    /// Lifetime this request was given, in seconds.
+    fn lifetime_secs(&self) -> u64 {
+        (self.expires - self.created).max(0) as u64
+    }
+
     fn state(&self) -> RequestState {
         RequestState {
             request_id: self.id.clone(),
@@ -181,6 +186,17 @@ impl Pending {
             status: RequestStatus::Pending,
             deny_reason: None,
             result: None,
+            expires_at: Some(fmt_unix(self.expires)),
+            pending_lifetime_secs: self.lifetime_secs(),
+        }
+    }
+
+    /// The terminal state this request ended in (no expiry any more).
+    fn ended_state(&self, status: RequestStatus) -> RequestState {
+        RequestState {
+            status,
+            expires_at: None,
+            ..self.state()
         }
     }
 
@@ -309,8 +325,7 @@ impl Core {
                         }
                     }
                     (_, Some(host_id)) => {
-                        let mut state = p.state();
-                        state.status = RequestStatus::Expired;
+                        let state = p.ended_state(RequestStatus::Expired);
                         b.done.insert(
                             p.id.clone(),
                             Done {
@@ -343,35 +358,73 @@ impl Core {
         }
     }
 
-    /// Resolve a secret name; a miss while some vault is not ready → `vault_unavailable`.
-    pub(crate) fn find_secret(&self, query: &str) -> Result<(NamedSecret, Vec<VaultListing>)> {
+    /// Resolve a secret name for a host's request; a miss while some vault is not ready →
+    /// `vault_unavailable`. A name that no current name resolves (ambiguous or not found)
+    /// but that equals the name recorded on one of the host's active leases resolves to
+    /// that lease's secret: names becoming vault-prefixed (or getting a `~hash`) must not
+    /// break the names an agent already holds leases under.
+    pub(crate) fn find_secret(&self, host_id: &str, query: &str) -> Result<NamedSecret> {
         let (listings, _) = self.registry.listings();
         let names = compute_names(&listings);
-        match lookup(&names, query) {
-            Ok(n) => Ok((n.clone(), listings)),
-            Err(e) if e.code == asm_proto::ErrorCode::NotFound => {
-                let unavailable: Vec<String> = self
-                    .registry
-                    .all()
-                    .into_iter()
-                    .filter(|v| v.provider.status() != VaultStatus::Ready)
-                    .map(|v| v.name)
-                    .collect();
-                let relevant = match query.split_once('/') {
-                    Some((vault, _)) => unavailable.iter().any(|u| u == vault),
-                    None => !unavailable.is_empty(),
-                };
-                if relevant {
-                    Err(CoreError::vault_unavailable(format!(
-                        "{query:?} was not found in the available vaults; unavailable: {}",
-                        unavailable.join(", ")
-                    )))
-                } else {
-                    Err(e)
-                }
-            }
-            Err(e) => Err(e),
+        let e = match lookup(&names, query) {
+            Ok(n) => return Ok(n.clone()),
+            Err(e) => e,
+        };
+        if !matches!(
+            e.code,
+            asm_proto::ErrorCode::NotFound | asm_proto::ErrorCode::Ambiguous
+        ) {
+            return Err(e);
         }
+        if let Some(n) = self.leased_secret(host_id, query, &names)? {
+            return Ok(n);
+        }
+        if e.code != asm_proto::ErrorCode::NotFound {
+            return Err(e);
+        }
+        let unavailable: Vec<String> = self
+            .registry
+            .all()
+            .into_iter()
+            .filter(|v| v.provider.status() != VaultStatus::Ready)
+            .map(|v| v.name)
+            .collect();
+        let relevant = match query.split_once('/') {
+            Some((vault, _)) => unavailable.iter().any(|u| u == vault),
+            None => !unavailable.is_empty(),
+        };
+        if relevant {
+            Err(CoreError::vault_unavailable(format!(
+                "{query:?} was not found in the available vaults; unavailable: {}",
+                unavailable.join(", ")
+            )))
+        } else {
+            Err(e)
+        }
+    }
+
+    /// The current entry of the secret behind the host's most recent active lease whose
+    /// recorded name is exactly `query`.
+    fn leased_secret(
+        &self,
+        host_id: &str,
+        query: &str,
+        names: &[NamedSecret],
+    ) -> Result<Option<NamedSecret>> {
+        let t = now();
+        let mut leases: Vec<LeaseRecord> = self
+            .store
+            .leases_of_host(host_id)?
+            .into_iter()
+            .filter(|l| l.name == query && l.is_active(t))
+            .collect();
+        leases.sort_by_key(|l| std::cmp::Reverse(l.created_at));
+        Ok(leases.iter().find_map(|l| {
+            names
+                .iter()
+                .find(|n| n.vault_id == l.vault_id && n.meta.key == l.secret_key)
+                .cloned()
+        }))
     }
 
     /// `POST /requests`. Returns the state; `approved` only for the existing-lease shortcut.
@@ -447,7 +500,7 @@ impl Core {
     ) -> Result<RequestState> {
         let reason = validate_reason(reason)?;
         let requested = normalize_host_patterns(hosts)?;
-        let (named, _) = self.find_secret(name)?;
+        let named = self.find_secret(&host.id, name)?;
         let secret = SecretRef::from_named(&named);
 
         if !raw && let Some(state) = self.get_shortcut(host, agent, &secret, &requested, &reason)? {
@@ -563,6 +616,8 @@ impl Core {
                 expires_at: lease.expires_at.map(fmt_unix),
                 files,
             })),
+            expires_at: None,
+            pending_lifetime_secs: self.settings().request_lifetime_secs.max(1),
         };
         lock(&self.book).done.insert(
             id.clone(),
@@ -579,7 +634,8 @@ impl Core {
                 format!("get {} served from an existing lease", secret.display),
             )
             .host(Some(&host.id))
-            .secret(&secret.display)
+            // The lease's recorded name, like its other rows (names may have been prefixed since).
+            .secret(&lease.name)
             .detail(serde_json::json!({
                 "request_id": id,
                 "request": "get",
@@ -616,7 +672,7 @@ impl Core {
         value: String,
     ) -> Result<RequestState> {
         validate_secret_value(&value)?;
-        let (named, _) = self.find_secret(name)?;
+        let named = self.find_secret(&host.id, name)?;
         let secret = SecretRef::from_named(&named);
         let field = match field
             .map(|f| f.trim().to_string())
@@ -698,19 +754,25 @@ impl Core {
                         continue;
                     }
                     let known = v.provider.collections().unwrap_or_default();
-                    let collections =
-                        b.collections
-                            .iter()
-                            .map(|id| {
-                                known.iter().find(|c| &c.id == id).cloned().unwrap_or(
-                                    CollectionInfo {
-                                        id: id.clone(),
-                                        name: id.clone(),
-                                        organization_id: None,
-                                    },
-                                )
-                            })
-                            .collect();
+                    let collections = b
+                        .collections
+                        .iter()
+                        .map(|id| {
+                            known
+                                .iter()
+                                .find(|c| &c.id == id)
+                                .cloned()
+                                .unwrap_or_else(|| CollectionInfo {
+                                    id: id.clone(),
+                                    name: b
+                                        .collection_names
+                                        .get(id)
+                                        .cloned()
+                                        .unwrap_or_else(|| id.clone()),
+                                    organization_id: None,
+                                })
+                        })
+                        .collect();
                     out.push(AddTargetData {
                         vault_id: v.id.clone(),
                         vault_name: v.name.clone(),
@@ -818,8 +880,7 @@ impl Core {
             match pos {
                 Some(i) if !b.pending[i].resolving => {
                     let p = b.pending.remove(i);
-                    let mut state = p.state();
-                    state.status = RequestStatus::Cancelled;
+                    let state = p.ended_state(RequestStatus::Cancelled);
                     b.done.insert(
                         p.id.clone(),
                         Done {
@@ -864,8 +925,7 @@ impl Core {
             b.pending = keep;
             gone.iter()
                 .map(|p| {
-                    let mut state = p.state();
-                    state.status = RequestStatus::Cancelled;
+                    let state = p.ended_state(RequestStatus::Cancelled);
                     b.done.insert(
                         p.id.clone(),
                         Done {
@@ -1028,8 +1088,7 @@ impl Core {
                     }
                 }
                 (_, Some(host_id)) => {
-                    let mut state = p.state();
-                    state.status = status;
+                    let mut state = p.ended_state(status);
                     state.deny_reason = deny_reason.clone();
                     state.result = result;
                     b.done.insert(

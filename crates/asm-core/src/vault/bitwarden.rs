@@ -23,14 +23,14 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use super::{
     AddTarget, BitwardenConfig, BitwardenSecrets, CollectionInfo, SecretKind, SecretMeta,
-    VaultProvider, VaultStatus,
+    VaultConfig, VaultProvider, VaultStatus,
 };
 use crate::error::{CoreError, Result};
 use crate::paths::{DataDirs, ensure_private_dir};
@@ -775,7 +775,8 @@ struct State {
 
 pub struct BitwardenVault {
     dir: PathBuf,
-    cfg: BitwardenConfig,
+    /// Exposure fields may change in place (`reconfigure`); connection fields never do.
+    cfg: RwLock<BitwardenConfig>,
     secrets: BitwardenSecrets,
     state: Mutex<State>,
     /// Serialises start/stop.
@@ -812,7 +813,7 @@ impl BitwardenVault {
     fn new(dir: PathBuf, cfg: BitwardenConfig, secrets: BitwardenSecrets) -> Self {
         BitwardenVault {
             dir,
-            cfg,
+            cfg: RwLock::new(cfg),
             secrets,
             state: Mutex::new(State {
                 serve: None,
@@ -826,7 +827,7 @@ impl BitwardenVault {
     /// The bw CLI for this instance; the path is resolved on every start.
     fn instance(&self) -> Result<Instance> {
         let bw = self
-            .cfg
+            .cfg()
             .bw_path
             .clone()
             .filter(|p| !p.is_empty())
@@ -849,6 +850,10 @@ impl BitwardenVault {
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn cfg(&self) -> RwLockReadGuard<'_, BitwardenConfig> {
+        self.cfg.read().unwrap_or_else(|p| p.into_inner())
     }
 
     fn set_status(&self, s: VaultStatus) {
@@ -879,12 +884,19 @@ impl BitwardenVault {
 
     fn login_if_needed(&self, inst: &Instance) -> Result<()> {
         let st = inst.status()?;
+        let (server_url, email, client_id) = {
+            let c = self.cfg();
+            (
+                c.server_url.trim().to_owned(),
+                c.email.trim().to_owned(),
+                c.client_id.trim().to_owned(),
+            )
+        };
         let status = str_at(&st, &["status"]).unwrap_or("unauthenticated");
-        let server_ok = str_at(&st, &["serverUrl"])
-            .is_some_and(|u| norm_url(u) == norm_url(&self.cfg.server_url));
-        let email_ok = self.cfg.email.trim().is_empty()
-            || str_at(&st, &["userEmail"])
-                .is_some_and(|e| e.eq_ignore_ascii_case(self.cfg.email.trim()));
+        let server_ok =
+            str_at(&st, &["serverUrl"]).is_some_and(|u| norm_url(u) == norm_url(&server_url));
+        let email_ok = email.is_empty()
+            || str_at(&st, &["userEmail"]).is_some_and(|e| e.eq_ignore_ascii_case(&email));
         if status != "unauthenticated" && server_ok && email_ok {
             return Ok(());
         }
@@ -892,12 +904,12 @@ impl BitwardenVault {
             inst.run(&["logout"], &[])?;
         }
         if !server_ok {
-            inst.run(&["config", "server", self.cfg.server_url.trim()], &[])?;
+            inst.run(&["config", "server", &server_url], &[])?;
         }
         inst.run(
             &["login", "--apikey"],
             &[
-                ("BW_CLIENTID", self.cfg.client_id.trim()),
+                ("BW_CLIENTID", client_id.as_str()),
                 ("BW_CLIENTSECRET", &self.secrets.client_secret),
             ],
         )?;
@@ -1078,7 +1090,7 @@ impl BitwardenVault {
     fn fetch_visible(&self, ep: &Endpoint, key: &str) -> Result<Value> {
         check_id(key)?;
         let item = call(ep, "GET", &format!("/object/item/{key}"), None)?;
-        if !is_visible(&item, &self.cfg) {
+        if !is_visible(&item, &self.cfg()) {
             return Err(CoreError::not_found(
                 "the Bitwarden item is not exposed by this vault",
             ));
@@ -1115,9 +1127,10 @@ impl VaultProvider for BitwardenVault {
     fn list(&self) -> Result<Vec<SecretMeta>> {
         let data = call(&self.endpoint()?, "GET", "/list/object/items", None)?;
         let mut seen = HashSet::new();
+        let cfg = self.cfg();
         Ok(list_data(&data)
             .iter()
-            .filter(|i| is_visible(i, &self.cfg))
+            .filter(|i| is_visible(i, &cfg))
             .filter_map(map_item)
             .filter(|m| seen.insert(m.key.clone()))
             .collect())
@@ -1149,7 +1162,7 @@ impl VaultProvider for BitwardenVault {
         let ep = self.endpoint()?;
         let (org, collections) = match &target.collection_id {
             Some(c) => {
-                if !self.cfg.collections.iter().any(|e| e == c) {
+                if !self.cfg().collections.iter().any(|e| e == c) {
                     return Err(CoreError::invalid(
                         "that collection is not exposed by this vault",
                     ));
@@ -1167,7 +1180,7 @@ impl VaultProvider for BitwardenVault {
                 )
             }
             None => {
-                if !self.cfg.personal {
+                if !self.cfg().personal {
                     return Err(CoreError::invalid(
                         "this vault does not expose the personal vault; choose a collection",
                     ));
@@ -1234,10 +1247,28 @@ impl VaultProvider for BitwardenVault {
 
     /// Exposed collections with their names (for the `add` popup).
     fn collections(&self) -> Result<Vec<CollectionInfo>> {
-        Ok(BitwardenVault::collections(self)?
+        let all = BitwardenVault::collections(self)?;
+        let cfg = self.cfg();
+        Ok(all
             .into_iter()
-            .filter(|c| self.cfg.collections.contains(&c.id))
+            .filter(|c| cfg.collections.contains(&c.id))
             .collect())
+    }
+
+    fn all_collections(&self) -> Result<Vec<CollectionInfo>> {
+        BitwardenVault::collections(self)
+    }
+
+    fn reconfigure(&self, config: &VaultConfig) -> bool {
+        let VaultConfig::Bitwarden(new) = config else {
+            return false;
+        };
+        let mut cfg = self.cfg.write().unwrap_or_else(|p| p.into_inner());
+        if !cfg.same_connection(new) {
+            return false;
+        }
+        *cfg = new.clone();
+        true
     }
 }
 
@@ -1370,6 +1401,7 @@ while (my $c = $srv->accept) {
             collections: vec!["c-1".into()],
             personal: false,
             bw_path: Some(bw_path.into()),
+            collection_names: Default::default(),
         }
     }
 
@@ -1394,6 +1426,7 @@ mod tests {
             collections: collections.iter().map(|s| s.to_string()).collect(),
             personal,
             bw_path: None,
+            collection_names: Default::default(),
         }
     }
 
@@ -1636,6 +1669,35 @@ mod tests {
         assert_eq!(
             fake_bw::events(&app_dir),
             ["serve", "unlock-failed", "unlock", "sync"]
+        );
+
+        // Exposure changes apply in place: serve keeps running, still unlocked.
+        let ids = |cols: Vec<CollectionInfo>| cols.into_iter().map(|c| c.id).collect::<Vec<_>>();
+        assert_eq!(ids(VaultProvider::all_collections(&v).unwrap()), ["c-1"]);
+        assert_eq!(ids(VaultProvider::collections(&v).unwrap()), ["c-1"]);
+        let mut exposed = cfg.clone();
+        exposed.collections.clear();
+        exposed.personal = true;
+        exposed.collection_names.insert("c-1".into(), "Team".into());
+        assert!(v.reconfigure(&VaultConfig::Bitwarden(exposed)));
+        assert_eq!(v.status(), VaultStatus::Ready);
+        assert!(
+            VaultProvider::collections(&v).unwrap().is_empty(),
+            "c-1 no longer exposed"
+        );
+        let mut moved = cfg.clone();
+        moved.server_url = "https://other.example.invalid".into();
+        assert!(
+            !v.reconfigure(&VaultConfig::Bitwarden(moved)),
+            "a new account needs a restart"
+        );
+        assert!(!v.reconfigure(&VaultConfig::Keychain));
+        assert!(v.reconfigure(&VaultConfig::Bitwarden(cfg.clone())));
+        assert_eq!(ids(VaultProvider::collections(&v).unwrap()), ["c-1"]);
+        assert_eq!(
+            fake_bw::events(&app_dir),
+            ["serve", "unlock-failed", "unlock", "sync"],
+            "no restart"
         );
 
         // serve crashes: the vault is unavailable, and sync restarts it Locked.

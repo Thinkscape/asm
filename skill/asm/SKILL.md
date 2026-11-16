@@ -35,7 +35,8 @@ asm list --json     # with vault, kind, fields and any active lease
 ```
 
 Names may be vault-prefixed (`work/GITHUB_TOKEN`) when two vaults hold the same name; use
-the name exactly as listed.
+the name exactly as listed. A name you already hold an active lease under keeps working
+after names become prefixed, and the lease's files keep their paths.
 
 ## 4. Requesting
 
@@ -47,7 +48,9 @@ asm get --hosts api.github.com GITHUB_TOKEN "Open a PR on acme/web for the login
   secret, which service. At most 250 characters.
 - Request only the hosts you will call: `api.example.com`, or `*.example.com` for a domain
   and its subdomains. Broad patterns get flagged to the operator.
-- The command waits up to 120 s (`--wait SECS`) and then prints:
+- The command waits until the operator decides or the request expires on the manager
+  (the operator's request lifetime, typically 10 minutes; `--wait SECS` stops earlier),
+  then prints:
 
   ```
   mode: sentinel
@@ -67,8 +70,12 @@ asm get --hosts api.github.com GITHUB_TOKEN "Open a PR on acme/web for the login
 - `denied: host selection too open` (exit 3): narrow `--hosts` and ask again.
 - `denied: provide a better reason` (exit 3): rewrite the reason so a human can judge it.
 - `denied: <other text>`: follow it; do not retry the same request.
-- Exit 4 (`pending: …`): the operator has not answered yet; run the same command again to
-  keep waiting.
+- `expired: no decision within N minutes` (exit 3): nobody answered in time; tell the user
+  an approval is needed, then ask again.
+- Exit 4 (`pending: …`, only with an explicit `--wait`): the operator has not answered
+  yet; run the same command again to keep waiting on the same request.
+- `… may still be pending on the manager` (exit 1): the manager stopped answering while
+  you waited; run the same command again to pick the request up.
 - HTTP 403 `asm: sentinel not valid for this host or scheme`: the host is not approved for
   this lease, or the URL is not HTTPS, or the lease has ended.
 - `request lost; run the command again`: the manager restarted; repeat the command.

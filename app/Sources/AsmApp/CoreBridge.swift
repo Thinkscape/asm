@@ -90,6 +90,11 @@ final class CoreBridge: @unchecked Sendable {
         try Self.mapped { try manager.bitwardenConnect(draft: VaultDraft(draft)) }.map(CollectionItem.init)
     }
 
+    /// Collections for the edit sheet: all of them when the vault is unlocked, else the exposed ones.
+    func vaultCollections(_ id: String) throws -> [CollectionChoiceItem] {
+        try Self.mapped { try manager.vaultCollections(vaultId: id) }.map(CollectionChoiceItem.init)
+    }
+
     func syncVault(_ id: String) throws {
         try Self.mapped { try manager.syncVault(id: id) }
     }
@@ -227,6 +232,12 @@ private extension HostInfoItem {
 private extension CollectionItem {
     init(_ c: CollectionInfo) {
         self.init(id: c.id, name: c.name)
+    }
+}
+
+private extension CollectionChoiceItem {
+    init(_ c: CollectionChoice) {
+        self.init(id: c.id, name: c.name, enabled: c.enabled)
     }
 }
 

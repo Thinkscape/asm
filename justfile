@@ -40,12 +40,18 @@ core:
 core-native-libs:
     cargo rustc -p asm-core --release --crate-type staticlib -- --print native-static-libs 2>&1 | grep native-static-libs
 
-# macOS app bundle, signed
+# macOS app bundle, signed.
+# The -isysroot linker flag records the real SDK version in the binary: without it Swift
+# Build links with --sysroot, the binary claims SDK 14.0, and macOS 27 draws the legacy
+# (pre-Liquid Glass) window chrome.
 app: proxy core
-    swift build -c release --arch arm64 --arch x86_64 --package-path app
+    #!/usr/bin/env bash
+    set -euo pipefail
+    flags=(-c release --arch arm64 --arch x86_64 --package-path app -Xswiftc -Xclang-linker -Xswiftc -isysroot -Xswiftc -Xclang-linker -Xswiftc "$(xcrun --show-sdk-path)")
+    swift build "${flags[@]}"
     rm -rf "{{app}}"
     mkdir -p "{{app}}/Contents/MacOS"
-    cp "$(swift build -c release --arch arm64 --arch x86_64 --package-path app --show-bin-path)/AsmApp" "{{app}}/Contents/MacOS/AsmApp"
+    cp "$(swift build "${flags[@]}" --show-bin-path)/AsmApp" "{{app}}/Contents/MacOS/AsmApp"
     cp dist/bin/iron-proxy "{{app}}/Contents/MacOS/iron-proxy"
     cp app/Bundle/Info.plist "{{app}}/Contents/Info.plist"
     codesign --force --options runtime --sign "{{identity}}" "{{app}}/Contents/MacOS/iron-proxy"

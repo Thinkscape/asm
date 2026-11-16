@@ -290,6 +290,7 @@ fn get_result(content: &str) -> Value {
 }
 
 fn requests_handler(outcome: &'static str) -> Arc<Handler> {
+    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     Arc::new(move |method, path, body| match (method, path) {
         ("GET", "/v1/leases") => (200, json!({"leases":[]})),
         ("GET", "/v1/secrets") => (
@@ -298,33 +299,54 @@ fn requests_handler(outcome: &'static str) -> Arc<Handler> {
         ),
         ("POST", "/v1/requests") => {
             assert_eq!(body["agent"], "test-agent");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
             (
                 202,
-                json!({"request_id":REQ,"kind":body["kind"],"status":"pending","deny_reason":null,"result":null}),
+                json!({"request_id":REQ,"kind":body["kind"],"status":"pending","deny_reason":null,"result":null,
+                    "expires_at":asm_proto::time::fmt_unix(now + 600),"pending_lifetime_secs":600}),
             )
         }
-        ("GET", p) if p.starts_with(&format!("/v1/requests/{REQ}?wait=")) => match outcome {
-            "approve-get" => (
-                200,
-                json!({"request_id":REQ,"kind":"get","status":"approved","deny_reason":null,"result":get_result("asm_0123456789012345678901234567890123456789")}),
-            ),
-            "approve-write" => (
-                200,
-                json!({"request_id":REQ,"kind":"update","status":"approved","deny_reason":null,"result":{"name":"work/GitHub","vault":"work"}}),
-            ),
-            "deny" => (
-                200,
-                json!({"request_id":REQ,"kind":"get","status":"denied","deny_reason":"provide a better reason","result":null}),
-            ),
-            "lost" => (
-                404,
-                json!({"error":{"code":"not_found","message":"no such request"}}),
-            ),
-            _ => (
-                200,
-                json!({"request_id":REQ,"kind":"get","status":"pending","deny_reason":null,"result":null}),
-            ),
-        },
+        ("GET", p) if p.starts_with(&format!("/v1/requests/{REQ}?wait=")) => {
+            let n = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match outcome {
+                "approve-get" => (
+                    200,
+                    json!({"request_id":REQ,"kind":"get","status":"approved","deny_reason":null,"result":get_result("asm_0123456789012345678901234567890123456789")}),
+                ),
+                // The manager is unreachable for two polls, then approves.
+                "flaky" if n < 2 => (502, Value::String("bad gateway".into())),
+                "flaky" => (
+                    200,
+                    json!({"request_id":REQ,"kind":"get","status":"approved","deny_reason":null,"result":get_result("asm_0123456789012345678901234567890123456789"),
+                        "expires_at":null,"pending_lifetime_secs":600}),
+                ),
+                "down" => (502, Value::String("bad gateway".into())),
+                "expire" => (
+                    200,
+                    json!({"request_id":REQ,"kind":"get","status":"expired","deny_reason":null,"result":null,
+                        "expires_at":null,"pending_lifetime_secs":600}),
+                ),
+                "approve-write" => (
+                    200,
+                    json!({"request_id":REQ,"kind":"update","status":"approved","deny_reason":null,"result":{"name":"work/GitHub","vault":"work"}}),
+                ),
+                "deny" => (
+                    200,
+                    json!({"request_id":REQ,"kind":"get","status":"denied","deny_reason":"provide a better reason","result":null}),
+                ),
+                "lost" => (
+                    404,
+                    json!({"error":{"code":"not_found","message":"no such request"}}),
+                ),
+                _ => (
+                    200,
+                    json!({"request_id":REQ,"kind":"get","status":"pending","deny_reason":null,"result":null}),
+                ),
+            }
+        }
         _ => (
             404,
             json!({"error":{"code":"not_found","message":format!("{method} {path}")}}),
@@ -426,6 +448,42 @@ fn get_outcomes_and_exit_codes() {
 
     let out = asm(&e, &["get", "X", &"r".repeat(251)], "");
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn request_lifetime_and_unreachable_manager() {
+    // Expired on the manager → exit 3 naming its lifetime.
+    let (_f, e) = paired("expire");
+    let out = asm(&e, &["get", "X", "why"], "");
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(
+        text(&out.stderr),
+        "expired: no decision within 10 minutes\n"
+    );
+
+    // Two failed polls are retried; the approval still arrives.
+    let (f, e) = paired("flaky");
+    let out = asm(&e, &["get", "X", "why"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).starts_with("mode: sentinel\n"));
+    let polls = f
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, p, _)| m == "GET" && p.starts_with("/v1/requests/"))
+        .count();
+    assert_eq!(polls, 3);
+
+    // Unreachable until an explicit --wait ends → exit 1, the request may still be pending.
+    let (_f, e) = paired("down");
+    let started = std::time::Instant::now();
+    let out = asm(&e, &["get", "--wait", "2", "X", "why"], "");
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("answered HTTP 502"), "{err}");
+    assert!(err.contains("may still be pending"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! `asm list`, `get`, `update`, `add`: listing secrets and the request/approval flow.
 
 use crate::api::Api;
-use crate::error::CliError;
+use crate::error::{CliError, RERUN_TO_PICK_UP};
 use crate::files::SecretsDir;
 use crate::state::{self, HostState};
 use asm_proto::error::ErrorCode;
@@ -100,27 +100,129 @@ fn check_name(name: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Submit a request and wait up to `wait` for its outcome.
-fn submit(api: &Api, body: &RequestBody, wait: Duration) -> Result<RequestResult, CliError> {
-    let deadline = Instant::now() + wait;
+/// Waited past the manager's expiry before giving up on an unreachable manager.
+const EXPIRY_MARGIN: Duration = Duration::from_secs(15);
+/// Wait when the manager does not say when a request expires (older managers).
+const FALLBACK_WAIT: Duration = Duration::from_secs(600);
+/// Longest pause between retries while the manager is unreachable.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// How long, from now, the manager keeps a pending request (plus a margin): from its
+/// `expires_at`, bounded by its lifetime (`0` = not sent). A request that is pending
+/// cannot already be past its expiry nor outlive its lifetime; such a value means the two
+/// clocks differ, and the lifetime is used instead. Neither sent → 600 s.
+pub fn pending_window(expires_at: Option<&str>, lifetime_secs: u64, now: i64) -> Duration {
+    let left = expires_at
+        .and_then(asm_proto::time::parse_unix)
+        .map(|e| e - now)
+        .filter(|l| *l > 0)
+        .map(|l| l as u64);
+    let secs = match (left, lifetime_secs) {
+        (Some(l), 0) => l,
+        (Some(l), max) if l <= max => l,
+        (_, 0) => return FALLBACK_WAIT,
+        (_, max) => max,
+    };
+    Duration::from_secs(secs) + EXPIRY_MARGIN
+}
+
+/// `"10 minutes"`, `"1 minute"`, `"90 seconds"`.
+fn fmt_lifetime(secs: u64) -> String {
+    match secs {
+        60 => "1 minute".to_owned(),
+        s if s % 60 == 0 => format!("{} minutes", s / 60),
+        s => format!("{s} seconds"),
+    }
+}
+
+/// Retry pacing while the manager is unreachable: 1 s, doubling, at most 30 s.
+pub struct Backoff(Duration);
+
+impl Backoff {
+    pub fn new() -> Self {
+        Backoff(Duration::from_secs(1))
+    }
+
+    pub fn reset(&mut self) {
+        self.0 = Duration::from_secs(1);
+    }
+
+    /// Sleep before the next attempt, never past `until`; `false` once `until` has passed.
+    pub fn wait(&mut self, until: Instant) -> bool {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(self.0.min(left));
+        self.0 = (self.0 * 2).min(MAX_BACKOFF);
+        true
+    }
+}
+
+/// Submit a request and wait for its outcome. `wait: None` waits as long as the manager
+/// keeps the request pending (its `expires_at` plus a margin); `Some(w)` stops after `w`
+/// with exit 4 while it is still pending. An unreachable manager is retried until the
+/// earlier of the two.
+fn submit(
+    api: &Api,
+    body: &RequestBody,
+    wait: Option<Duration>,
+) -> Result<RequestResult, CliError> {
+    let started = Instant::now();
     let mut state: RequestState = api.post("/requests", body)?;
     if !asm_proto::crypto::is_uuid(&state.request_id) {
         return Err(CliError::failure("the manager sent an invalid request id"));
     }
+    let lifetime = state.pending_lifetime_secs;
+    let expected = started
+        + pending_window(
+            state.expires_at.as_deref(),
+            state.pending_lifetime_secs,
+            unix_now(),
+        );
+    let hard = wait.map(|w| started + w);
+    let retry_until = hard.map_or(expected, |h| h.min(expected));
+    let mut backoff = Backoff::new();
+    // The last connection error, while the manager is unreachable.
+    let mut last_error: Option<String> = None;
     while state.status == RequestStatus::Pending {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(CliError::pending());
-        }
-        let secs = (remaining.as_secs_f64().ceil() as u64).clamp(1, MAX_POLL_WAIT_SECS);
-        let started = Instant::now();
-        state = match api.get(&format!("/requests/{}?wait={secs}", state.request_id)) {
-            Ok(s) => s,
-            Err(e) if e.code == Some(ErrorCode::NotFound) => return Err(CliError::request_lost()),
-            Err(e) => return Err(e),
+        let now = Instant::now();
+        let secs = match hard {
+            Some(h) if now >= h => {
+                return Err(match last_error {
+                    Some(msg) => CliError::lost_contact(&msg, RERUN_TO_PICK_UP),
+                    None => CliError::pending(),
+                });
+            }
+            Some(h) => {
+                (h.duration_since(now).as_secs_f64().ceil() as u64).clamp(1, MAX_POLL_WAIT_SECS)
+            }
+            None => MAX_POLL_WAIT_SECS,
         };
-        if state.status == RequestStatus::Pending {
-            pace(started);
+        let polled = Instant::now();
+        match api.get(&format!("/requests/{}?wait={secs}", state.request_id)) {
+            Ok(s) => {
+                state = s;
+                backoff.reset();
+                last_error = None;
+                if state.status == RequestStatus::Pending {
+                    pace(polled);
+                }
+            }
+            Err(e) if e.code == Some(ErrorCode::NotFound) => return Err(CliError::request_lost()),
+            Err(e) if e.transient => {
+                if !backoff.wait(retry_until) {
+                    return Err(CliError::lost_contact(&e.message, RERUN_TO_PICK_UP));
+                }
+                last_error = Some(e.message);
+            }
+            Err(e) => return Err(e),
         }
     }
     match state.status {
@@ -128,9 +230,16 @@ fn submit(api: &Api, body: &RequestBody, wait: Duration) -> Result<RequestResult
             CliError::failure("the manager approved the request but sent no result")
         }),
         RequestStatus::Denied => Err(CliError::denied(state.deny_reason.as_deref())),
-        RequestStatus::Expired => Err(CliError::ended(
-            "expired: the request was not answered in time",
-        )),
+        RequestStatus::Expired => {
+            let lifetime = match state.pending_lifetime_secs {
+                0 => lifetime,
+                l => l,
+            };
+            Err(CliError::ended(match lifetime {
+                0 => "expired: the request was not answered in time".to_owned(),
+                l => format!("expired: no decision within {}", fmt_lifetime(l)),
+            }))
+        }
         RequestStatus::Cancelled => Err(CliError::ended("cancelled: the request was cancelled")),
         RequestStatus::Pending => unreachable!("loop exits only on a terminal status"),
     }
@@ -162,7 +271,8 @@ struct JsonGet<'a> {
 pub struct GetArgs {
     pub raw: bool,
     pub hosts: Vec<String>,
-    pub wait: u64,
+    /// `None` = until the request expires on the manager.
+    pub wait: Option<u64>,
     pub json: bool,
     pub name: String,
     pub reason: String,
@@ -182,7 +292,7 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
         reason,
         agent: crate::hostinfo::agent_label(),
     };
-    let result = match submit(&s.api, &body, Duration::from_secs(a.wait))? {
+    let result = match submit(&s.api, &body, a.wait.map(Duration::from_secs))? {
         RequestResult::Get(r) => r,
         RequestResult::Write(_) => {
             return Err(CliError::failure(
@@ -259,7 +369,7 @@ fn read_value() -> Result<String, CliError> {
     )?)
 }
 
-pub fn update(field: Option<String>, wait: u64, name: String) -> Result<(), CliError> {
+pub fn update(field: Option<String>, wait: Option<u64>, name: String) -> Result<(), CliError> {
     check_name(&name)?;
     let field = field.map(|f| f.trim().to_owned()).filter(|f| !f.is_empty());
     let value = read_value()?;
@@ -272,7 +382,7 @@ pub fn update(field: Option<String>, wait: u64, name: String) -> Result<(), CliE
         value,
         agent: crate::hostinfo::agent_label(),
     };
-    let w = write_result(submit(&s.api, &body, Duration::from_secs(wait))?)?;
+    let w = write_result(submit(&s.api, &body, wait.map(Duration::from_secs))?)?;
     // Raw leases on this secret were revoked by the update: remove their files.
     if let Err(e) = s.sync_leases() {
         eprintln!("warning: {}", e.message);
@@ -281,7 +391,7 @@ pub fn update(field: Option<String>, wait: u64, name: String) -> Result<(), CliE
     Ok(())
 }
 
-pub fn add(wait: u64, name: String) -> Result<(), CliError> {
+pub fn add(wait: Option<u64>, name: String) -> Result<(), CliError> {
     check_name(&name)?;
     if name.contains('/') {
         return Err(CliError::invalid("a new secret name must not contain '/'"));
@@ -295,7 +405,7 @@ pub fn add(wait: u64, name: String) -> Result<(), CliError> {
         value,
         agent: crate::hostinfo::agent_label(),
     };
-    let w = write_result(submit(&s.api, &body, Duration::from_secs(wait))?)?;
+    let w = write_result(submit(&s.api, &body, wait.map(Duration::from_secs))?)?;
     println!("added {} to {}; run asm get to use it", w.name, w.vault);
     Ok(())
 }
@@ -338,5 +448,46 @@ mod tests {
             parse_hosts(&["API.github.com".into(), " ".into(), "*.example.com".into()]).unwrap();
         assert_eq!(h, vec!["*.example.com", "api.github.com"]);
         assert!(parse_hosts(&["https://x".into()]).is_err());
+    }
+
+    #[test]
+    fn pending_windows() {
+        let now = 1_000_000;
+        let at = |s: i64| asm_proto::time::fmt_unix(now + s);
+        let m = EXPIRY_MARGIN;
+        // The manager's expiry wins when it fits the lifetime (a re-attached request).
+        assert_eq!(
+            pending_window(Some(&at(300)), 600, now),
+            Duration::from_secs(300) + m
+        );
+        assert_eq!(
+            pending_window(Some(&at(600)), 600, now),
+            Duration::from_secs(600) + m
+        );
+        // Clock skew: already past, or longer than the lifetime → the lifetime.
+        assert_eq!(
+            pending_window(Some(&at(-30)), 600, now),
+            Duration::from_secs(600) + m
+        );
+        assert_eq!(
+            pending_window(Some(&at(5000)), 600, now),
+            Duration::from_secs(600) + m
+        );
+        // Only one of them sent.
+        assert_eq!(pending_window(None, 120, now), Duration::from_secs(120) + m);
+        assert_eq!(
+            pending_window(Some(&at(90)), 0, now),
+            Duration::from_secs(90) + m
+        );
+        // Neither (an older manager) → 600 s.
+        assert_eq!(pending_window(None, 0, now), FALLBACK_WAIT);
+        assert_eq!(pending_window(Some("garbage"), 0, now), FALLBACK_WAIT);
+    }
+
+    #[test]
+    fn lifetimes() {
+        assert_eq!(fmt_lifetime(600), "10 minutes");
+        assert_eq!(fmt_lifetime(60), "1 minute");
+        assert_eq!(fmt_lifetime(90), "90 seconds");
     }
 }

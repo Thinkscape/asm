@@ -111,10 +111,15 @@ fn interactive(
         poll_token: poll_token.clone(),
         client_nonce: hex_encode(client_nonce),
     };
-    match api.post::<_, PairResponse>(&format!("/pair/{pair_id}/reveal"), &reveal)? {
-        PairResponse::Pending { .. } => {}
-        other => return Err(unexpected(&other)),
-    }
+    let started = std::time::Instant::now();
+    let expires_at =
+        match api.post::<_, PairResponse>(&format!("/pair/{pair_id}/reveal"), &reveal)? {
+            PairResponse::Pending { expires_at, .. } => expires_at,
+            other => return Err(unexpected(&other)),
+        };
+    // An unreachable manager is retried until the request would have expired there.
+    let retry_until = started
+        + crate::requests::pending_window(expires_at.as_deref(), 0, crate::requests::unix_now());
     println!("verification code: {}", format_pairing_code(code));
     eprintln!(
         "Check that the manager shows the same code, then approve the request there. Waiting…"
@@ -125,10 +130,25 @@ fn interactive(
         "/pair/{pair_id}?poll_token={}&wait={MAX_POLL_WAIT_SECS}",
         query_escape(&poll_token)
     );
+    let mut backoff = crate::requests::Backoff::new();
     loop {
-        let started = std::time::Instant::now();
-        match api.get::<PairResponse>(&poll)? {
-            PairResponse::Pending { .. } => crate::requests::pace(started),
+        let polled = std::time::Instant::now();
+        let r = match api.get::<PairResponse>(&poll) {
+            Ok(r) => r,
+            Err(e) if e.transient => {
+                if !backoff.wait(retry_until) {
+                    return Err(CliError::lost_contact(
+                        &e.message,
+                        "the pairing request may still be pending on the manager: deny it there, then run asm pair again",
+                    ));
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        backoff.reset();
+        match r {
+            PairResponse::Pending { .. } => crate::requests::pace(polled),
             PairResponse::Approved { host_id, token } => return Ok((host_id, token)),
             PairResponse::Denied { deny_reason } => {
                 return Err(CliError::denied(deny_reason.as_deref()));

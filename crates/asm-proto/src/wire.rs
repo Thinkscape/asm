@@ -65,7 +65,9 @@ impl HostInfo {
         ] {
             validate_agent_text(what, v)?;
         }
-        self.addresses.iter().try_for_each(|a| validate_agent_text("address", a))
+        self.addresses
+            .iter()
+            .try_for_each(|a| validate_agent_text("address", a))
     }
 }
 
@@ -118,6 +120,9 @@ pub enum PairResponse {
     Pending {
         #[serde(default)]
         deny_reason: Option<String>,
+        /// When the pairing request expires unanswered (RFC 3339); absent from older managers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<String>,
     },
     Denied {
         #[serde(default)]
@@ -228,16 +233,18 @@ impl RequestBody {
     /// The secret name the request is about.
     pub fn name(&self) -> &str {
         match self {
-            RequestBody::Get { name, .. } | RequestBody::Update { name, .. } | RequestBody::Add { name, .. } => name,
+            RequestBody::Get { name, .. }
+            | RequestBody::Update { name, .. }
+            | RequestBody::Add { name, .. } => name,
         }
     }
 
     /// The agent label.
     pub fn agent(&self) -> &str {
         match self {
-            RequestBody::Get { agent, .. } | RequestBody::Update { agent, .. } | RequestBody::Add { agent, .. } => {
-                agent
-            }
+            RequestBody::Get { agent, .. }
+            | RequestBody::Update { agent, .. }
+            | RequestBody::Add { agent, .. } => agent,
         }
     }
 }
@@ -277,6 +284,14 @@ pub struct RequestState {
     pub status: RequestStatus,
     pub deny_reason: Option<String>,
     pub result: Option<RequestResult>,
+    /// While pending: when the request expires unanswered (RFC 3339); `null` once
+    /// resolved. Absent from older managers.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// The manager's pending-request lifetime in seconds (always set while pending);
+    /// 0 = unknown (older manager).
+    #[serde(default)]
+    pub pending_lifetime_secs: u64,
 }
 
 /// Result of an approved request: `GetResult` for `get`, `WriteResult` for `update`/`add`.
@@ -350,15 +365,48 @@ mod tests {
     #[test]
     fn pair_responses() {
         let r: PairResponse = from_str(r#"{"status":"pending"}"#).unwrap();
-        assert_eq!(r, PairResponse::Pending { deny_reason: None });
-        let r = PairResponse::AwaitingReveal { pair_id: "p".into(), poll_token: "t".into(), server_nonce: "00".into() };
+        assert_eq!(
+            r,
+            PairResponse::Pending {
+                deny_reason: None,
+                expires_at: None
+            }
+        );
+        let r = PairResponse::Pending {
+            deny_reason: None,
+            expires_at: Some("2026-11-16T12:00:00Z".into()),
+        };
+        assert_eq!(
+            to_value(&r).unwrap(),
+            json!({"status":"pending","deny_reason":null,"expires_at":"2026-11-16T12:00:00Z"})
+        );
+        assert_eq!(
+            to_value(PairResponse::Pending {
+                deny_reason: None,
+                expires_at: None
+            })
+            .unwrap(),
+            json!({"status":"pending","deny_reason":null}),
+            "older CLIs see the same pending answer as before"
+        );
+        let r = PairResponse::AwaitingReveal {
+            pair_id: "p".into(),
+            poll_token: "t".into(),
+            server_nonce: "00".into(),
+        };
         assert_eq!(
             to_value(&r).unwrap(),
             json!({"status":"awaiting_reveal","pair_id":"p","poll_token":"t","server_nonce":"00"})
         );
         let r: PairResponse = from_str(r#"{"status":"denied","deny_reason":"no"}"#).unwrap();
-        assert_eq!(r, PairResponse::Denied { deny_reason: Some("no".into()) });
-        let r: PairResponse = from_str(r#"{"status":"approved","host_id":"h","token":"t"}"#).unwrap();
+        assert_eq!(
+            r,
+            PairResponse::Denied {
+                deny_reason: Some("no".into())
+            }
+        );
+        let r: PairResponse =
+            from_str(r#"{"status":"approved","host_id":"h","token":"t"}"#).unwrap();
         assert!(matches!(r, PairResponse::Approved { .. }));
     }
 
@@ -370,8 +418,16 @@ mod tests {
         .unwrap();
         assert_eq!(b.kind(), RequestKind::Get);
         assert_eq!(b.name(), "X");
-        let b = RequestBody::Update { name: "X".into(), field: None, value: "v".into(), agent: "".into() };
-        assert_eq!(to_value(&b).unwrap(), json!({"kind":"update","name":"X","field":null,"value":"v","agent":""}));
+        let b = RequestBody::Update {
+            name: "X".into(),
+            field: None,
+            value: "v".into(),
+            agent: "".into(),
+        };
+        assert_eq!(
+            to_value(&b).unwrap(),
+            json!({"kind":"update","name":"X","field":null,"value":"v","agent":""})
+        );
         let b: RequestBody = from_str(r#"{"kind":"add","name":"X","value":"v"}"#).unwrap();
         assert_eq!(b.agent(), "");
     }
@@ -380,18 +436,37 @@ mod tests {
     fn request_states() {
         let get = json!({"request_id":"r","kind":"get","status":"approved","deny_reason":null,
             "result":{"lease_id":"l","mode":"sentinel","hosts":["a.com"],"expires_at":null,
-                      "files":[{"field":"value","relative_path":"X","content":"asm_x"}]}});
+                      "files":[{"field":"value","relative_path":"X","content":"asm_x"}]},
+            "expires_at":null,"pending_lifetime_secs":600});
         let s: RequestState = serde_json::from_value(get.clone()).unwrap();
-        assert!(matches!(s.result, Some(RequestResult::Get(GetResult { mode: LeaseMode::Sentinel, .. }))));
+        assert!(matches!(
+            s.result,
+            Some(RequestResult::Get(GetResult {
+                mode: LeaseMode::Sentinel,
+                ..
+            }))
+        ));
         assert_eq!(to_value(&s).unwrap(), get);
         let write = json!({"request_id":"r","kind":"add","status":"approved","deny_reason":null,
             "result":{"name":"X","vault":"v"}});
         let s: RequestState = serde_json::from_value(write).unwrap();
         assert!(matches!(s.result, Some(RequestResult::Write(_))));
+        // An older manager sends neither expiry field.
         let pending: RequestState =
             from_str(r#"{"request_id":"r","kind":"update","status":"pending","deny_reason":null,"result":null}"#)
                 .unwrap();
         assert!(!pending.status.is_terminal());
+        assert_eq!(
+            (pending.expires_at, pending.pending_lifetime_secs),
+            (None, 0)
+        );
+        let pending: RequestState = from_str(
+            r#"{"request_id":"r","kind":"get","status":"pending","deny_reason":null,"result":null,
+                "expires_at":"2026-11-16T12:10:00Z","pending_lifetime_secs":600}"#,
+        )
+        .unwrap();
+        assert_eq!(pending.expires_at.as_deref(), Some("2026-11-16T12:10:00Z"));
+        assert_eq!(pending.pending_lifetime_secs, 600);
     }
 
     #[test]
@@ -402,7 +477,11 @@ mod tests {
                 vault: "work".into(),
                 kind: SecretKind::Login,
                 fields: vec!["username".into(), "password".into()],
-                lease: Some(LeaseBrief { lease_id: "l".into(), mode: LeaseMode::Raw, expires_at: None }),
+                lease: Some(LeaseBrief {
+                    lease_id: "l".into(),
+                    mode: LeaseMode::Raw,
+                    expires_at: None,
+                }),
             }],
             warnings: vec![],
         };
@@ -418,7 +497,10 @@ mod tests {
 
     #[test]
     fn host_info_validation() {
-        let mut h = HostInfo { hostname: "nuk1".into(), ..Default::default() };
+        let mut h = HostInfo {
+            hostname: "nuk1".into(),
+            ..Default::default()
+        };
         assert!(h.validate().is_ok());
         h.username = "evil\u{202E}".into();
         assert!(h.validate().is_err());

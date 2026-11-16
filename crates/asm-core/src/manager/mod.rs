@@ -112,6 +112,9 @@ pub struct Core {
     pub activity: activity::ActivityLog,
     /// Vault id → ready at the last [`Core::track_vaults`].
     pub(crate) vault_ready: Mutex<HashMap<String, bool>>,
+    /// Collection id → name from Bitwarden "Connect" calls (a new vault has no id yet when
+    /// it connects; its save picks the names up from here).
+    pub(crate) connect_names: Mutex<HashMap<String, String>>,
 }
 
 /// `(field, value)` pairs read from a vault.
@@ -277,6 +280,7 @@ impl Core {
             vault_errors: Mutex::new(vault_errors),
             activity,
             vault_ready: Mutex::new(HashMap::new()),
+            connect_names: Mutex::new(HashMap::new()),
         });
         {
             let suspended = lock(&core.proxy_state).suspended.clone();

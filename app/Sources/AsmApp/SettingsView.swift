@@ -35,7 +35,8 @@ struct SettingsView: View {
             List(SettingsPane.allCases, selection: $selection) { pane in
                 Label(pane.title, systemImage: pane.symbol).tag(pane)
             }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
+            .navigationSplitViewColumnWidth(min: 200, ideal: 200, max: 200)
+            .toolbar(removing: .sidebarToggle)
         } detail: {
             SettingsDetail(model: model, pane: selection ?? .vaults)
         }

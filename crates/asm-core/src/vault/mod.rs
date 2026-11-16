@@ -2,6 +2,8 @@
 //! submodules. Every provider call is synchronous and may block: call it from a plain
 //! thread or `tokio::task::spawn_blocking`, never directly inside an async task.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -70,6 +72,18 @@ pub trait VaultProvider: Send + Sync {
     fn collections(&self) -> Result<Vec<CollectionInfo>> {
         Ok(Vec::new())
     }
+    /// Every collection the account can see, exposed or not (Bitwarden, needs `Ready`);
+    /// empty elsewhere.
+    fn all_collections(&self) -> Result<Vec<CollectionInfo>> {
+        Ok(Vec::new())
+    }
+    /// Apply a changed configuration to the running provider without restarting it.
+    /// Returns `false` when the change needs a new provider (the default). Bitwarden
+    /// applies exposure changes (collections, personal flag, cached names) in place, so
+    /// an unlocked vault stays unlocked.
+    fn reconfigure(&self, _config: &VaultConfig) -> bool {
+        false
+    }
 }
 
 /// Persisted (non-secret) vault configuration, stored as JSON in the `vaults` table.
@@ -94,6 +108,21 @@ pub struct BitwardenConfig {
     pub personal: bool,
     /// `None` = default (first existing of /opt/homebrew/bin/bw, /usr/local/bin/bw).
     pub bw_path: Option<String>,
+    /// Names of the exposed collections (id → name), cached at the last save or connect so
+    /// a locked vault can still show them.
+    #[serde(default)]
+    pub collection_names: BTreeMap<String, String>,
+}
+
+impl BitwardenConfig {
+    /// Same account and `bw` binary: only exposure (collections, personal flag, cached
+    /// names) may differ, which a running provider can take over in place.
+    pub fn same_connection(&self, other: &BitwardenConfig) -> bool {
+        self.server_url == other.server_url
+            && self.email == other.email
+            && self.client_id == other.client_id
+            && self.bw_path == other.bw_path
+    }
 }
 
 /// Stored secret part of a Bitwarden config (keychain, `creds`).
