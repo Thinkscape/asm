@@ -25,8 +25,8 @@ proxy:
 
 # Rust core → universal static lib, Swift bindings, xcframework
 core:
-    MACOSX_DEPLOYMENT_TARGET=14.0 cargo build -p asm-core --release --target aarch64-apple-darwin
-    MACOSX_DEPLOYMENT_TARGET=14.0 cargo build -p asm-core --release --target x86_64-apple-darwin
+    CFLAGS_aarch64_apple_darwin=-mmacosx-version-min=14.0 cargo build -p asm-core --release --target aarch64-apple-darwin
+    CFLAGS_x86_64_apple_darwin=-mmacosx-version-min=14.0 cargo build -p asm-core --release --target x86_64-apple-darwin
     mkdir -p dist/lib
     lipo -create target/aarch64-apple-darwin/release/libasm_core.a target/x86_64-apple-darwin/release/libasm_core.a -output dist/lib/libasm_core.a
     rm -rf app/Sources/AsmCore dist/ffi app/AsmCoreFFI.xcframework
@@ -45,7 +45,7 @@ app: proxy core
     swift build -c release --arch arm64 --arch x86_64 --package-path app
     rm -rf "{{app}}"
     mkdir -p "{{app}}/Contents/MacOS"
-    cp app/.build/apple/Products/Release/AsmApp "{{app}}/Contents/MacOS/AsmApp"
+    cp "$(swift build -c release --arch arm64 --arch x86_64 --package-path app --show-bin-path)/AsmApp" "{{app}}/Contents/MacOS/AsmApp"
     cp dist/bin/iron-proxy "{{app}}/Contents/MacOS/iron-proxy"
     cp app/Bundle/Info.plist "{{app}}/Contents/Info.plist"
     codesign --force --options runtime --sign "{{identity}}" "{{app}}/Contents/MacOS/iron-proxy"
