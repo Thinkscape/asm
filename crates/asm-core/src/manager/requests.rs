@@ -1,0 +1,1393 @@
+//! Host requests (`get`, `update`, `add`) and the shared pending list (which also holds
+//! revealed pairing requests). Pending requests, including the values of `update`/`add`,
+//! live in memory only; every state change happens under `Core::book`.
+
+use std::collections::HashMap;
+
+use asm_proto::crypto::{new_uuid_v4, sha256};
+use asm_proto::rules::{
+    is_broad, new_sentinel, normalize_host_pattern, normalize_host_patterns, relative_paths,
+    validate_agent_text, validate_reason, validate_secret_value,
+};
+use asm_proto::time::fmt_unix;
+use asm_proto::wire::{
+    GetResult, HostInfo, LeaseMode, RequestBody, RequestKind, RequestResult, RequestState,
+    RequestStatus, ResultFile, SecretKind, WriteResult,
+};
+
+use super::pairing::{PairAttempt, PairState};
+use super::{Core, TOPIC_LEASES, TOPIC_REQUESTS, TOPIC_VAULTS, lock, now, to_system_time};
+use crate::error::{CoreError, Result};
+use crate::ffi;
+use crate::proxy::ProxyEntry;
+use crate::store::{HistoryRecord, HostRecord, LeaseField, LeaseRecord};
+use crate::vault::names::{NamedSecret, VaultListing, base_name_exists, compute_names, lookup};
+use crate::vault::{AddTarget, CollectionInfo, VaultConfig, VaultStatus};
+
+/// Resolved host requests stay pollable this long.
+const DONE_KEEP_SECS: i64 = 3600;
+/// Unrevealed pairing attempts expire after this long.
+pub const REVEAL_SECS: i64 = 60;
+
+#[derive(Default)]
+pub struct Book {
+    pub(crate) pending: Vec<Pending>,
+    pub(crate) done: HashMap<String, Done>,
+    pub(crate) pairs: HashMap<String, PairAttempt>,
+}
+
+pub(crate) struct Done {
+    host_id: String,
+    state: RequestState,
+    at: i64,
+}
+
+/// A secret as resolved when the request was made.
+#[derive(Debug, Clone)]
+pub(crate) struct SecretRef {
+    pub vault_id: String,
+    pub vault_name: String,
+    pub key: String,
+    pub kind: SecretKind,
+    pub fields: Vec<String>,
+    pub display: String,
+    /// Name inside the vault after duplicate suffixes (`display` without the vault prefix).
+    pub base: String,
+    pub prefixed: bool,
+}
+
+impl SecretRef {
+    fn from_named(n: &NamedSecret) -> Self {
+        let base = if n.prefixed {
+            n.display
+                .split_once('/')
+                .map(|(_, b)| b.to_string())
+                .unwrap_or_else(|| n.display.clone())
+        } else {
+            n.display.clone()
+        };
+        Self {
+            vault_id: n.vault_id.clone(),
+            vault_name: n.vault_name.clone(),
+            key: n.meta.key.clone(),
+            kind: n.meta.kind,
+            fields: n.meta.fields.clone(),
+            display: n.display.clone(),
+            base,
+            prefixed: n.prefixed,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GetDetail {
+    pub secret: SecretRef,
+    pub raw: bool,
+    pub requested_hosts: Vec<String>,
+    pub reason: String,
+    pub initial: Vec<String>,
+    pub suggestions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UpdateDetail {
+    pub secret: SecretRef,
+    pub field: String,
+    pub old_value: String,
+    pub new_value: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AddTargetData {
+    pub vault_id: String,
+    pub vault_name: String,
+    pub kind: ffi::VaultKind,
+    pub collections: Vec<CollectionInfo>,
+    pub personal_allowed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AddDetail {
+    pub name: String,
+    pub value: String,
+    pub targets: Vec<AddTargetData>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum Detail {
+    Pair {
+        info: HostInfo,
+        address: String,
+        code: String,
+    },
+    Get(GetDetail),
+    Update(UpdateDetail),
+    Add(AddDetail),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Pending {
+    pub id: String,
+    pub created: i64,
+    pub expires: i64,
+    /// `None` for pairing requests.
+    pub host_id: Option<String>,
+    pub host_label: String,
+    pub host_info: Option<HostInfo>,
+    pub agent: String,
+    /// The operator's decision is being carried out (vault access); not expirable/cancellable.
+    pub resolving: bool,
+    pub error: Option<String>,
+    pub detail: Detail,
+}
+
+impl Pending {
+    fn kind_str(&self) -> &'static str {
+        match self.detail {
+            Detail::Pair { .. } => "pair",
+            Detail::Get(_) => "get",
+            Detail::Update(_) => "update",
+            Detail::Add(_) => "add",
+        }
+    }
+
+    fn wire_kind(&self) -> RequestKind {
+        match self.detail {
+            Detail::Update(_) => RequestKind::Update,
+            Detail::Add(_) => RequestKind::Add,
+            _ => RequestKind::Get,
+        }
+    }
+
+    fn summary(&self) -> String {
+        match &self.detail {
+            Detail::Pair { info, .. } => format!("pair {}", info.hostname),
+            Detail::Get(g) => format!(
+                "get {}{}",
+                g.secret.display,
+                if g.raw { " (raw)" } else { "" }
+            ),
+            Detail::Update(u) => format!("update {} ({})", u.secret.display, u.field),
+            Detail::Add(a) => format!("add {}", a.name),
+        }
+    }
+
+    fn state(&self) -> RequestState {
+        RequestState {
+            request_id: self.id.clone(),
+            kind: self.wire_kind(),
+            status: RequestStatus::Pending,
+            deny_reason: None,
+            result: None,
+        }
+    }
+
+    fn history(&self, status: RequestStatus, deny_reason: Option<String>, t: i64) -> HistoryRecord {
+        HistoryRecord {
+            id: self.id.clone(),
+            kind: self.kind_str().to_string(),
+            host_id: self.host_id.clone(),
+            host_label: self.host_label.clone(),
+            summary: self.summary(),
+            status: status_str(status).to_string(),
+            deny_reason,
+            created_at: self.created,
+            resolved_at: t,
+        }
+    }
+}
+
+pub(crate) fn status_str(s: RequestStatus) -> &'static str {
+    match s {
+        RequestStatus::Pending => "pending",
+        RequestStatus::Approved => "approved",
+        RequestStatus::Denied => "denied",
+        RequestStatus::Expired => "expired",
+        RequestStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Why an approval did not go through.
+pub(crate) enum Fail {
+    /// The decision cannot be carried out as given; the request stays pending.
+    Keep(CoreError),
+    /// The request becomes denied with this reason (e.g. `vault unavailable: …`).
+    Deny(String),
+}
+
+impl From<CoreError> for Fail {
+    fn from(e: CoreError) -> Self {
+        Fail::Keep(e)
+    }
+}
+
+/// Host part of a URI-ish string (`https://a.b:443/x`, `a.b`, `a.b:8080`) as a pattern.
+fn uri_host(s: &str) -> Option<String> {
+    let s = s.trim();
+    let rest = s.split_once("://").map(|(_, r)| r).unwrap_or(s);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next()?
+    } else {
+        authority.split(':').next()?
+    };
+    normalize_host_pattern(host).ok()
+}
+
+/// Initial (pre-filled) host list and suggestions for the `get` popup.
+pub(crate) fn host_candidates(
+    requested: &[String],
+    remembered: &[String],
+    uri: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let base: &[String] = if !requested.is_empty() {
+        requested
+    } else if !remembered.is_empty() {
+        remembered
+    } else {
+        uri
+    };
+    let mut initial: Vec<String> = Vec::new();
+    for p in base {
+        if p != "*" && !is_broad(p) && !initial.contains(p) {
+            initial.push(p.clone());
+        }
+    }
+    let mut suggestions: Vec<String> = Vec::new();
+    for p in requested.iter().chain(remembered).chain(uri) {
+        if !initial.contains(p) && !suggestions.contains(p) {
+            suggestions.push(p.clone());
+        }
+    }
+    (initial, suggestions)
+}
+
+fn hash_hex(v: &str) -> [u8; 32] {
+    sha256(v.as_bytes())
+}
+
+fn is_env_key(name: &str) -> bool {
+    let mut c = name.chars();
+    matches!(c.next(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic())
+        && c.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+impl Core {
+    fn record_history(&self, rows: &[HistoryRecord]) {
+        for r in rows {
+            if let Err(e) = self.store.insert_history(r) {
+                log::error!("request history: {}", e.message);
+            }
+        }
+    }
+
+    /// Expire pending requests and unrevealed pairing attempts; prune old resolved ones.
+    pub fn expire_requests(&self, t: i64) {
+        let mut rows = Vec::new();
+        let mut changed = false;
+        {
+            let mut b = lock(&self.book);
+            let (expired, keep): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut b.pending)
+                .into_iter()
+                .partition(|p| !p.resolving && p.expires <= t);
+            b.pending = keep;
+            for p in expired {
+                changed = true;
+                rows.push(p.history(RequestStatus::Expired, None, t));
+                match (&p.detail, &p.host_id) {
+                    (Detail::Pair { .. }, _) => {
+                        if let Some(a) = b.pairs.get_mut(&p.id) {
+                            a.state = PairState::Expired;
+                            a.ended = Some(t);
+                        }
+                    }
+                    (_, Some(host_id)) => {
+                        let mut state = p.state();
+                        state.status = RequestStatus::Expired;
+                        b.done.insert(
+                            p.id.clone(),
+                            Done {
+                                host_id: host_id.clone(),
+                                state,
+                                at: t,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            for a in b.pairs.values_mut() {
+                if matches!(a.state, PairState::AwaitingReveal) && a.expires <= t {
+                    a.state = PairState::Expired;
+                    a.ended = Some(t);
+                    changed = true;
+                }
+            }
+            b.done.retain(|_, d| d.at + DONE_KEEP_SECS > t);
+            b.pairs
+                .retain(|_, a| a.ended.is_none_or(|e| e + DONE_KEEP_SECS > t));
+        }
+        self.record_history(&rows);
+        if changed {
+            self.bump();
+            if !rows.is_empty() {
+                self.notify(TOPIC_REQUESTS);
+            }
+        }
+    }
+
+    /// Resolve a secret name; a miss while some vault is not ready → `vault_unavailable`.
+    pub(crate) fn find_secret(&self, query: &str) -> Result<(NamedSecret, Vec<VaultListing>)> {
+        let (listings, _) = self.registry.listings();
+        let names = compute_names(&listings);
+        match lookup(&names, query) {
+            Ok(n) => Ok((n.clone(), listings)),
+            Err(e) if e.code == asm_proto::ErrorCode::NotFound => {
+                let unavailable: Vec<String> = self
+                    .registry
+                    .all()
+                    .into_iter()
+                    .filter(|v| v.provider.status() != VaultStatus::Ready)
+                    .map(|v| v.name)
+                    .collect();
+                let relevant = match query.split_once('/') {
+                    Some((vault, _)) => unavailable.iter().any(|u| u == vault),
+                    None => !unavailable.is_empty(),
+                };
+                if relevant {
+                    Err(CoreError::vault_unavailable(format!(
+                        "{query:?} was not found in the available vaults; unavailable: {}",
+                        unavailable.join(", ")
+                    )))
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `POST /requests`. Returns the state; `approved` only for the existing-lease shortcut.
+    pub fn create_request(&self, host: &HostRecord, body: RequestBody) -> Result<RequestState> {
+        let agent = body.agent().trim().to_string();
+        validate_agent_text("agent", &agent)?;
+        if agent.chars().count() > 128 {
+            return Err(CoreError::invalid("agent label is too long"));
+        }
+        let t = now();
+        if !agent.is_empty() {
+            self.store.upsert_agent(&host.id, &agent, t)?;
+            self.notify(super::TOPIC_HOSTS);
+        }
+        self.expire_requests(t);
+        match body {
+            RequestBody::Get {
+                name,
+                raw,
+                hosts,
+                reason,
+                ..
+            } => self.create_get(host, &agent, &name, raw, &hosts, &reason),
+            RequestBody::Update {
+                name, field, value, ..
+            } => self.create_update(host, &agent, &name, field, value),
+            RequestBody::Add { name, value, .. } => self.create_add(host, &agent, name, value),
+        }
+    }
+
+    fn new_pending(&self, host: &HostRecord, agent: &str, detail: Detail) -> Pending {
+        let t = now();
+        let lifetime = self.settings().request_lifetime_secs.max(1) as i64;
+        Pending {
+            id: new_uuid_v4(),
+            created: t,
+            expires: t + lifetime,
+            host_id: Some(host.id.clone()),
+            host_label: host.info.hostname.clone(),
+            host_info: Some(host.info.clone()),
+            agent: agent.to_string(),
+            resolving: false,
+            error: None,
+            detail,
+        }
+    }
+
+    /// Push a pending request unless an equal one of the same host exists (re-attach).
+    fn push_pending(&self, p: Pending, same: impl Fn(&Pending) -> bool) -> RequestState {
+        let state = {
+            let mut b = lock(&self.book);
+            if let Some(existing) = b.pending.iter().find(|q| q.host_id == p.host_id && same(q)) {
+                return existing.state();
+            }
+            let s = p.state();
+            b.pending.push(p);
+            s
+        };
+        self.bump();
+        self.notify(TOPIC_REQUESTS);
+        state
+    }
+
+    fn create_get(
+        &self,
+        host: &HostRecord,
+        agent: &str,
+        name: &str,
+        raw: bool,
+        hosts: &[String],
+        reason: &str,
+    ) -> Result<RequestState> {
+        let reason = validate_reason(reason)?;
+        let requested = normalize_host_patterns(hosts)?;
+        let (named, _) = self.find_secret(name)?;
+        let secret = SecretRef::from_named(&named);
+
+        if !raw && let Some(state) = self.get_shortcut(host, agent, &secret, &requested)? {
+            return Ok(state);
+        }
+
+        let remembered = self.store.secret_hosts(&secret.vault_id, &secret.key)?;
+        let mut uri: Vec<String> = Vec::new();
+        for h in named.meta.uri_hosts.iter().filter_map(|u| uri_host(u)) {
+            if !uri.contains(&h) {
+                uri.push(h);
+            }
+        }
+        let (initial, suggestions) = host_candidates(&requested, &remembered, &uri);
+        let detail = GetDetail {
+            secret,
+            raw,
+            requested_hosts: requested,
+            reason,
+            initial,
+            suggestions,
+        };
+        let p = self.new_pending(host, agent, Detail::Get(detail.clone()));
+        Ok(self.push_pending(p, |q| match &q.detail {
+            Detail::Get(g) => {
+                g.secret.vault_id == detail.secret.vault_id
+                    && g.secret.key == detail.secret.key
+                    && g.raw == detail.raw
+                    && g.requested_hosts == detail.requested_hosts
+                    && g.reason == detail.reason
+            }
+            _ => false,
+        }))
+    }
+
+    /// Existing active sentinel lease covering the request → approved without a popup.
+    fn get_shortcut(
+        &self,
+        host: &HostRecord,
+        agent: &str,
+        secret: &SecretRef,
+        requested: &[String],
+    ) -> Result<Option<RequestState>> {
+        let t = now();
+        let mut candidates: Vec<LeaseRecord> = self
+            .store
+            .leases_of_host(&host.id)?
+            .into_iter()
+            .filter(|l| {
+                l.is_active(t)
+                    && l.mode == LeaseMode::Sentinel
+                    && l.vault_id == secret.vault_id
+                    && l.secret_key == secret.key
+                    && (requested.is_empty()
+                        || l.hosts == ["*"]
+                        || requested.iter().all(|r| l.hosts.contains(r)))
+            })
+            .collect();
+        // Longest-lived first (unlimited first).
+        candidates.sort_by_key(|l| std::cmp::Reverse(l.expires_at.unwrap_or(i64::MAX)));
+        let Some(lease) = candidates.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let needs_values = lease.fields.iter().any(|f| f.sentinel.is_none());
+        let values = if needs_values {
+            let entry = self
+                .registry
+                .get(&lease.vault_id)
+                .ok_or_else(|| CoreError::vault_unavailable("vault was removed"))?;
+            entry
+                .provider
+                .read(&lease.secret_key)
+                .map_err(|e| CoreError::vault_unavailable(e.message))?
+        } else {
+            Vec::new()
+        };
+        let mut files = Vec::new();
+        for f in &lease.fields {
+            let content = match &f.sentinel {
+                Some(s) => s.clone(),
+                None => values
+                    .iter()
+                    .find(|(n, _)| n == &f.field)
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| {
+                        CoreError::vault_unavailable(format!(
+                            "field {:?} is no longer in the vault",
+                            f.field
+                        ))
+                    })?,
+            };
+            files.push(ResultFile {
+                field: f.field.clone(),
+                relative_path: f.path.clone(),
+                content,
+            });
+        }
+        if self.suspended().contains_key(&lease.id) {
+            self.sync_proxy(true);
+        }
+        let id = new_uuid_v4();
+        let state = RequestState {
+            request_id: id.clone(),
+            kind: RequestKind::Get,
+            status: RequestStatus::Approved,
+            deny_reason: None,
+            result: Some(RequestResult::Get(GetResult {
+                lease_id: lease.id.clone(),
+                mode: LeaseMode::Sentinel,
+                hosts: lease.hosts.clone(),
+                expires_at: lease.expires_at.map(fmt_unix),
+                files,
+            })),
+        };
+        lock(&self.book).done.insert(
+            id.clone(),
+            Done {
+                host_id: host.id.clone(),
+                state: state.clone(),
+                at: t,
+            },
+        );
+        let _ = agent;
+        self.record_history(&[HistoryRecord {
+            id,
+            kind: "get".into(),
+            host_id: Some(host.id.clone()),
+            host_label: host.info.hostname.clone(),
+            summary: format!("get {} (existing lease)", secret.display),
+            status: "approved".into(),
+            deny_reason: None,
+            created_at: t,
+            resolved_at: t,
+        }]);
+        self.notify(TOPIC_REQUESTS);
+        Ok(Some(state))
+    }
+
+    fn create_update(
+        &self,
+        host: &HostRecord,
+        agent: &str,
+        name: &str,
+        field: Option<String>,
+        value: String,
+    ) -> Result<RequestState> {
+        validate_secret_value(&value)?;
+        let (named, _) = self.find_secret(name)?;
+        let secret = SecretRef::from_named(&named);
+        let field = match field
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty())
+        {
+            Some(f) => {
+                validate_agent_text("field", &f)?;
+                f
+            }
+            None => match secret.kind {
+                SecretKind::Login => "password".to_string(),
+                SecretKind::Single if secret.fields.len() == 1 => secret.fields[0].clone(),
+                _ => {
+                    return Err(CoreError::invalid(format!(
+                        "{} has several fields ({}); choose one with --field",
+                        secret.display,
+                        secret.fields.join(", ")
+                    )));
+                }
+            },
+        };
+        let known = secret.fields.contains(&field)
+            || (secret.kind == SecretKind::Login && (field == "password" || field == "username"));
+        if !known {
+            return Err(CoreError::invalid(format!(
+                "{} has no field {field:?}; fields: {}",
+                secret.display,
+                secret.fields.join(", ")
+            )));
+        }
+        let hash = hash_hex(&value);
+        // Re-attach before reading the vault again.
+        {
+            let b = lock(&self.book);
+            if let Some(q) = b.pending.iter().find(|q| {
+                q.host_id.as_deref() == Some(&host.id)
+                    && matches!(&q.detail, Detail::Update(u) if u.secret.vault_id == secret.vault_id
+                        && u.secret.key == secret.key && u.field == field && hash_hex(&u.new_value) == hash)
+            }) {
+                return Ok(q.state());
+            }
+        }
+        let entry = self
+            .registry
+            .get(&secret.vault_id)
+            .ok_or_else(|| CoreError::vault_unavailable("vault was removed"))?;
+        let old_value = entry
+            .provider
+            .read(&secret.key)
+            .map_err(|e| CoreError::vault_unavailable(e.message))?
+            .into_iter()
+            .find(|(f, _)| f == &field)
+            .map(|(_, v)| v)
+            .unwrap_or_default();
+        let detail = UpdateDetail {
+            secret,
+            field,
+            old_value,
+            new_value: value,
+        };
+        let p = self.new_pending(host, agent, Detail::Update(detail.clone()));
+        Ok(self.push_pending(p, |q| {
+            matches!(&q.detail, Detail::Update(u) if u.secret.vault_id == detail.secret.vault_id
+                && u.secret.key == detail.secret.key && u.field == detail.field
+                && hash_hex(&u.new_value) == hash)
+        }))
+    }
+
+    /// Vaults that can receive `add <name>` (plan step 4 table).
+    pub(crate) fn add_targets(&self, name: &str) -> Vec<AddTargetData> {
+        let mut out = Vec::new();
+        for v in self.registry.all() {
+            if v.provider.status() != VaultStatus::Ready {
+                continue;
+            }
+            match &v.config {
+                VaultConfig::Bitwarden(b) => {
+                    if b.collections.is_empty() && !b.personal {
+                        continue;
+                    }
+                    let known = v.provider.collections().unwrap_or_default();
+                    let collections =
+                        b.collections
+                            .iter()
+                            .map(|id| {
+                                known.iter().find(|c| &c.id == id).cloned().unwrap_or(
+                                    CollectionInfo {
+                                        id: id.clone(),
+                                        name: id.clone(),
+                                        organization_id: None,
+                                    },
+                                )
+                            })
+                            .collect();
+                    out.push(AddTargetData {
+                        vault_id: v.id.clone(),
+                        vault_name: v.name.clone(),
+                        kind: ffi::VaultKind::Bitwarden,
+                        collections,
+                        personal_allowed: b.personal,
+                    });
+                }
+                VaultConfig::EnvFile { .. } => {
+                    if is_env_key(name) {
+                        out.push(AddTargetData {
+                            vault_id: v.id.clone(),
+                            vault_name: v.name.clone(),
+                            kind: ffi::VaultKind::EnvFile,
+                            collections: Vec::new(),
+                            personal_allowed: false,
+                        });
+                    }
+                }
+                VaultConfig::Keychain => out.push(AddTargetData {
+                    vault_id: v.id.clone(),
+                    vault_name: v.name.clone(),
+                    kind: ffi::VaultKind::Keychain,
+                    collections: Vec::new(),
+                    personal_allowed: false,
+                }),
+            }
+        }
+        out
+    }
+
+    fn create_add(
+        &self,
+        host: &HostRecord,
+        agent: &str,
+        name: String,
+        value: String,
+    ) -> Result<RequestState> {
+        validate_secret_value(&value)?;
+        let name = name.trim().to_string();
+        if name.is_empty() || name.chars().count() > 256 {
+            return Err(CoreError::invalid("name must be 1–256 characters"));
+        }
+        if name.contains('/') {
+            return Err(CoreError::invalid("name must not contain '/'"));
+        }
+        validate_agent_text("name", &name)?;
+        let (listings, _) = self.registry.listings();
+        if base_name_exists(&listings, &name) {
+            return Err(CoreError::exists(format!(
+                "a secret named {name:?} already exists; use asm update"
+            )));
+        }
+        let targets = self.add_targets(&name);
+        if targets.is_empty() {
+            return Err(CoreError::vault_unavailable(format!(
+                "no available vault can store a secret named {name:?}"
+            )));
+        }
+        let hash = hash_hex(&value);
+        let detail = AddDetail {
+            name,
+            value,
+            targets,
+        };
+        let p = self.new_pending(host, agent, Detail::Add(detail.clone()));
+        Ok(self.push_pending(p, |q| {
+            matches!(&q.detail, Detail::Add(a) if a.name == detail.name && hash_hex(&a.value) == hash)
+        }))
+    }
+
+    /// `GET /requests/{id}`: the request's state. A raw result is returned once, then dropped.
+    pub fn request_state(&self, host_id: &str, id: &str) -> Result<RequestState> {
+        self.expire_requests(now());
+        let mut b = lock(&self.book);
+        if let Some(p) = b
+            .pending
+            .iter()
+            .find(|p| p.id == id && p.host_id.as_deref() == Some(host_id))
+        {
+            return Ok(p.state());
+        }
+        if let Some(d) = b.done.get_mut(id).filter(|d| d.host_id == host_id) {
+            let state = d.state.clone();
+            if let Some(RequestResult::Get(g)) = &d.state.result
+                && g.mode == LeaseMode::Raw
+            {
+                d.state.result = None;
+            }
+            return Ok(state);
+        }
+        Err(CoreError::not_found("no such request"))
+    }
+
+    /// `DELETE /requests/{id}`.
+    pub fn cancel_request(&self, host_id: &str, id: &str) -> Result<RequestState> {
+        let t = now();
+        self.expire_requests(t);
+        let (state, row) = {
+            let mut b = lock(&self.book);
+            let pos = b
+                .pending
+                .iter()
+                .position(|p| p.id == id && p.host_id.as_deref() == Some(host_id));
+            match pos {
+                Some(i) if !b.pending[i].resolving => {
+                    let p = b.pending.remove(i);
+                    let mut state = p.state();
+                    state.status = RequestStatus::Cancelled;
+                    b.done.insert(
+                        p.id.clone(),
+                        Done {
+                            host_id: host_id.to_string(),
+                            state: state.clone(),
+                            at: t,
+                        },
+                    );
+                    (state, Some(p.history(RequestStatus::Cancelled, None, t)))
+                }
+                Some(i) => (b.pending[i].state(), None),
+                None => match b.done.get(id).filter(|d| d.host_id == host_id) {
+                    Some(d) => {
+                        let mut s = d.state.clone();
+                        if matches!(&s.result, Some(RequestResult::Get(g)) if g.mode == LeaseMode::Raw)
+                        {
+                            s.result = None;
+                        }
+                        (s, None)
+                    }
+                    None => return Err(CoreError::not_found("no such request")),
+                },
+            }
+        };
+        if let Some(row) = row {
+            self.record_history(&[row]);
+            self.bump();
+            self.notify(TOPIC_REQUESTS);
+        }
+        Ok(state)
+    }
+
+    /// Cancel every pending request of a host (host revoked).
+    pub(crate) fn cancel_host_requests(&self, host_id: &str) {
+        let t = now();
+        let rows: Vec<HistoryRecord> = {
+            let mut b = lock(&self.book);
+            let (gone, keep): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut b.pending)
+                .into_iter()
+                .partition(|p| p.host_id.as_deref() == Some(host_id) && !p.resolving);
+            b.pending = keep;
+            gone.iter()
+                .map(|p| {
+                    let mut state = p.state();
+                    state.status = RequestStatus::Cancelled;
+                    b.done.insert(
+                        p.id.clone(),
+                        Done {
+                            host_id: host_id.to_string(),
+                            state,
+                            at: t,
+                        },
+                    );
+                    p.history(RequestStatus::Cancelled, Some("host revoked".into()), t)
+                })
+                .collect()
+        };
+        if !rows.is_empty() {
+            self.record_history(&rows);
+            self.bump();
+            self.notify(TOPIC_REQUESTS);
+        }
+    }
+
+    // ---- resolution ----
+
+    /// Carry out the operator's decision on a pending request.
+    pub fn resolve_request(&self, id: &str, decision: ffi::Decision) -> Result<()> {
+        let t = now();
+        self.expire_requests(t);
+        // Phase 1: claim the request.
+        let p = {
+            let mut b = lock(&self.book);
+            let Some(i) = b.pending.iter().position(|p| p.id == id) else {
+                return Err(CoreError::not_found("this request is no longer pending"));
+            };
+            if b.pending[i].resolving {
+                return Err(CoreError::invalid("this request is already being resolved"));
+            }
+            let ok = matches!(
+                (&b.pending[i].detail, &decision),
+                (_, ffi::Decision::Deny { .. })
+                    | (Detail::Pair { .. }, ffi::Decision::ApprovePair)
+                    | (Detail::Get(_), ffi::Decision::ApproveGet { .. })
+                    | (Detail::Update(_), ffi::Decision::ApproveWrite { .. })
+                    | (Detail::Add(_), ffi::Decision::ApproveWrite { .. })
+            );
+            if !ok {
+                return Err(CoreError::invalid(
+                    "this decision does not fit the request kind",
+                ));
+            }
+            if let ffi::Decision::Deny { reason } = &decision {
+                let reason = Some(reason.trim().to_string()).filter(|r| !r.is_empty());
+                let p = b.pending.remove(i);
+                drop(b);
+                self.finish(p, Err(reason), t);
+                return Ok(());
+            }
+            b.pending[i].resolving = true;
+            b.pending[i].clone()
+        };
+
+        // Phase 2: do the work without holding the book.
+        let outcome: std::result::Result<Option<RequestResult>, Fail> = match (&p.detail, decision)
+        {
+            (Detail::Pair { .. }, _) => self.approve_pair(&p).map(|_| None),
+            (
+                Detail::Get(g),
+                ffi::Decision::ApproveGet {
+                    mode,
+                    duration_secs,
+                    hosts,
+                },
+            ) => self
+                .approve_get(&p, g, mode.into(), duration_secs, hosts)
+                .map(|r| Some(RequestResult::Get(r))),
+            (Detail::Update(u), ffi::Decision::ApproveWrite { vault_id, .. }) => self
+                .approve_update(u, &vault_id)
+                .map(|r| Some(RequestResult::Write(r))),
+            (
+                Detail::Add(a),
+                ffi::Decision::ApproveWrite {
+                    vault_id,
+                    collection_id,
+                },
+            ) => self
+                .approve_add(a, &vault_id, collection_id)
+                .map(|r| Some(RequestResult::Write(r))),
+            _ => Err(Fail::Keep(CoreError::invalid(
+                "this decision does not fit the request kind",
+            ))),
+        };
+
+        // Phase 3: record the outcome.
+        let t = now();
+        match outcome {
+            Ok(result) => {
+                let p = self.take_pending(id);
+                if let Some(p) = p {
+                    self.finish(p, Ok(result), t);
+                }
+                Ok(())
+            }
+            Err(Fail::Keep(e)) => {
+                {
+                    let mut b = lock(&self.book);
+                    if let Some(q) = b.pending.iter_mut().find(|q| q.id == id) {
+                        q.resolving = false;
+                        q.error = Some(e.message.clone());
+                    }
+                }
+                self.notify(TOPIC_REQUESTS);
+                Err(e)
+            }
+            Err(Fail::Deny(reason)) => {
+                if let Some(p) = self.take_pending(id) {
+                    self.finish(p, Err(Some(reason.clone())), t);
+                }
+                Err(CoreError::vault_unavailable(reason))
+            }
+        }
+    }
+
+    fn take_pending(&self, id: &str) -> Option<Pending> {
+        let mut b = lock(&self.book);
+        let i = b.pending.iter().position(|p| p.id == id)?;
+        Some(b.pending.remove(i))
+    }
+
+    /// Move a removed pending request to its terminal state. `Ok(result)` = approved,
+    /// `Err(reason)` = denied.
+    fn finish(
+        &self,
+        p: Pending,
+        outcome: std::result::Result<Option<RequestResult>, Option<String>>,
+        t: i64,
+    ) {
+        let (status, deny_reason, result) = match outcome {
+            Ok(r) => (RequestStatus::Approved, None, r),
+            Err(reason) => (RequestStatus::Denied, reason, None),
+        };
+        {
+            let mut b = lock(&self.book);
+            match (&p.detail, &p.host_id) {
+                (Detail::Pair { .. }, _) => {
+                    if let Some(a) = b.pairs.get_mut(&p.id) {
+                        if status == RequestStatus::Denied {
+                            a.state = PairState::Denied(deny_reason.clone());
+                        }
+                        a.ended = Some(t);
+                    }
+                }
+                (_, Some(host_id)) => {
+                    let mut state = p.state();
+                    state.status = status;
+                    state.deny_reason = deny_reason.clone();
+                    state.result = result;
+                    b.done.insert(
+                        p.id.clone(),
+                        Done {
+                            host_id: host_id.clone(),
+                            state,
+                            at: t,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+        self.record_history(&[p.history(status, deny_reason, t)]);
+        self.bump();
+        self.notify(TOPIC_REQUESTS);
+    }
+
+    fn approve_get(
+        &self,
+        p: &Pending,
+        g: &GetDetail,
+        mode: LeaseMode,
+        duration_secs: Option<u64>,
+        hosts: Vec<String>,
+    ) -> std::result::Result<GetResult, Fail> {
+        let hosts = match mode {
+            LeaseMode::Raw => Vec::new(),
+            LeaseMode::Sentinel => {
+                let h = normalize_host_patterns(&hosts).map_err(CoreError::from)?;
+                if h.is_empty() {
+                    return Err(Fail::Keep(CoreError::invalid(
+                        "choose at least one host, or Any host",
+                    )));
+                }
+                if h.iter().any(|x| x == "*") {
+                    vec!["*".to_string()]
+                } else {
+                    h
+                }
+            }
+        };
+        let s = &g.secret;
+        let entry = self
+            .registry
+            .get(&s.vault_id)
+            .ok_or_else(|| Fail::Deny("vault unavailable: vault was removed".into()))?;
+        let values = entry
+            .provider
+            .read(&s.key)
+            .map_err(|e| Fail::Deny(format!("vault unavailable: {}", e.message)))?;
+        if values.is_empty() {
+            return Err(Fail::Deny(
+                "vault unavailable: the secret has no fields".into(),
+            ));
+        }
+        let field_names: Vec<&str> = values.iter().map(|(f, _)| f.as_str()).collect();
+        let paths = relative_paths(
+            s.prefixed.then_some(s.vault_name.as_str()),
+            &s.base,
+            s.kind,
+            &field_names,
+        );
+        let lease_id = new_uuid_v4();
+        let t = now();
+        let mut files = Vec::new();
+        let mut fields = Vec::new();
+        let mut entries = Vec::new();
+        for (index, ((field, value), path)) in values.iter().zip(paths).enumerate() {
+            let sentinel = (mode == LeaseMode::Sentinel && field != "username").then(new_sentinel);
+            if let Some(sv) = &sentinel {
+                entries.push(ProxyEntry {
+                    lease_id: lease_id.clone(),
+                    index,
+                    sentinel: sv.clone(),
+                    value: value.clone(),
+                    hosts: hosts.clone(),
+                });
+            }
+            files.push(ResultFile {
+                field: field.clone(),
+                relative_path: path.clone(),
+                content: sentinel.clone().unwrap_or_else(|| value.clone()),
+            });
+            fields.push(LeaseField {
+                field: field.clone(),
+                sentinel,
+                path,
+            });
+        }
+        let expires_at = duration_secs.map(|d| t.saturating_add(d.min(i64::MAX as u64) as i64));
+        let lease = LeaseRecord {
+            id: lease_id.clone(),
+            host_id: p.host_id.clone().unwrap_or_default(),
+            vault_id: s.vault_id.clone(),
+            vault_name: s.vault_name.clone(),
+            secret_key: s.key.clone(),
+            name: s.display.clone(),
+            mode,
+            fields,
+            hosts: hosts.clone(),
+            reason: g.reason.clone(),
+            agent: p.agent.clone(),
+            created_at: t,
+            expires_at,
+            revoked_at: None,
+        };
+        self.store.insert_lease(&lease)?;
+        if mode == LeaseMode::Sentinel {
+            self.store
+                .replace_secret_hosts(&s.vault_id, &s.key, &hosts)?;
+            self.sync_proxy_with(false, |st| {
+                st.entries.insert(lease_id.clone(), entries);
+            });
+        }
+        lock(&self.last_active).insert(lease_id.clone());
+        self.notify(TOPIC_LEASES);
+        Ok(GetResult {
+            lease_id,
+            mode,
+            hosts,
+            expires_at: expires_at.map(fmt_unix),
+            files,
+        })
+    }
+
+    fn approve_update(
+        &self,
+        u: &UpdateDetail,
+        vault_id: &str,
+    ) -> std::result::Result<WriteResult, Fail> {
+        let s = &u.secret;
+        if vault_id != s.vault_id {
+            return Err(Fail::Keep(CoreError::invalid(
+                "an update is written to the secret's own vault",
+            )));
+        }
+        let entry = self
+            .registry
+            .get(&s.vault_id)
+            .ok_or_else(|| Fail::Deny("vault unavailable: vault was removed".into()))?;
+        entry
+            .provider
+            .update(&s.key, &u.field, &u.new_value)
+            .map_err(|e| Fail::Deny(format!("vault unavailable: {}", e.message)))?;
+        let t = now();
+        let leases: Vec<LeaseRecord> = self
+            .store
+            .active_leases(t)
+            .map_err(Fail::Keep)?
+            .into_iter()
+            .filter(|l| l.vault_id == s.vault_id && l.secret_key == s.key)
+            .collect();
+        for l in leases.iter().filter(|l| l.mode == LeaseMode::Raw) {
+            if let Err(e) = self.store.revoke_lease(&l.id, t) {
+                log::error!("revoke raw lease after update: {}", e.message);
+            }
+        }
+        let sentinel: Vec<&LeaseRecord> = leases
+            .iter()
+            .filter(|l| l.mode == LeaseMode::Sentinel)
+            .collect();
+        self.sync_proxy_with(false, |st| {
+            for l in &sentinel {
+                if let Some(es) = st.entries.get_mut(&l.id) {
+                    for e in es.iter_mut() {
+                        if l.fields.get(e.index).is_some_and(|f| f.field == u.field) {
+                            e.value = u.new_value.clone();
+                        }
+                    }
+                }
+            }
+        });
+        if !leases.is_empty() {
+            self.notify(TOPIC_LEASES);
+        }
+        self.notify(TOPIC_VAULTS);
+        Ok(WriteResult {
+            name: s.display.clone(),
+            vault: s.vault_name.clone(),
+        })
+    }
+
+    fn approve_add(
+        &self,
+        a: &AddDetail,
+        vault_id: &str,
+        collection_id: Option<String>,
+    ) -> std::result::Result<WriteResult, Fail> {
+        let Some(target) = a.targets.iter().find(|t| t.vault_id == vault_id) else {
+            return Err(Fail::Keep(CoreError::invalid(
+                "choose one of the offered vaults",
+            )));
+        };
+        let collection_id = match target.kind {
+            ffi::VaultKind::Bitwarden => match collection_id {
+                Some(c) if target.collections.iter().any(|x| x.id == c) => Some(c),
+                None if target.personal_allowed => None,
+                _ => {
+                    return Err(Fail::Keep(CoreError::invalid(
+                        "choose one of the offered collections",
+                    )));
+                }
+            },
+            _ => None,
+        };
+        let (listings, _) = self.registry.listings();
+        if base_name_exists(&listings, &a.name) {
+            return Err(Fail::Deny(format!(
+                "a secret named {:?} already exists",
+                a.name
+            )));
+        }
+        let entry = self
+            .registry
+            .get(vault_id)
+            .ok_or_else(|| Fail::Deny("vault unavailable: vault was removed".into()))?;
+        entry
+            .provider
+            .add(&a.name, &a.value, &AddTarget { collection_id })
+            .map_err(|e| Fail::Deny(format!("vault unavailable: {}", e.message)))?;
+        self.notify(TOPIC_VAULTS);
+        Ok(WriteResult {
+            name: a.name.clone(),
+            vault: target.vault_name.clone(),
+        })
+    }
+
+    // ---- snapshot ----
+
+    pub fn snapshot(&self) -> ffi::Snapshot {
+        self.expire_requests(now());
+        let default_duration = self.settings().lease_default_secs;
+        let pending: Vec<Pending> = lock(&self.book).pending.clone();
+        let pending = pending
+            .into_iter()
+            .map(|p| pending_to_ffi(p, default_duration))
+            .collect();
+        let recent = self
+            .store
+            .recent_history(10)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|h| {
+                let outcome = match h.status.as_str() {
+                    "approved" => ffi::RequestOutcome::Approved,
+                    "denied" => ffi::RequestOutcome::Denied,
+                    "expired" => ffi::RequestOutcome::Expired,
+                    "cancelled" => ffi::RequestOutcome::Cancelled,
+                    _ => return None,
+                };
+                Some(ffi::RecentRequest {
+                    id: h.id,
+                    kind: kind_from_str(&h.kind),
+                    summary: h.summary,
+                    host_label: h.host_label,
+                    outcome,
+                    deny_reason: h.deny_reason,
+                    resolved_at: to_system_time(h.resolved_at),
+                })
+            })
+            .collect();
+        ffi::Snapshot { pending, recent }
+    }
+}
+
+fn kind_from_str(s: &str) -> ffi::RequestKind {
+    match s {
+        "pair" => ffi::RequestKind::Pair,
+        "update" => ffi::RequestKind::Update,
+        "add" => ffi::RequestKind::Add,
+        _ => ffi::RequestKind::Get,
+    }
+}
+
+fn pattern_check(p: &str) -> ffi::HostPatternCheck {
+    ffi::HostPatternCheck {
+        normalized: p.to_string(),
+        broad: is_broad(p),
+    }
+}
+
+fn pending_to_ffi(p: Pending, default_duration: Option<u64>) -> ffi::PendingRequest {
+    let summary = p.summary();
+    let kind = kind_from_str(p.kind_str());
+    let detail = match p.detail {
+        Detail::Pair {
+            info,
+            address,
+            code,
+        } => ffi::RequestDetail::Pair {
+            host_info: info.into(),
+            observed_address: address,
+            code,
+        },
+        Detail::Get(g) => ffi::RequestDetail::Get {
+            name: g.secret.display,
+            vault_id: g.secret.vault_id,
+            vault_name: g.secret.vault_name,
+            kind: g.secret.kind.into(),
+            fields: g.secret.fields,
+            reason: g.reason,
+            raw_requested: g.raw,
+            requested_hosts: g.requested_hosts,
+            initial_hosts: g.initial.iter().map(|h| pattern_check(h)).collect(),
+            suggested_hosts: g.suggestions.iter().map(|h| pattern_check(h)).collect(),
+            default_duration_secs: default_duration,
+        },
+        Detail::Update(u) => ffi::RequestDetail::Update {
+            name: u.secret.display,
+            vault_id: u.secret.vault_id,
+            vault_name: u.secret.vault_name,
+            field: u.field,
+            old_value: u.old_value,
+            new_value: u.new_value,
+        },
+        Detail::Add(a) => ffi::RequestDetail::Add {
+            name: a.name,
+            value: a.value,
+            targets: a
+                .targets
+                .into_iter()
+                .map(|t| ffi::AddTarget {
+                    vault_id: t.vault_id,
+                    vault_name: t.vault_name,
+                    kind: t.kind,
+                    collections: t.collections.into_iter().map(Into::into).collect(),
+                    personal_allowed: t.personal_allowed,
+                })
+                .collect(),
+        },
+    };
+    ffi::PendingRequest {
+        id: p.id,
+        kind,
+        created_at: to_system_time(p.created),
+        expires_at: to_system_time(p.expires),
+        host_id: p.host_id,
+        host_label: p.host_label,
+        host_info: p.host_info.map(Into::into),
+        agent: p.agent,
+        summary,
+        error: p.error,
+        detail,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn host_list_initial_value() {
+        // Requested hosts win; broad and `*` are only suggested.
+        let (i, s) = host_candidates(
+            &v(&["api.github.com", "*", "*github.com"]),
+            &v(&["old.example.com"]),
+            &v(&["github.com"]),
+        );
+        assert_eq!(i, v(&["api.github.com"]));
+        assert_eq!(s, v(&["*", "*github.com", "old.example.com", "github.com"]));
+        // Then remembered hosts.
+        let (i, _) = host_candidates(&[], &v(&["old.example.com"]), &v(&["github.com"]));
+        assert_eq!(i, v(&["old.example.com"]));
+        // Then URI hosts.
+        let (i, s) = host_candidates(&[], &[], &v(&["github.com"]));
+        assert_eq!(i, v(&["github.com"]));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn uri_hosts() {
+        assert_eq!(
+            uri_host("https://user@API.github.com:443/login?x=1").as_deref(),
+            Some("api.github.com")
+        );
+        assert_eq!(uri_host("example.com").as_deref(), Some("example.com"));
+        assert_eq!(
+            uri_host("http://[::1]:8080/"),
+            None,
+            "IPv6 literals are not valid patterns"
+        );
+        assert_eq!(uri_host("androidapp://"), None);
+    }
+
+    #[test]
+    fn env_keys() {
+        assert!(is_env_key("DEMO_TOKEN"));
+        assert!(is_env_key("_x1"));
+        assert!(!is_env_key("1X"));
+        assert!(!is_env_key("my-key"));
+        assert!(!is_env_key(""));
+    }
+}

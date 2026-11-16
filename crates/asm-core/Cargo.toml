@@ -10,3 +10,26 @@ crate-type = ["lib", "staticlib"]
 [dependencies]
 asm-proto.workspace = true
 uniffi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+rusqlite.workspace = true
+rcgen.workspace = true
+reqwest = { workspace = true, features = ["blocking", "json", "rustls-no-provider"] }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+security-framework.workspace = true
+security-framework-sys = "2.17"
+core-foundation = "0.10"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "process", "io-util", "fs"] }
+base64 = "0.22"
+hex = "0.4"
+thiserror = "2"
+libc = "0.2"
+subtle = "2"
+getrandom = "0.3"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

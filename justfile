@@ -25,15 +25,15 @@ proxy:
 
 # Rust core → universal static lib, Swift bindings, xcframework
 core:
-    cargo build -p asm-core --release --target aarch64-apple-darwin
-    cargo build -p asm-core --release --target x86_64-apple-darwin
+    MACOSX_DEPLOYMENT_TARGET=14.0 cargo build -p asm-core --release --target aarch64-apple-darwin
+    MACOSX_DEPLOYMENT_TARGET=14.0 cargo build -p asm-core --release --target x86_64-apple-darwin
     mkdir -p dist/lib
     lipo -create target/aarch64-apple-darwin/release/libasm_core.a target/x86_64-apple-darwin/release/libasm_core.a -output dist/lib/libasm_core.a
     rm -rf app/Sources/AsmCore dist/ffi app/AsmCoreFFI.xcframework
     mkdir -p app/Sources/AsmCore dist/ffi/Headers
     cargo run -q -p uniffi-bindgen-swift -- dist/lib/libasm_core.a app/Sources/AsmCore --swift-sources
     cargo run -q -p uniffi-bindgen-swift -- dist/lib/libasm_core.a dist/ffi/Headers --headers
-    cargo run -q -p uniffi-bindgen-swift -- dist/lib/libasm_core.a dist/ffi/Headers --xcframework --modulemap --modulemap-filename module.modulemap
+    cargo run -q -p uniffi-bindgen-swift -- dist/lib/libasm_core.a dist/ffi/Headers --modulemap --module-name asm_coreFFI --modulemap-filename module.modulemap
     xcodebuild -create-xcframework -library dist/lib/libasm_core.a -headers dist/ffi/Headers -output app/AsmCoreFFI.xcframework
 
 # Native libraries asm-core needs at link time (copy into app/Package.swift linkerSettings)
