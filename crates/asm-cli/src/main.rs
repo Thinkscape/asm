@@ -74,10 +74,20 @@ enum Command {
         wait: u64,
         name: String,
     },
-    /// Show proxy addresses and the environment for using them.
+    /// Show the proxy addresses, which one is reachable, and the CA files (information only).
     ProxyInfo {
         #[arg(long)]
         json: bool,
+    },
+    /// Print shell code that points HTTP clients at the proxy: eval "$(asm proxy-env)".
+    /// Prints nothing on stdout (and exits 1) when no proxy address is reachable.
+    ProxyEnv {
+        /// Output syntax.
+        #[arg(long, value_enum, default_value = "posix")]
+        shell: proxy::Shell,
+        /// Print code that removes the variables instead.
+        #[arg(long)]
+        unset: bool,
     },
     /// Check pairing, connectivity, files and the proxy.
     Doctor {
@@ -114,6 +124,7 @@ fn main() {
         Command::Update { field, wait, name } => requests::update(field, wait, name),
         Command::Add { wait, name } => requests::add(wait, name),
         Command::ProxyInfo { json } => proxy::proxy_info(json),
+        Command::ProxyEnv { shell, unset } => proxy::proxy_env(shell, unset),
         Command::Doctor { probe_url } => proxy::doctor(&probe_url),
     };
     if let Err(e) = result {

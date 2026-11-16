@@ -15,14 +15,17 @@ the proxy swaps it for the real value on the way out.
 ## 2. Setup
 
 ```bash
-asm doctor                                  # every line should say ok
-eval "$(asm proxy-info | grep '^export')"   # in the shell that runs commands needing secrets
+asm doctor                 # every line should say ok
+eval "$(asm proxy-env)"    # in the shell that runs commands needing secrets
+asm proxy-info             # optional: proxy addresses and CA files, for reading
 ```
 
 `doctor` prints `FAIL paired` when this machine is not paired: ask the operator to pair it
-(`asm pair <manager-host> [code]`). The exports set `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
-`NO_PROXY` and the CA bundle variables (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
-`CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `NODE_EXTRA_CA_CERTS`).
+(`asm pair <manager-host> [code]`). `proxy-env` prints only shell code: it sets `HTTPS_PROXY`,
+`HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` and the CA bundle variables (`SSL_CERT_FILE`,
+`REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `NODE_EXTRA_CA_CERTS`). It prints
+nothing and exits 1 when the proxy is unreachable. `asm proxy-env --unset` prints code that
+removes them; fish users add `--shell fish`.
 
 ## 3. Finding secrets
 

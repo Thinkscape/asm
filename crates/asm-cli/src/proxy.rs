@@ -1,4 +1,4 @@
-//! `asm proxy-info` and `asm doctor`.
+//! `asm proxy-info`, `asm proxy-env` and `asm doctor`.
 
 use crate::api::Api;
 use crate::error::CliError;
@@ -82,62 +82,148 @@ struct JsonProxy {
 struct JsonProxyInfo {
     port: u16,
     ca_sha256: String,
+    ca_file: String,
+    ca_bundle_file: String,
     proxies: Vec<JsonProxy>,
     recommended: Option<String>,
-    env: serde_json::Map<String, serde_json::Value>,
 }
 
-pub fn proxy_info(json: bool) -> Result<(), CliError> {
+/// Proxy addresses from the manager's hints; the CA files are refreshed on the way.
+/// `recommended` is the first hint that accepts a TCP connection.
+struct Resolved {
+    host: HostState,
+    info: ProxyInfo,
+    proxies: Vec<JsonProxy>,
+    recommended: Option<usize>,
+}
+
+fn resolve() -> Result<Resolved, CliError> {
     let s = Session::open()?;
     s.warn_secrets();
     s.sync_leases()?;
     let info: ProxyInfo = s.api.get("/proxy-info")?;
     refresh_ca(&s.api, &info)?;
-    let recommended = info.hints.iter().position(|h| accepts_tcp(h, info.port));
-    let proxies: Vec<JsonProxy> = info
+    let mut recommended = None;
+    let proxies = info
         .hints
         .iter()
         .enumerate()
-        .map(|(i, h)| JsonProxy {
-            hint: h.clone(),
-            http: format!("http://{}", authority(h, info.port)),
-            socks5h: format!("socks5h://{}", authority(h, info.port)),
-            recommended: Some(i) == recommended,
+        .map(|(i, h)| {
+            // Probe until one answers; later hints are listed but not probed.
+            let recommend = recommended.is_none() && accepts_tcp(h, info.port);
+            if recommend {
+                recommended = Some(i);
+            }
+            JsonProxy {
+                hint: h.clone(),
+                http: format!("http://{}", authority(h, info.port)),
+                socks5h: format!("socks5h://{}", authority(h, info.port)),
+                recommended: recommend,
+            }
         })
         .collect();
-    let env = match recommended {
-        Some(i) => exports(&s.host, &proxies[i].http)?,
-        None => Vec::new(),
-    };
+    Ok(Resolved {
+        host: s.host,
+        info,
+        proxies,
+        recommended,
+    })
+}
+
+fn unreachable_error(port: u16) -> CliError {
+    CliError::failure(format!(
+        "no proxy hint accepts TCP connections on port {port}; check the network path to the manager's Mac"
+    ))
+}
+
+/// `asm proxy-info`: what the proxy is and how to reach it. Informational only; use
+/// `asm proxy-env` for shell variables.
+pub fn proxy_info(json: bool) -> Result<(), CliError> {
+    let r = resolve()?;
+    let ca = state::ca_path()?.to_string_lossy().into_owned();
+    let bundle = state::ca_bundle_path()?.to_string_lossy().into_owned();
     if json {
         let j = JsonProxyInfo {
-            port: info.port,
-            ca_sha256: info.ca_sha256.clone(),
-            recommended: recommended.map(|i| proxies[i].http.clone()),
-            env: env
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), serde_json::Value::String(v.clone())))
-                .collect(),
-            proxies,
+            port: r.info.port,
+            ca_sha256: r.info.ca_sha256.clone(),
+            ca_file: ca,
+            ca_bundle_file: bundle,
+            recommended: r.recommended.map(|i| r.proxies[i].http.clone()),
+            proxies: r.proxies,
         };
         println!("{}", serde_json::to_string_pretty(&j).expect("serializes"));
     } else {
-        for p in &proxies {
-            let mark = if p.recommended { " (recommended)" } else { "" };
-            println!("{}{mark}", p.http);
-            println!("{}{mark}", p.socks5h);
+        println!("proxy port: {}", r.info.port);
+        for p in &r.proxies {
+            let mark = if p.recommended { "  (recommended)" } else { "" };
+            println!("  {}{mark}", p.http);
+            println!("  {}{mark}", p.socks5h);
         }
-        for (k, v) in &env {
-            println!("export {k}={}", shell_quote(v));
+        if r.proxies.is_empty() {
+            println!("  (the manager lists no hostname hints)");
+        }
+        println!("CA certificate: {ca}");
+        println!("CA bundle (system roots + proxy CA): {bundle}");
+        println!("CA SHA-256: {}", r.info.ca_sha256);
+        if r.recommended.is_some() {
+            println!("to use it in this shell: eval \"$(asm proxy-env)\"");
         }
     }
-    if recommended.is_none() {
-        return Err(CliError::failure(format!(
-            "no proxy hint accepts TCP connections on port {}; check the network path to the manager's Mac",
-            info.port
-        )));
+    match r.recommended {
+        Some(_) => Ok(()),
+        None => Err(unreachable_error(r.info.port)),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum Shell {
+    /// bash, zsh, sh: `export K='v'`
+    Posix,
+    /// fish: `set -gx K 'v'`
+    Fish,
+}
+
+/// Names `proxy-env` sets, in output order.
+const ENV_NAMES: [&str; 9] = [
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "NODE_EXTRA_CA_CERTS",
+];
+
+/// `asm proxy-env`: shell code only, for `eval "$(asm proxy-env)"`. Messages go to
+/// stderr; when no proxy is reachable stdout stays empty and the exit code is 1.
+pub fn proxy_env(shell: Shell, unset: bool) -> Result<(), CliError> {
+    if unset {
+        for k in ENV_NAMES {
+            match shell {
+                Shell::Posix => println!("unset {k}"),
+                Shell::Fish => println!("set -e {k}"),
+            }
+        }
+        return Ok(());
+    }
+    let r = resolve()?;
+    let Some(i) = r.recommended else {
+        return Err(unreachable_error(r.info.port));
+    };
+    for (k, v) in exports(&r.host, &r.proxies[i].http)? {
+        match shell {
+            Shell::Posix => println!("export {k}={}", shell_quote(&v)),
+            Shell::Fish => println!("set -gx {k} {}", fish_quote(&v)),
+        }
     }
     Ok(())
+}
+
+/// Single-quote for fish (escapes `\` and `'`).
+fn fish_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\\', r"\\").replace('\'', r"\'"))
 }
 
 /// Collects doctor lines; tracks whether anything failed.
