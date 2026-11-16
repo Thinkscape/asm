@@ -134,7 +134,7 @@ func doTransform(t *testing.T, s *Secrets, req *http.Request) {
 }
 
 func openaiReq(method, path string) *http.Request {
-	req := httptest.NewRequest(method, "http://api.openai.com"+path, nil)
+	req := httptest.NewRequest(method, "https://api.openai.com"+path, nil)
 	req.Host = "api.openai.com"
 	return req
 }
@@ -160,7 +160,7 @@ func TestSecrets_QueryParamSwap(t *testing.T) {
 		},
 	}})
 
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat?token=proxy-openai-abc123&other=value", nil)
+	req := httptest.NewRequest("GET", "https://api.openai.com/v1/chat?token=proxy-openai-abc123&other=value", nil)
 	req.Host = "api.openai.com"
 
 	doTransform(t, s, req)
@@ -175,7 +175,7 @@ func TestSecrets_QueryParamNotSwappedByDefault(t *testing.T) {
 		e.MatchHeaders = nil
 	})})
 
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat?token=proxy-openai-abc123&other=value", nil)
+	req := httptest.NewRequest("GET", "https://api.openai.com/v1/chat?token=proxy-openai-abc123&other=value", nil)
 	req.Host = "api.openai.com"
 
 	doTransform(t, s, req)
@@ -216,17 +216,70 @@ func TestSecrets_HostMatch(t *testing.T) {
 	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
 }
 
-func TestSecrets_HostNoMatch(t *testing.T) {
+func TestSecrets_SentinelForOtherDestinationRejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		url     string
+		host    string
+		prepare func(req *http.Request)
+	}{
+		{"header to other host", "https://evil.com/steal", "evil.com", func(req *http.Request) {
+			req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+		}},
+		{"unlisted header to other host", "https://evil.com/steal", "evil.com", func(req *http.Request) {
+			req.Header.Set("X-Anything", "proxy-openai-abc123")
+		}},
+		{"basic auth to other host", "https://evil.com/steal", "evil.com", func(req *http.Request) {
+			req.SetBasicAuth("user", "proxy-openai-abc123")
+		}},
+		{"path to other host", "https://evil.com/steal/proxy-openai-abc123", "evil.com", func(*http.Request) {}},
+		{"query to other host", "https://evil.com/steal?k=proxy-openai-abc123", "evil.com", func(*http.Request) {}},
+		{"plain http to approved host", "http://api.openai.com/v1/chat", "api.openai.com", func(req *http.Request) {
+			req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := makeSecrets(t, []secretEntry{defaultEntry()})
+			req := httptest.NewRequest("GET", tc.url, nil)
+			req.Host = tc.host
+			tc.prepare(req)
+
+			res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+			require.NoError(t, err)
+			require.Equal(t, transform.ActionReject, res.Action)
+			require.Equal(t, http.StatusForbidden, res.Response.StatusCode)
+			body, err := io.ReadAll(res.Response.Body)
+			require.NoError(t, err)
+			require.Equal(t, "asm: sentinel not valid for this host or scheme\n", string(body))
+			require.NotContains(t, req.Header.Get("Authorization"), "sk-real-openai-key")
+		})
+	}
+}
+
+func TestSecrets_OtherHostWithoutSentinelPassesThrough(t *testing.T) {
 	s := makeSecrets(t, []secretEntry{defaultEntry()})
 
-	req := httptest.NewRequest("GET", "http://evil.com/steal", nil)
+	req := httptest.NewRequest("GET", "https://evil.com/steal", nil)
 	req.Host = "evil.com"
+	req.Header.Set("Authorization", "Bearer something-else")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer something-else", req.Header.Get("Authorization"))
+}
+
+func TestSecrets_AllowPlainHTTPSwaps(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{{
+		Source:  envSource("OPENAI_API_KEY"),
+		Rules:   []hostmatch.RuleConfig{{Host: "api.openai.com"}},
+		Replace: &replaceConfig{ProxyValue: "proxy-openai-abc123", AllowPlainHTTP: true},
+	}})
+	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
+	req.Host = "api.openai.com"
 	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
 
 	doTransform(t, s, req)
-
-	// Token should NOT be replaced — host doesn't match
-	require.Equal(t, "Bearer proxy-openai-abc123", req.Header.Get("Authorization"))
+	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
 }
 
 func TestSecrets_WildcardHost(t *testing.T) {
@@ -237,7 +290,7 @@ func TestSecrets_WildcardHost(t *testing.T) {
 		e.Rules = []hostmatch.RuleConfig{{Host: "*.anthropic.com"}}
 	})})
 
-	req := httptest.NewRequest("GET", "http://api.anthropic.com/v1/messages", nil)
+	req := httptest.NewRequest("GET", "https://api.anthropic.com/v1/messages", nil)
 	req.Host = "api.anthropic.com"
 	req.Header.Set("X-Api-Key", "proxy-anthropic-xyz789")
 
@@ -501,25 +554,13 @@ func TestSecrets_BodyTooLarge(t *testing.T) {
 func TestSecrets_HostWithPort(t *testing.T) {
 	s := makeSecrets(t, []secretEntry{defaultEntry()})
 
-	req := httptest.NewRequest("GET", "http://api.openai.com:443/v1/chat", nil)
+	req := httptest.NewRequest("GET", "https://api.openai.com:443/v1/chat", nil)
 	req.Host = "api.openai.com:443"
 	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
 
 	doTransform(t, s, req)
 
 	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
-}
-
-func TestSecrets_ResponseIsNoop(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
-		e.MatchHeaders = nil
-	})})
-
-	req := httptest.NewRequest("GET", "http://example.com/", nil)
-	resp := &http.Response{StatusCode: http.StatusOK}
-	res, err := s.TransformResponse(context.Background(), &transform.TransformContext{}, req, resp)
-	require.NoError(t, err)
-	require.Equal(t, transform.ActionContinue, res.Action)
 }
 
 func TestSecrets_ConcurrentSafety(t *testing.T) {
@@ -648,7 +689,7 @@ func TestSecrets_RequireNonMatchingHostAllowsThrough(t *testing.T) {
 	})})
 
 	// Request to a different host — host doesn't match, so require doesn't apply.
-	req := httptest.NewRequest("GET", "http://other.com/v1/chat", nil)
+	req := httptest.NewRequest("GET", "https://other.com/v1/chat", nil)
 	req.Host = "other.com"
 	req.Header.Set("Authorization", "Bearer sk-some-other-key")
 
@@ -701,16 +742,11 @@ func TestSecrets_MethodFiltering(t *testing.T) {
 		e.Rules = []hostmatch.RuleConfig{{Host: "api.openai.com", Methods: []string{"POST"}}}
 	})})
 
-	// GET request should NOT match the rule
-	req := openaiReq("GET", "/v1/chat")
-	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
-
-	doTransform(t, s, req)
-	require.Equal(t, "Bearer proxy-openai-abc123", req.Header.Get("Authorization"))
+	// GET request does not match the rule: its sentinel is rejected, not sent
+	requireSentinelRejected(t, s, openaiReqWithToken("GET", "/v1/chat"))
 
 	// POST request should match
-	req = openaiReq("POST", "/v1/chat")
-	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+	req := openaiReqWithToken("POST", "/v1/chat")
 
 	doTransform(t, s, req)
 	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
@@ -721,19 +757,29 @@ func TestSecrets_PathFiltering(t *testing.T) {
 		e.Rules = []hostmatch.RuleConfig{{Host: "api.openai.com", Paths: []string{"/v1/*"}}}
 	})})
 
-	// Path outside /v1/* should NOT match
-	req := openaiReq("GET", "/v2/chat")
-	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
-
-	doTransform(t, s, req)
-	require.Equal(t, "Bearer proxy-openai-abc123", req.Header.Get("Authorization"))
+	// Path outside /v1/* does not match: its sentinel is rejected, not sent
+	requireSentinelRejected(t, s, openaiReqWithToken("GET", "/v2/chat"))
 
 	// Path inside /v1/* should match
-	req = openaiReq("GET", "/v1/chat")
-	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+	req := openaiReqWithToken("GET", "/v1/chat")
 
 	doTransform(t, s, req)
 	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
+}
+
+func openaiReqWithToken(method, path string) *http.Request {
+	req := openaiReq(method, path)
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+	return req
+}
+
+func requireSentinelRejected(t *testing.T, s *Secrets, req *http.Request) {
+	t.Helper()
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionReject, res.Action)
+	require.Equal(t, http.StatusForbidden, res.Response.StatusCode)
+	require.Equal(t, "Bearer proxy-openai-abc123", req.Header.Get("Authorization"))
 }
 
 func TestSecrets_MixedSourceTypes(t *testing.T) {
@@ -822,7 +868,7 @@ func TestAWSSM_EndToEnd_JSONKey(t *testing.T) {
 		Rules:        []hostmatch.RuleConfig{{Host: "api.example.com"}},
 	}})
 
-	req := httptest.NewRequest("GET", "http://api.example.com/v1/data", nil)
+	req := httptest.NewRequest("GET", "https://api.example.com/v1/data", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("X-Api-Key", "proxy-tok")
 
@@ -844,7 +890,7 @@ func TestAWSSM_EndToEnd_BodySwap(t *testing.T) {
 
 	body := `{"key": "proxy-tok"}`
 	rb := transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
-	req := httptest.NewRequest("POST", "http://api.example.com/v1/data", nil)
+	req := httptest.NewRequest("POST", "https://api.example.com/v1/data", nil)
 	req.Host = "api.example.com"
 	req.Body = rb
 
@@ -879,14 +925,14 @@ func TestAWSSM_EndToEnd_TTLRefresh(t *testing.T) {
 	require.Equal(t, int32(0), callCount.Load(), "lazy: no fetch before first request")
 
 	// First request: triggers initial fetch (call 1, value-1).
-	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req := httptest.NewRequest("GET", "https://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer proxy-tok")
 	doTransform(t, s, req)
 	require.Equal(t, "Bearer value-1", req.Header.Get("Authorization"))
 
 	// Second request: TTL already expired, triggers refresh (call 2, value-2).
-	req = httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req = httptest.NewRequest("GET", "https://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer proxy-tok")
 	doTransform(t, s, req)
@@ -922,21 +968,21 @@ func TestAWSSM_EndToEnd_TTLServesStaleOnError(t *testing.T) {
 	require.Equal(t, int32(0), callCount.Load(), "lazy: no fetch before first request")
 
 	// First request: lazy fetch succeeds and caches "good-value".
-	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req := httptest.NewRequest("GET", "https://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer proxy-tok")
 	doTransform(t, s, req)
 	require.Equal(t, "Bearer good-value", req.Header.Get("Authorization"))
 
 	// Second request: TTL expired, refresh fails, stale "good-value" served.
-	req = httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req = httptest.NewRequest("GET", "https://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer proxy-tok")
 	doTransform(t, s, req)
 	require.Equal(t, "Bearer good-value", req.Header.Get("Authorization"))
 
 	// Third request: same — refresh fails again, stale value still served.
-	req = httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req = httptest.NewRequest("GET", "https://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer proxy-tok")
 	doTransform(t, s, req)
@@ -959,7 +1005,7 @@ func TestAWSSM_EndToEnd_RequireRejectsWithoutToken(t *testing.T) {
 		Rules:        []hostmatch.RuleConfig{{Host: "api.example.com"}},
 	}})
 
-	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req := httptest.NewRequest("GET", "https://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer wrong-token")
 
@@ -1011,7 +1057,7 @@ func TestAWSSSM_EndToEnd_JSONKeyHeaderSwap(t *testing.T) {
 		Rules: []hostmatch.RuleConfig{{Host: "api.example.com"}},
 	}})
 
-	req := httptest.NewRequest("GET", "http://api.example.com/v1/data", nil)
+	req := httptest.NewRequest("GET", "https://api.example.com/v1/data", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer proxy-token-789")
 
@@ -1111,7 +1157,7 @@ func TestInject_QueryParam(t *testing.T) {
 		e.Inject = &injectConfig{QueryParam: "key"}
 	})})
 
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat?existing=value", nil)
+	req := httptest.NewRequest("GET", "https://api.openai.com/v1/chat?existing=value", nil)
 	req.Host = "api.openai.com"
 	doTransform(t, s, req)
 
@@ -1261,7 +1307,7 @@ func TestInject_ConfigErrors(t *testing.T) {
 // --- Path mode tests ---
 
 func telegramReq(path string) *http.Request {
-	req := httptest.NewRequest("POST", "http://api.telegram.org"+path, nil)
+	req := httptest.NewRequest("POST", "https://api.telegram.org"+path, nil)
 	req.Host = "api.telegram.org"
 	return req
 }
@@ -1385,7 +1431,7 @@ func TestLazy_RequestSkipsUnavailableSecretWhenNotRequired(t *testing.T) {
 	s, err := newFromConfig(cfg, missingSecretRegistry())
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req := httptest.NewRequest("GET", "https://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer proxy-tok")
 
@@ -1404,7 +1450,7 @@ func TestLazy_RequestRejectedWhenReplaceRequireAndSecretUnavailable(t *testing.T
 	s, err := newFromConfig(cfg, missingSecretRegistry())
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req := httptest.NewRequest("GET", "https://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer proxy-tok")
 
@@ -1422,7 +1468,7 @@ func TestLazy_RequestRejectedWhenInjectRequireAndSecretUnavailable(t *testing.T)
 	s, err := newFromConfig(cfg, missingSecretRegistry())
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req := httptest.NewRequest("GET", "https://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 
 	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
@@ -1439,7 +1485,7 @@ func TestLazy_InjectRequireFalseSkipsOnUnavailable(t *testing.T) {
 	s, err := newFromConfig(cfg, missingSecretRegistry())
 	require.NoError(t, err)
 
-	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req := httptest.NewRequest("GET", "https://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 
 	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
@@ -1493,7 +1539,7 @@ func TestLazy_FailureCachedAcrossRequests(t *testing.T) {
 	require.NoError(t, err)
 
 	for range 5 {
-		req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+		req := httptest.NewRequest("GET", "https://api.example.com/v1", nil)
 		req.Host = "api.example.com"
 		req.Header.Set("Authorization", "Bearer proxy-tok")
 		doTransform(t, s, req)

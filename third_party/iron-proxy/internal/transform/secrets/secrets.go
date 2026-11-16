@@ -52,6 +52,10 @@ type replaceConfig struct {
 	MatchPath    bool     `yaml:"match_path,omitempty"`
 	MatchQuery   bool     `yaml:"match_query,omitempty"`
 	Require      bool     `yaml:"require,omitempty"`
+	// AllowPlainHTTP permits substitution on requests that did not arrive
+	// over TLS. Off by default: a real value sent over plain HTTP is visible
+	// on the network path to the upstream.
+	AllowPlainHTTP bool `yaml:"allow_plain_http,omitempty"`
 }
 
 type injectConfig struct {
@@ -70,12 +74,13 @@ type resolvedSecret struct {
 	rules  []hostmatch.Rule
 
 	// replace mode fields
-	proxyValue   string
-	matchHeaders []headerMatcher // empty = all headers
-	matchBody    bool
-	matchPath    bool
-	matchQuery   bool
-	require      bool
+	proxyValue     string
+	matchHeaders   []headerMatcher // empty = all headers
+	matchBody      bool
+	matchPath      bool
+	matchQuery     bool
+	require        bool
+	allowPlainHTTP bool
 
 	// inject mode fields
 	injectHeader     string
@@ -128,7 +133,14 @@ var formatterFuncs = template.FuncMap{
 // Secrets is the transform that swaps proxy tokens for real secrets.
 type Secrets struct {
 	secrets []resolvedSecret
+	// hasReplace is true when at least one entry is in replace mode.
+	hasReplace bool
 }
+
+const (
+	msgSentinelNotValid = "asm: sentinel not valid for this host or scheme"
+	msgWebSocketSwap    = "asm: sentinels are not substituted on WebSocket upgrades"
+)
 
 func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) {
 	var c secretsConfig
@@ -200,6 +212,7 @@ func resolveSource(registry sourceBuilderRegistry, node yaml.Node) (secretSource
 // newFromConfig creates a Secrets transform from a parsed config.
 func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets, error) {
 	resolved := make([]resolvedSecret, 0, len(cfg.Secrets))
+	hasReplace := false
 
 	for i, entry := range cfg.Secrets {
 		// Normalize legacy top-level fields into a replace block.
@@ -240,21 +253,23 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 			if err != nil {
 				return nil, err
 			}
+			hasReplace = true
 			resolved = append(resolved, resolvedSecret{
-				source:       source,
-				mode:         "replace",
-				proxyValue:   replace.ProxyValue,
-				matchHeaders: matchers,
-				matchBody:    replace.MatchBody,
-				matchPath:    replace.MatchPath,
-				matchQuery:   replace.MatchQuery,
-				require:      replace.Require,
-				rules:        rules,
+				source:         source,
+				mode:           "replace",
+				proxyValue:     replace.ProxyValue,
+				matchHeaders:   matchers,
+				matchBody:      replace.MatchBody,
+				matchPath:      replace.MatchPath,
+				matchQuery:     replace.MatchQuery,
+				require:        replace.Require,
+				allowPlainHTTP: replace.AllowPlainHTTP,
+				rules:          rules,
 			})
 		}
 	}
 
-	return &Secrets{secrets: resolved}, nil
+	return &Secrets{secrets: resolved, hasReplace: hasReplace}, nil
 }
 
 // normalizeEntry validates the entry and returns either a replaceConfig or injectConfig.
@@ -338,8 +353,26 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	var swapped, injected []secretRecord
 	var unavailable []string
 
+	if s.hasReplace {
+		// Let the upstream transport negotiate gzip and decode it itself, so
+		// TransformResponse sees an identity-encoded body it can redact.
+		// Upstream headers are copied from req after request transforms.
+		req.Header.Del("Accept-Encoding")
+	}
+
 	for _, sec := range s.secrets {
-		if !hostmatch.MatchAnyRule(sec.rules, req) {
+		hostMatch := hostmatch.MatchAnyRule(sec.rules, req)
+		if sec.mode == "replace" && (!hostMatch || (req.TLS == nil && !sec.allowPlainHTTP)) {
+			// A sentinel headed somewhere it is not substituted would leak
+			// the placeholder (a bearer capability) to that destination.
+			if sentinelInRequest(req, sec.proxyValue) {
+				tctx.Annotate("rejected", sec.source.Name())
+				tctx.Annotate("reject_reason", "sentinel_not_valid")
+				return rejectResult(req, http.StatusForbidden, msgSentinelNotValid), nil
+			}
+			continue
+		}
+		if !hostMatch {
 			continue
 		}
 
@@ -367,7 +400,7 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		}
 
 		var locations []string
-		locations = append(locations, s.swapHeaders(req, &sec, realValue)...)
+		locations = append(locations, s.swapHeaders(tctx, req, &sec, realValue)...)
 
 		if sec.matchQuery {
 			locations = append(locations, s.swapQuery(req, &sec, realValue)...)
@@ -387,10 +420,23 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 
 		if len(locations) > 0 {
 			swapped = append(swapped, secretRecord{Secret: name, Locations: locations})
+			addRedactPair(tctx, realValue, sec.proxyValue)
+			// A partial response could split an echoed value so response
+			// redaction cannot see it whole.
+			req.Header.Del("Range")
+			req.Header.Del("If-Range")
 		} else if sec.require {
 			tctx.Annotate("rejected", name)
 			return &transform.TransformResult{Action: transform.ActionReject}, nil
 		}
+	}
+
+	// WebSocket frames are relayed raw and cannot be redacted, so a
+	// substituted upgrade request would hand the real value to a channel
+	// with no response protection.
+	if len(swapped) > 0 && isWebSocketUpgrade(req) {
+		tctx.Annotate("reject_reason", "websocket_upgrade")
+		return rejectResult(req, http.StatusForbidden, msgWebSocketSwap), nil
 	}
 
 	if len(swapped) > 0 {
@@ -437,17 +483,101 @@ func (s *Secrets) formatValue(sec *resolvedSecret, realValue string) (string, er
 	return buf.String(), nil
 }
 
-func (s *Secrets) TransformResponse(_ context.Context, _ *transform.TransformContext, _ *http.Request, _ *http.Response) (*transform.TransformResult, error) {
-	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+// sentinelInRequest reports whether proxyValue occurs in any request header
+// value, the URL path or the query string. Bodies are not scanned.
+func sentinelInRequest(req *http.Request, proxyValue string) bool {
+	for name, vals := range req.Header {
+		for _, v := range vals {
+			if headerContains(name, v, proxyValue) {
+				return true
+			}
+		}
+	}
+	if req.URL == nil {
+		return false
+	}
+	if strings.Contains(req.URL.Path, proxyValue) ||
+		strings.Contains(req.URL.RawPath, proxyValue) ||
+		strings.Contains(req.URL.RawQuery, proxyValue) {
+		return true
+	}
+	decoded, err := url.QueryUnescape(req.URL.RawQuery)
+	return err == nil && strings.Contains(decoded, proxyValue)
 }
 
-func (s *Secrets) swapHeaders(req *http.Request, sec *resolvedSecret, realValue string) []string {
+// isWebSocketUpgrade detects a WebSocket upgrade request. Connection is
+// parsed as comma-separated tokens with an exact case-insensitive "upgrade"
+// match.
+func isWebSocketUpgrade(req *http.Request) bool {
+	if !strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
+		return false
+	}
+	for _, v := range req.Header.Values("Connection") {
+		for _, t := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(t), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// addRedactPair records a substitution for response redaction, skipping
+// real values already recorded.
+func addRedactPair(tctx *transform.TransformContext, real, placeholder string) {
+	for _, p := range tctx.RedactPairs {
+		if p.Real == real {
+			return
+		}
+	}
+	tctx.RedactPairs = append(tctx.RedactPairs, transform.RedactPair{Real: real, Placeholder: placeholder})
+}
+
+// addBasicAuthPair records the re-encoded Basic credentials of a changed
+// Authorization header, so an echo of the whole base64 payload is redacted
+// back to the payload the client sent.
+func addBasicAuthPair(tctx *transform.TransformContext, headerName, oldValue, newValue string) {
+	if oldValue == newValue || !strings.EqualFold(headerName, "Authorization") {
+		return
+	}
+	oldPayload, okOld := strings.CutPrefix(oldValue, "Basic ")
+	newPayload, okNew := strings.CutPrefix(newValue, "Basic ")
+	if okOld && okNew {
+		addRedactPair(tctx, newPayload, oldPayload)
+	}
+}
+
+// rejectResult builds an ActionReject result carrying a plain-text response.
+func rejectResult(req *http.Request, status int, msg string) *transform.TransformResult {
+	body := []byte(msg + "\n")
+	return &transform.TransformResult{
+		Action: transform.ActionReject,
+		Response: &http.Response{
+			StatusCode: status,
+			Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+			Proto:      "HTTP/1.1",
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+			Header: http.Header{
+				"Content-Type":           {"text/plain; charset=utf-8"},
+				"X-Content-Type-Options": {"nosniff"},
+			},
+			Body:          transform.NewBufferedBodyFromBytes(body),
+			ContentLength: int64(len(body)),
+			Request:       req,
+		},
+	}
+}
+
+func (s *Secrets) swapHeaders(tctx *transform.TransformContext, req *http.Request, sec *resolvedSecret, realValue string) []string {
 	var locations []string
 	if len(sec.matchHeaders) == 0 {
 		for name, vals := range req.Header {
 			for i, v := range vals {
 				if headerContains(name, v, sec.proxyValue) {
-					req.Header[name][i] = replaceInHeader(name, v, sec.proxyValue, realValue)
+					replaced := replaceInHeader(name, v, sec.proxyValue, realValue)
+					req.Header[name][i] = replaced
+					addBasicAuthPair(tctx, name, v, replaced)
 					locations = append(locations, "header:"+name)
 				}
 			}
@@ -469,7 +599,9 @@ func (s *Secrets) swapHeaders(req *http.Request, sec *resolvedSecret, realValue 
 			if headerContains(canonical, v, sec.proxyValue) {
 				hit = true
 			}
-			return replaceInHeader(canonical, v, sec.proxyValue, realValue)
+			replaced := replaceInHeader(canonical, v, sec.proxyValue, realValue)
+			addBasicAuthPair(tctx, canonical, v, replaced)
+			return replaced
 		})
 		if hit {
 			locations = append(locations, "header:"+wireName)
@@ -572,8 +704,19 @@ func (s *Secrets) swapBody(req *http.Request, sec *resolvedSecret, realValue str
 		return ""
 	}
 
+	// An earlier entry may have read the body to EOF without replacing it.
+	bb, buffered := req.Body.(*transform.BufferedBody)
+	if buffered {
+		bb.Reset()
+	}
+
 	data, err := io.ReadAll(req.Body)
 	if err != nil {
+		return ""
+	}
+	// A truncated body is never forwarded (the proxy answers 413), so do not
+	// spend a substitution on it.
+	if buffered && bb.Truncated() {
 		return ""
 	}
 

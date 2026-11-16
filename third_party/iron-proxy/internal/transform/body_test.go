@@ -43,16 +43,40 @@ func TestBufferedBody_MultipleResets(t *testing.T) {
 
 func TestBufferedBody_MaxBytesTruncates(t *testing.T) {
 	body := NewBufferedBody(io.NopCloser(strings.NewReader("hello world")), 5)
+	require.False(t, body.Truncated())
 
 	data, err := io.ReadAll(body)
 	require.NoError(t, err)
 	require.Equal(t, "hello", string(data))
+	require.True(t, body.Truncated())
 
 	// Reset and re-read: same truncated data.
 	body.Reset()
 	data, err = io.ReadAll(body)
 	require.NoError(t, err)
 	require.Equal(t, "hello", string(data))
+}
+
+func TestBufferedBody_Truncated(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		maxBytes int64
+		want     bool
+	}{
+		{"under limit", "abcd", 5, false},
+		{"exactly at limit", "abcde", 5, false},
+		{"one over limit", "abcdef", 5, true},
+		{"unlimited", "abcdef", 0, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := NewBufferedBody(io.NopCloser(strings.NewReader(tc.body)), tc.maxBytes)
+			_, err := io.ReadAll(body)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, body.Truncated())
+		})
+	}
 }
 
 func TestBufferedBody_Unlimited(t *testing.T) {

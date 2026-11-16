@@ -395,6 +395,19 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 		p.writeResponse(w, rejectResp)
 		return
 	}
+	// A transform buffered a body over the limit; forwarding the truncated
+	// prefix would silently corrupt the request (and skip substitutions).
+	if transform.RequireBufferedBody(r.Body).Truncated() {
+		result.Action = transform.ActionReject
+		result.StatusCode = http.StatusRequestEntityTooLarge
+		result.RequestTransforms = append(result.RequestTransforms, transform.TransformTrace{
+			Name:        "body_limit",
+			Action:      transform.ActionReject,
+			Annotations: map[string]any{"reason": "request_body_too_large"},
+		})
+		http.Error(w, "asm: request body exceeds proxy.max_request_body_bytes", http.StatusRequestEntityTooLarge)
+		return
+	}
 
 	// MCP policy: evaluate the request against any matching MCP server. Runs
 	// after the transform pipeline so allowlist/secrets have already applied.

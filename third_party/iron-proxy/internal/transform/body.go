@@ -15,8 +15,8 @@ import (
 // original reader directly — avoiding buffering for the final response write
 // or upstream send.
 //
-// A maxBytes of 0 means unlimited; when the limit is exceeded the body is
-// truncated silently.
+// A maxBytes of 0 means unlimited; when the limit is exceeded the buffer holds
+// the first maxBytes bytes and Truncated reports true.
 type BufferedBody struct {
 	once     sync.Once
 	mu       sync.Mutex // protects pos only
@@ -24,6 +24,9 @@ type BufferedBody struct {
 	data     []byte
 	pos      int
 	maxBytes int64
+	// truncated is written once inside buffer's sync.Once and only read after
+	// buffering completed.
+	truncated bool
 }
 
 // NewBufferedBody wraps an io.ReadCloser for lazy buffering. maxBytes caps
@@ -67,9 +70,14 @@ func (b *BufferedBody) buffer() error {
 	b.once.Do(func() {
 		var r io.Reader = b.original
 		if b.maxBytes > 0 {
-			r = io.LimitReader(r, b.maxBytes)
+			// Read one extra byte to tell "exactly at the limit" from "over it".
+			r = io.LimitReader(r, b.maxBytes+1)
 		}
 		b.data, err = io.ReadAll(r)
+		if b.maxBytes > 0 && int64(len(b.data)) > b.maxBytes {
+			b.truncated = true
+			b.data = b.data[:b.maxBytes]
+		}
 		b.original.Close()
 		b.original = nil
 	})
@@ -82,6 +90,12 @@ func (b *BufferedBody) Reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.pos = 0
+}
+
+// Truncated reports whether the original body exceeded maxBytes when it was
+// buffered. It is false while the body has not been buffered.
+func (b *BufferedBody) Truncated() bool {
+	return b.truncated
 }
 
 // StreamingReader returns a reader for the final output (response write or

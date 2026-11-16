@@ -94,9 +94,21 @@ type TransformContext struct {
 	// `request_body_truncated`. nil when no body_capture rule matched.
 	BodyCapture BodyCapture
 
+	// RedactPairs records the real values a request transform substituted,
+	// each with the placeholder that should replace echoes of it in the
+	// response. The same *TransformContext reaches both pipeline phases, so
+	// response transforms read what request transforms appended.
+	RedactPairs []RedactPair
+
 	// annotations is written by transforms via Annotate and read by the pipeline
 	// to build TransformTrace. Not exported — transforms use the Annotate method.
 	annotations map[string]any
+}
+
+// RedactPair maps a real value substituted into a request to the placeholder
+// that replaces it when the response echoes it back.
+type RedactPair struct {
+	Real, Placeholder string
 }
 
 // TunnelInfo carries metadata from the CONNECT/SOCKS5 tunnel that established

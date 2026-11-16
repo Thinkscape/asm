@@ -471,6 +471,27 @@ values before forwarding upstream. You control where it looks:
   the proxy token are rejected with 403. This prevents a compromised workload
   from bypassing the secret-swap mechanism with alternative credentials. Default: `false`.
 - **`hosts`:** restrict swapping to specific domains or CIDRs.
+- **`allow_plain_http`:** substitute on requests that did not arrive over TLS.
+  Default: `false`, so replace-mode tokens are only swapped on HTTPS requests.
+
+Replace-mode safeguards (asm fork):
+
+- A request that carries a proxy token in a header, the URL path or the query,
+  but goes to a host outside the entry's rules (or over plain HTTP without
+  `allow_plain_http`), is rejected with 403
+  `asm: sentinel not valid for this host or scheme`.
+- A WebSocket upgrade that would receive a substituted value is rejected with
+  403; WebSocket frames are relayed raw and cannot be redacted.
+- A request body larger than `max_request_body_bytes` that a transform had to
+  buffer is rejected with 413 instead of being forwarded truncated.
+- `Accept-Encoding` is removed from requests so the proxy negotiates and decodes
+  gzip itself; `Range` and `If-Range` are removed when a value was substituted.
+- Responses are redacted on a best-effort basis: echoes of a substituted value
+  (raw, query/path-escaped, JSON-escaped, base64, hex) in headers, trailers and
+  the body become the proxy token the client sent; values of other entries
+  become `asm_redacted`. Values shorter than 8 bytes are not redacted. A
+  content-encoded response to a request that received a substitution is
+  refused with 502.
 
 Query parameters are always scanned.
 
