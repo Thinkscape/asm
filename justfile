@@ -53,10 +53,11 @@ app: proxy core
     flags=(-c release --arch arm64 --arch x86_64 --package-path app -Xswiftc -Xclang-linker -Xswiftc -isysroot -Xswiftc -Xclang-linker -Xswiftc "$(xcrun --show-sdk-path)")
     swift build "${flags[@]}"
     rm -rf "{{app}}"
-    mkdir -p "{{app}}/Contents/MacOS"
+    mkdir -p "{{app}}/Contents/MacOS" "{{app}}/Contents/Resources"
     cp "$(swift build "${flags[@]}" --show-bin-path)/AsmApp" "{{app}}/Contents/MacOS/AsmApp"
     cp dist/bin/iron-proxy "{{app}}/Contents/MacOS/iron-proxy"
     cp app/Bundle/Info.plist "{{app}}/Contents/Info.plist"
+    cp app/Bundle/AppIcon.icns "{{app}}/Contents/Resources/AppIcon.icns"
     codesign --force --options runtime --sign "{{identity}}" "{{app}}/Contents/MacOS/iron-proxy"
     codesign --force --options runtime --sign "{{identity}}" "{{app}}"
 

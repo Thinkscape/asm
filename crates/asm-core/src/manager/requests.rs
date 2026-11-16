@@ -137,6 +137,8 @@ pub(crate) struct Pending {
     pub host_label: String,
     pub host_info: Option<HostInfo>,
     pub agent: String,
+    /// Address the request came from (TCP peer of the manager API).
+    pub address: String,
     /// The operator's decision is being carried out (vault access); not expirable/cancellable.
     pub resolving: bool,
     pub error: Option<String>,
@@ -427,8 +429,14 @@ impl Core {
         }))
     }
 
-    /// `POST /requests`. Returns the state; `approved` only for the existing-lease shortcut.
-    pub fn create_request(&self, host: &HostRecord, body: RequestBody) -> Result<RequestState> {
+    /// `POST /requests` from `address` (the TCP peer). Returns the state; `approved` only
+    /// for the existing-lease shortcut.
+    pub fn create_request(
+        &self,
+        host: &HostRecord,
+        address: &str,
+        body: RequestBody,
+    ) -> Result<RequestState> {
         let agent = body.agent().trim().to_string();
         validate_agent_text("agent", &agent)?;
         if agent.chars().count() > 128 {
@@ -447,15 +455,23 @@ impl Core {
                 hosts,
                 reason,
                 ..
-            } => self.create_get(host, &agent, &name, raw, &hosts, &reason),
+            } => self.create_get(host, &agent, address, &name, raw, &hosts, &reason),
             RequestBody::Update {
                 name, field, value, ..
-            } => self.create_update(host, &agent, &name, field, value),
-            RequestBody::Add { name, value, .. } => self.create_add(host, &agent, name, value),
+            } => self.create_update(host, &agent, address, &name, field, value),
+            RequestBody::Add { name, value, .. } => {
+                self.create_add(host, &agent, address, name, value)
+            }
         }
     }
 
-    fn new_pending(&self, host: &HostRecord, agent: &str, detail: Detail) -> Pending {
+    fn new_pending(
+        &self,
+        host: &HostRecord,
+        agent: &str,
+        address: &str,
+        detail: Detail,
+    ) -> Pending {
         let t = now();
         let lifetime = self.settings().request_lifetime_secs.max(1) as i64;
         Pending {
@@ -466,6 +482,7 @@ impl Core {
             host_label: host.label().to_string(),
             host_info: Some(host.info.clone()),
             agent: agent.to_string(),
+            address: address.to_string(),
             resolving: false,
             error: None,
             detail,
@@ -493,6 +510,7 @@ impl Core {
         &self,
         host: &HostRecord,
         agent: &str,
+        address: &str,
         name: &str,
         raw: bool,
         hosts: &[String],
@@ -523,7 +541,7 @@ impl Core {
             initial,
             suggestions,
         };
-        let p = self.new_pending(host, agent, Detail::Get(detail.clone()));
+        let p = self.new_pending(host, agent, address, Detail::Get(detail.clone()));
         Ok(self.push_pending(p, |q| match &q.detail {
             Detail::Get(g) => {
                 g.secret.vault_id == detail.secret.vault_id
@@ -667,6 +685,7 @@ impl Core {
         &self,
         host: &HostRecord,
         agent: &str,
+        address: &str,
         name: &str,
         field: Option<String>,
         value: String,
@@ -733,7 +752,7 @@ impl Core {
             old_value,
             new_value: value,
         };
-        let p = self.new_pending(host, agent, Detail::Update(detail.clone()));
+        let p = self.new_pending(host, agent, address, Detail::Update(detail.clone()));
         Ok(self.push_pending(p, |q| {
             matches!(&q.detail, Detail::Update(u) if u.secret.vault_id == detail.secret.vault_id
                 && u.secret.key == detail.secret.key && u.field == detail.field
@@ -808,6 +827,7 @@ impl Core {
         &self,
         host: &HostRecord,
         agent: &str,
+        address: &str,
         name: String,
         value: String,
     ) -> Result<RequestState> {
@@ -838,7 +858,7 @@ impl Core {
             value,
             targets,
         };
-        let p = self.new_pending(host, agent, Detail::Add(detail.clone()));
+        let p = self.new_pending(host, agent, address, Detail::Add(detail.clone()));
         Ok(self.push_pending(p, |q| {
             matches!(&q.detail, Detail::Add(a) if a.name == detail.name && hash_hex(&a.value) == hash)
         }))
@@ -1446,6 +1466,7 @@ fn pending_to_ffi(p: Pending, default_duration: Option<u64>) -> ffi::PendingRequ
         host_label: p.host_label,
         host_info: p.host_info.map(Into::into),
         agent: p.agent,
+        address: p.address,
         summary,
         error: p.error,
         detail,

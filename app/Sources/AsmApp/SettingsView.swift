@@ -38,6 +38,7 @@ struct SettingsView: View {
             List(SettingsPane.allCases, selection: $selection) { pane in
                 Label(pane.title, systemImage: pane.symbol).tag(pane)
             }
+            .safeAreaInset(edge: .bottom, spacing: 0) { SidebarLogotype() }
             .navigationSplitViewColumnWidth(min: 200, ideal: 200, max: 200)
             .toolbar(removing: .sidebarToggle)
         } detail: {
@@ -74,6 +75,39 @@ struct SettingsView: View {
         }) { vault in
             UnlockVaultSheet(model: model, vault: vault)
         }
+    }
+}
+
+/// Logotype pinned to the bottom of the Settings sidebar: app icon, "ASM", version.
+private struct SidebarLogotype: View {
+    private var version: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // The icon image carries the macOS grid margin (artwork 824/1024): draw it
+            // larger than its layout frame so the artwork itself is 22 pt.
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 27, height: 27)
+                .frame(width: 22, height: 22)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(verbatim: "ASM")
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                Text("Version \(version)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.leading, 20)
+        .padding(.trailing, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 14)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("Agents Secrets Manager, version \(version)"))
     }
 }
 

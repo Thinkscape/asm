@@ -305,8 +305,8 @@ private extension PendingItem {
         }
         self.init(
             id: r.id, kind: RequestKind(r.kind), createdAt: r.createdAt, expiresAt: r.expiresAt,
-            hostLabel: r.hostLabel, hostname: r.hostInfo?.hostname ?? "", agent: r.agent, summary: r.summary,
-            error: r.error, detail: detail
+            hostLabel: r.hostLabel, hostname: r.hostInfo?.hostname ?? "", agent: r.agent, address: r.address,
+            summary: r.summary, error: r.error, detail: detail
         )
     }
 }

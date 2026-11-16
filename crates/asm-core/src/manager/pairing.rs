@@ -172,6 +172,7 @@ pub(crate) fn reveal_attempt(
         host_label: a.info.hostname.clone(),
         host_info: Some(a.info.clone()),
         agent: String::new(),
+        address: a.ip.clone(),
         resolving: false,
         error: None,
         detail: Detail::Pair {

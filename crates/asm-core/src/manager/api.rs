@@ -257,12 +257,14 @@ async fn secrets(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<Secr
 
 async fn create_request(
     State(core): Shared,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: std::result::Result<Json<RequestBody>, JsonRejection>,
 ) -> ApiResult<Response> {
     let host = auth(&core, &headers).await?;
     let Json(body) = body.map_err(bad_json)?;
-    let state = blocking(move || core.create_request(&host, body)).await?;
+    let address = remote.ip().to_canonical().to_string();
+    let state = blocking(move || core.create_request(&host, &address, body)).await?;
     let code = if state.status == RequestStatus::Pending {
         StatusCode::ACCEPTED
     } else {

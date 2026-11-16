@@ -6,11 +6,47 @@ struct MenuBarLabel: View {
 
     var body: some View {
         if pendingCount > 0 {
-            Text("\(Image(systemName: "key.fill")) \(pendingCount)")
+            Text("\(Image(nsImage: MenuBarGlyph.image)) \(pendingCount)")
         } else {
-            Image(systemName: "key.fill")
+            Image(nsImage: MenuBarGlyph.image)
         }
     }
+}
+
+/// The app icon's padlock robot as a vector template image for the menu bar: rounded
+/// shackle, rounded body with a pill-shaped visor cut out, two oval eyes in the visor.
+enum MenuBarGlyph {
+    @MainActor static let image: NSImage = {
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            ctx.setFillColor(.black)
+            ctx.setStrokeColor(.black)
+
+            let shackle = CGMutablePath()
+            shackle.move(to: CGPoint(x: 5, y: 8.5))
+            shackle.addLine(to: CGPoint(x: 5, y: 6))
+            shackle.addArc(center: CGPoint(x: 9, y: 6), radius: 4, startAngle: .pi, endAngle: 2 * .pi, clockwise: false)
+            shackle.addLine(to: CGPoint(x: 13, y: 8.5))
+            ctx.addPath(shackle)
+            ctx.setLineWidth(2)
+            ctx.strokePath()
+
+            // Even-odd fill: body, minus the visor, plus the eyes inside it.
+            let body = CGMutablePath()
+            body.addPath(RoundedRectangle(cornerRadius: 3.2, style: .continuous)
+                .path(in: CGRect(x: 2, y: 7.2, width: 14, height: 9.8)).cgPath)
+            body.addPath(Capsule().path(in: CGRect(x: 4.2, y: 9.4, width: 9.6, height: 4.4)).cgPath)
+            for x in [7.0, 11.0] {
+                body.addPath(Capsule().path(in: CGRect(x: x - 0.75, y: 10.3, width: 1.5, height: 2.6)).cgPath)
+            }
+            ctx.addPath(body)
+            ctx.fillPath(using: .evenOdd)
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "Agents Secrets Manager"
+        return image
+    }()
 }
 
 /// The 360 pt window shown from the menu bar item. Every button that opens another

@@ -35,10 +35,14 @@ final class ActivationPolicyController {
         })
     }
 
-    /// Registers a window whose presence makes the app a regular app.
+    /// Registers a window whose presence makes the app a regular app. The window is
+    /// registered before it is ordered in (not visible yet), so the policy is evaluated
+    /// on the next main-actor turn. Evaluating it now switched the app back to accessory,
+    /// and a window opened while another app stays active gets no later key or occlusion
+    /// change that would switch it back to regular.
     func track(_ window: NSWindow) {
         windows.add(window)
-        update(closing: nil)
+        Task { @MainActor in self.update(closing: nil) }
     }
 
     /// Opens a Settings or Activity Log window from the menu bar (or a menu command) and

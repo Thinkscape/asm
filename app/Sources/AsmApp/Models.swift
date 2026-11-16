@@ -89,6 +89,8 @@ struct PendingItem: Identifiable, Equatable, Sendable {
     /// The requesting machine's reported hostname.
     var hostname: String
     var agent: String
+    /// Address the request came from, as the manager saw it.
+    var address: String
     var summary: String
     var error: String?
     var detail: RequestDetail

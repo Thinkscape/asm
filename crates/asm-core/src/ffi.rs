@@ -238,6 +238,8 @@ pub struct PendingRequest {
     /// Host info of the requesting host (for pairing: the info it sent).
     pub host_info: Option<HostInfo>,
     pub agent: String,
+    /// Address the request came from as the manager saw it (pairing: the observed address).
+    pub address: String,
     /// One-line summary for the menu (`kind`-specific).
     pub summary: String,
     /// Last failed approval attempt that left the request pending.

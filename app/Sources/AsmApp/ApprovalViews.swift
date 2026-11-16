@@ -1,139 +1,160 @@
+import AppKit
 import SwiftUI
 
-/// Root of the approval panel: the shown request, "k of N", and the 1-second guard
-/// that ignores approve clicks and Return right after the shown request changes.
+// MARK: - Root
+
+/// Root of the approval panel: the shown request and the 1-second guard that ignores
+/// approve clicks, Return and Esc right after the shown request changes.
 struct ApprovalRoot: View {
     let model: AppModel
+    /// Hides the panel; requests stay pending.
+    let close: () -> Void
     @State private var armed = false
+    @State private var hovering = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if let request = model.shownRequest {
-                ApprovalHeader(
-                    kind: request.kind,
-                    hostLabel: request.hostLabel,
-                    hostname: request.hostname,
-                    agent: request.agent,
-                    createdAt: request.createdAt,
-                    expiresAt: request.expiresAt,
+        ApprovalContent(model: model, armed: armed)
+            .padding(18)
+            .frame(width: 410)
+            .fixedSize(horizontal: false, vertical: true)
+            .modifier(PanelBackground())
+            // Top-aligned, so while the panel animates a height change the content is
+            // revealed or hidden at the bottom edge.
+            .frame(maxHeight: .infinity, alignment: .top)
+            .overlay(alignment: .topLeading) {
+                CloseButton(action: close)
+                    .padding(6)
+                    .opacity(hovering ? 1 : 0)
+                    .allowsHitTesting(hovering)
+            }
+            .onHover { hovering = $0 }
+            .task(id: model.shownRequestID) {
+                armed = false
+                try? await Task.sleep(for: .seconds(1))
+                armed = !Task.isCancelled
+            }
+    }
+}
+
+private struct ApprovalContent: View {
+    let model: AppModel
+    let armed: Bool
+
+    var body: some View {
+        if let request = model.shownRequest {
+            ApprovalBody(
+                model: model,
+                request: request,
+                queue: QueueInfo(
                     position: (model.pending.firstIndex { $0.id == request.id } ?? 0) + 1,
                     total: model.pending.count,
+                    expiresAt: request.expiresAt,
                     step: model.showNext(offset:)
-                )
-                ApprovalBody(model: model, request: request, armed: armed)
-                    .id(request.id)
-            } else {
-                Text("No pending requests.")
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 120)
-            }
-        }
-        .padding(.horizontal, 18)
-        .padding(.top, 30)
-        .padding(.bottom, 16)
-        .frame(width: 520)
-        .fixedSize(horizontal: false, vertical: true)
-        .task(id: model.shownRequestID) {
-            armed = false
-            try? await Task.sleep(for: .seconds(1))
-            armed = !Task.isCancelled
+                ),
+                armed: armed
+            )
+            .id(request.id)
+        } else {
+            Text("No pending requests.")
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, minHeight: 120)
         }
     }
 }
 
-private struct ApprovalHeader: View {
-    let kind: RequestKind
-    /// Friendly name of the host; `hostname` is shown beside it when it differs.
-    let hostLabel: String
-    let hostname: String
-    let agent: String
-    let createdAt: Date
-    let expiresAt: Date
-    let position: Int
-    let total: Int
-    let step: (Int) -> Void
-
-    private var title: LocalizedStringKey {
-        switch kind {
-        case .pair: "Pairing request"
-        case .get: "Secret request"
-        case .update: "Update request"
-        case .add: "Add request"
+/// Liquid Glass on macOS 26 and later, the regular material before.
+private struct PanelBackground: ViewModifier {
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 24, style: .continuous)
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular, in: shape)
+        } else {
+            content
+                .background(.regularMaterial, in: shape)
+                .overlay(shape.strokeBorder(.separator, lineWidth: 0.5))
         }
     }
+}
+
+private struct CloseButton: View {
+    let action: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Label(title, systemImage: kind.symbol).font(.headline)
-                Spacer()
-                if total > 1 {
-                    Button { step(-1) } label: { Image(systemName: "chevron.left") }
-                        .buttonStyle(.borderless)
-                }
-                Text("\(position) of \(total)").font(.callout).monospacedDigit().foregroundStyle(.secondary)
-                if total > 1 {
-                    Button { step(1) } label: { Image(systemName: "chevron.right") }
-                        .buttonStyle(.borderless)
-                }
-            }
-            HStack(spacing: 4) {
-                Text(verbatim: hostLabel).fontWeight(.medium)
-                if !hostname.isEmpty && hostname != hostLabel {
-                    Text(verbatim: "(\(hostname))").foregroundStyle(.secondary)
-                }
-                if !agent.isEmpty {
-                    Text("·").foregroundStyle(.secondary)
-                    Text(verbatim: agent).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Text("expires \(expiresAt, style: .relative)").font(.caption).foregroundStyle(.secondary)
-            }
-            .font(.callout)
-            .lineLimit(1)
+        Button(action: action) {
+            Image(systemName: "xmark")
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(.secondary)
+                .frame(width: 18, height: 18)
+                .background(.regularMaterial, in: Circle())
+                .overlay(Circle().strokeBorder(.separator, lineWidth: 0.5))
         }
-        .padding(.bottom, 10)
+        .buttonStyle(.plain)
+        .help("Close; requests stay pending")
+        .accessibilityLabel("Close")
+    }
+}
+
+/// Position in the queue, navigation and the expiry of the shown request.
+private struct QueueInfo {
+    var position: Int
+    var total: Int
+    var expiresAt: Date
+    var step: (Int) -> Void
+}
+
+/// What every request view needs besides its own detail.
+private struct RequestContext {
+    var request: PendingItem
+    var queue: QueueInfo
+    var armed: Bool
+    var error: String?
+    var resolve: (DecisionItem) -> Void
+
+    func deny(_ reason: String) {
+        resolve(.deny(reason: reason))
+    }
+
+    /// `<agent> on <host>`, or the host alone when the agent is unknown.
+    var requesterTitle: Text {
+        request.agent.isEmpty
+            ? Text(verbatim: request.hostLabel)
+            : Text("\(Text(verbatim: request.agent)) on \(Text(verbatim: request.hostLabel))")
+    }
+
+    /// Friendly name, with the reported hostname when it differs.
+    var hostLine: String {
+        let name = request.hostLabel
+        let hostname = request.hostname
+        return hostname.isEmpty || hostname == name ? name : "\(name) (\(hostname))"
     }
 }
 
 private struct ApprovalBody: View {
     let model: AppModel
     let request: PendingItem
+    let queue: QueueInfo
     let armed: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            switch request.detail {
-            case let .pair(info, address, code):
-                PairApproval(info: info, observedAddress: address, code: code, armed: armed) { decision in
-                    resolve(decision)
-                }
-            case let .get(detail):
-                GetApproval(
-                    detail: detail,
-                    durations: CoreBridge.leaseDurations,
-                    armed: armed,
-                    check: model.checkHostPattern
-                ) { decision in
-                    resolve(decision)
-                }
-            case let .update(name, vaultID, vault, field, oldValue, newValue):
-                UpdateApproval(name: name, vaultID: vaultID, vaultName: vault, field: field, oldValue: oldValue, newValue: newValue, armed: armed) { decision in
-                    resolve(decision)
-                }
-            case let .add(name, value, targets):
-                AddApproval(name: name, value: value, targets: targets, armed: armed) { decision in
-                    resolve(decision)
-                }
-            }
-            if let error = request.error ?? model.resolveError {
-                Label {
-                    Text(verbatim: error)
-                } icon: {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
-                }
-                .font(.callout)
-            }
+        let context = RequestContext(
+            request: request,
+            queue: queue,
+            armed: armed,
+            error: request.error ?? model.resolveError,
+            resolve: resolve
+        )
+        switch request.detail {
+        case let .pair(info, address, code):
+            PairApproval(context: context, info: info, observedAddress: address, code: code)
+        case let .get(detail):
+            GetApproval(context: context, detail: detail, durations: CoreBridge.leaseDurations, check: model.checkHostPattern)
+        case let .update(name, vaultID, vault, field, oldValue, newValue):
+            UpdateApproval(
+                context: context, name: name, vaultID: vaultID, vaultName: vault,
+                field: field, oldValue: oldValue, newValue: newValue
+            )
+        case let .add(name, value, targets):
+            AddApproval(context: context, name: name, value: value, targets: targets)
         }
     }
 
@@ -143,56 +164,249 @@ private struct ApprovalBody: View {
     }
 }
 
-// MARK: - Shared pieces
+// MARK: - Frame
 
-/// Deny split button plus the custom-reason editor, followed by the approve buttons.
-private struct ApprovalActions<Approve: View>: View {
-    let cannedReasons: [String]
-    let deny: (String) -> Void
-    @ViewBuilder let approve: () -> Approve
-    @State private var customReason: String?
-    @FocusState private var reasonFocused: Bool
+/// Header, request-specific rows, the Details disclosure, the core's error, the
+/// action row and a footnote, in that order.
+private struct ApprovalScaffold<Header: View, Content: View, Details: View, Actions: View>: View {
+    let error: String?
+    let footnote: Text?
+    let header: Header
+    let content: Content
+    let details: Details
+    let actions: Actions
 
-    var body: some View {
-        VStack(alignment: .trailing, spacing: 8) {
-            if customReason != nil {
-                TextField("Reason sent to the agent", text: Binding(
-                    get: { customReason ?? "" },
-                    set: { customReason = $0 }
-                ))
-                .textFieldStyle(.roundedBorder)
-                .focused($reasonFocused)
-                .onSubmit(sendCustom)
-                .onAppear { reasonFocused = true }
-                HStack {
-                    Button("Cancel") { customReason = nil }
-                    Button("Deny with this reason", action: sendCustom)
-                        .disabled((customReason ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            }
-            HStack {
-                Menu {
-                    ForEach(cannedReasons, id: \.self) { reason in
-                        Button("Deny (\(reason))") { deny(reason) }
-                    }
-                    Button("Deny with custom reason…") { customReason = "" }
-                } label: {
-                    Text("Deny")
-                } primaryAction: {
-                    deny("")
-                }
-                .fixedSize()
-                Spacer()
-                approve()
-            }
-        }
-        .padding(.top, 4)
+    init(
+        error: String?,
+        footnote: Text?,
+        @ViewBuilder header: () -> Header,
+        @ViewBuilder content: () -> Content,
+        @ViewBuilder details: () -> Details,
+        @ViewBuilder actions: () -> Actions
+    ) {
+        self.error = error
+        self.footnote = footnote
+        self.header = header()
+        self.content = content()
+        self.details = details()
+        self.actions = actions()
     }
 
-    private func sendCustom() {
-        let reason = (customReason ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !reason.isEmpty else { return }
-        deny(reason)
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            header
+            content
+            DetailsDisclosure { details }
+            if let error {
+                ErrorLine(message: error)
+            }
+            actions
+            if let footnote {
+                footnote
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+private struct ApprovalHeader<Icon: View>: View {
+    let title: Text
+    let subtitle: Text
+    let queue: QueueInfo
+    let icon: Icon
+
+    init(title: Text, subtitle: Text, queue: QueueInfo, @ViewBuilder icon: () -> Icon) {
+        self.title = title
+        self.subtitle = subtitle
+        self.queue = queue
+        self.icon = icon()
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            icon
+                .frame(width: 40, height: 40)
+            VStack(alignment: .leading, spacing: 2) {
+                title
+                    .font(.system(size: 15, weight: .semibold))
+                    .lineLimit(2)
+                subtitle
+                    .font(.system(size: 13))
+                    .lineLimit(3)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            QueueBadge(queue: queue)
+        }
+    }
+}
+
+/// The bundle's app icon.
+private struct AppIconImage: View {
+    var body: some View {
+        Image(nsImage: NSApp.applicationIconImage)
+            .resizable()
+            .interpolation(.high)
+            .aspectRatio(contentMode: .fit)
+            .accessibilityHidden(true)
+    }
+}
+
+/// `1 of N` (with arrows when more requests wait) and the time left before the request expires.
+private struct QueueBadge: View {
+    let queue: QueueInfo
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            HStack(spacing: 2) {
+                if queue.total > 1 {
+                    Button { queue.step(-1) } label: { Image(systemName: "chevron.left") }
+                        .buttonStyle(.borderless)
+                        .help("Previous request")
+                        .accessibilityLabel("Previous request")
+                }
+                Text("\(queue.position) of \(queue.total)")
+                if queue.total > 1 {
+                    Button { queue.step(1) } label: { Image(systemName: "chevron.right") }
+                        .buttonStyle(.borderless)
+                        .help("Next request")
+                        .accessibilityLabel("Next request")
+                }
+            }
+            TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                Text("\(Self.remaining(until: queue.expiresAt, now: timeline.date)) left")
+            }
+        }
+        .font(.system(size: 12))
+        .monospacedDigit()
+        .foregroundStyle(.secondary)
+        .fixedSize()
+    }
+
+    static func remaining(until end: Date, now: Date) -> String {
+        let seconds = max(0, Int(end.timeIntervalSince(now).rounded(.up)))
+        return Duration.seconds(seconds).formatted(.time(pattern: seconds >= 3600 ? .hourMinuteSecond : .minuteSecond))
+    }
+}
+
+/// The agent's reason, quoted, on a tinted background with an accent bar.
+private struct ReasonBlock: View {
+    let reason: String
+    @State private var expanded = false
+    @State private var fullHeight: CGFloat = 0
+    @State private var shownHeight: CGFloat = 0
+
+    private var quoted: String { "\u{201C}\(reason)\u{201D}" }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Rectangle()
+                .fill(Color.accentColor)
+                .frame(width: 3)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(verbatim: quoted)
+                    .font(.system(size: 14))
+                    .lineLimit(expanded ? nil : 4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { shownHeight = $0 }
+                    .background(alignment: .topLeading) {
+                        // Same text without a line limit, to tell whether the shown one is cut.
+                        Text(verbatim: quoted)
+                            .font(.system(size: 14))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .hidden()
+                            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { fullHeight = $0 }
+                    }
+                if expanded || fullHeight > shownHeight + 1 {
+                    Button(expanded ? "Show less" : "Show more") { expanded.toggle() }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+        }
+        .background(Color.accentColor.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(Text("Reason: \(Text(verbatim: reason))"))
+    }
+}
+
+/// Orange caution shown when the real value would leave the Mac.
+private struct RawCaution: View {
+    var body: some View {
+        Label {
+            Text("The agent will keep the real value. It cannot be taken back.")
+                .fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        }
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.orange.opacity(0.4), lineWidth: 0.5))
+    }
+}
+
+private struct SectionLabel: View {
+    let title: LocalizedStringKey
+
+    init(_ title: LocalizedStringKey) {
+        self.title = title
+    }
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.secondary)
+    }
+}
+
+/// Collapsed by default; holds label/value rows.
+private struct DetailsDisclosure<Rows: View>: View {
+    let rows: Rows
+    @State private var expanded = false
+
+    init(@ViewBuilder rows: () -> Rows) {
+        self.rows = rows()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+            Button {
+                // No `withAnimation`: SwiftUI's animated window resize re-enters AppKit layout
+                // and crashes; `ApprovalPanel` animates the height change itself.
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .animation(.snappy(duration: 0.2), value: expanded)
+                    Text("Details")
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .accessibilityValue(expanded ? Text("expanded") : Text("collapsed"))
+            if expanded {
+                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 4) {
+                    rows
+                }
+                .font(.system(size: 12))
+            }
+            Divider()
+        }
     }
 }
 
@@ -202,9 +416,41 @@ private struct InfoRow: View {
 
     var body: some View {
         GridRow {
-            Text(label).foregroundStyle(.secondary).gridColumnAlignment(.trailing)
-            Text(verbatim: value).textSelection(.enabled)
+            Text(label)
+                .foregroundStyle(.secondary)
+                .gridColumnAlignment(.leading)
+            Text(verbatim: value.isEmpty ? "—" : value)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+}
+
+/// Rows every request kind shows in Details, after its own.
+private struct RequestMetaRows: View {
+    let context: RequestContext
+
+    var body: some View {
+        InfoRow(label: "Host", value: context.hostLine)
+        InfoRow(label: "From", value: context.request.address)
+        InfoRow(label: "Agent", value: context.request.agent)
+        InfoRow(label: "Created", value: context.request.createdAt.formatted(date: .abbreviated, time: .standard))
+        InfoRow(label: "Expires", value: context.request.expiresAt.formatted(date: .abbreviated, time: .standard))
+        InfoRow(label: "Request ID", value: context.request.id)
+    }
+}
+
+private struct ErrorLine: View {
+    let message: String
+
+    var body: some View {
+        Label {
+            Text(verbatim: message).fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+        }
+        .font(.callout)
     }
 }
 
@@ -213,28 +459,270 @@ private struct MaskedValue: View {
     let value: String
 
     var body: some View {
-        Text("\(String(repeating: "•", count: min(value.count, 16))) (\(value.count) characters)")
-            .monospaced()
+        HStack(spacing: 6) {
+            Text(verbatim: String(repeating: "•", count: min(value.count, 12))).monospaced()
+            Text("\(value.count) characters").foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Lays children out in rows, wrapping to the proposed width.
+private struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let rows = arrange(width: proposal.width ?? .infinity, subviews: subviews)
+        let width = rows.map(\.width).max() ?? 0
+        let height = rows.map(\.height).reduce(0, +) + spacing * CGFloat(max(rows.count - 1, 0))
+        return CGSize(width: proposal.width ?? width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for row in arrange(width: bounds.width, subviews: subviews) {
+            var x = bounds.minX
+            for (index, size) in row.items {
+                subviews[index].place(
+                    at: CGPoint(x: x, y: y + (row.height - size.height) / 2),
+                    proposal: ProposedViewSize(size)
+                )
+                x += size.width + spacing
+            }
+            y += row.height + spacing
+        }
+    }
+
+    private struct Row {
+        var items: [(Int, CGSize)] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+
+    private func arrange(width: CGFloat, subviews: Subviews) -> [Row] {
+        var rows: [Row] = []
+        var row = Row()
+        for index in subviews.indices {
+            var size = subviews[index].sizeThatFits(.unspecified)
+            if size.width > width {
+                size = subviews[index].sizeThatFits(ProposedViewSize(width: width, height: nil))
+                size.width = min(size.width, width)
+            }
+            if !row.items.isEmpty, row.width + spacing + size.width > width {
+                rows.append(row)
+                row = Row()
+            }
+            row.width += (row.items.isEmpty ? 0 : spacing) + size.width
+            row.height = max(row.height, size.height)
+            row.items.append((index, size))
+        }
+        if !row.items.isEmpty { rows.append(row) }
+        return rows
+    }
+}
+
+// MARK: - Actions
+
+/// Split Deny button (canned reasons, custom reason) on the left, approve buttons on
+/// the right. Esc denies without a reason once armed, unless a text field is edited.
+private struct ApprovalActions<Trailing: View>: View {
+    let cannedReasons: [String]
+    let armed: Bool
+    let escapeDenies: Bool
+    let deny: (String) -> Void
+    @Binding var editingReason: Bool
+    let trailing: Trailing
+    @State private var customReason = ""
+    @FocusState private var reasonFocused: Bool
+
+    init(
+        cannedReasons: [String],
+        armed: Bool,
+        escapeDenies: Bool,
+        editingReason: Binding<Bool>,
+        deny: @escaping (String) -> Void,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
+        self.cannedReasons = cannedReasons
+        self.armed = armed
+        self.escapeDenies = escapeDenies
+        _editingReason = editingReason
+        self.deny = deny
+        self.trailing = trailing()
+    }
+
+    private var trimmedReason: String {
+        customReason.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if editingReason {
+                HStack(spacing: 6) {
+                    TextField("Reason sent to the agent", text: $customReason)
+                        .textFieldStyle(.roundedBorder)
+                        .focused($reasonFocused)
+                        .onSubmit(sendCustom)
+                        .onExitCommand { editingReason = false }
+                        .onAppear { reasonFocused = true }
+                    Button("Cancel") { editingReason = false }
+                    Button("Deny", action: sendCustom)
+                        .disabled(trimmedReason.isEmpty)
+                }
+                .controlSize(.regular)
+            }
+            // One row when it fits (longer translations wrap the approve buttons above Deny).
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 6) {
+                    denyButton
+                    Spacer(minLength: 0)
+                    trailing
+                }
+                VStack(alignment: .trailing, spacing: 8) {
+                    HStack(spacing: 6) { trailing }
+                    HStack {
+                        denyButton
+                        Spacer(minLength: 0)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+        .background {
+            Button("Deny") { deny("") }
+                .keyboardShortcut(.cancelAction)
+                .disabled(!armed || !escapeDenies || editingReason)
+                .opacity(0)
+                .frame(width: 0, height: 0)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private var denyButton: some View {
+        DenySplitButton(cannedReasons: cannedReasons, deny: deny) {
+            customReason = ""
+            editingReason = true
+        }
+    }
+
+    private func sendCustom() {
+        guard !trimmedReason.isEmpty else { return }
+        deny(trimmedReason)
+    }
+}
+
+/// Deny (no reason) with a menu of reasons. Drawn by SwiftUI like `PanelButtonStyle`,
+/// so it looks the same whether or not the non-activating panel is key.
+private struct DenySplitButton: View {
+    let cannedReasons: [String]
+    let deny: (String) -> Void
+    let customReason: () -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button {
+                deny("")
+            } label: {
+                Text("Deny")
+                    .padding(.leading, 12)
+                    .padding(.trailing, 8)
+                    .frame(maxHeight: .infinity)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            Divider()
+                .padding(.vertical, 8)
+            Menu {
+                ForEach(cannedReasons, id: \.self) { reason in
+                    Button("Deny (\(reason))") { deny(reason) }
+                }
+                Button("Deny with custom reason…", action: customReason)
+            } label: {
+                Label("Deny with a reason", systemImage: "chevron.down")
+                    .labelStyle(.iconOnly)
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .padding(.leading, 5)
+            .padding(.trailing, 8)
+        }
+        .font(.system(size: 13, weight: .medium))
+        .frame(height: 30)
+        .background(.fill.tertiary, in: Capsule())
+        .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+        .fixedSize()
+    }
+}
+
+/// Capsule buttons drawn by SwiftUI: a new request does not make the panel key, and
+/// AppKit buttons would then look inactive (no accent fill, dimmed labels).
+private struct PanelButtonStyle: ButtonStyle {
+    enum Role {
+        /// Filled with the accent colour.
+        case primary
+        /// Filled orange: gives away the real value.
+        case caution
+        /// Neutral fill with a hairline border.
+        case secondary
+    }
+
+    var role: Role
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .medium))
+            .lineLimit(1)
+            .padding(.horizontal, 11)
+            .fixedSize()
+            .frame(minWidth: 76, minHeight: 30, maxHeight: 30)
+            .foregroundStyle(foreground)
+            .background(background, in: Capsule())
+            .overlay(Capsule().strokeBorder(role == .secondary ? AnyShapeStyle(.separator) : AnyShapeStyle(.clear), lineWidth: 0.5))
+            .contentShape(Capsule())
+            .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.45)
+    }
+
+    private var foreground: AnyShapeStyle {
+        switch role {
+        case .primary: AnyShapeStyle(.white)
+        case .caution: AnyShapeStyle(.black.opacity(0.85))
+        case .secondary: AnyShapeStyle(.primary)
+        }
+    }
+
+    private var background: AnyShapeStyle {
+        switch role {
+        case .primary: AnyShapeStyle(Color.accentColor)
+        case .caution: AnyShapeStyle(Color.orange)
+        case .secondary: AnyShapeStyle(.fill.tertiary)
+        }
+    }
+}
+
+extension ButtonStyle where Self == PanelButtonStyle {
+    fileprivate static func panel(_ role: PanelButtonStyle.Role) -> PanelButtonStyle {
+        PanelButtonStyle(role: role)
     }
 }
 
 // MARK: - Pair
 
 private struct PairApproval: View {
+    let context: RequestContext
     let info: HostInfoItem
     let observedAddress: String
     let code: String
-    let armed: Bool
-    let resolve: (DecisionItem) -> Void
     @State private var name: String
+    @State private var editingReason = false
     @FocusState private var nameFocused: Bool
 
-    init(info: HostInfoItem, observedAddress: String, code: String, armed: Bool, resolve: @escaping (DecisionItem) -> Void) {
+    init(context: RequestContext, info: HostInfoItem, observedAddress: String, code: String) {
+        self.context = context
         self.info = info
         self.observedAddress = observedAddress
         self.code = code
-        self.armed = armed
-        self.resolve = resolve
         _name = State(initialValue: info.hostname)
     }
 
@@ -251,60 +739,94 @@ private struct PairApproval: View {
         return nil
     }
 
+    private var deviceSymbol: String {
+        if info.container { return "shippingbox" }
+        return info.os.lowercased().contains("linux") ? "server.rack" : "laptopcomputer"
+    }
+
+    private var summaryLine: String {
+        // `osVersion` often already names the OS ("macOS 27.0.1" for os "macos").
+        let os = info.osVersion.lowercased().contains(info.os.lowercased())
+            ? info.osVersion
+            : [info.os, info.osVersion].filter { !$0.isEmpty }.joined(separator: " ")
+        return [info.hostname, os, info.arch, observedAddress].filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Friendly name").font(.caption).foregroundStyle(.secondary)
-            TextField(text: $name, prompt: Text(verbatim: info.hostname)) {
-                Text("Friendly name")
+        ApprovalScaffold(
+            error: context.error,
+            footnote: Text("Pairing lets this device ask for secrets. You still approve every request.")
+        ) {
+            ApprovalHeader(
+                title: Text("New device wants to pair"),
+                subtitle: Text(verbatim: summaryLine).foregroundStyle(.secondary),
+                queue: context.queue
+            ) {
+                Image(systemName: deviceSymbol)
+                    .font(.system(size: 28))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
             }
-            .labelsHidden()
-            .textFieldStyle(.roundedBorder)
-            .focused($nameFocused)
-            .onSubmit(approve)
-            if let nameProblem {
-                Text(verbatim: nameProblem).font(.caption).foregroundStyle(.red)
+        } content: {
+            VStack(alignment: .leading, spacing: 6) {
+                SectionLabel("Name")
+                TextField(text: $name, prompt: Text(verbatim: info.hostname)) {
+                    Text("Name")
+                }
+                .labelsHidden()
+                .textFieldStyle(.roundedBorder)
+                .controlSize(.large)
+                .focused($nameFocused)
+                .onExitCommand { nameFocused = false }
+                if let nameProblem {
+                    Text(verbatim: nameProblem).font(.caption).foregroundStyle(.red)
+                }
+            }
+            VStack(spacing: 6) {
+                Text(verbatim: code)
+                    .font(.system(size: 36, weight: .semibold, design: .monospaced))
+                    .monospacedDigit()
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .accessibilityLabel(Text("Verification code \(Text(verbatim: code))"))
+                Text("Must match the code shown in the terminal")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } details: {
+            InfoRow(label: "User", value: info.username)
+            InfoRow(label: "Kernel", value: info.kernel)
+            InfoRow(label: "Addresses", value: info.addresses.joined(separator: ", "))
+            InfoRow(label: "asm version", value: info.asmVersion)
+            InfoRow(label: "Container", value: info.container ? String(localized: "yes") : String(localized: "no"))
+            InfoRow(label: "Request ID", value: context.request.id)
+        } actions: {
+            ApprovalActions(
+                cannedReasons: [],
+                armed: context.armed,
+                escapeDenies: !nameFocused,
+                editingReason: $editingReason,
+                deny: context.deny
+            ) {
+                // Not the default button: comparing the codes is the approval, so Return never pairs.
+                Button("Pair", action: approve)
+                    .buttonStyle(.panel(.primary))
+                    .disabled(!context.armed || nameProblem != nil)
             }
         }
         .onAppear {
             if NSApp.keyWindow is ApprovalPanel { focusName() }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
-            if note.object is ApprovalPanel { focusName() }
-        }
-        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 4) {
-            InfoRow(label: "Hostname", value: info.hostname)
-            InfoRow(label: "User", value: info.username)
-            InfoRow(label: "OS", value: "\(info.os) \(info.osVersion)")
-            InfoRow(label: "Kernel", value: info.kernel)
-            InfoRow(label: "Architecture", value: info.arch)
-            InfoRow(label: "Addresses", value: info.addresses.joined(separator: ", "))
-            InfoRow(label: "Container", value: info.container ? "yes" : "no")
-            InfoRow(label: "asm version", value: info.asmVersion)
-            InfoRow(label: "Connected from", value: observedAddress)
-        }
-        .font(.callout)
-        VStack(spacing: 4) {
-            Text("Verification code").font(.caption).foregroundStyle(.secondary)
-            Text(verbatim: code)
-                .font(.system(size: 34, weight: .semibold, design: .monospaced))
-                .textSelection(.enabled)
-            Text("Approve only if the terminal shows the same code.").font(.caption).foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 8)
-        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
-        ApprovalActions(cannedReasons: [], deny: { resolve(.deny(reason: $0)) }) {
-            // While the name field has focus, Return goes to its `onSubmit` only (one approval).
-            Button("Approve", action: approve)
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(nameFocused ? nil : .defaultAction)
-                .disabled(!armed || nameProblem != nil)
+            if note.object is ApprovalPanel, !editingReason { focusName() }
         }
     }
 
     private func approve() {
-        guard armed, nameProblem == nil else { return }
-        resolve(.approvePair(name: name))
+        guard context.armed, nameProblem == nil else { return }
+        context.resolve(.approvePair(name: name))
     }
 
     /// Focus the name field and select its text, so typing replaces the hostname.
@@ -326,236 +848,485 @@ private struct HostEntry: Identifiable, Equatable {
 }
 
 private struct GetApproval: View {
+    let context: RequestContext
     let detail: GetDetail
     let durations: [LeaseDuration]
-    let armed: Bool
     let check: (String) -> Result<HostPatternCheckItem, AppError>
-    let resolve: (DecisionItem) -> Void
 
-    @State private var hosts: [HostEntry] = []
+    @State private var hosts: [HostEntry]
     @State private var anyHost = false
-    @State private var duration: UInt64 = 0
-    @State private var loaded = false
+    @State private var duration: UInt64
+    @State private var editingHost = false
     @State private var newHost = ""
     @State private var hostError: String?
+    @State private var editingReason = false
+    /// "Show Value…" was clicked on a hidden-value request: confirm inline.
+    @State private var confirmingRaw = false
     @FocusState private var hostFieldFocused: Bool
 
-    private var suggestions: [String] {
+    init(
+        context: RequestContext,
+        detail: GetDetail,
+        durations: [LeaseDuration],
+        check: @escaping (String) -> Result<HostPatternCheckItem, AppError>
+    ) {
+        self.context = context
+        self.detail = detail
+        self.durations = durations
+        self.check = check
+        _hosts = State(initialValue: detail.initialHosts.map { HostEntry(pattern: $0.normalized, broad: $0.broad) })
+        _duration = State(initialValue: detail.defaultDurationSecs ?? 0)
+    }
+
+    private var raw: Bool { detail.rawRequested }
+    private var durationSecs: UInt64? { duration == 0 ? nil : duration }
+    private var canAllowHidden: Bool { context.armed && (anyHost || !hosts.isEmpty) }
+    /// Return approves hidden only on hidden-value requests, and never while typing.
+    private var allowIsDefault: Bool { !raw && !confirmingRaw && !hostFieldFocused && !editingReason }
+
+    /// Requested hosts and the secret's remembered/URI hosts that are not chosen yet.
+    private var suggestions: [HostEntry] {
         let present = Set(hosts.map(\.pattern))
         var seen = Set<String>()
+        let broad = Dictionary(detail.suggestedHosts.map { ($0.normalized, $0.broad) }, uniquingKeysWith: { a, _ in a })
         let candidates = detail.requestedHosts + detail.suggestedHosts.map(\.normalized)
-        return candidates.filter { !present.contains($0) && seen.insert($0).inserted }
+        return candidates
+            .filter { $0 != "*" && !present.contains($0) && seen.insert($0).inserted }
+            .map { HostEntry(pattern: $0, broad: broad[$0] ?? false) }
+    }
+
+    private var subtitle: Text {
+        let name = Text(verbatim: detail.name).fontWeight(.bold)
+        if raw {
+            let rawValue = Text("raw value").foregroundStyle(.orange).fontWeight(.semibold)
+            return Text("wants the \(rawValue) of \(name)")
+        }
+        return Text("wants to use \(name)")
+    }
+
+    private var footnote: Text {
+        if confirmingRaw {
+            return Text("The agent asked for a hidden value. Show Value gives it the real value instead.")
+        }
+        if raw {
+            return Text("Allow Hidden Instead gives the agent a token that works only through the proxy, over HTTPS, for these hosts.")
+        }
+        return anyHost
+            ? Text("The agent gets a token that works only through the proxy, over HTTPS, for any host.")
+            : Text("The agent gets a token that works only through the proxy, over HTTPS, for these hosts.")
+    }
+
+    private var approvedHostsLine: String {
+        anyHost ? String(localized: "any host") : hosts.map(\.pattern).joined(separator: ", ")
     }
 
     var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 4) {
-            InfoRow(label: "Secret", value: detail.name)
-            InfoRow(label: "Vault", value: detail.vaultName)
-            InfoRow(label: "Fields", value: detail.fields.joined(separator: ", "))
-        }
-        .font(.callout)
-
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Reason").font(.caption).foregroundStyle(.secondary)
-            Text(verbatim: detail.reason)
-                .font(.title3)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(10)
-        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
-
-        RequestedMode(raw: detail.rawRequested)
-
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Allowed hosts").font(.headline)
-            if !anyHost {
-                ForEach(hosts) { entry in
-                    HostEntryRow(pattern: entry.pattern, broad: entry.broad) {
-                        hosts.removeAll { $0.pattern == entry.pattern }
+        ApprovalScaffold(error: context.error, footnote: footnote) {
+            ApprovalHeader(title: context.requesterTitle, subtitle: subtitle, queue: context.queue) {
+                AppIconImage()
+            }
+        } content: {
+            ReasonBlock(reason: detail.reason)
+            if raw || confirmingRaw {
+                RawCaution()
+            }
+            HostsSection(
+                hosts: $hosts,
+                anyHost: $anyHost,
+                editing: $editingHost,
+                newHost: $newHost,
+                error: $hostError,
+                fieldFocused: $hostFieldFocused,
+                suggestions: suggestions,
+                dimmed: raw || confirmingRaw,
+                add: add
+            )
+            VStack(alignment: .leading, spacing: 6) {
+                SectionLabel("For")
+                Picker("For", selection: $duration) {
+                    ForEach(durations) { option in
+                        Text(verbatim: option.title).tag(option.id)
                     }
                 }
-                HStack {
-                    TextField("api.example.com or *.example.com", text: $newHost)
-                        .textFieldStyle(.roundedBorder)
-                        .focused($hostFieldFocused)
-                        .onSubmit(addTypedHost)
-                    Button("Add", action: addTypedHost).disabled(newHost.trimmingCharacters(in: .whitespaces).isEmpty)
-                }
-                if let hostError {
-                    Text(verbatim: hostError).font(.caption).foregroundStyle(.red)
-                }
-                if !suggestions.isEmpty {
-                    SuggestionChips(suggestions: suggestions, add: add)
-                }
+                .labelsHidden()
+                .fixedSize()
             }
-            Toggle("Any host", isOn: $anyHost)
-            if anyHost {
-                Label("Any host lets the agent obtain the real value.", systemImage: "exclamationmark.triangle.fill")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
+        } details: {
+            InfoRow(label: "Vault", value: detail.vaultName)
+            InfoRow(label: "Fields", value: detail.fields.joined(separator: ", "))
+            InfoRow(label: "Requested hosts", value: detail.requestedHosts.joined(separator: ", "))
+            InfoRow(label: "Approved hosts", value: approvedHostsLine)
+            InfoRow(label: "Requested mode", value: raw ? String(localized: "raw value") : String(localized: "hidden (sentinel)"))
+            RequestMetaRows(context: context)
+        } actions: {
+            ApprovalActions(
+                cannedReasons: ["host selection too open", "provide a better reason"],
+                armed: context.armed,
+                escapeDenies: !hostFieldFocused && !confirmingRaw,
+                editingReason: $editingReason,
+                deny: context.deny
+            ) {
+                if confirmingRaw {
+                    Button("Cancel") { confirmingRaw = false }
+                        .buttonStyle(.panel(.secondary))
+                        .keyboardShortcut(.cancelAction)
+                    Button("Show Value", action: approveRaw)
+                        .buttonStyle(.panel(.caution))
+                        .disabled(!context.armed)
+                } else if raw {
+                    Button("Allow Hidden Instead", action: approveHidden)
+                        .buttonStyle(.panel(.secondary))
+                        .disabled(!canAllowHidden)
+                    Button("Show Value", action: approveRaw)
+                        .buttonStyle(.panel(.caution))
+                        .disabled(!context.armed)
+                } else {
+                    Button("Show Value…") { confirmingRaw = true }
+                        .buttonStyle(.panel(.secondary))
+                        .disabled(!context.armed)
+                    Button("Allow", action: approveHidden)
+                        .buttonStyle(.panel(.primary))
+                        .keyboardShortcut(allowIsDefault ? .defaultAction : nil)
+                        .disabled(!canAllowHidden)
+                }
             }
         }
-
-        Picker("Duration", selection: $duration) {
-            ForEach(durations) { option in
-                Text(option.title).tag(option.id)
-            }
-        }
-        .fixedSize()
-
-        ApprovalActions(
-            cannedReasons: ["host selection too open", "provide a better reason"],
-            deny: { resolve(.deny(reason: $0)) }
-        ) {
-            Button("Approve and show raw value") {
-                resolve(.approveGet(raw: true, durationSecs: durationSecs, hosts: []))
-            }
-            .disabled(!armed)
-            Button("Approve and hide value") {
-                resolve(.approveGet(raw: false, durationSecs: durationSecs, hosts: anyHost ? ["*"] : hosts.map(\.pattern)))
-            }
-            .keyboardShortcut(hostFieldFocused ? nil : .defaultAction)
-            .disabled(!armed || (!anyHost && hosts.isEmpty))
-        }
-        .onAppear(perform: load)
     }
 
-    private var durationSecs: UInt64? { duration == 0 ? nil : duration }
-
-    private func load() {
-        guard !loaded else { return }
-        loaded = true
-        duration = detail.defaultDurationSecs ?? 0
-        hosts = detail.initialHosts.map { HostEntry(pattern: $0.normalized, broad: $0.broad) }
+    private func approveHidden() {
+        guard canAllowHidden else { return }
+        context.resolve(.approveGet(raw: false, durationSecs: durationSecs, hosts: anyHost ? ["*"] : hosts.map(\.pattern)))
     }
 
-    private func add(_ pattern: String) {
+    private func approveRaw() {
+        guard context.armed else { return }
+        context.resolve(.approveGet(raw: true, durationSecs: durationSecs, hosts: []))
+    }
+
+    /// Validates with the core's rule; `*` turns on "Any host".
+    private func add(_ pattern: String) -> Bool {
         switch check(pattern) {
         case let .success(result):
             hostError = nil
             if result.normalized == "*" {
                 anyHost = true
+                editingHost = false
             } else if !hosts.contains(where: { $0.pattern == result.normalized }) {
                 hosts.append(HostEntry(pattern: result.normalized, broad: result.broad))
             }
+            return true
         case let .failure(error):
             hostError = error.message
-        }
-    }
-
-    private func addTypedHost() {
-        let text = newHost.trimmingCharacters(in: .whitespaces)
-        guard !text.isEmpty else { return }
-        add(text)
-        if hostError == nil { newHost = "" }
-    }
-}
-
-private struct RequestedMode: View {
-    let raw: Bool
-
-    var body: some View {
-        Label(
-            raw ? "The agent asks for the raw value" : "The agent asks for a hidden value (sentinel)",
-            systemImage: raw ? "eye.trianglebadge.exclamationmark" : "eye.slash"
-        )
-        .font(.callout.weight(raw ? .semibold : .regular))
-        .foregroundStyle(raw ? .orange : .secondary)
-        .padding(raw ? 6 : 0)
-        .background(raw ? Color.orange.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
-    }
-}
-
-private struct HostEntryRow: View {
-    let pattern: String
-    let broad: Bool
-    let remove: () -> Void
-
-    var body: some View {
-        HStack {
-            Text(verbatim: pattern).monospaced()
-            if broad {
-                Text("broad")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 5)
-                    .background(Color.orange.opacity(0.2), in: Capsule())
-                    .foregroundStyle(.orange)
-                    .help("This pattern matches many hosts.")
-            }
-            Spacer()
-            Button(action: remove) { Image(systemName: "minus.circle") }
-                .buttonStyle(.borderless)
-                .help("Remove")
+            return false
         }
     }
 }
 
-private struct SuggestionChips: View {
-    let suggestions: [String]
-    let add: (String) -> Void
+/// "Can be used with": host pills, the `+` pill that becomes an inline field with
+/// suggestions and "Any host".
+private struct HostsSection: View {
+    @Binding var hosts: [HostEntry]
+    @Binding var anyHost: Bool
+    @Binding var editing: Bool
+    @Binding var newHost: String
+    @Binding var error: String?
+    var fieldFocused: FocusState<Bool>.Binding
+    let suggestions: [HostEntry]
+    /// Raw requests: the hosts apply only if the operator allows it hidden.
+    let dimmed: Bool
+    let add: (String) -> Bool
+
+    private var filteredSuggestions: [HostEntry] {
+        let typed = newHost.trimmingCharacters(in: .whitespaces).lowercased()
+        return typed.isEmpty ? suggestions : suggestions.filter { $0.pattern.contains(typed) }
+    }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text("Suggestions").font(.caption).foregroundStyle(.secondary)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack {
-                    ForEach(suggestions, id: \.self) { suggestion in
-                        Button {
-                            add(suggestion)
-                        } label: {
-                            Text(verbatim: suggestion).font(.caption)
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                SectionLabel("Can be used with")
+                if dimmed {
+                    Text("Used if you allow it hidden")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
                 }
             }
+            VStack(alignment: .leading, spacing: 6) {
+                FlowLayout(spacing: 6) {
+                    if anyHost {
+                        HostPill(warning: true, help: "Any host lets the agent obtain the real value.", remove: { anyHost = false }) {
+                            Text("Any host")
+                        }
+                    } else {
+                        ForEach(hosts) { entry in
+                            HostPill(
+                                warning: entry.broad,
+                                help: entry.broad ? "Broad pattern: it matches many hosts." : nil,
+                                remove: { hosts.removeAll { $0.id == entry.id } }
+                            ) {
+                                Text(verbatim: entry.pattern)
+                            }
+                        }
+                        if editing {
+                            HostField(text: $newHost, focused: fieldFocused, submit: submit, cancel: stopEditing)
+                        } else {
+                            AddPill { startEditing() }
+                        }
+                    }
+                }
+                if editing && !anyHost {
+                    FlowLayout(spacing: 6) {
+                        ForEach(filteredSuggestions) { suggestion in
+                            Button {
+                                _ = add(suggestion.pattern)
+                                fieldFocused.wrappedValue = true
+                            } label: {
+                                Label { Text(verbatim: suggestion.pattern) } icon: { Image(systemName: "plus") }
+                            }
+                            .buttonStyle(SuggestionChipStyle(warning: suggestion.broad))
+                            .help(suggestion.broad ? "Broad pattern: it matches many hosts." : "")
+                        }
+                        Button {
+                            _ = add("*")
+                        } label: {
+                            Label("Any host", systemImage: "exclamationmark.triangle")
+                        }
+                        .buttonStyle(SuggestionChipStyle(warning: true))
+                        .help("Any host lets the agent obtain the real value.")
+                    }
+                }
+                if let error {
+                    Text(verbatim: error).font(.caption).foregroundStyle(.red)
+                }
+                if anyHost {
+                    Label("Any host lets the agent obtain the real value.", systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+            }
+            .opacity(dimmed ? 0.55 : 1)
         }
+    }
+
+    private func startEditing() {
+        error = nil
+        newHost = ""
+        editing = true
+    }
+
+    private func stopEditing() {
+        editing = false
+        newHost = ""
+        error = nil
+        fieldFocused.wrappedValue = false
+    }
+
+    /// Return adds the typed host and keeps the field for another; empty Return closes it.
+    private func submit() {
+        let text = newHost.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else {
+            stopEditing()
+            return
+        }
+        if add(text) {
+            newHost = ""
+            if !anyHost { fieldFocused.wrappedValue = true }
+        }
+    }
+}
+
+/// Small dashed capsule for a host that can be added.
+private struct SuggestionChipStyle: ButtonStyle {
+    let warning: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .labelStyle(.titleAndIcon)
+            .font(.system(size: 12))
+            .foregroundStyle(warning ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 3)
+            .background(warning ? AnyShapeStyle(Color.orange.opacity(0.1)) : AnyShapeStyle(.clear), in: Capsule())
+            .overlay(
+                Capsule().strokeBorder(
+                    warning ? AnyShapeStyle(Color.orange.opacity(0.6)) : AnyShapeStyle(.separator),
+                    style: StrokeStyle(lineWidth: 1, dash: [3, 2])
+                )
+            )
+            .contentShape(Capsule())
+            .opacity(configuration.isPressed ? 0.7 : 1)
+    }
+}
+
+private struct HostPill<Label: View>: View {
+    let warning: Bool
+    let help: LocalizedStringKey?
+    let remove: () -> Void
+    let label: Label
+    @State private var hovering = false
+
+    init(warning: Bool, help: LocalizedStringKey?, remove: @escaping () -> Void, @ViewBuilder label: () -> Label) {
+        self.warning = warning
+        self.help = help
+        self.remove = remove
+        self.label = label()
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if warning {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+            }
+            label
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Button(action: remove) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .opacity(hovering ? 1 : 0)
+            .allowsHitTesting(hovering)
+            .accessibilityHidden(true)
+        }
+        .font(.system(size: 13))
+        .padding(.leading, 10)
+        .padding(.trailing, 6)
+        .padding(.vertical, 4)
+        .background(
+            warning ? AnyShapeStyle(Color.orange.opacity(0.14)) : AnyShapeStyle(.background.opacity(0.6)),
+            in: Capsule()
+        )
+        .overlay(Capsule().strokeBorder(warning ? AnyShapeStyle(Color.orange.opacity(0.45)) : AnyShapeStyle(.separator), lineWidth: 0.5))
+        .onHover { hovering = $0 }
+        .help(help.map { Text($0) } ?? Text(verbatim: ""))
+        .accessibilityElement(children: .combine)
+        .accessibilityAction(named: Text("Remove"), remove)
+    }
+}
+
+private struct AddPill: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "plus")
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 30, height: 22)
+                .background(.background.opacity(0.6), in: Capsule())
+                .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("Add a host")
+        .accessibilityLabel("Add a host")
+    }
+}
+
+private struct HostField: View {
+    @Binding var text: String
+    var focused: FocusState<Bool>.Binding
+    let submit: () -> Void
+    let cancel: () -> Void
+
+    var body: some View {
+        TextField("api.example.com", text: $text)
+            .textFieldStyle(.plain)
+            .font(.system(size: 13))
+            .focused(focused)
+            .onSubmit(submit)
+            .onExitCommand(perform: cancel)
+            .onAppear { focused.wrappedValue = true }
+            .frame(width: 170)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(.background.opacity(0.8), in: Capsule())
+            .overlay(Capsule().strokeBorder(Color.accentColor.opacity(0.7), lineWidth: 1))
     }
 }
 
 // MARK: - Update
 
 private struct UpdateApproval: View {
+    let context: RequestContext
     let name: String
     let vaultID: String
     let vaultName: String
     let field: String
     let oldValue: String
     let newValue: String
-    let armed: Bool
-    let resolve: (DecisionItem) -> Void
     @State private var revealed = false
+    @State private var editingReason = false
 
     var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
-            InfoRow(label: "Secret", value: name)
+        ApprovalScaffold(
+            error: context.error,
+            footnote: Text("Approving writes the new value to \(Text(verbatim: vaultName)). Raw values of this secret handed out earlier are revoked.")
+        ) {
+            ApprovalHeader(
+                title: context.requesterTitle,
+                subtitle: Text("wants to change \(Text(verbatim: name).fontWeight(.bold))"),
+                queue: context.queue
+            ) {
+                AppIconImage()
+            }
+        } content: {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline) {
+                    SectionLabel("Field")
+                    Text(verbatim: field).font(.system(size: 13).monospaced())
+                    Spacer()
+                    Toggle("Reveal", isOn: $revealed)
+                        .toggleStyle(.button)
+                        .controlSize(.small)
+                }
+                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 4) {
+                    GridRow {
+                        Text("Old").foregroundStyle(.secondary)
+                        value(oldValue, against: newValue)
+                    }
+                    GridRow {
+                        Text("New").foregroundStyle(.secondary)
+                        value(newValue, against: oldValue)
+                    }
+                }
+                .font(.system(size: 13))
+            }
+            .padding(12)
+            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        } details: {
             InfoRow(label: "Vault", value: vaultName)
             InfoRow(label: "Field", value: field)
-            GridRow {
-                Text("Old value").foregroundStyle(.secondary).gridColumnAlignment(.trailing)
-                if revealed {
-                    Text(ChangedRange.highlight(oldValue, against: newValue)).monospaced().textSelection(.enabled)
-                } else {
-                    MaskedValue(value: oldValue)
+            RequestMetaRows(context: context)
+        } actions: {
+            ApprovalActions(
+                cannedReasons: [],
+                armed: context.armed,
+                escapeDenies: true,
+                editingReason: $editingReason,
+                deny: context.deny
+            ) {
+                Button("Allow") {
+                    guard context.armed else { return }
+                    context.resolve(.approveWrite(vaultID: vaultID, collectionID: nil))
                 }
-            }
-            GridRow {
-                Text("New value").foregroundStyle(.secondary).gridColumnAlignment(.trailing)
-                if revealed {
-                    Text(ChangedRange.highlight(newValue, against: oldValue)).monospaced().textSelection(.enabled)
-                } else {
-                    MaskedValue(value: newValue)
-                }
+                .buttonStyle(.panel(.primary))
+                .keyboardShortcut(editingReason ? nil : .defaultAction)
+                .disabled(!context.armed)
             }
         }
-        .font(.callout)
-        Toggle("Reveal", isOn: $revealed)
-        ApprovalActions(cannedReasons: [], deny: { resolve(.deny(reason: $0)) }) {
-            Button("Approve") { resolve(.approveWrite(vaultID: vaultID, collectionID: nil)) }
-                .keyboardShortcut(.defaultAction)
-                .disabled(!armed)
+    }
+
+    @ViewBuilder private func value(_ value: String, against other: String) -> some View {
+        if revealed {
+            Text(ChangedRange.highlight(value, against: other))
+                .monospaced()
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            MaskedValue(value: value)
         }
     }
 }
@@ -582,11 +1353,10 @@ enum ChangedRange {
 // MARK: - Add
 
 private struct AddApproval: View {
+    let context: RequestContext
     let name: String
     let value: String
     let targets: [AddTargetItem]
-    let armed: Bool
-    let resolve: (DecisionItem) -> Void
 
     /// Sentinel tag for "personal vault" in the collection picker.
     private static let personal = "\u{1}personal"
@@ -594,49 +1364,93 @@ private struct AddApproval: View {
     @State private var revealed = false
     @State private var vaultID = ""
     @State private var collectionID = ""
+    @State private var editingReason = false
 
     private var target: AddTargetItem? { targets.first { $0.vaultID == vaultID } }
+    private var canAllow: Bool {
+        context.armed && target != nil && !(target?.kind == .bitwarden && collectionID.isEmpty)
+    }
 
     var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
-            InfoRow(label: "Name", value: name)
-            GridRow {
-                Text("Value").foregroundStyle(.secondary).gridColumnAlignment(.trailing)
+        ApprovalScaffold(
+            error: context.error,
+            footnote: Text("The secret is saved to the chosen vault. The agent needs a separate request to use it.")
+        ) {
+            ApprovalHeader(
+                title: context.requesterTitle,
+                subtitle: Text("wants to add \(Text(verbatim: name).fontWeight(.bold))"),
+                queue: context.queue
+            ) {
+                AppIconImage()
+            }
+        } content: {
+            HStack(alignment: .firstTextBaseline) {
+                SectionLabel("Value")
                 if revealed {
-                    Text(verbatim: value).monospaced().textSelection(.enabled)
+                    Text(verbatim: value)
+                        .font(.system(size: 13).monospaced())
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    MaskedValue(value: value)
+                    MaskedValue(value: value).font(.system(size: 13))
                 }
+                Spacer()
+                Toggle("Reveal", isOn: $revealed)
+                    .toggleStyle(.button)
+                    .controlSize(.small)
             }
-        }
-        .font(.callout)
-        Toggle("Reveal", isOn: $revealed)
-        if targets.isEmpty {
-            Text("No vault can receive this secret.").foregroundStyle(.secondary)
-        } else {
-            Picker("Vault", selection: $vaultID) {
-                ForEach(targets) { target in
-                    Text(verbatim: "\(target.vaultName) (\(target.kind.title))").tag(target.vaultID)
-                }
-            }
-            if let target, target.kind == .bitwarden {
-                Picker("Collection", selection: $collectionID) {
-                    ForEach(target.collections) { collection in
-                        Text(verbatim: collection.name).tag(collection.id)
+            .padding(12)
+            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            if targets.isEmpty {
+                Text("No vault can receive this secret.").foregroundStyle(.secondary)
+            } else {
+                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 8) {
+                    GridRow {
+                        SectionLabel("Save to")
+                        Picker("Save to", selection: $vaultID) {
+                            ForEach(targets) { target in
+                                Text(verbatim: "\(target.vaultName) (\(target.kind.title))").tag(target.vaultID)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
                     }
-                    if target.personalAllowed {
-                        Text("Personal vault (no organization)").tag(Self.personal)
+                    if let target, target.kind == .bitwarden {
+                        GridRow {
+                            SectionLabel("Collection")
+                            Picker("Collection", selection: $collectionID) {
+                                ForEach(target.collections) { collection in
+                                    Text(verbatim: collection.name).tag(collection.id)
+                                }
+                                if target.personalAllowed {
+                                    Text("Personal vault (no organization)").tag(Self.personal)
+                                }
+                            }
+                            .labelsHidden()
+                            .fixedSize()
+                        }
                     }
                 }
             }
-        }
-        ApprovalActions(cannedReasons: [], deny: { resolve(.deny(reason: $0)) }) {
-            Button("Approve") {
-                let collection = (target?.kind == .bitwarden && collectionID != Self.personal) ? collectionID : nil
-                resolve(.approveWrite(vaultID: vaultID, collectionID: collection))
+        } details: {
+            RequestMetaRows(context: context)
+        } actions: {
+            ApprovalActions(
+                cannedReasons: [],
+                armed: context.armed,
+                escapeDenies: true,
+                editingReason: $editingReason,
+                deny: context.deny
+            ) {
+                Button("Allow") {
+                    guard canAllow else { return }
+                    let collection = (target?.kind == .bitwarden && collectionID != Self.personal) ? collectionID : nil
+                    context.resolve(.approveWrite(vaultID: vaultID, collectionID: collection))
+                }
+                .buttonStyle(.panel(.primary))
+                .keyboardShortcut(editingReason ? nil : .defaultAction)
+                .disabled(!canAllow)
             }
-            .keyboardShortcut(.defaultAction)
-            .disabled(!armed || target == nil || (target?.kind == .bitwarden && collectionID.isEmpty))
         }
         .onAppear {
             if vaultID.isEmpty, let first = targets.first { select(first.vaultID) }

@@ -1,6 +1,9 @@
-<!-- Logo: docs/assets/logotype.png goes here, e.g.
-<p align="center"><img src="docs/assets/logotype.png" alt="Agents Secrets Manager" width="480"></p>
--->
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logotype-dark.png">
+    <img src="docs/assets/logotype.png" alt="Agents Secrets Manager" width="480">
+  </picture>
+</p>
 
 # Agents Secrets Manager (asm)
 
