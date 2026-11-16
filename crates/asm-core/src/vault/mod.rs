@@ -58,6 +58,13 @@ pub trait VaultProvider: Send + Sync {
     }
     /// Stop helper processes (Bitwarden `bw serve`). Called on remove and shutdown.
     fn shutdown(&self) {}
+    /// Unlock with the master password (Bitwarden). The password is used once and never
+    /// stored; a wrong one returns an error whose message is meant for the operator.
+    fn unlock(&self, _master_password: &str) -> Result<()> {
+        Err(crate::error::CoreError::invalid(
+            "only Bitwarden vaults have a master password",
+        ))
+    }
     /// Collections exposed for `add` (Bitwarden: the configured collection ids with their
     /// names); empty elsewhere.
     fn collections(&self) -> Result<Vec<CollectionInfo>> {
@@ -66,7 +73,8 @@ pub trait VaultProvider: Send + Sync {
 }
 
 /// Persisted (non-secret) vault configuration, stored as JSON in the `vaults` table.
-/// Secret parts (Bitwarden client secret, master password) live in the keychain via `creds`.
+/// The Bitwarden client secret lives in the keychain via `creds`; the master password is
+/// never stored (it only unlocks the running `bw serve`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VaultConfig {
@@ -88,11 +96,10 @@ pub struct BitwardenConfig {
     pub bw_path: Option<String>,
 }
 
-/// Secret parts of a Bitwarden config, as entered in the UI.
+/// Stored secret part of a Bitwarden config (keychain, `creds`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitwardenSecrets {
     pub client_secret: String,
-    pub master_password: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

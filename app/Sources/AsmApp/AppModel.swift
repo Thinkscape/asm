@@ -33,6 +33,18 @@ final class AppModel {
     /// Error from the last failed `resolve`, shown in the approval panel.
     var resolveError: String?
 
+    /// Vault whose unlock sheet is shown in the Settings window.
+    var unlockingVaultID: String?
+
+    var unlockingVault: VaultItem? {
+        vaults.first { $0.id == unlockingVaultID }
+    }
+
+    /// Bitwarden vaults waiting for their master password (it is never stored).
+    var lockedVaults: [VaultItem] {
+        vaults.filter(\.canUnlock)
+    }
+
     @ObservationIgnored private var bridge: CoreBridge?
     @ObservationIgnored private lazy var panel = ApprovalPanelController(model: self)
     @ObservationIgnored private var wakeObserver: NSObjectProtocol?
@@ -208,6 +220,14 @@ final class AppModel {
     func syncVault(_ id: String) async -> String? {
         let error = await perform { try $0.syncVault(id) }
         await refresh("vaults")
+        return error
+    }
+
+    /// Unlocks a Locked Bitwarden vault; the password is kept only by the running manager.
+    func unlockVault(_ id: String, masterPassword: String) async -> String? {
+        let error = await perform { try $0.unlockVault(id, masterPassword: masterPassword) }
+        await refresh("vaults")
+        await refresh("leases")
         return error
     }
 

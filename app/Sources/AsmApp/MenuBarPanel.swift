@@ -27,6 +27,11 @@ struct MenuBarPanel: View {
                 }
                 .font(.callout)
             }
+            let locked = model.lockedVaults
+            if !locked.isEmpty {
+                LockedVaultsSection(locked: locked, unlock: { model.unlockingVaultID = $0 })
+                Divider()
+            }
             PendingSection(pending: model.pending, open: model.openApproval(for:))
             Divider()
             RecentSection(recent: model.recent)
@@ -35,6 +40,32 @@ struct MenuBarPanel: View {
         }
         .padding(12)
         .frame(width: 360)
+    }
+}
+
+/// One line per Locked Bitwarden vault; Unlock… opens the unlock sheet in the Settings window.
+private struct LockedVaultsSection: View {
+    let locked: [VaultItem]
+    let unlock: (String) -> Void
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(locked) { vault in
+                HStack(spacing: 8) {
+                    Image(systemName: "lock.fill").frame(width: 18).foregroundStyle(.orange)
+                    Text("\(Text(verbatim: vault.name)) is locked").lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    Button("Unlock…") {
+                        unlock(vault.id)
+                        openWindow(id: "settings")
+                        NSApp.activate()
+                    }
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 4)
+            }
+        }
     }
 }
 

@@ -32,7 +32,15 @@ struct VaultsPane: View {
                 Table(model.vaults, selection: $selection) {
                     TableColumn("Name") { vault in Text(verbatim: vault.name) }
                     TableColumn("Kind") { vault in Text(vault.kind.title) }
-                    TableColumn("Status") { vault in VaultStatusCell(state: vault.state) }
+                    TableColumn("Status") { vault in
+                        HStack {
+                            VaultStatusCell(state: vault.state)
+                            if vault.canUnlock {
+                                Button("Unlock…") { model.unlockingVaultID = vault.id }
+                                    .controlSize(.small)
+                            }
+                        }
+                    }
                     TableColumn("Secrets") { vault in
                         Text(verbatim: vault.secretCount.map(String.init) ?? "–").monospacedDigit()
                     }
@@ -46,6 +54,9 @@ struct VaultsPane: View {
                 .contextMenu(forSelectionType: String.self) { ids in
                     if let id = ids.first, let vault = model.vaults.first(where: { $0.id == id }) {
                         Button("Edit…") { edit(vault) }
+                        if vault.canUnlock {
+                            Button("Unlock…") { model.unlockingVaultID = vault.id }
+                        }
                         if vault.kind == .bitwarden {
                             Button("Sync now") { sync(vault.id) }
                         }
@@ -117,6 +128,71 @@ struct VaultsPane: View {
     }
 }
 
+extension VaultItem {
+    /// A Bitwarden vault waiting for its master password, which is never stored.
+    var canUnlock: Bool { kind == .bitwarden && state == .locked }
+}
+
+/// Asks for a Bitwarden master password and unlocks the vault in the running manager.
+struct UnlockVaultSheet: View {
+    let model: AppModel
+    let vault: VaultItem
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var password = ""
+    @State private var unlocking = false
+    @State private var error: String?
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    SecureField("Master password", text: $password)
+                        .focused($focused)
+                        .onSubmit(unlock)
+                } header: {
+                    Text("Unlock \(Text(verbatim: vault.name))")
+                } footer: {
+                    Text("Not stored; needed again after the app restarts.")
+                }
+                if let error {
+                    Section {
+                        Text(verbatim: error).foregroundStyle(.red).textSelection(.enabled)
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            SheetButtons(
+                saveTitle: "Unlock",
+                problem: password.isEmpty ? "Enter the master password." : nil,
+                saving: unlocking,
+                cancel: { dismiss() },
+                save: unlock
+            )
+        }
+        .frame(width: 420, height: error == nil ? 220 : 300)
+        .onAppear { focused = true }
+    }
+
+    private func unlock() {
+        guard !password.isEmpty, !unlocking else { return }
+        unlocking = true
+        error = nil
+        let id = vault.id
+        let masterPassword = password
+        Task {
+            if let failure = await model.unlockVault(id, masterPassword: masterPassword) {
+                error = failure
+                unlocking = false
+            } else {
+                password = ""
+                dismiss()
+            }
+        }
+    }
+}
+
 private struct VaultStatusCell: View {
     let state: VaultState
 
@@ -184,7 +260,7 @@ private struct BitwardenSheet: View {
     private var problem: String? {
         if let problem = vaultNameProblem(name) { return problem }
         if config.serverURL.isEmpty || config.email.isEmpty || config.clientID.isEmpty { return "Fill in the server URL, email and client id." }
-        if isNew && (clientSecret.isEmpty || masterPassword.isEmpty) { return "Enter the client secret and master password." }
+        if isNew && clientSecret.isEmpty { return "Enter the client secret." }
         return nil
     }
 
@@ -199,11 +275,11 @@ private struct BitwardenSheet: View {
                 Section {
                     TextField("Client id", text: $config.clientID, prompt: Text(verbatim: "user.…"))
                     SecureField("Client secret", text: $clientSecret, prompt: Text(isNew ? "Required" : "Unchanged"))
-                    SecureField("Master password", text: $masterPassword, prompt: Text(isNew ? "Required" : "Unchanged"))
+                    SecureField("Master password", text: $masterPassword, prompt: Text("For Connect and to unlock now"))
                 } header: {
                     Text("Personal API key")
                 } footer: {
-                    Text("Stored in the login keychain. Find the API key under Settings → Security → Keys in the Bitwarden web vault.")
+                    Text("The client id and secret are stored in the login keychain. The master password is never stored: it is used for Connect and to unlock the vault now, and is needed again after the app restarts. Find the API key under Settings → Security → Keys in the Bitwarden web vault.")
                 }
                 Section("Command-line tool") {
                     TextField("bw path", text: $config.bwPath, prompt: Text(verbatim: model.general.bwPath.isEmpty ? "/opt/homebrew/bin/bw" : model.general.bwPath))
@@ -211,7 +287,7 @@ private struct BitwardenSheet: View {
                 Section {
                     HStack {
                         Button(connected ? "Reconnect" : "Connect", action: connect)
-                            .disabled(connecting || problem != nil)
+                            .disabled(connecting || problem != nil || masterPassword.isEmpty)
                         if let vault {
                             Button("Sync now") {
                                 Task { error = await model.syncVault(vault.id) }
@@ -220,7 +296,7 @@ private struct BitwardenSheet: View {
                         if connecting { ProgressView().controlSize(.small) }
                     }
                     if collections.isEmpty {
-                        Text(connected ? "This account has no collections." : "Connect to list the collections.")
+                        Text(connected ? "This account has no collections." : "Enter the master password and Connect to list the collections.")
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(collections) { collection in
@@ -258,7 +334,6 @@ private struct BitwardenSheet: View {
         name = vault.name
         config = existing
         selected = Set(existing.collectionIDs)
-        connect()
     }
 
     private func connect() {

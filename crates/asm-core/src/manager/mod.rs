@@ -18,8 +18,8 @@ use crate::proxy::{ProxyEntry, ProxySupervisor};
 use crate::settings::Settings;
 use crate::store::{LeaseRecord, Store};
 use crate::tls::ServerCert;
-use crate::vault::VaultConfig;
 use crate::vault::registry::{Registry, VaultEntry};
+use crate::vault::{VaultConfig, creds};
 
 pub mod admin;
 pub mod api;
@@ -177,7 +177,9 @@ impl Core {
         let settings = Settings::load(&store)?;
         let cert = ServerCert::load_or_create(&dirs.tls)?;
 
-        // Vaults: build providers in parallel (Bitwarden may block while logging in).
+        // Vaults: build providers in parallel (Bitwarden may block while logging in). A
+        // Bitwarden vault starts Locked; first drop any master password an earlier build
+        // stored in the keychain.
         let registry = Registry::new();
         let vaults = store.list_vaults()?;
         let built: Vec<_> = std::thread::scope(|s| {
@@ -186,7 +188,14 @@ impl Core {
                 .map(|v| {
                     let dirs = &dirs;
                     let cfg = effective_config(&settings, &v.config);
-                    s.spawn(move || Registry::build_provider(dirs, &v.id, &cfg))
+                    s.spawn(move || {
+                        if matches!(cfg, VaultConfig::Bitwarden(_))
+                            && let Err(e) = creds::delete_legacy_master_password(&v.id)
+                        {
+                            log::warn!("vault {}: {}", v.name, e.message);
+                        }
+                        Registry::build_provider(dirs, &v.id, &cfg)
+                    })
                 })
                 .collect();
             handles

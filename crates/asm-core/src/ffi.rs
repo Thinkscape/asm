@@ -349,7 +349,10 @@ pub struct VaultInfo {
 }
 
 /// Vault editor contents. `id: None` creates a vault. For Bitwarden, an empty
-/// `client_secret` / `master_password` keeps the stored one (required for new vaults).
+/// `client_secret` keeps the stored one (required for new vaults). `master_password` is
+/// never stored: when non-empty, `save_vault` uses it once to unlock (a new vault that
+/// cannot be unlocked is not kept); empty = leave the vault Locked. `bitwarden_connect`
+/// requires it.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct VaultDraft {
     pub id: Option<String>,
@@ -593,6 +596,12 @@ impl Manager {
 
     pub fn sync_vault(&self, id: String) -> FfiResult<()> {
         Ok(self.core.sync_vault(&id)?)
+    }
+
+    /// Unlock a Locked Bitwarden vault. The password is used once and never stored; a
+    /// wrong one throws with a message for the operator.
+    pub fn unlock_vault(&self, vault_id: String, master_password: String) -> FfiResult<()> {
+        Ok(self.core.unlock_vault(&vault_id, &master_password)?)
     }
 
     pub fn list_hosts(&self) -> Vec<HostRecord> {

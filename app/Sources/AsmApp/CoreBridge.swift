@@ -94,6 +94,10 @@ final class CoreBridge: @unchecked Sendable {
         try Self.mapped { try manager.syncVault(id: id) }
     }
 
+    func unlockVault(_ id: String, masterPassword: String) throws {
+        try Self.mapped { try manager.unlockVault(vaultId: id, masterPassword: masterPassword) }
+    }
+
     // MARK: Hosts and pairing codes
 
     func listHosts() throws -> [HostItem] {

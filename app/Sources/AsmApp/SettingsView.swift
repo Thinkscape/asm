@@ -40,6 +40,16 @@ struct SettingsView: View {
             SettingsDetail(model: model, pane: selection ?? .vaults)
         }
         .frame(minWidth: 820, minHeight: 520)
+        .background(RegularWindowMarker())
+        .onChange(of: model.unlockingVaultID, initial: true) { _, id in
+            if id != nil { selection = .vaults }
+        }
+        .sheet(item: Binding(
+            get: { model.unlockingVault },
+            set: { if $0 == nil { model.unlockingVaultID = nil } }
+        )) { vault in
+            UnlockVaultSheet(model: model, vault: vault)
+        }
     }
 }
 

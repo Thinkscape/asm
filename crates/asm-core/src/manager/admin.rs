@@ -22,9 +22,6 @@ use crate::store::{PairingCodeRecord, VaultRecord};
 use crate::vault::registry::{Registry, VaultEntry};
 use crate::vault::{BitwardenSecrets, VaultConfig, VaultStatus, bitwarden, creds};
 
-const CLIENT_SECRET: &str = "client_secret";
-const MASTER_PASSWORD: &str = "master_password";
-
 fn vault_kind(c: &VaultConfig) -> ffi::VaultKind {
     match c {
         VaultConfig::Bitwarden(_) => ffi::VaultKind::Bitwarden,
@@ -176,11 +173,8 @@ impl Core {
                         "server URL, email and client id are required",
                     ));
                 }
-                let missing = draft.client_secret.is_empty() || draft.master_password.is_empty();
-                if current.is_none() && missing {
-                    return Err(CoreError::invalid(
-                        "client secret and master password are required",
-                    ));
+                if current.is_none() && draft.client_secret.is_empty() {
+                    return Err(CoreError::invalid("the client secret is required"));
                 }
             }
         }
@@ -195,17 +189,8 @@ impl Core {
             position,
         };
         self.store.upsert_vault(&rec)?;
-        if matches!(rec.config, VaultConfig::Bitwarden(_)) {
-            let set = || -> Result<()> {
-                if !draft.client_secret.is_empty() {
-                    creds::set(&id, CLIENT_SECRET, &draft.client_secret)?;
-                }
-                if !draft.master_password.is_empty() {
-                    creds::set(&id, MASTER_PASSWORD, &draft.master_password)?;
-                }
-                Ok(())
-            };
-            if let Err(e) = set() {
+        if matches!(rec.config, VaultConfig::Bitwarden(_)) && !draft.client_secret.is_empty() {
+            if let Err(e) = creds::set(&id, creds::CLIENT_SECRET, &draft.client_secret) {
                 if current.is_none() {
                     let _ = self.store.delete_vault(&id);
                     let _ = creds::delete_all(&id);
@@ -213,10 +198,69 @@ impl Core {
                 return Err(e);
             }
         }
-        self.start_vault(&rec);
+        // Keep the running provider when nothing it depends on changed (e.g. a rename), so
+        // an unlocked Bitwarden vault stays unlocked.
+        let reuse = current
+            .as_ref()
+            .is_some_and(|c| c.config == rec.config && draft.client_secret.is_empty())
+            .then(|| self.registry.get(&id))
+            .flatten();
+        match reuse {
+            Some(v) => self.registry.insert(VaultEntry {
+                name: rec.name.clone(),
+                ..v
+            }),
+            None => self.start_vault(&rec),
+        }
+        // Bitwarden: a master password in the draft unlocks once and is dropped.
+        if matches!(rec.config, VaultConfig::Bitwarden(_)) && !draft.master_password.is_empty() {
+            let unlocked = match self.registry.get(&id) {
+                Some(v) => v.provider.unlock(&draft.master_password),
+                None => Err(CoreError::vault_unavailable(
+                    lock(&self.vault_errors)
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| "vault could not be started".to_string()),
+                )),
+            };
+            if let Err(e) = unlocked {
+                if current.is_none() {
+                    // Nothing is kept for a new vault that cannot be unlocked.
+                    let _ = self.remove_vault(&id);
+                } else {
+                    self.notify(TOPIC_VAULTS);
+                }
+                return Err(e);
+            }
+        }
         self.notify(TOPIC_VAULTS);
         self.sync_proxy(true);
         Ok(self.vault_info(&rec))
+    }
+
+    /// Unlock a Bitwarden vault with its master password (never stored). On success the
+    /// vault is Ready and its suspended leases are rebuilt.
+    pub fn unlock_vault(&self, id: &str, master_password: &str) -> Result<()> {
+        let Some(v) = self.registry.get(id) else {
+            return Err(match lock(&self.vault_errors).get(id) {
+                Some(m) => CoreError::vault_unavailable(m.clone()),
+                None => CoreError::not_found("no such vault"),
+            });
+        };
+        if !matches!(v.config, VaultConfig::Bitwarden(_)) {
+            return Err(CoreError::invalid(
+                "only Bitwarden vaults have a master password",
+            ));
+        }
+        if master_password.is_empty() {
+            return Err(CoreError::invalid("enter the master password"));
+        }
+        let res = v.provider.unlock(master_password);
+        self.notify(TOPIC_VAULTS);
+        res?;
+        self.sync_proxy(true);
+        self.notify(TOPIC_LEASES);
+        Ok(())
     }
 
     pub fn remove_vault(&self, id: &str) -> Result<()> {
@@ -257,27 +301,20 @@ impl Core {
         let VaultConfig::Bitwarden(cfg) = VaultConfig::from(draft.config) else {
             return Err(CoreError::invalid("not a Bitwarden vault"));
         };
-        let stored = |kind: &str| -> Result<Option<String>> {
-            match &draft.id {
-                Some(id) => creds::get(id, kind),
-                None => Ok(None),
-            }
-        };
         let client_secret = if draft.client_secret.is_empty() {
-            stored(CLIENT_SECRET)?
+            match &draft.id {
+                Some(id) => creds::get(id, creds::CLIENT_SECRET)?,
+                None => None,
+            }
         } else {
             Some(draft.client_secret)
         };
-        let master_password = if draft.master_password.is_empty() {
-            stored(MASTER_PASSWORD)?
-        } else {
-            Some(draft.master_password)
+        let Some(client_secret) = client_secret else {
+            return Err(CoreError::invalid("enter the client secret"));
         };
-        let (Some(client_secret), Some(master_password)) = (client_secret, master_password) else {
-            return Err(CoreError::invalid(
-                "enter the client secret and master password",
-            ));
-        };
+        if draft.master_password.is_empty() {
+            return Err(CoreError::invalid("enter the master password"));
+        }
         let vault_id = draft.id.unwrap_or_else(new_uuid_v4);
         let VaultConfig::Bitwarden(cfg) =
             effective_config(&self.settings(), &VaultConfig::Bitwarden(cfg))
@@ -288,10 +325,8 @@ impl Core {
             &self.dirs,
             &vault_id,
             &cfg,
-            &BitwardenSecrets {
-                client_secret,
-                master_password,
-            },
+            &BitwardenSecrets { client_secret },
+            &draft.master_password,
         )?;
         Ok(cols.into_iter().map(Into::into).collect())
     }

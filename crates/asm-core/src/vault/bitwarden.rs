@@ -3,8 +3,13 @@
 //! Each instance has its own `BITWARDENCLI_APPDATA_DIR=<data>/bw/<vault_id>`. Start-up:
 //! `bw status`; when logged out (or logged in to another server/account): `bw config server`
 //! → `bw login --apikey`; then `bw serve --hostname unix://<dir>/serve.sock` in its own
-//! process group, poll `GET /status` up to 10 s, `POST /unlock` when locked. `bw serve`
-//! refuses to start while logged out, so login happens before the first spawn.
+//! process group, poll `GET /status` up to 10 s. `bw serve` refuses to start while logged
+//! out, so login happens before the first spawn.
+//!
+//! The master password is never stored: a freshly started serve is `Locked` until the
+//! operator calls `unlock` (`POST /unlock`); only serve's own memory then holds the
+//! unlocked session. Sync never unlocks, and a serve restart leaves the vault `Locked`.
+//! Stop sends `POST /lock` before killing serve.
 //!
 //! HTTP to serve uses a minimal HTTP/1.1 client over the Unix socket (or loopback TCP in
 //! the fallback): `Host: localhost:8087`, never an `Origin` header (serve answers 403),
@@ -33,6 +38,8 @@ use crate::paths::{DataDirs, ensure_private_dir};
 const SERVE_WAIT: Duration = Duration::from_secs(10);
 const CLI_TIMEOUT: Duration = Duration::from_secs(90);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+/// `POST /lock` on stop: best effort, must not hold up quitting.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 /// `sun_path` is 104 bytes on macOS, including the terminating NUL.
 const MAX_SOCKET_PATH: usize = 103;
 const TCP_NOTE: &str = "bw serve listens on 127.0.0.1 (reachable by other local processes)";
@@ -59,21 +66,21 @@ trait Stream: Read + Write {}
 impl<T: Read + Write> Stream for T {}
 
 impl Endpoint {
-    fn connect(&self) -> std::io::Result<Box<dyn Stream>> {
+    fn connect(&self, timeout: Duration) -> std::io::Result<Box<dyn Stream>> {
         Ok(match self {
             Endpoint::Unix(p) => {
                 let s = UnixStream::connect(p)?;
-                s.set_read_timeout(Some(HTTP_TIMEOUT))?;
-                s.set_write_timeout(Some(HTTP_TIMEOUT))?;
+                s.set_read_timeout(Some(timeout))?;
+                s.set_write_timeout(Some(timeout))?;
                 Box::new(s)
             }
             Endpoint::Tcp(port) => {
                 let s = TcpStream::connect_timeout(
                     &([127, 0, 0, 1], *port).into(),
-                    Duration::from_secs(5),
+                    Duration::from_secs(5).min(timeout),
                 )?;
-                s.set_read_timeout(Some(HTTP_TIMEOUT))?;
-                s.set_write_timeout(Some(HTTP_TIMEOUT))?;
+                s.set_read_timeout(Some(timeout))?;
+                s.set_write_timeout(Some(timeout))?;
                 Box::new(s)
             }
         })
@@ -85,8 +92,9 @@ impl Endpoint {
         method: &str,
         path: &str,
         body: Option<&Value>,
+        timeout: Duration,
     ) -> std::io::Result<(u16, Vec<u8>)> {
-        let mut s = self.connect()?;
+        let mut s = self.connect(timeout)?;
         let body = body.map(|b| serde_json::to_vec(b).expect("json value serialises"));
         let mut req = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost:8087\r\nAccept: application/json\r\nConnection: close\r\n"
@@ -193,8 +201,18 @@ fn bw_error(message: &str) -> CoreError {
 
 /// Call serve and unwrap the `{"success":…,"data":…}` envelope.
 fn call(ep: &Endpoint, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+    call_timeout(ep, method, path, body, HTTP_TIMEOUT)
+}
+
+fn call_timeout(
+    ep: &Endpoint,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout: Duration,
+) -> Result<Value> {
     let (code, bytes) = ep
-        .http(method, path, body)
+        .http(method, path, body, timeout)
         .map_err(|e| CoreError::vault_unavailable(format!("bw serve unreachable: {e}")))?;
     let v: Value = serde_json::from_slice(&bytes).map_err(|_| {
         CoreError::vault_unavailable(format!(
@@ -727,7 +745,8 @@ pub struct BitwardenVault {
 }
 
 impl BitwardenVault {
-    /// Spawns `bw serve`, logs in / unlocks as needed (plan step 4). Errors carry bw's stderr.
+    /// Spawns `bw serve`, logging in as needed (plan step 4). The vault is `Locked` until
+    /// `unlock`. Errors carry bw's stderr.
     pub fn start(
         dirs: &DataDirs,
         vault_id: &str,
@@ -798,15 +817,26 @@ impl BitwardenVault {
         self.state().status = s;
     }
 
-    /// Start (or restart) serve and bring the vault to `Ready`.
+    /// Start (or restart) serve. The vault ends up `Locked` (serve keeps no unlocked
+    /// session across restarts), or `Error` on failure.
     fn ensure_running(&self) -> Result<()> {
         let _l = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
-        let res = self.start_locked();
-        match &res {
-            Ok(()) => self.set_status(VaultStatus::Ready),
-            Err(e) => self.set_status(VaultStatus::Error(e.message.clone())),
+        self.restart_serve_held().map(|_| ())
+    }
+
+    /// `restart_serve` with the outcome recorded as the vault status. Caller holds
+    /// `lifecycle`.
+    fn restart_serve_held(&self) -> Result<Endpoint> {
+        match self.restart_serve() {
+            Ok((ep, status)) => {
+                self.set_status(status);
+                Ok(ep)
+            }
+            Err(e) => {
+                self.set_status(VaultStatus::Error(e.message.clone()));
+                Err(e)
+            }
         }
-        res
     }
 
     fn login_if_needed(&self, inst: &Instance) -> Result<()> {
@@ -836,7 +866,9 @@ impl BitwardenVault {
         Ok(())
     }
 
-    fn start_locked(&self) -> Result<()> {
+    /// (Re)start serve; returns its endpoint and `Ready` when serve reports `unlocked`,
+    /// else `Locked`. Never unlocks. Caller holds `lifecycle`.
+    fn restart_serve(&self) -> Result<(Endpoint, VaultStatus)> {
         if let Some(mut s) = self.state().serve.take() {
             s.stop();
         }
@@ -882,22 +914,53 @@ impl BitwardenVault {
             s = inst.spawn_serve(&endpoint)?;
             st = s.wait_ready()?;
         }
-        if st == "locked" {
-            call(
-                &s.endpoint,
-                "POST",
-                "/unlock",
-                Some(&json!({ "password": self.secrets.master_password })),
-            )
-            .map_err(|e| CoreError::vault_unavailable(format!("unlock failed: {}", e.message)))?;
-        } else if st != "unlocked" {
-            return Err(CoreError::vault_unavailable(format!(
-                "bw serve reports status {st:?}"
-            )));
-        }
+        let status = match st.as_str() {
+            "unlocked" => VaultStatus::Ready,
+            "locked" => VaultStatus::Locked,
+            _ => {
+                return Err(CoreError::vault_unavailable(format!(
+                    "bw serve reports status {st:?}"
+                )));
+            }
+        };
+        let endpoint = s.endpoint.clone();
         let mut state = self.state();
         state.serve = Some(s);
         state.note = note;
+        Ok((endpoint, status))
+    }
+
+    /// Unlock serve with the master password (`POST /unlock`); the password is not kept.
+    /// Starts serve first when it is not running. A wrong password → `invalid` with bw's
+    /// message; the vault stays `Locked`.
+    pub fn unlock(&self, master_password: &str) -> Result<()> {
+        let _l = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        let running = {
+            let mut st = self.state();
+            if let Some(msg) = st.serve.as_mut().and_then(Serve::exited) {
+                st.serve = None;
+                st.status = VaultStatus::Error(msg);
+            }
+            st.serve
+                .as_ref()
+                .map(|s| (s.endpoint.clone(), st.status == VaultStatus::Ready))
+        };
+        let ep = match running {
+            Some((_, true)) => return Ok(()),
+            Some((ep, false)) => ep,
+            None => self.restart_serve_held()?,
+        };
+        call(
+            &ep,
+            "POST",
+            "/unlock",
+            Some(&json!({ "password": master_password })),
+        )
+        .map_err(|e| match e.message.strip_prefix("bw: ") {
+            Some(m) => CoreError::invalid(format!("unlock failed: {m}")),
+            None => CoreError::new(e.code, format!("unlock failed: {}", e.message)),
+        })?;
+        self.set_status(VaultStatus::Ready);
         Ok(())
     }
 
@@ -953,12 +1016,17 @@ impl BitwardenVault {
 
     fn stop(&self) {
         let _l = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
-        let serve = {
+        let (serve, was_ready) = {
             let mut st = self.state();
+            let was_ready = st.status == VaultStatus::Ready;
             st.status = VaultStatus::Error("stopped".into());
-            st.serve.take()
+            (st.serve.take(), was_ready)
         };
         if let Some(mut s) = serve {
+            if was_ready && s.exited().is_none() {
+                // Drop the unlocked session before the process goes away.
+                let _ = call_timeout(&s.endpoint, "POST", "/lock", None, LOCK_TIMEOUT);
+            }
             s.stop();
         }
     }
@@ -1057,21 +1125,39 @@ impl VaultProvider for BitwardenVault {
         self.state().note.clone()
     }
 
+    /// Never unlocks: a `Locked` vault stays `Locked`. A dead serve is restarted (and is
+    /// then `Locked`).
     fn sync(&self) -> Result<()> {
         let ep = match self.endpoint() {
             Ok(ep) => ep,
-            Err(_) => return self.ensure_running(),
+            Err(_) => {
+                let st = self.state();
+                if st.status == VaultStatus::Locked && st.serve.is_some() {
+                    return Ok(());
+                }
+                drop(st);
+                return self.ensure_running();
+            }
         };
         call(&ep, "POST", "/sync", None)?;
         let st = call(&ep, "GET", "/status", None)?;
         match str_at(&st, &["template", "status"]) {
             Some("unlocked") => Ok(()),
+            Some("locked") => {
+                let _l = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+                self.set_status(VaultStatus::Locked);
+                Ok(())
+            }
             _ => self.ensure_running(),
         }
     }
 
     fn shutdown(&self) {
         self.stop();
+    }
+
+    fn unlock(&self, master_password: &str) -> Result<()> {
+        BitwardenVault::unlock(self, master_password)
     }
 
     /// Exposed collections with their names (for the `add` popup).
@@ -1089,24 +1175,136 @@ impl Drop for BitwardenVault {
     }
 }
 
-/// UI "Connect": start with these settings, return collections, stop serve again.
-/// Uses a separate data directory so it never disturbs a running instance of the vault.
+/// UI "Connect": start with these settings, unlock with `master_password`, return
+/// collections, stop serve again. Uses a separate data directory so it never disturbs a
+/// running instance of the vault. The password is not kept.
 pub fn connect(
     dirs: &DataDirs,
     vault_id: &str,
     cfg: &BitwardenConfig,
     secrets: &BitwardenSecrets,
+    master_password: &str,
 ) -> Result<Vec<CollectionInfo>> {
     let dir = dirs.bw.join(format!("{vault_id}.connect"));
     let res = (|| {
         let v = BitwardenVault::new(dir.clone(), cfg.clone(), secrets.clone());
         v.ensure_running()?;
+        v.unlock(master_password)?;
         let c = BitwardenVault::collections(&v);
         v.stop();
         c
     })();
     let _ = std::fs::remove_dir_all(&dir);
     res
+}
+
+/// A fake `bw` (Perl script, no network, no real Bitwarden) for tests: `status` reports a
+/// logged-in, locked account; `serve` answers `/status`, `/unlock` (password
+/// [`fake_bw::PASSWORD`]), `/lock`, `/sync` and the two list endpoints over a Unix socket.
+/// Events (`serve`, `unlock`, `unlock-failed`, `lock`, `sync`, other commands) are appended
+/// to `<app data dir>/events.log`.
+#[cfg(test)]
+pub(crate) mod fake_bw {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    use super::BitwardenConfig;
+
+    pub const PASSWORD: &str = "correct horse";
+
+    const SCRIPT: &str = r#"#!/usr/bin/perl
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+use Socket qw(SOCK_STREAM);
+
+my $dir = $ENV{BITWARDENCLI_APPDATA_DIR} // die "no app data dir";
+my $cmd = shift(@ARGV) // '';
+sub event { open(my $f, '>>', "$dir/events.log") or return; print $f "$_[0]\n"; close $f; }
+if ($cmd eq 'status') {
+    print '{"serverUrl":"https://vault.example.invalid","userEmail":"me@example.invalid","status":"locked"}', "\n";
+    exit 0;
+}
+if ($cmd ne 'serve') { event($cmd); exit 0; }
+my %opt = @ARGV;
+my $path = $opt{'--hostname'} // '';
+$path =~ s{^unix://}{} or exit 2;
+unlink $path;
+my $srv = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $path, Listen => 8) or die "listen: $!";
+event('serve');
+my $unlocked = 0;
+my $ok = '{"success":true,"data":{}}';
+while (my $c = $srv->accept) {
+    my $line = <$c>;
+    next unless defined $line;
+    my (undef, $p) = split / /, $line;
+    my $len = 0;
+    while (my $h = <$c>) {
+        last if $h =~ /^\r?\n$/;
+        $len = $1 if $h =~ /^content-length:\s*(\d+)/i;
+    }
+    my $body = '';
+    read($c, $body, $len) if $len;
+    my $r;
+    if ($p eq '/status') {
+        my $s = $unlocked ? 'unlocked' : 'locked';
+        $r = qq({"success":true,"data":{"object":"template","template":{"status":"$s"}}});
+    } elsif ($p eq '/unlock') {
+        if ($body =~ /"password":"correct horse"/) { $unlocked = 1; event('unlock'); $r = $ok; }
+        else { event('unlock-failed'); $r = '{"success":false,"message":"Invalid master password."}'; }
+    } elsif ($p eq '/lock') {
+        $unlocked = 0; event('lock'); $r = $ok;
+    } elsif (!$unlocked) {
+        $r = '{"success":false,"message":"Vault is locked."}';
+    } elsif ($p eq '/sync') {
+        event('sync'); $r = $ok;
+    } elsif ($p eq '/list/object/items') {
+        $r = '{"success":true,"data":{"object":"list","data":[]}}';
+    } elsif ($p eq '/list/object/collections') {
+        $r = '{"success":true,"data":{"object":"list","data":[{"object":"collection","id":"c-1","name":"Team","organizationId":"o-1"}]}}';
+    } else {
+        $r = '{"success":false,"message":"Not found."}';
+    }
+    print $c "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " . length($r) . "\r\nConnection: close\r\n\r\n" . $r;
+    close $c;
+}
+"#;
+
+    /// Temp dir under /tmp (Unix socket paths are limited to 103 bytes).
+    pub fn tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("asmbw")
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+
+    /// Write the script into `dir`; returns its path.
+    pub fn install(dir: &Path) -> String {
+        let p = dir.join("fake-bw");
+        std::fs::write(&p, SCRIPT).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    /// A config matching the fake account, using `bw_path`.
+    pub fn config(bw_path: &str) -> BitwardenConfig {
+        BitwardenConfig {
+            server_url: "https://vault.example.invalid".into(),
+            email: "me@example.invalid".into(),
+            client_id: "user.x".into(),
+            collections: vec!["c-1".into()],
+            personal: false,
+            bw_path: Some(bw_path.into()),
+        }
+    }
+
+    pub fn events(app_dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(app_dir.join("events.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1327,5 +1525,78 @@ mod tests {
         std::fs::write(inst.pid_file(), pid.to_string()).unwrap();
         inst.kill_stale_serve();
         assert!(!inst.pid_file().exists());
+    }
+
+    /// Lifecycle against the fake `bw`: starts Locked, sync never unlocks, a wrong password
+    /// is an `invalid` error, unlock makes it Ready, a crashed serve comes back Locked, stop
+    /// locks serve first; `connect` unlocks a throwaway instance.
+    #[test]
+    fn starts_locked_and_unlocks_only_on_request() {
+        let tmp = fake_bw::tempdir();
+        let dirs = DataDirs::create(&tmp.path().join("d"), Some(&tmp.path().join("t"))).unwrap();
+        let cfg = fake_bw::config(&fake_bw::install(tmp.path()));
+        let secrets = BitwardenSecrets {
+            client_secret: "cs".into(),
+        };
+        let app_dir = dirs.bw_vault("v1");
+        let v = BitwardenVault::start_or_error(&dirs, "v1", cfg.clone(), secrets.clone());
+        assert_eq!(v.status(), VaultStatus::Locked);
+        assert_eq!(
+            v.list().unwrap_err().code,
+            asm_proto::ErrorCode::VaultUnavailable
+        );
+        v.sync().unwrap();
+        assert_eq!(v.status(), VaultStatus::Locked, "sync never unlocks");
+
+        let e = VaultProvider::unlock(&v, "wrong").unwrap_err();
+        assert_eq!(e.code, asm_proto::ErrorCode::Invalid);
+        assert_eq!(e.message, "unlock failed: Invalid master password.");
+        assert_eq!(v.status(), VaultStatus::Locked);
+
+        VaultProvider::unlock(&v, fake_bw::PASSWORD).unwrap();
+        assert_eq!(v.status(), VaultStatus::Ready);
+        assert!(v.list().unwrap().is_empty());
+        v.sync().unwrap();
+        assert_eq!(v.status(), VaultStatus::Ready);
+        assert_eq!(
+            fake_bw::events(&app_dir),
+            ["serve", "unlock-failed", "unlock", "sync"]
+        );
+
+        // serve crashes: the vault is unavailable, and sync restarts it Locked.
+        let pid: i32 = std::fs::read_to_string(app_dir.join("serve.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(v.status(), VaultStatus::Error(_)) {
+            assert!(Instant::now() < deadline, "crash not noticed");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        v.sync().unwrap();
+        assert_eq!(v.status(), VaultStatus::Locked, "restart leaves it locked");
+
+        VaultProvider::unlock(&v, fake_bw::PASSWORD).unwrap();
+        v.shutdown();
+        assert_eq!(
+            fake_bw::events(&app_dir).last().map(String::as_str),
+            Some("lock"),
+            "stop locks serve before killing it"
+        );
+        assert!(matches!(v.status(), VaultStatus::Error(_)));
+
+        let cols = connect(&dirs, "v2", &cfg, &secrets, fake_bw::PASSWORD).unwrap();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].id, "c-1");
+        assert_eq!(
+            connect(&dirs, "v3", &cfg, &secrets, "nope")
+                .unwrap_err()
+                .code,
+            asm_proto::ErrorCode::Invalid
+        );
     }
 }

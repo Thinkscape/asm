@@ -41,6 +41,9 @@ impl VaultProvider for UnavailableVault {
     fn add(&self, _name: &str, _value: &str, _target: &AddTarget) -> Result<()> {
         Err(CoreError::vault_unavailable(self.0.clone()))
     }
+    fn unlock(&self, _master_password: &str) -> Result<()> {
+        Err(CoreError::vault_unavailable(self.0.clone()))
+    }
 }
 
 #[derive(Default)]
@@ -53,32 +56,39 @@ impl Registry {
         Self::default()
     }
 
-    /// Build a provider from config; Bitwarden reads its secrets from `creds`. A Bitwarden
-    /// vault that fails to start is still returned, with status `Error(<message>)`; its
-    /// `sync()` retries. May block while `bw` logs in and unlocks.
+    /// Build a provider from config; Bitwarden reads its client secret from `creds`. A
+    /// Bitwarden vault starts `Locked` (the master password is never stored) and needs
+    /// `unlock`; one that fails to start is still returned, with status `Error(<message>)`,
+    /// and its `sync()` retries. May block while `bw` logs in.
     pub fn build_provider(
         dirs: &DataDirs,
         id: &str,
         config: &VaultConfig,
     ) -> Result<Arc<dyn VaultProvider>> {
+        Self::build_provider_with(dirs, id, config, creds::get)
+    }
+
+    /// `build_provider` with the credential lookup `(vault_id, kind)` injected.
+    fn build_provider_with(
+        dirs: &DataDirs,
+        id: &str,
+        config: &VaultConfig,
+        stored: impl FnOnce(&str, &str) -> Result<Option<String>>,
+    ) -> Result<Arc<dyn VaultProvider>> {
         Ok(match config {
             VaultConfig::EnvFile { path } => Arc::new(EnvFileVault::new(PathBuf::from(path))),
             VaultConfig::Keychain => Arc::new(KeychainVault::new()),
-            VaultConfig::Bitwarden(cfg) => {
-                let client_secret = creds::get(id, "client_secret")?;
-                let master_password = creds::get(id, "master_password")?;
-                match (client_secret, master_password) {
-                    (Some(client_secret), Some(master_password)) => Arc::new(BitwardenVault::start_or_error(
-                        dirs,
-                        id,
-                        cfg.clone(),
-                        BitwardenSecrets { client_secret, master_password },
-                    )),
-                    _ => Arc::new(UnavailableVault(
-                        "client secret or master password missing from the keychain; edit the vault".into(),
-                    )),
-                }
-            }
+            VaultConfig::Bitwarden(cfg) => match stored(id, creds::CLIENT_SECRET)? {
+                Some(client_secret) => Arc::new(BitwardenVault::start_or_error(
+                    dirs,
+                    id,
+                    cfg.clone(),
+                    BitwardenSecrets { client_secret },
+                )),
+                None => Arc::new(UnavailableVault(
+                    "client secret missing from the keychain; edit the vault".into(),
+                )),
+            },
         })
     }
 
@@ -219,5 +229,40 @@ mod tests {
             .collect();
         assert_eq!(d, ["SOME_APP_TOKEN", "ONLY"]);
         r.shutdown_all();
+    }
+
+    /// No master password is ever looked up or stored: a Bitwarden vault built at start is
+    /// Locked (serve up) or Error (serve cannot start), never Ready.
+    #[test]
+    fn bitwarden_without_master_password_is_never_ready() {
+        use super::super::bitwarden::fake_bw;
+        let tmp = fake_bw::tempdir();
+        let dirs = DataDirs::create(&tmp.path().join("d"), Some(&tmp.path().join("t"))).unwrap();
+        let stored = |_: &str, kind: &str| -> Result<Option<String>> {
+            assert_eq!(
+                kind,
+                creds::CLIENT_SECRET,
+                "only the client secret is stored"
+            );
+            Ok(Some("cs".into()))
+        };
+
+        let cfg = VaultConfig::Bitwarden(fake_bw::config(&fake_bw::install(tmp.path())));
+        let p = Registry::build_provider_with(&dirs, "bw1", &cfg, stored).unwrap();
+        assert_eq!(p.status(), VaultStatus::Locked);
+        p.sync().unwrap();
+        assert_eq!(p.status(), VaultStatus::Locked);
+        p.shutdown();
+
+        let cfg = VaultConfig::Bitwarden(fake_bw::config("/nonexistent/bw"));
+        let p = Registry::build_provider_with(&dirs, "bw2", &cfg, stored).unwrap();
+        assert!(matches!(p.status(), VaultStatus::Error(_)));
+
+        let p = Registry::build_provider_with(&dirs, "bw3", &cfg, |_, _| Ok(None)).unwrap();
+        assert!(matches!(p.status(), VaultStatus::Error(_)));
+        assert_eq!(
+            p.unlock("x").unwrap_err().code,
+            asm_proto::ErrorCode::VaultUnavailable
+        );
     }
 }
