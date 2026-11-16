@@ -19,6 +19,16 @@ fn hostname() -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// The Bonjour local host name (System Settings → Sharing), without `.local`.
+fn bonjour_name() -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "LocalHostName"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !s.is_empty()).then_some(s)
+}
+
 /// Non-loopback, non-link-local interface addresses (IPv4 first).
 pub fn local_addresses() -> Vec<IpAddr> {
     let mut out = Vec::new();
@@ -60,17 +70,16 @@ pub fn local_addresses() -> Vec<IpAddr> {
     out
 }
 
-/// Hostname, `<hostname>.local` and interface addresses, de-duplicated.
+/// Hostname, the Bonjour name (`<LocalHostName>.local`) and interface addresses,
+/// de-duplicated. The hostname may already be a DNS name (`mac.home.arpa`), so `.local`
+/// is never appended to it.
 pub fn local_names() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(h) = hostname() {
-        let short = h.trim_end_matches(".local").to_string();
-        out.push(format!("{short}.local"));
-        if !short.is_empty() && short != h {
-            out.push(short);
-        } else if h != format!("{short}.local") {
-            out.push(h);
-        }
+        out.push(h);
+    }
+    if let Some(bonjour) = bonjour_name() {
+        out.push(format!("{}.local", bonjour.to_ascii_lowercase()));
     }
     out.extend(local_addresses().into_iter().map(|ip| ip.to_string()));
     let mut seen = std::collections::HashSet::new();

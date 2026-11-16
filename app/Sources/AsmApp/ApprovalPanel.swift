@@ -73,6 +73,15 @@ final class ApprovalPanelController {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
         guard let visible = screen?.visibleFrame else { return }
+        // The hosting controller sizes the panel lazily; settle the content size first so
+        // the top-right placement uses the real width (otherwise it lands off screen).
+        if let view = panel.contentViewController?.view {
+            view.layoutSubtreeIfNeeded()
+            let fitting = view.fittingSize
+            if fitting.width > 0, fitting.height > 0 {
+                panel.setContentSize(fitting)
+            }
+        }
         let size = panel.frame.size
         let margin: CGFloat = 16
         panel.setFrameOrigin(NSPoint(x: visible.maxX - size.width - margin, y: visible.maxY - size.height - margin))
