@@ -4,6 +4,7 @@
 //! Locking: `ops` serialises every operation that touches the child or the files
 //! (public mutators and the monitor's restart). `state` is only held briefly.
 
+pub mod audit;
 mod ca;
 mod config;
 mod files;
@@ -28,8 +29,12 @@ use asm_proto::time::now_rfc3339;
 use crate::error::{CoreError, Result};
 use crate::paths::DataDirs;
 
+pub use audit::ProxyEvent;
 pub use config::DEFAULT_DENY_CIDRS;
 pub use redact::REDACTED;
+
+/// Receives activity events from the proxy's threads; must not block.
+pub type EventSink = Arc<dyn Fn(ProxyEvent) + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyConfig {
@@ -130,6 +135,8 @@ struct State {
     backoff: Duration,
     restart_at: Option<Instant>,
     shutdown: bool,
+    /// Successful spawns so far (the first is "started", later ones "restarted").
+    spawns: u32,
 }
 
 pub struct ProxySupervisor {
@@ -138,6 +145,7 @@ pub struct ProxySupervisor {
     ca: ca::CaPaths,
     ca_expiry: Option<String>,
     on_change: Arc<dyn Fn() + Send + Sync>,
+    on_event: EventSink,
     logs: Arc<logs::LogSink>,
     ops: Mutex<()>,
     state: Mutex<State>,
@@ -157,6 +165,7 @@ impl ProxySupervisor {
         cfg: ProxyConfig,
         entries: Vec<ProxyEntry>,
         on_change: Arc<dyn Fn() + Send + Sync>,
+        on_event: EventSink,
     ) -> Result<Arc<Self>> {
         validate_entries(&entries)?;
         let binary = bin_dir.join("iron-proxy");
@@ -174,6 +183,7 @@ impl ProxySupervisor {
             ca,
             ca_expiry,
             on_change,
+            on_event,
             ops: Mutex::new(()),
             state: Mutex::new(State {
                 cfg,
@@ -186,6 +196,7 @@ impl ProxySupervisor {
                 backoff: BACKOFF_MIN,
                 restart_at: None,
                 shutdown: false,
+                spawns: 0,
             }),
             dirs,
         });
@@ -271,6 +282,10 @@ impl ProxySupervisor {
             Err(e) => {
                 self.logs
                     .push(&format!("asm: proxy reload failed ({e}); restarting"));
+                self.event(
+                    "reload_failed",
+                    format!("proxy reload failed ({e}); restarting"),
+                );
                 self.kill_locked();
                 self.spawn_locked()
                     .inspect_err(|e| self.schedule_retry(e.message.clone()))
@@ -312,6 +327,12 @@ impl ProxySupervisor {
         self.logs.push(&format!(
             "asm: proxy failed with the new settings ({why}); restoring the previous settings"
         ));
+        self.event(
+            "crashed",
+            format!(
+                "proxy failed with the new listen settings ({why}); previous settings restored"
+            ),
+        );
         self.kill_locked();
         self.write_config(&old, &entries)?;
         {
@@ -426,6 +447,10 @@ impl ProxySupervisor {
         (self.on_change)();
     }
 
+    fn event(&self, kind: &'static str, summary: String) {
+        (self.on_event)(ProxyEvent::Lifecycle { kind, summary });
+    }
+
     fn write_files(&self, entries: &[ProxyEntry]) -> Result<()> {
         for e in entries {
             files::write_private_atomic(
@@ -507,19 +532,30 @@ impl ProxySupervisor {
         if let Some(home) = std::env::var_os("HOME") {
             cmd.env("HOME", home);
         }
-        let mut child = cmd.spawn().map_err(|e| {
-            CoreError::internal(format!("cannot start {}: {e}", self.binary.display()))
-        })?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("cannot start {}: {e}", self.binary.display());
+                if lock(&self.state).error.as_deref() != Some(msg.as_str()) {
+                    self.event("start_failed", format!("proxy failed to start: {msg}"));
+                }
+                return Err(CoreError::internal(msg));
+            }
+        };
         let pid = child.id();
         if let Some(stderr) = child.stderr.take() {
             let sink = Arc::clone(&self.logs);
+            let on_event = Arc::clone(&self.on_event);
             let _ = std::thread::Builder::new()
                 .name("asm-proxy-log".into())
                 .spawn(move || {
                     let mut r = BufReader::new(stderr);
                     let mut buf = Vec::with_capacity(1024);
                     while matches!(r.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
-                        sink.push(&String::from_utf8_lossy(&buf));
+                        let audit = sink.push_inspect(&String::from_utf8_lossy(&buf), audit::parse);
+                        if let Some(a) = audit {
+                            on_event(ProxyEvent::Request(a));
+                        }
                         buf.clear();
                     }
                 });
@@ -540,6 +576,14 @@ impl ProxySupervisor {
         st.error = None;
         st.restart_at = None;
         st.last_reload = Some(now_rfc3339());
+        st.spawns += 1;
+        let kind = if st.spawns == 1 {
+            "started"
+        } else {
+            "restarted"
+        };
+        drop(st);
+        self.event(kind, format!("proxy {kind} (pid {pid})"));
         Ok(())
     }
 
@@ -609,7 +653,9 @@ impl ProxySupervisor {
             };
             if let Some(status) = exited {
                 let _ = std::fs::remove_file(self.dirs.proxy.join(PID_FILE));
-                self.schedule_retry(self.exit_message(status));
+                let msg = self.exit_message(status);
+                self.event("crashed", format!("proxy exited unexpectedly: {msg}"));
+                self.schedule_retry(msg);
                 changed = true;
             }
             let due = {

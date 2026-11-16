@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 
 /// Puts the app in the Dock and the Cmd+Tab switcher while a regular window
-/// (Settings) is open, and back to a menu-bar-only app when the last one closes.
-/// The approval panel and the menu bar panel are never tracked.
+/// (Settings, Activity Log) is open, and back to a menu-bar-only app when the last one
+/// closes. The approval panel and the menu bar panel are never tracked.
 @MainActor
 final class ActivationPolicyController {
     static let shared = ActivationPolicyController()
@@ -14,6 +14,14 @@ final class ActivationPolicyController {
     private init() {
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { note in
+            let window = note.object as? NSWindow
+            MainActor.assumeIsolated {
+                ActivationPolicyController.shared.windowChanged(window, closing: false)
+            }
+        })
+        // A window opened while the app is in the background never becomes key, and when
+        // it is registered it is not visible yet: react when it appears on screen.
+        observers.append(center.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: nil, queue: .main) { note in
             let window = note.object as? NSWindow
             MainActor.assumeIsolated {
                 ActivationPolicyController.shared.windowChanged(window, closing: false)
@@ -100,5 +108,26 @@ struct AsmApp: App {
             SettingsView(model: appDelegate.model)
         }
         .defaultSize(width: 920, height: 600)
+        .commands { ActivityLogCommands() }
+
+        Window("Activity Log", id: "activity") {
+            ActivityView(model: appDelegate.model)
+        }
+        .defaultSize(width: 1000, height: 640)
+    }
+}
+
+/// Window ▸ Show Activity Log (⌘L); the main menu is only shown while the app is regular.
+struct ActivityLogCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(after: .windowArrangement) {
+            Button("Show Activity Log") {
+                openWindow(id: "activity")
+                NSApp.activate()
+            }
+            .keyboardShortcut("l")
+        }
     }
 }

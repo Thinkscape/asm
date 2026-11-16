@@ -39,6 +39,12 @@ fn counter() -> (Arc<AtomicUsize>, Arc<dyn Fn() + Send + Sync>) {
     )
 }
 
+fn events() -> (Arc<Mutex<Vec<ProxyEvent>>>, EventSink) {
+    let v = Arc::new(Mutex::new(Vec::new()));
+    let c = Arc::clone(&v);
+    (v, Arc::new(move |e| c.lock().unwrap().push(e)))
+}
+
 /// HTTP server that records each request's `X-Key` header and echoes it in the body.
 fn echo_server() -> (u16, Arc<Mutex<Vec<String>>>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -134,12 +140,14 @@ fn start_without_binary_but_existing_ca_reports_error() {
     };
     assert!(!format!("{entry:?}").contains(REAL));
     let (calls, cb) = counter();
+    let (_, ev) = events();
     let sup = ProxySupervisor::start(
         tmp.path().join("nobin"),
         dirs.clone(),
         ProxyConfig::default(),
         vec![entry],
         cb,
+        ev,
     )
     .unwrap();
     let st = sup.status();
@@ -160,12 +168,14 @@ fn start_fails_when_ca_cannot_be_created() {
     let tmp = tempfile::tempdir().unwrap();
     let dirs = DataDirs::create(&tmp.path().join("data"), Some(tmp.path())).unwrap();
     let (_, cb) = counter();
+    let (_, ev) = events();
     let err = ProxySupervisor::start(
         tmp.path().join("nobin"),
         dirs,
         ProxyConfig::default(),
         vec![],
         cb,
+        ev,
     )
     .err()
     .expect("must fail");
@@ -239,7 +249,8 @@ fn end_to_end_with_patched_iron_proxy() {
     };
     let (echo_port, seen) = echo_server();
     let (_, cb) = counter();
-    let sup = ProxySupervisor::start(bin, dirs.clone(), cfg.clone(), vec![entry], cb).unwrap();
+    let (events, ev) = events();
+    let sup = ProxySupervisor::start(bin, dirs.clone(), cfg.clone(), vec![entry], cb, ev).unwrap();
     wait_for("healthy proxy", Duration::from_secs(15), || {
         sup.status().healthy
     });
@@ -310,6 +321,31 @@ fn end_to_end_with_patched_iron_proxy() {
     assert!(logs.iter().all(|l| !l.contains(REAL)));
     let log_file = std::fs::read_to_string(dirs.logs.join("proxy.log")).unwrap();
     assert!(!log_file.contains(REAL));
+
+    // Activity events: lifecycle, the substitution (mapped to its value file) and the
+    // rejected sentinel; never the real value.
+    let events = events.lock().unwrap().clone();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ProxyEvent::Lifecycle {
+            kind: "started",
+            ..
+        }
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ProxyEvent::Lifecycle {
+            kind: "crashed",
+            ..
+        }
+    )));
+    assert!(events.iter().any(|e| matches!(e, ProxyEvent::Request(a)
+        if a.swaps.iter().any(|s| audit::lease_of_value_path(&s.value_path)
+            == Some(("lease-1".to_string(), 0))))));
+    assert!(events.iter().any(|e| matches!(e, ProxyEvent::Request(a)
+        if a.status == Some(403) && a.rejected.as_ref().is_some_and(|r|
+            r.reason.as_deref() == Some("sentinel_not_valid")))));
+    assert!(!format!("{events:?}").contains(REAL));
 
     let pid = sup.status().pid.unwrap();
     sup.shutdown();

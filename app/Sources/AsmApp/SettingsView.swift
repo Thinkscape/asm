@@ -44,6 +44,9 @@ struct SettingsView: View {
         .onChange(of: model.unlockingVaultID, initial: true) { _, id in
             if id != nil { selection = .vaults }
         }
+        .onChange(of: model.leaseFocus, initial: true) { _, focus in
+            if focus != nil { selection = .leases }
+        }
         .sheet(item: Binding(
             get: { model.unlockingVault },
             set: { if $0 == nil { model.unlockingVaultID = nil } }

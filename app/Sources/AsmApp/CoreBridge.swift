@@ -158,6 +158,15 @@ final class CoreBridge: @unchecked Sendable {
         manager.proxyLogTail(lines: lines)
     }
 
+    // MARK: Activity log
+
+    func listActivity(_ query: ActivityQueryItem) throws -> [ActivityItem] {
+        manager.listActivity(query: ActivityQuery(
+            categories: query.categories, hostId: query.hostID, search: query.search,
+            beforeId: query.beforeID, limit: query.limit
+        )).map(ActivityItem.init)
+    }
+
     func generalSettings() throws -> GeneralSettingsItem {
         GeneralSettingsItem(manager.generalSettings())
     }
@@ -368,6 +377,20 @@ private extension LeaseItem {
             id: l.leaseId, hostLabel: l.hostLabel, hostname: l.hostname, source: l.vaultName, name: l.name,
             mode: l.mode == .raw ? .raw : .sentinel, hosts: l.hosts, createdAt: l.createdAt,
             expiresAt: l.expiresAt, status: status, suspended: l.suspended, rawDelivered: l.rawDelivered
+        )
+    }
+}
+
+private extension ActivityItem {
+    init(_ e: ActivityEntry) {
+        var leaseID: String?
+        if let data = e.detail?.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            leaseID = object["lease_id"] as? String
+        }
+        self.init(
+            id: e.id, at: e.at, category: e.category, kind: e.kind, hostID: e.hostId,
+            hostLabel: e.hostLabel, secret: e.secret, summary: e.summary, detail: e.detail, leaseID: leaseID
         )
     }
 }

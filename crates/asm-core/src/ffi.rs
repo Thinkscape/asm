@@ -507,6 +507,44 @@ pub struct DurationOption {
     pub secs: Option<u64>,
 }
 
+/// Filter for [`Manager::list_activity`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ActivityQuery {
+    /// `"requests"`, `"leases"`, `"proxy"`, `"pairing"`, `"vaults"`; empty = all.
+    pub categories: Vec<String>,
+    /// Only rows of this host.
+    pub host_id: Option<String>,
+    /// Case-insensitive (ASCII) substring of the summary, secret or host label; "" = all.
+    pub search: String,
+    /// Rows older than this id (paging); `None` = newest.
+    pub before_id: Option<i64>,
+    /// Page size; 0 = 200, at most 1000.
+    pub limit: u32,
+}
+
+/// One activity log row. Never holds secret values.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ActivityEntry {
+    pub id: i64,
+    pub at: SystemTime,
+    pub category: String,
+    /// Per category, e.g. requests: `requested`, `approved`, `reused`, `denied`, `failed`,
+    /// `expired`, `cancelled`; leases: `created`, `revoked`, `expired`, `suspended`,
+    /// `resumed`; proxy: `substitution`, `rejected`, `started`, `restarted`, `crashed`,
+    /// `start_failed`, `reload_failed`; pairing: `requested`, `approved`, `denied`,
+    /// `expired`, `paired_with_code`, `renamed`, `revoked`; vaults: `added`, `edited`,
+    /// `removed`, `unlocked`, `unlock_failed`, `unavailable`, `available`.
+    pub kind: String,
+    pub host_id: Option<String>,
+    /// The host's current friendly name; "" without a host.
+    pub host_label: String,
+    /// Secret display name (lease name, requested secret).
+    pub secret: Option<String>,
+    pub summary: String,
+    /// JSON object text; `lease_id` is set when a lease is known.
+    pub detail: Option<String>,
+}
+
 /// Lease duration choices for the popup, in display order.
 #[uniffi::export]
 pub fn lease_durations() -> Vec<DurationOption> {
@@ -671,6 +709,11 @@ impl Manager {
 
     pub fn proxy_log_tail(&self, lines: u32) -> Vec<String> {
         self.core.proxy.log_tail(lines as usize)
+    }
+
+    /// Activity log, newest first (see [`ActivityQuery`]).
+    pub fn list_activity(&self, query: ActivityQuery) -> Vec<ActivityEntry> {
+        self.core.list_activity(query)
     }
 
     pub fn general_settings(&self) -> GeneralSettings {

@@ -56,14 +56,21 @@ impl LogSink {
 
     /// Redact, then store one line (trailing newline characters are stripped).
     pub fn push(&self, line: &str) {
+        self.push_inspect(line, |_| ());
+    }
+
+    /// As [`push`](Self::push), handing the redacted line to `inspect` first.
+    pub fn push_inspect<R>(&self, line: &str, inspect: impl FnOnce(&str) -> R) -> R {
         let line = line.trim_end_matches(['\n', '\r']);
         let mut g = self.lock();
         let line = g.redactor.redact(line);
+        let out = inspect(&line);
         g.write_file(&line);
         if g.ring.len() == g.capacity {
             g.ring.pop_front();
         }
         g.ring.push_back(line);
+        out
     }
 
     /// The last `n` lines, oldest first.

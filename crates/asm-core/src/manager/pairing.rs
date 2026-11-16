@@ -7,7 +7,9 @@ use asm_proto::pairing::{
 };
 use asm_proto::rules::validate_agent_text;
 use asm_proto::wire::{HostInfo, PairRequest, PairResponse, RevealRequest};
+use serde_json::json;
 
+use super::activity::{self, Category, Event};
 use super::requests::{Book, Detail, Fail, Pending, REVEAL_SECS};
 use super::{Core, TOPIC_HOSTS, TOPIC_REQUESTS, lock, now};
 use crate::error::{CoreError, Result};
@@ -204,7 +206,8 @@ pub(crate) fn poll_attempt(
 }
 
 /// Unattended pairing: check the code against the certificate and the store (atomically
-/// counting one use) and create the host. Every rejection is `unauthorized`.
+/// counting one use) and create the host. Every rejection is `unauthorized`. Returns the
+/// host id, its token and the code's label.
 pub(crate) fn pair_with_code(
     store: &Store,
     cert_sha256: &[u8; 32],
@@ -212,7 +215,7 @@ pub(crate) fn pair_with_code(
     info: HostInfo,
     ip: &str,
     t: i64,
-) -> Result<(String, String)> {
+) -> Result<(String, String, String)> {
     let rejected = || CoreError::unauthorized("pairing code rejected");
     let code = UnattendedCode::parse(code).map_err(|_| rejected())?;
     if !code.matches_cert(cert_sha256) {
@@ -228,10 +231,9 @@ pub(crate) fn pair_with_code(
         last_seen: Some(t),
         revoked_at: None,
     };
-    if store.consume_pairing_code(&code.secret_sha256(), t, &host, &sha256(token.as_bytes()))? {
-        Ok((host.id, token))
-    } else {
-        Err(rejected())
+    match store.consume_pairing_code(&code.secret_sha256(), t, &host, &sha256(token.as_bytes()))? {
+        Some(label) => Ok((host.id, token, label)),
+        None => Err(rejected()),
     }
 }
 
@@ -241,8 +243,19 @@ impl Core {
         req.host_info.validate()?;
         let t = now();
         if let Some(code) = req.pairing_code.as_deref().filter(|c| !c.trim().is_empty()) {
-            let (host_id, token) =
+            let hostname = req.host_info.hostname.clone();
+            let info = serde_json::to_value(&req.host_info).unwrap_or_default();
+            let (host_id, token, label) =
                 pair_with_code(&self.store, &self.cert.sha256, code, req.host_info, ip, t)?;
+            self.log(
+                Event::new(
+                    Category::Pairing,
+                    "paired_with_code",
+                    format!("{hostname} paired with pairing code \"{label}\""),
+                )
+                .host(Some(&host_id))
+                .detail(json!({ "code_label": label, "address": ip, "host_info": info })),
+            );
             self.notify(TOPIC_HOSTS);
             return Ok(PairResponse::Approved { host_id, token });
         }
@@ -263,14 +276,21 @@ impl Core {
         let t = now();
         self.expire_requests(t);
         let lifetime = self.settings().request_lifetime_secs.max(1) as i64;
-        let r = reveal_attempt(
-            &mut lock(&self.book),
-            &self.cert.sha256,
-            pair_id,
-            &req,
-            t,
-            lifetime,
-        )?;
+        let (r, popup) = {
+            let mut b = lock(&self.book);
+            let awaiting = b
+                .pairs
+                .get(pair_id)
+                .is_some_and(|a| matches!(a.state, PairState::AwaitingReveal));
+            let r = reveal_attempt(&mut b, &self.cert.sha256, pair_id, &req, t, lifetime)?;
+            let popup = awaiting
+                .then(|| b.pending.iter().find(|p| p.id == pair_id).cloned())
+                .flatten();
+            (r, popup)
+        };
+        if let Some(p) = popup {
+            self.log(activity::requested(&p));
+        }
         self.bump();
         self.notify(TOPIC_REQUESTS);
         Ok(r)
@@ -497,7 +517,7 @@ mod tests {
             .insert_pairing_code(&rec("c1", Some(1000), Some(1)), &code.secret_sha256())
             .unwrap();
         let s = code.to_string();
-        let unauthorized = |r: Result<(String, String)>| {
+        let unauthorized = |r: Result<(String, String, String)>| {
             assert_eq!(r.unwrap_err().code, asm_proto::ErrorCode::Unauthorized)
         };
 
@@ -515,7 +535,9 @@ mod tests {
         // Expired.
         unauthorized(pair_with_code(&store, &CERT, &s, info("a"), "ip", 1000));
         // Valid once, then used up.
-        let (host_id, token) = pair_with_code(&store, &CERT, &s, info("a"), "ip", 10).unwrap();
+        let (host_id, token, label) =
+            pair_with_code(&store, &CERT, &s, info("a"), "ip", 10).unwrap();
+        assert_eq!(label, "ci");
         let h = store
             .host_by_token(&sha256(token.as_bytes()))
             .unwrap()

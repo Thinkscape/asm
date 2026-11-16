@@ -289,3 +289,81 @@ struct LeaseDuration: Identifiable, Hashable, Sendable {
     var title: String
     var id: UInt64 { seconds ?? 0 }
 }
+
+/// Categories of the activity log (core `ActivityEntry.category`).
+enum ActivityCategory: String, CaseIterable, Identifiable, Sendable {
+    case requests, leases, proxy, pairing, vaults
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .requests: "Requests"
+        case .leases: "Leases"
+        case .proxy: "Proxy"
+        case .pairing: "Pairing"
+        case .vaults: "Vaults"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .requests: "tray.full"
+        case .leases: "clock.badge.checkmark"
+        case .proxy: "arrow.left.arrow.right"
+        case .pairing: "link"
+        case .vaults: "lock.rectangle.stack"
+        }
+    }
+}
+
+/// One activity log row. Never holds secret values.
+struct ActivityItem: Identifiable, Equatable, Sendable {
+    var id: Int64
+    var at: Date
+    var category: String
+    var kind: String
+    var hostID: String?
+    /// The host's friendly name when the row was read; "" without a host.
+    var hostLabel: String
+    var secret: String?
+    var summary: String
+    /// JSON object text.
+    var detail: String?
+    /// `detail.lease_id`, when the row concerns a known lease.
+    var leaseID: String?
+
+    var knownCategory: ActivityCategory? { ActivityCategory(rawValue: category) }
+
+    /// `detail` pretty-printed (sorted keys), or as stored when it is not JSON.
+    var prettyDetail: String? {
+        guard let detail else { return nil }
+        guard let data = detail.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let pretty = try? JSONSerialization.data(
+                  withJSONObject: object, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+              ),
+              let text = String(data: pretty, encoding: .utf8)
+        else { return detail }
+        return text
+    }
+}
+
+/// Filter and page of `listActivity`.
+struct ActivityQueryItem: Equatable, Sendable {
+    /// Category raw values; empty = all.
+    var categories: [String] = []
+    var hostID: String?
+    var search: String = ""
+    /// Rows older than this id; `nil` = newest page.
+    var beforeID: Int64?
+    var limit: UInt32 = 200
+}
+
+/// Asks the Settings window to show Leases searching for `search` and select `leaseID`
+/// (Activity Log "Show lease"). `token` makes repeated requests distinct.
+struct LeaseFocus: Equatable, Sendable {
+    var leaseID: String
+    var search: String
+    var token = UUID()
+}

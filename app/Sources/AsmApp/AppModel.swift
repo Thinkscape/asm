@@ -26,6 +26,11 @@ final class AppModel {
     private(set) var proxyStatus = ProxyStatusItem()
     private(set) var proxyLog: [String] = []
     private(set) var general = GeneralSettingsItem()
+    /// Bumped when the core reports new activity rows (topic `activity`); the Activity Log
+    /// window fetches what is new.
+    private(set) var activityRevision = 0
+    /// Set by the Activity Log's "Show lease"; the Settings window shows the lease.
+    var leaseFocus: LeaseFocus?
 
     /// Request shown in the approval panel; `nil` when nothing is pending.
     private(set) var shownRequestID: String?
@@ -130,6 +135,8 @@ final class AppModel {
             case "settings":
                 general = try await call { try $0.generalSettings() }
                 proxySettings = try await call { try $0.proxySettings() }
+            case "activity":
+                activityRevision &+= 1
             default:
                 break
             }
@@ -271,6 +278,17 @@ final class AppModel {
         }
         await refresh("leases")
         return firstError
+    }
+
+    // MARK: Activity log
+
+    func listActivity(_ query: ActivityQueryItem) async throws -> [ActivityItem] {
+        try await call { try $0.listActivity(query) }
+    }
+
+    /// Switches the Settings window to Leases, searching for `secret` with `leaseID` selected.
+    func showLease(_ leaseID: String, secret: String) {
+        leaseFocus = LeaseFocus(leaseID: leaseID, search: secret)
     }
 
     // MARK: Proxy and settings

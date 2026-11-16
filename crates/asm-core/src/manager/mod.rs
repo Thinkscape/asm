@@ -1,6 +1,6 @@
 //! Manager core: shared state, startup, the HTTPS API listener, lease sweep and the
 //! proxy entry set. Request flows live in `requests`, pairing in `pairing`, UI operations
-//! in `admin`, HTTP handlers in `api`.
+//! in `admin`, HTTP handlers in `api`, the audit trail in `activity`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -21,6 +21,7 @@ use crate::tls::ServerCert;
 use crate::vault::registry::{Registry, VaultEntry};
 use crate::vault::{VaultConfig, creds};
 
+pub mod activity;
 pub mod admin;
 pub mod api;
 pub mod netinfo;
@@ -35,6 +36,7 @@ pub const TOPIC_HOSTS: &str = "hosts";
 pub const TOPIC_VAULTS: &str = "vaults";
 pub const TOPIC_PROXY: &str = "proxy";
 pub const TOPIC_SETTINGS: &str = "settings";
+pub const TOPIC_ACTIVITY: &str = "activity";
 
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
 const BW_SYNC_EVERY: Duration = Duration::from_secs(300);
@@ -88,7 +90,7 @@ struct ApiServer {
 pub struct Core {
     pub dirs: DataDirs,
     pub bin_dir: PathBuf,
-    pub store: Store,
+    pub store: Arc<Store>,
     pub registry: Registry,
     pub proxy: Arc<ProxySupervisor>,
     pub cert: ServerCert,
@@ -106,6 +108,10 @@ pub struct Core {
     last_active: Mutex<HashSet<String>>,
     /// Vaults whose provider could not be built (id → message).
     pub(crate) vault_errors: Mutex<HashMap<String, String>>,
+    /// Audit trail writer.
+    pub activity: activity::ActivityLog,
+    /// Vault id → ready at the last [`Core::track_vaults`].
+    pub(crate) vault_ready: Mutex<HashMap<String, bool>>,
 }
 
 /// `(field, value)` pairs read from a vault.
@@ -172,7 +178,8 @@ impl Core {
     ) -> Result<Arc<Self>> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dirs = DataDirs::create(&data_dir, options.values_root.as_deref())?;
-        let store = Store::open(&dirs.db())?;
+        let store = Arc::new(Store::open(&dirs.db())?);
+        let activity = activity::ActivityLog::start(store.clone(), observer.clone());
         Settings::seed(&store, &options.settings)?;
         let settings = Settings::load(&store)?;
         let cert = ServerCert::load_or_create(&dirs.tls)?;
@@ -241,6 +248,7 @@ impl Core {
             settings.proxy.clone(),
             proxy_state.flatten(),
             on_change,
+            activity.proxy_sink(),
         )?;
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -267,7 +275,18 @@ impl Core {
             api: Mutex::new(None),
             last_active: Mutex::new(active.iter().map(|l| l.id.clone()).collect()),
             vault_errors: Mutex::new(vault_errors),
+            activity,
+            vault_ready: Mutex::new(HashMap::new()),
         });
+        {
+            let suspended = lock(&core.proxy_state).suspended.clone();
+            for l in &sentinel {
+                if let Some(why) = suspended.get(&l.id) {
+                    core.log_lease_suspended(l, why);
+                }
+            }
+        }
+        core.track_vaults();
 
         if let Err(e) = core.bind_api(&settings.api_bind, settings.api_port) {
             core.shutdown();
@@ -447,6 +466,14 @@ impl Core {
         build_entries(&self.registry, &todo, &mut st);
         let changed = before != (fingerprint(&st), st.suspended.clone());
         if changed {
+            for l in &active {
+                let was = before.1.contains_key(&l.id);
+                match st.suspended.get(&l.id) {
+                    Some(why) if !was => self.log_lease_suspended(l, why),
+                    None if was && st.entries.contains_key(&l.id) => self.log_lease_resumed(l),
+                    _ => {}
+                }
+            }
             let entries = st.flatten();
             if let Err(e) = self.proxy.apply(entries) {
                 log::error!("proxy apply: {}", e.message);
@@ -468,20 +495,32 @@ impl Core {
 
     // ---- periodic work ----
 
-    /// Expire requests, prune history, notice lease expiry and drop ended leases from the proxy.
+    /// Expire requests, prune history and the activity log, notice lease expiry, vault
+    /// availability changes, and drop ended leases from the proxy.
     pub fn sweep(&self) {
         let t = now();
         self.expire_requests(t);
         let _ = self.store.prune_history(t - HISTORY_SECS);
+        self.prune_activity(t);
         if let Ok(active) = self.store.active_leases(t) {
             let ids: HashSet<String> = active.into_iter().map(|l| l.id).collect();
             let mut last = lock(&self.last_active);
             if *last != ids {
+                let gone: Vec<String> = last.difference(&ids).cloned().collect();
                 *last = ids;
                 drop(last);
+                // Revocations were logged when they happened.
+                for id in gone {
+                    if let Ok(Some(l)) = self.store.get_lease(&id)
+                        && l.revoked_at.is_none()
+                    {
+                        self.log_lease_expired(&l);
+                    }
+                }
                 self.notify(TOPIC_LEASES);
             }
         }
+        self.track_vaults();
         self.sync_proxy(false);
     }
 
@@ -502,6 +541,7 @@ impl Core {
         }
         if any {
             self.notify(TOPIC_VAULTS);
+            self.track_vaults();
             self.sync_proxy(true);
         }
     }
@@ -515,6 +555,7 @@ impl Core {
         if let Some(rt) = lock(&self.rt).take() {
             rt.shutdown_background();
         }
+        self.activity.stop();
     }
 }
 

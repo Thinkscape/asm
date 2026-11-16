@@ -16,7 +16,9 @@ use asm_proto::wire::{
 };
 
 use super::pairing::{PairAttempt, PairState};
-use super::{Core, TOPIC_LEASES, TOPIC_REQUESTS, TOPIC_VAULTS, lock, now, to_system_time};
+use super::{
+    Core, TOPIC_LEASES, TOPIC_REQUESTS, TOPIC_VAULTS, activity, lock, now, to_system_time,
+};
 use crate::error::{CoreError, Result};
 use crate::ffi;
 use crate::proxy::ProxyEntry;
@@ -142,7 +144,7 @@ pub(crate) struct Pending {
 }
 
 impl Pending {
-    fn kind_str(&self) -> &'static str {
+    pub(crate) fn kind_str(&self) -> &'static str {
         match self.detail {
             Detail::Pair { .. } => "pair",
             Detail::Get(_) => "get",
@@ -159,7 +161,7 @@ impl Pending {
         }
     }
 
-    fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         match &self.detail {
             Detail::Pair { info, .. } => format!("pair {}", info.hostname),
             Detail::Get(g) => format!(
@@ -298,6 +300,7 @@ impl Core {
             for p in expired {
                 changed = true;
                 rows.push(p.history(RequestStatus::Expired, None, t));
+                self.log(activity::ended(&p, "expired", None));
                 match (&p.detail, &p.host_id) {
                     (Detail::Pair { .. }, _) => {
                         if let Some(a) = b.pairs.get_mut(&p.id) {
@@ -423,6 +426,7 @@ impl Core {
             if let Some(existing) = b.pending.iter().find(|q| q.host_id == p.host_id && same(q)) {
                 return existing.state();
             }
+            self.log(activity::requested(&p));
             let s = p.state();
             b.pending.push(p);
             s
@@ -446,7 +450,7 @@ impl Core {
         let (named, _) = self.find_secret(name)?;
         let secret = SecretRef::from_named(&named);
 
-        if !raw && let Some(state) = self.get_shortcut(host, agent, &secret, &requested)? {
+        if !raw && let Some(state) = self.get_shortcut(host, agent, &secret, &requested, &reason)? {
             return Ok(state);
         }
 
@@ -486,6 +490,7 @@ impl Core {
         agent: &str,
         secret: &SecretRef,
         requested: &[String],
+        reason: &str,
     ) -> Result<Option<RequestState>> {
         let t = now();
         let mut candidates: Vec<LeaseRecord> = self
@@ -567,7 +572,26 @@ impl Core {
                 at: t,
             },
         );
-        let _ = agent;
+        self.log(
+            activity::Event::new(
+                activity::Category::Requests,
+                "reused",
+                format!("get {} served from an existing lease", secret.display),
+            )
+            .host(Some(&host.id))
+            .secret(&secret.display)
+            .detail(serde_json::json!({
+                "request_id": id,
+                "request": "get",
+                "agent": agent,
+                "vault": secret.vault_name,
+                "requested_hosts": requested,
+                "reason": reason,
+                "lease_id": lease.id,
+                "lease_hosts": lease.hosts,
+                "expires_at": lease.expires_at.map(fmt_unix),
+            })),
+        );
         self.record_history(&[HistoryRecord {
             id,
             kind: "get".into(),
@@ -804,6 +828,7 @@ impl Core {
                             at: t,
                         },
                     );
+                    self.log(activity::ended(&p, "cancelled", None));
                     (state, Some(p.history(RequestStatus::Cancelled, None, t)))
                 }
                 Some(i) => (b.pending[i].state(), None),
@@ -849,6 +874,7 @@ impl Core {
                             at: t,
                         },
                     );
+                    self.log(activity::ended(p, "cancelled", Some("host revoked")));
                     p.history(RequestStatus::Cancelled, Some("host revoked".into()), t)
                 })
                 .collect()
@@ -892,7 +918,7 @@ impl Core {
                 let reason = Some(reason.trim().to_string()).filter(|r| !r.is_empty());
                 let p = b.pending.remove(i);
                 drop(b);
-                self.finish(p, Err(reason), t);
+                self.finish(p, Err(reason), t, false);
                 return Ok(());
             }
             b.pending[i].resolving = true;
@@ -938,7 +964,7 @@ impl Core {
             Ok(result) => {
                 let p = self.take_pending(id);
                 if let Some(p) = p {
-                    self.finish(p, Ok(result), t);
+                    self.finish(p, Ok(result), t, false);
                 }
                 Ok(())
             }
@@ -955,7 +981,7 @@ impl Core {
             }
             Err(Fail::Deny(reason)) => {
                 if let Some(p) = self.take_pending(id) {
-                    self.finish(p, Err(Some(reason.clone())), t);
+                    self.finish(p, Err(Some(reason.clone())), t, true);
                 }
                 Err(CoreError::vault_unavailable(reason))
             }
@@ -969,13 +995,23 @@ impl Core {
     }
 
     /// Move a removed pending request to its terminal state. `Ok(result)` = approved,
-    /// `Err(reason)` = denied.
+    /// `Err(reason)` = denied (`failed`: by a vault failure while approving).
     fn finish(
         &self,
         p: Pending,
         outcome: std::result::Result<Option<RequestResult>, Option<String>>,
         t: i64,
+        failed: bool,
     ) {
+        let event = match &outcome {
+            Ok(r) => activity::approved(&p, r.as_ref(), t),
+            Err(reason) => activity::ended(
+                &p,
+                if failed { "failed" } else { "denied" },
+                reason.as_deref(),
+            ),
+        };
+        self.log(event);
         let (status, deny_reason, result) = match outcome {
             Ok(r) => (RequestStatus::Approved, None, r),
             Err(reason) => (RequestStatus::Denied, reason, None),
@@ -1103,6 +1139,7 @@ impl Core {
             revoked_at: None,
         };
         self.store.insert_lease(&lease)?;
+        self.log_lease_created(&lease);
         if mode == LeaseMode::Sentinel {
             self.store
                 .replace_secret_hosts(&s.vault_id, &s.key, &hosts)?;
@@ -1149,8 +1186,10 @@ impl Core {
             .filter(|l| l.vault_id == s.vault_id && l.secret_key == s.key)
             .collect();
         for l in leases.iter().filter(|l| l.mode == LeaseMode::Raw) {
-            if let Err(e) = self.store.revoke_lease(&l.id, t) {
-                log::error!("revoke raw lease after update: {}", e.message);
+            match self.store.revoke_lease(&l.id, t) {
+                Ok(true) => self.log_lease_revoked(l, "secret updated"),
+                Ok(false) => {}
+                Err(e) => log::error!("revoke raw lease after update: {}", e.message),
             }
         }
         let sentinel: Vec<&LeaseRecord> = leases

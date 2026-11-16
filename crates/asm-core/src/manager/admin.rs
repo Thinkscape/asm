@@ -11,6 +11,7 @@ use asm_proto::pairing::UnattendedCode;
 use asm_proto::rules::validate_agent_text;
 use asm_proto::wire::LeaseMode;
 
+use super::activity::{self, Category, Event};
 use super::{
     Core, TOPIC_HOSTS, TOPIC_LEASES, TOPIC_PROXY, TOPIC_REQUESTS, TOPIC_SETTINGS, TOPIC_VAULTS,
     effective_config, lock, now, to_system_time,
@@ -213,6 +214,15 @@ impl Core {
             None => self.start_vault(&rec),
         }
         // Bitwarden: a master password in the draft unlocks once and is dropped.
+        let edit_event = current.as_ref().map(|c| {
+            let summary = if c.name == rec.name {
+                format!("vault {} edited", rec.name)
+            } else {
+                format!("vault {} renamed to {}", c.name, rec.name)
+            };
+            activity::vault_event("edited", &rec.id, &rec.name, &rec.config, summary)
+        });
+        let mut unlocked_now = false;
         if matches!(rec.config, VaultConfig::Bitwarden(_)) && !draft.master_password.is_empty() {
             let unlocked = match self.registry.get(&id) {
                 Some(v) => v.provider.unlock(&draft.master_password),
@@ -224,16 +234,55 @@ impl Core {
                 )),
             };
             if let Err(e) = unlocked {
-                if current.is_none() {
-                    // Nothing is kept for a new vault that cannot be unlocked.
-                    let _ = self.remove_vault(&id);
-                } else {
-                    self.notify(TOPIC_VAULTS);
+                match edit_event {
+                    None => {
+                        // Nothing is kept for a new vault that cannot be unlocked.
+                        let msg = format!("{} (vault not added)", e.message);
+                        self.log(activity::unlock_failed(
+                            &rec.id,
+                            &rec.name,
+                            &rec.config,
+                            &msg,
+                        ));
+                        let _ = self.remove_vault_logged(&id, false);
+                    }
+                    Some(ev) => {
+                        self.log(ev);
+                        self.log(activity::unlock_failed(
+                            &rec.id,
+                            &rec.name,
+                            &rec.config,
+                            &e.message,
+                        ));
+                        self.notify(TOPIC_VAULTS);
+                        self.track_vaults();
+                    }
                 }
                 return Err(e);
             }
+            unlocked_now = true;
+            self.vault_seen(&id, true);
+        }
+        self.log(edit_event.unwrap_or_else(|| {
+            activity::vault_event(
+                "added",
+                &rec.id,
+                &rec.name,
+                &rec.config,
+                format!("vault {} added", rec.name),
+            )
+        }));
+        if unlocked_now {
+            self.log(activity::vault_event(
+                "unlocked",
+                &rec.id,
+                &rec.name,
+                &rec.config,
+                format!("vault {} unlocked", rec.name),
+            ));
         }
         self.notify(TOPIC_VAULTS);
+        self.track_vaults();
         self.sync_proxy(true);
         Ok(self.vault_info(&rec))
     }
@@ -257,6 +306,21 @@ impl Core {
         }
         let res = v.provider.unlock(master_password);
         self.notify(TOPIC_VAULTS);
+        match &res {
+            Ok(()) => {
+                self.vault_seen(&v.id, true);
+                self.log(activity::vault_event(
+                    "unlocked",
+                    &v.id,
+                    &v.name,
+                    &v.config,
+                    format!("vault {} unlocked", v.name),
+                ));
+            }
+            Err(e) => self.log(activity::unlock_failed(
+                &v.id, &v.name, &v.config, &e.message,
+            )),
+        }
         res?;
         self.sync_proxy(true);
         self.notify(TOPIC_LEASES);
@@ -264,6 +328,11 @@ impl Core {
     }
 
     pub fn remove_vault(&self, id: &str) -> Result<()> {
+        self.remove_vault_logged(id, true)
+    }
+
+    /// `record = false`: a new vault that could not be unlocked is dropped again quietly.
+    fn remove_vault_logged(&self, id: &str, record: bool) -> Result<()> {
         let rec = self
             .store
             .list_vaults()?
@@ -279,6 +348,15 @@ impl Core {
             }
             let _ = std::fs::remove_dir_all(self.dirs.bw_vault(id));
         }
+        if record {
+            self.log(activity::vault_event(
+                "removed",
+                &rec.id,
+                &rec.name,
+                &rec.config,
+                format!("vault {} removed", rec.name),
+            ));
+        }
         let t = now();
         let mut revoked = false;
         for l in self
@@ -287,8 +365,12 @@ impl Core {
             .into_iter()
             .filter(|l| l.vault_id == id)
         {
-            revoked |= self.store.revoke_lease(&l.id, t)?;
+            if self.store.revoke_lease(&l.id, t)? {
+                revoked = true;
+                self.log_lease_revoked(&l, "vault removed");
+            }
         }
+        lock(&self.vault_ready).remove(id);
         self.sync_proxy(false);
         self.notify(TOPIC_VAULTS);
         if revoked {
@@ -350,6 +432,7 @@ impl Core {
                 self.notify(TOPIC_VAULTS);
             }
         }
+        self.track_vaults();
         self.sync_proxy(true);
         Ok(())
     }
@@ -402,6 +485,17 @@ impl Core {
         if !self.store.revoke_host(host_id, t)? {
             return Err(CoreError::not_found("no such host"));
         }
+        if let Some(h) = self.store.get_host(host_id)? {
+            self.log(
+                Event::new(
+                    Category::Pairing,
+                    "revoked",
+                    format!("host {} revoked", h.label()),
+                )
+                .host(Some(host_id))
+                .detail(serde_json::json!({ "hostname": h.info.hostname, "address": h.address })),
+            );
+        }
         self.cancel_host_requests(host_id);
         for l in self
             .store
@@ -409,7 +503,9 @@ impl Core {
             .into_iter()
             .filter(|l| l.is_active(t))
         {
-            self.store.revoke_lease(&l.id, t)?;
+            if self.store.revoke_lease(&l.id, t)? {
+                self.log_lease_revoked(&l, "host revoked");
+            }
         }
         self.sync_proxy(false);
         self.notify(TOPIC_HOSTS);
@@ -428,6 +524,21 @@ impl Core {
         let name = super::pairing::host_name(name, &host.info.hostname)?;
         if !self.store.rename_host(host_id, &name)? {
             return Err(CoreError::not_found("no such host"));
+        }
+        if host.label() != name {
+            self.log(
+                Event::new(
+                    Category::Pairing,
+                    "renamed",
+                    format!("host {} renamed to {name}", host.label()),
+                )
+                .host(Some(host_id))
+                .detail(serde_json::json!({
+                    "old_name": host.label(),
+                    "new_name": name,
+                    "hostname": host.info.hostname,
+                })),
+            );
         }
         self.notify(TOPIC_HOSTS);
         self.notify(TOPIC_LEASES);
@@ -560,6 +671,7 @@ impl Core {
             .get_lease(id)?
             .ok_or_else(|| CoreError::not_found("no such lease"))?;
         if self.store.revoke_lease(&lease.id, now())? {
+            self.log_lease_revoked(&lease, "operator");
             self.sync_proxy(false);
             self.notify(TOPIC_LEASES);
         }

@@ -94,6 +94,16 @@ struct LeasesPane: View {
         .onChange(of: filter) { recompute() }
         .onChange(of: search) { recompute() }
         .onChange(of: sortOrder) { recompute() }
+        .onChange(of: model.leaseFocus, initial: true) { _, focus in
+            guard let focus else { return }
+            filter = .all
+            search = focus.search
+            recompute()
+            if visible.contains(where: { $0.id == focus.leaseID }) {
+                selection = [focus.leaseID]
+            }
+            model.leaseFocus = nil
+        }
     }
 
     private var emptyText: LocalizedStringKey {

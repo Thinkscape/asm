@@ -174,6 +174,11 @@ private struct MenuBarFooter: View {
                 NSApp.activate()
             }
             .keyboardShortcut(",")
+            Button("Show Log…") {
+                openWindow(id: "activity")
+                NSApp.activate()
+            }
+            .keyboardShortcut("l")
             Spacer()
             Button("Quit") { NSApp.terminate(nil) }
                 .keyboardShortcut("q")

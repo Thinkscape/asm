@@ -1,6 +1,7 @@
 //! SQLite store (`<data>/asm.db`). Holds settings, vault configs, hosts, pairing codes,
-//! resolved request history and lease metadata. Never holds secret values: leases keep
-//! sentinels and file paths only, host tokens and pairing codes are stored as SHA-256.
+//! resolved request history, lease metadata and the activity log. Never holds secret
+//! values: leases keep sentinels and file paths only, host tokens and pairing codes are
+//! stored as SHA-256.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -313,7 +314,67 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
         tx.commit()?;
     }
+    let has_activity = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'activity'")?
+        .exists([])?;
+    if !has_activity {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE activity(
+                 id       INTEGER PRIMARY KEY,
+                 at       TEXT NOT NULL,
+                 category TEXT NOT NULL,
+                 kind     TEXT NOT NULL,
+                 host_id  TEXT,
+                 secret   TEXT,
+                 summary  TEXT NOT NULL,
+                 detail   TEXT
+             );
+             CREATE INDEX activity_at ON activity(at);
+             CREATE INDEX activity_host ON activity(host_id, id);",
+        )?;
+        tx.commit()?;
+    }
     Ok(())
+}
+
+/// A row to append to the activity log. `at` is RFC 3339 UTC (`2026-11-16T12:34:56Z`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewActivity {
+    pub at: String,
+    pub category: &'static str,
+    pub kind: &'static str,
+    pub host_id: Option<String>,
+    pub secret: Option<String>,
+    pub summary: String,
+    /// JSON text.
+    pub detail: Option<String>,
+}
+
+/// An activity row as listed; `host_label` is the host's current friendly name ("" when
+/// there is no host or it is unknown).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityRecord {
+    pub id: i64,
+    pub at: String,
+    pub category: String,
+    pub kind: String,
+    pub host_id: Option<String>,
+    pub host_label: String,
+    pub secret: Option<String>,
+    pub summary: String,
+    pub detail: Option<String>,
+}
+
+/// Activity list filter. Empty `categories` = all; `search` (case-insensitive for ASCII)
+/// matches the summary, the secret or the host's friendly name; newest first.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityFilter {
+    pub categories: Vec<String>,
+    pub host_id: Option<String>,
+    pub search: String,
+    pub before_id: Option<i64>,
+    pub limit: u32,
 }
 
 fn insert_host_row(db: &Connection, h: &HostRecord, token_hash: &[u8; 32]) -> Result<()> {
@@ -506,31 +567,32 @@ impl Store {
     }
 
     /// Atomically check a pairing code (hash, expiry, remaining uses, not revoked), count one
-    /// use, and insert the new host. Returns false (nothing changed) when the code is rejected.
+    /// use, and insert the new host. Returns the code's label, or `None` (nothing changed)
+    /// when the code is rejected.
     pub fn consume_pairing_code(
         &self,
         secret_hash: &[u8; 32],
         now: i64,
         host: &HostRecord,
         token_hash: &[u8; 32],
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let mut db = self.db();
         let tx = db.transaction()?;
-        let row: Option<(String, Vec<u8>)> = tx
+        let row: Option<(String, Vec<u8>, String)> = tx
             .query_row(
-                "SELECT id, secret_hash FROM pairing_codes
+                "SELECT id, secret_hash, label FROM pairing_codes
                  WHERE secret_hash = ?1 AND revoked_at IS NULL
                    AND (expires_at IS NULL OR expires_at > ?2)
                    AND (max_uses IS NULL OR uses < max_uses)",
                 params![&secret_hash[..], now],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((id, stored)) = row else {
-            return Ok(false);
+        let Some((id, stored, label)) = row else {
+            return Ok(None);
         };
         if !asm_proto::crypto::ct_eq(&stored, secret_hash) {
-            return Ok(false);
+            return Ok(None);
         }
         tx.execute(
             "UPDATE pairing_codes SET uses = uses + 1 WHERE id = ?1",
@@ -538,7 +600,7 @@ impl Store {
         )?;
         insert_host_row(&tx, host, token_hash)?;
         tx.commit()?;
-        Ok(true)
+        Ok(Some(label))
     }
 
     // ---- request history ----
@@ -745,6 +807,85 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    // ---- activity log ----
+
+    pub fn insert_activity(&self, rows: &[NewActivity]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        {
+            let mut st = tx.prepare_cached(
+                "INSERT INTO activity(at, category, kind, host_id, secret, summary, detail)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for r in rows {
+                st.execute(params![
+                    r.at, r.category, r.kind, r.host_id, r.secret, r.summary, r.detail
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_activity(&self, f: &ActivityFilter) -> Result<Vec<ActivityRecord>> {
+        let mut sql = String::from(
+            "SELECT a.id, a.at, a.category, a.kind, a.host_id,
+                    coalesce(nullif(h.name, ''), json_extract(h.info, '$.hostname'), ''),
+                    a.secret, a.summary, a.detail
+             FROM activity a LEFT JOIN hosts h ON h.id = a.host_id
+             WHERE (?1 IS NULL OR a.id < ?1)
+               AND (?2 IS NULL OR a.host_id = ?2)
+               AND (?3 = ''
+                    OR instr(lower(a.summary), lower(?3)) > 0
+                    OR instr(lower(coalesce(a.secret, '')), lower(?3)) > 0
+                    OR instr(lower(coalesce(h.name, '')), lower(?3)) > 0)",
+        );
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&f.before_id, &f.host_id, &f.search];
+        if !f.categories.is_empty() {
+            let marks: Vec<String> = (0..f.categories.len())
+                .map(|i| format!("?{}", i + 5))
+                .collect();
+            sql.push_str(&format!(" AND a.category IN ({})", marks.join(", ")));
+        }
+        sql.push_str(" ORDER BY a.id DESC LIMIT ?4");
+        args.push(&f.limit);
+        for c in &f.categories {
+            args.push(c);
+        }
+        let db = self.db();
+        let mut st = db.prepare(&sql)?;
+        let rows = st.query_map(args.as_slice(), |r| {
+            Ok(ActivityRecord {
+                id: r.get(0)?,
+                at: r.get(1)?,
+                category: r.get(2)?,
+                kind: r.get(3)?,
+                host_id: r.get(4)?,
+                host_label: r.get(5)?,
+                secret: r.get(6)?,
+                summary: r.get(7)?,
+                detail: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Delete rows older than `cutoff` (RFC 3339 UTC, compared as text) and all but the
+    /// newest `keep` rows. Returns the number of rows deleted.
+    pub fn prune_activity(&self, cutoff: &str, keep: u32) -> Result<usize> {
+        let db = self.db();
+        let old = db.execute("DELETE FROM activity WHERE at < ?1", [cutoff])?;
+        let over = db.execute(
+            "DELETE FROM activity
+             WHERE id <= (SELECT id FROM activity ORDER BY id DESC LIMIT 1 OFFSET ?1)",
+            [keep],
+        )?;
+        Ok(old + over)
+    }
 }
 
 #[cfg(test)]
@@ -811,6 +952,201 @@ mod tests {
         assert_eq!(s.list_hosts().unwrap().len(), 2);
     }
 
+    fn activity(
+        at: &str,
+        category: &'static str,
+        host: Option<&str>,
+        summary: &str,
+    ) -> NewActivity {
+        NewActivity {
+            at: at.into(),
+            category,
+            kind: "test",
+            host_id: host.map(Into::into),
+            secret: Some("DEMO_TOKEN".into()),
+            summary: summary.into(),
+            detail: Some("{\"k\":1}".into()),
+        }
+    }
+
+    #[test]
+    fn migrates_database_without_activity_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        {
+            // A database from the build before the activity log (friendly names present).
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE hosts(
+                    id         TEXT PRIMARY KEY,
+                    token_hash BLOB NOT NULL UNIQUE,
+                    info       TEXT NOT NULL,
+                    name       TEXT NOT NULL DEFAULT '',
+                    address    TEXT NOT NULL,
+                    paired_at  INTEGER NOT NULL,
+                    last_seen  INTEGER,
+                    revoked_at INTEGER
+                );
+                INSERT INTO hosts VALUES('h1', x'01', '{\"hostname\":\"old-box\"}', 'Build box', '10.0.0.9', 50, 60, NULL);",
+            )
+            .unwrap();
+            assert!(
+                !c.prepare("SELECT 1 FROM sqlite_master WHERE name = 'activity'")
+                    .unwrap()
+                    .exists([])
+                    .unwrap()
+            );
+        }
+        let s = Store::open(&path).unwrap();
+        s.insert_activity(&[
+            activity("2026-11-16T00:00:00Z", "pairing", Some("h1"), "renamed"),
+            activity("2026-11-16T00:00:01Z", "proxy", None, "proxy started"),
+        ])
+        .unwrap();
+        let rows = s
+            .list_activity(&ActivityFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].summary, "proxy started", "newest first");
+        assert_eq!(rows[1].host_label, "Build box", "current friendly name");
+        assert_eq!(rows[0].host_label, "");
+        drop(s);
+        // Opening again keeps the rows.
+        let s = Store::open(&path).unwrap();
+        let f = ActivityFilter {
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(s.list_activity(&f).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn activity_filters_and_paging() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("asm.db")).unwrap();
+        s.insert_host(&host("h1"), &[1u8; 32]).unwrap();
+        s.rename_host("h1", "Agent Box").unwrap();
+        let rows: Vec<NewActivity> = (0..10)
+            .map(|i| {
+                let (cat, h) = if i % 2 == 0 {
+                    ("requests", Some("h1"))
+                } else {
+                    ("proxy", None)
+                };
+                activity(
+                    &format!("2026-11-16T00:00:{i:02}Z"),
+                    cat,
+                    h,
+                    &format!("row {i}"),
+                )
+            })
+            .collect();
+        s.insert_activity(&rows).unwrap();
+        let list = |f: ActivityFilter| -> Vec<String> {
+            s.list_activity(&f)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.summary)
+                .collect()
+        };
+        let all = list(ActivityFilter {
+            limit: 3,
+            ..Default::default()
+        });
+        assert_eq!(all, ["row 9", "row 8", "row 7"]);
+        let ids: Vec<i64> = s
+            .list_activity(&ActivityFilter {
+                limit: 3,
+                ..Default::default()
+            })
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        let older = list(ActivityFilter {
+            before_id: Some(ids[2]),
+            limit: 3,
+            ..Default::default()
+        });
+        assert_eq!(older, ["row 6", "row 5", "row 4"]);
+        let proxy = list(ActivityFilter {
+            categories: vec!["proxy".into()],
+            limit: 100,
+            ..Default::default()
+        });
+        assert_eq!(proxy.len(), 5);
+        let both = list(ActivityFilter {
+            categories: vec!["proxy".into(), "requests".into()],
+            limit: 100,
+            ..Default::default()
+        });
+        assert_eq!(both.len(), 10);
+        let by_host = list(ActivityFilter {
+            host_id: Some("h1".into()),
+            limit: 100,
+            ..Default::default()
+        });
+        assert_eq!(by_host.len(), 5);
+        let by_label = list(ActivityFilter {
+            search: "agent box".into(),
+            limit: 100,
+            ..Default::default()
+        });
+        assert_eq!(by_label.len(), 5, "search matches the host's friendly name");
+        let by_summary = list(ActivityFilter {
+            search: "ROW 3".into(),
+            limit: 100,
+            ..Default::default()
+        });
+        assert_eq!(by_summary, ["row 3"]);
+        let by_secret = list(ActivityFilter {
+            search: "demo_tok".into(),
+            limit: 100,
+            ..Default::default()
+        });
+        assert_eq!(by_secret.len(), 10);
+    }
+
+    #[test]
+    fn activity_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("asm.db")).unwrap();
+        let rows: Vec<NewActivity> = (0..20)
+            .map(|i| {
+                activity(
+                    &format!("2026-10-{:02}T12:00:00Z", i + 1),
+                    "proxy",
+                    None,
+                    &format!("row {i}"),
+                )
+            })
+            .collect();
+        s.insert_activity(&rows).unwrap();
+        let f = ActivityFilter {
+            limit: 100,
+            ..Default::default()
+        };
+        // Older than the cutoff: rows 0..=4 (Oct 1–5).
+        assert_eq!(s.prune_activity("2026-10-06T00:00:00Z", 100).unwrap(), 5);
+        assert_eq!(s.list_activity(&f).unwrap().len(), 15);
+        // Row cap: keep the newest 10.
+        assert_eq!(s.prune_activity("2026-10-06T00:00:00Z", 10).unwrap(), 5);
+        let left: Vec<String> = s
+            .list_activity(&f)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.summary)
+            .collect();
+        assert_eq!(left.len(), 10);
+        assert_eq!(left.first().map(String::as_str), Some("row 19"));
+        assert_eq!(left.last().map(String::as_str), Some("row 10"));
+        // Under both limits: nothing to do.
+        assert_eq!(s.prune_activity("2026-10-06T00:00:00Z", 10).unwrap(), 0);
+    }
+
     #[test]
     fn pairing_code_consumption_is_bounded() {
         let dir = tempfile::tempdir().unwrap();
@@ -827,16 +1163,21 @@ mod tests {
         };
         s.insert_pairing_code(&code, &hash).unwrap();
         assert!(
-            !s.consume_pairing_code(&[8u8; 32], 200, &host("h0"), &[0u8; 32])
+            s.consume_pairing_code(&[8u8; 32], 200, &host("h0"), &[0u8; 32])
                 .unwrap()
+                .is_none()
         );
-        assert!(
+        assert_eq!(
             s.consume_pairing_code(&hash, 200, &host("h1"), &[1u8; 32])
                 .unwrap()
+                .as_deref(),
+            Some("ci"),
+            "answers the code's label"
         );
         assert!(
-            !s.consume_pairing_code(&hash, 201, &host("h2"), &[2u8; 32])
-                .unwrap(),
+            s.consume_pairing_code(&hash, 201, &host("h2"), &[2u8; 32])
+                .unwrap()
+                .is_none(),
             "used up"
         );
         assert!(s.host_by_token(&[1u8; 32]).unwrap().is_some());
@@ -849,18 +1190,21 @@ mod tests {
         };
         s.insert_pairing_code(&code2, &[9u8; 32]).unwrap();
         assert!(
-            !s.consume_pairing_code(&[9u8; 32], 1000, &host("h3"), &[3u8; 32])
-                .unwrap(),
+            s.consume_pairing_code(&[9u8; 32], 1000, &host("h3"), &[3u8; 32])
+                .unwrap()
+                .is_none(),
             "expired"
         );
         assert!(
             s.consume_pairing_code(&[9u8; 32], 999, &host("h4"), &[4u8; 32])
                 .unwrap()
+                .is_some()
         );
         assert!(s.revoke_pairing_code("c2", 999).unwrap());
         assert!(
-            !s.consume_pairing_code(&[9u8; 32], 999, &host("h5"), &[5u8; 32])
-                .unwrap(),
+            s.consume_pairing_code(&[9u8; 32], 999, &host("h5"), &[5u8; 32])
+                .unwrap()
+                .is_none(),
             "revoked"
         );
     }

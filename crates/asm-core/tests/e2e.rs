@@ -637,5 +637,129 @@ fn headless_end_to_end() {
         .unwrap();
     assert_eq!(h.name, first_hostname);
 
+    // Activity log: the flow is recorded, and no row holds a real value.
+    let query = |categories: &[&str], host: Option<&str>| asm_core::ffi::ActivityQuery {
+        categories: categories.iter().map(|c| c.to_string()).collect(),
+        host_id: host.map(str::to_string),
+        search: String::new(),
+        before_id: None,
+        limit: 1000,
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let rows = loop {
+        let rows = m.list_activity(query(&[], None));
+        let subs = rows
+            .iter()
+            .filter(|r| r.category == "proxy" && r.kind == "substitution")
+            .count();
+        // Two substituted requests through the first lease, one through the second.
+        if subs >= 3 || Instant::now() > deadline {
+            break rows;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    for r in &rows {
+        let text = format!(
+            "{} {} {:?} {:?}",
+            r.summary, r.host_label, r.secret, r.detail
+        );
+        assert!(
+            !text.contains(REAL_1) && !text.contains(REAL_2),
+            "activity row leaks a value: {text}"
+        );
+        assert!(r.id > 0);
+    }
+    let has = |category: &str, kind: &str| {
+        rows.iter()
+            .any(|r| r.category == category && r.kind == kind)
+    };
+    for (category, kind) in [
+        ("vaults", "added"),
+        ("pairing", "paired_with_code"),
+        ("pairing", "requested"),
+        ("pairing", "approved"),
+        ("pairing", "renamed"),
+        ("requests", "requested"),
+        ("requests", "approved"),
+        ("requests", "reused"),
+        ("requests", "denied"),
+        ("leases", "created"),
+        ("leases", "revoked"),
+        ("proxy", "started"),
+        ("proxy", "substitution"),
+        ("proxy", "rejected"),
+    ] {
+        assert!(has(category, kind), "missing activity {category}/{kind}");
+    }
+    let sub = rows
+        .iter()
+        .find(|r| r.category == "proxy" && r.kind == "substitution")
+        .unwrap();
+    assert_eq!(sub.secret.as_deref(), Some("DEMO_TOKEN"));
+    assert_eq!(sub.host_id.as_deref(), Some(first_host.as_str()));
+    assert!(
+        sub.summary.contains("substituted in header:X-Key"),
+        "{}",
+        sub.summary
+    );
+    assert!(
+        sub.detail.as_deref().unwrap_or("").contains("lease_id"),
+        "{:?}",
+        sub.detail
+    );
+    let revoked: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.category == "leases" && r.kind == "revoked")
+        .map(|r| r.summary.as_str())
+        .collect();
+    assert!(
+        revoked
+            .iter()
+            .any(|s| s.contains("revoked by the operator"))
+            && revoked.iter().any(|s| s.contains("secret updated")),
+        "{revoked:?}"
+    );
+    let denied = rows
+        .iter()
+        .find(|r| r.category == "requests" && r.kind == "denied")
+        .unwrap();
+    assert!(
+        denied.summary.contains("provide a better reason"),
+        "{}",
+        denied.summary
+    );
+    // Filters: category, host, search and paging.
+    let proxy_rows = m.list_activity(query(&["proxy"], None));
+    assert!(!proxy_rows.is_empty() && proxy_rows.iter().all(|r| r.category == "proxy"));
+    let host_rows = m.list_activity(query(&[], Some(&first_host)));
+    assert!(
+        !host_rows.is_empty()
+            && host_rows
+                .iter()
+                .all(|r| r.host_id.as_deref() == Some(first_host.as_str()))
+    );
+    assert!(
+        host_rows.iter().all(|r| r.host_label == first_hostname),
+        "host label is the current friendly name"
+    );
+    let mut search = query(&[], None);
+    search.search = "e2e friendly".into();
+    let found = m.list_activity(search);
+    assert!(
+        !found.is_empty()
+            && found
+                .iter()
+                .all(|r| r.host_label == "e2e friendly" || r.summary.contains("e2e friendly"))
+    );
+    let mut page = query(&[], None);
+    page.limit = 2;
+    let first_page = m.list_activity(page.clone());
+    assert_eq!(first_page.len(), 2);
+    page.before_id = Some(first_page[1].id);
+    let second_page = m.list_activity(page);
+    assert!(second_page.iter().all(|r| r.id < first_page[1].id));
+    assert!(rows.windows(2).all(|w| w[0].id > w[1].id), "newest first");
+    assert_eq!(rows[0].id, first_page[0].id);
+
     m.shutdown();
 }
