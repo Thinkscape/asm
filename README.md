@@ -12,3 +12,7 @@ macOS menu-bar manager (Rust core + SwiftUI shell), the `asm` CLI for agent mach
 |`skill/asm`|Agent skill|
 
 Build: `just setup` once, then `just dist`. Tests: `just test`.
+
+Install the CLI: `just install-cli` (this Mac, `~/.local/bin/asm`) or
+`just install-cli-remote <ssh-host>` (Linux host, `~/.local/bin/asm`, arch picked automatically).
+Then `asm pair <manager-host>` on that machine.

@@ -61,6 +61,17 @@ cli:
     cp target/aarch64-unknown-linux-musl/release/asm dist/cli/asm-linux-aarch64
     cp target/universal2-apple-darwin/release/asm dist/cli/asm-macos-universal
 
+# Install the CLI on this Mac as ~/.local/bin/asm (override with dir=…)
+install-cli dir="~/.local/bin": cli
+    mkdir -p {{dir}}
+    install -m 0755 dist/cli/asm-macos-universal {{dir}}/asm
+    @echo "installed {{dir}}/asm"
+
+# Install the CLI on a Linux host over SSH as ~/.local/bin/asm (x86_64 or aarch64 picked from uname -m)
+install-cli-remote host: cli
+    arch=$(ssh {{host}} uname -m); case "$arch" in x86_64|amd64) f=asm-linux-x86_64;; aarch64|arm64) f=asm-linux-aarch64;; *) echo "unsupported arch $arch"; exit 1;; esac; \
+    ssh {{host}} 'mkdir -p ~/.local/bin' && scp -q dist/cli/$f {{host}}:.local/bin/asm && ssh {{host}} 'chmod 0755 ~/.local/bin/asm && ~/.local/bin/asm --version'
+
 skill:
     mkdir -p dist/skill/asm
     cp skill/asm/SKILL.md dist/skill/asm/SKILL.md
