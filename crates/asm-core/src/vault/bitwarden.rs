@@ -114,14 +114,52 @@ impl Endpoint {
         }
         s.write_all(&out)?;
         s.flush()?;
+        // Read until the message is complete, not until EOF: `bw serve` keeps some
+        // connections open after the response despite `Connection: close` (seen on
+        // `POST /unlock`), and waiting for EOF then blocks until the read timeout.
         let mut raw = Vec::new();
-        s.read_to_end(&mut raw)?;
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = s.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+            if response_complete(&raw) {
+                break;
+            }
+        }
         parse_http_response(&raw)
     }
 }
 
 fn bad_response(m: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bw serve: {m}"))
+}
+
+/// Whether `raw` holds a whole response: headers plus `Content-Length` bytes, or a
+/// chunked body through its final `0` chunk. Without either, only EOF ends it.
+fn response_complete(raw: &[u8]) -> bool {
+    let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&raw[..head_end]) else {
+        return true; // parse_http_response reports it
+    };
+    let body = &raw[head_end + 4..];
+    for l in head.split("\r\n").skip(1) {
+        let Some((k, v)) = l.split_once(':') else {
+            continue;
+        };
+        let (k, v) = (k.trim().to_ascii_lowercase(), v.trim().to_ascii_lowercase());
+        if k == "transfer-encoding" && v.contains("chunked") {
+            return decode_chunked(body).is_ok();
+        }
+        if k == "content-length" {
+            return v.parse::<usize>().map_or(true, |n| body.len() >= n);
+        }
+    }
+    false
 }
 
 fn parse_http_response(raw: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
@@ -950,18 +988,52 @@ impl BitwardenVault {
             Some((ep, false)) => ep,
             None => self.restart_serve_held()?,
         };
-        call(
-            &ep,
-            "POST",
-            "/unlock",
-            Some(&json!({ "password": master_password })),
-        )
-        .map_err(|e| match e.message.strip_prefix("bw: ") {
-            Some(m) => CoreError::invalid(format!("unlock failed: {m}")),
-            None => CoreError::new(e.code, format!("unlock failed: {}", e.message)),
-        })?;
+        Self::unlock_serve(&ep, master_password)?;
         self.set_status(VaultStatus::Ready);
         Ok(())
+    }
+    /// `POST /unlock`, finished by whichever comes first: its response, or `/status`
+    /// reporting `unlocked`. bw 2026.2.0 sets the user key and then runs post-unlock
+    /// steps (key-connector check, KDF migrations) before answering; on a real
+    /// Vaultwarden account those steps were seen to never answer, leaving the vault
+    /// unlocked behind a request that blocks until the read timeout. `unlocked` is only
+    /// reported after the password checked out, so it is a sound success signal.
+    fn unlock_serve(ep: &Endpoint, master_password: &str) -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let ep = ep.clone();
+            let body = json!({ "password": master_password });
+            std::thread::spawn(move || {
+                let _ = tx.send(call(&ep, "POST", "/unlock", Some(&body)));
+            });
+        }
+        let deadline = Instant::now() + HTTP_TIMEOUT;
+        loop {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(r) => {
+                    return r
+                        .map(|_| ())
+                        .map_err(|e| match e.message.strip_prefix("bw: ") {
+                            Some(m) => CoreError::invalid(format!("unlock failed: {m}")),
+                            None => CoreError::new(e.code, format!("unlock failed: {}", e.message)),
+                        });
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(CoreError::internal("unlock failed: worker thread ended"));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if let Ok(st) = call_timeout(ep, "GET", "/status", None, Duration::from_secs(5))
+                && str_at(&st, &["template", "status"]) == Some("unlocked")
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(CoreError::vault_unavailable(
+                    "unlock failed: bw serve did not answer",
+                ));
+            }
+        }
     }
 
     /// Endpoint of a running, ready serve.
@@ -1233,6 +1305,7 @@ unlink $path;
 my $srv = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $path, Listen => 8) or die "listen: $!";
 event('serve');
 my $unlocked = 0;
+my @stalled;
 my $ok = '{"success":true,"data":{}}';
 while (my $c = $srv->accept) {
     my $line = <$c>;
@@ -1251,6 +1324,8 @@ while (my $c = $srv->accept) {
         $r = qq({"success":true,"data":{"object":"template","template":{"status":"$s"}}});
     } elsif ($p eq '/unlock') {
         if ($body =~ /"password":"correct horse"/) { $unlocked = 1; event('unlock'); $r = $ok; }
+        # Like bw 2026.2.0 against a real account: unlocked, but the response never comes.
+        elsif ($body =~ /"password":"stalling horse"/) { $unlocked = 1; event('unlock'); push @stalled, $c; next; }
         else { event('unlock-failed'); $r = '{"success":false,"message":"Invalid master password."}'; }
     } elsif ($p eq '/lock') {
         $unlocked = 0; event('lock'); $r = $ok;
@@ -1598,5 +1673,28 @@ mod tests {
                 .code,
             asm_proto::ErrorCode::Invalid
         );
+    }
+
+    /// bw 2026.2.0 can unlock the vault and then never answer `POST /unlock` (seen
+    /// against the lab Vaultwarden): unlock must still finish, via `/status`.
+    #[test]
+    fn unlock_finishes_when_serve_never_answers() {
+        let tmp = fake_bw::tempdir();
+        let dirs = DataDirs::create(&tmp.path().join("d"), Some(&tmp.path().join("t"))).unwrap();
+        let cfg = fake_bw::config(&fake_bw::install(tmp.path()));
+        let secrets = BitwardenSecrets {
+            client_secret: "cs".into(),
+        };
+        let v = BitwardenVault::start_or_error(&dirs, "v1", cfg, secrets);
+        assert_eq!(v.status(), VaultStatus::Locked);
+        let started = Instant::now();
+        VaultProvider::unlock(&v, "stalling horse").unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "unlock waited for the stalled response"
+        );
+        assert_eq!(v.status(), VaultStatus::Ready);
+        assert!(v.list().unwrap().is_empty());
+        v.shutdown();
     }
 }
