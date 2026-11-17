@@ -21,6 +21,7 @@ final class AppModel {
     private(set) var pending: [PendingItem] = []
     private(set) var recent: [RecentItem] = []
     private(set) var vaults: [VaultItem] = []
+    private(set) var generators: [GeneratorItem] = []
     private(set) var hosts: [HostItem] = []
     private(set) var pairingCodes: [PairingCodeItem] = []
     private(set) var leases: [LeaseItem] = []
@@ -150,6 +151,8 @@ final class AppModel {
                 pairingCodes = try await call { try $0.listPairingCodes() }
             case "vaults":
                 vaults = try await call { try $0.listVaults() }
+            case "generators":
+                generators = try await call { try $0.listGenerators() }
             case "proxy":
                 await refreshProxy()
             case "firewall":
@@ -277,6 +280,28 @@ final class AppModel {
         return error
     }
 
+    // MARK: Generators
+
+    func githubConnect(_ draft: GeneratorDraftItem) async throws -> GithubInstallationItem {
+        try await call { try $0.githubConnect(draft) }
+    }
+
+    func saveGenerator(_ draft: GeneratorDraftItem) async throws -> GeneratorItem {
+        let generator = try await call { try $0.saveGenerator(draft) }
+        await refresh("generators")
+        await refresh("leases")
+        await refresh("requests")
+        return generator
+    }
+
+    func removeGenerator(_ id: String) async -> String? {
+        let error = await perform { try $0.removeGenerator(id) }
+        await refresh("generators")
+        await refresh("leases")
+        await refresh("requests")
+        return error
+    }
+
     // MARK: Hosts and pairing codes
 
     func revokeHost(_ id: String) async -> String? {
@@ -390,3 +415,4 @@ final class AppModel {
         return error
     }
 }
+

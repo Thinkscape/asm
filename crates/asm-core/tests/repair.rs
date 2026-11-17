@@ -65,17 +65,14 @@ impl Drop for Setup {
     }
 }
 
-/// A manager with a `.env` vault holding `DEMO_TOKEN`; `None` (test skipped) without
-/// `dist/bin/iron-proxy`.
-fn setup() -> Option<Setup> {
+/// A manager with a `.env` vault holding `DEMO_TOKEN`.
+fn setup() -> Setup {
     let bin_dir = workspace().join("dist/bin");
-    if !bin_dir.join("iron-proxy").exists() {
-        eprintln!(
-            "SKIPPED: {} is missing; run `just proxy` first",
-            bin_dir.join("iron-proxy").display()
-        );
-        return None;
-    }
+    assert!(
+        bin_dir.join("iron-proxy").is_file(),
+        "missing prerequisite {}; run `just proxy` before integration tests",
+        bin_dir.join("iron-proxy").display()
+    );
     let tmp = tempfile::tempdir().unwrap();
     let env_file = tmp.path().join("demo.env");
     std::fs::write(&env_file, "DEMO_TOKEN=real-value-123\n").unwrap();
@@ -106,7 +103,7 @@ fn setup() -> Option<Setup> {
         master_password: String::new(),
     })
     .expect("add .env vault");
-    Some(Setup { m, tmp })
+    Setup { m, tmp }
 }
 
 const HINT: &str = "4242424242424242424242424242424242424242424242424242424242424242";
@@ -229,6 +226,14 @@ fn lease(m: &Manager, host_id: &str) -> String {
             RequestBody::Get {
                 name: "DEMO_TOKEN".into(),
                 raw: false,
+                sentinel: false,
+                fields: None,
+                generation: None,
+                refresh: false,
+                new_lease: false,
+                lease_id: None,
+                refresh_from_version: None,
+                client_capabilities: vec![],
                 hosts: vec!["api.example.com".into()],
                 reason: "repair test".into(),
                 agent: "test".into(),
@@ -241,6 +246,7 @@ fn lease(m: &Manager, host_id: &str) -> String {
             mode: LeaseMode::Sentinel,
             duration_secs: Some(3600),
             hosts: vec!["api.example.com".into()],
+            generation: None,
         },
     )
     .unwrap();
@@ -276,7 +282,7 @@ fn activity_kinds(m: &Manager) -> Vec<String> {
 
 #[test]
 fn code_with_valid_proof_rotates_the_same_host() {
-    let Some(s) = setup() else { return };
+    let s = setup();
     let m = &s.m;
     let (host_id, old_token) = pair_code(m, "box", Some(HINT), None);
     m.rename_host(host_id.clone(), "Build box".into()).unwrap();
@@ -300,7 +306,7 @@ fn code_with_valid_proof_rotates_the_same_host() {
 
 #[test]
 fn interactive_with_valid_proof_keeps_the_record() {
-    let Some(s) = setup() else { return };
+    let s = setup();
     let m = &s.m;
     let (host_id, old_token) = pair_code(m, "box", Some(HINT), None);
     let lease_id = lease(m, &host_id);
@@ -326,7 +332,7 @@ fn interactive_with_valid_proof_keeps_the_record() {
 
 #[test]
 fn hint_match_with_replace_revokes_the_old_host() {
-    let Some(s) = setup() else { return };
+    let s = setup();
     let m = &s.m;
     let (old_id, old_token) = pair_code(m, "box", Some(HINT), None);
     m.rename_host(old_id.clone(), "Build box".into()).unwrap();
@@ -354,7 +360,7 @@ fn hint_match_with_replace_revokes_the_old_host() {
 
 #[test]
 fn hint_match_without_replace_adds_a_host() {
-    let Some(s) = setup() else { return };
+    let s = setup();
     let m = &s.m;
     let (old_id, old_token) = pair_code(m, "box", Some(HINT), None);
     let lease_id = lease(m, &old_id);
@@ -376,7 +382,7 @@ fn hint_match_without_replace_adds_a_host() {
 
 #[test]
 fn code_with_hint_only_adds_a_host() {
-    let Some(s) = setup() else { return };
+    let s = setup();
     let m = &s.m;
     let (old_id, old_token) = pair_code(m, "box", Some(HINT), None);
     let lease_id = lease(m, &old_id);
@@ -400,7 +406,7 @@ fn code_with_hint_only_adds_a_host() {
 
 #[test]
 fn revoked_hosts_token_is_no_proof() {
-    let Some(s) = setup() else { return };
+    let s = setup();
     let m = &s.m;
     let (old_id, old_token) = pair_code(m, "box", None, None);
     m.revoke_host(old_id.clone()).unwrap();
@@ -421,7 +427,7 @@ fn revoked_hosts_token_is_no_proof() {
 
 #[test]
 fn resolved_requests_link_to_their_activity_rows() {
-    let Some(s) = setup() else { return };
+    let s = setup();
     let m = &s.m;
     // Pairing approved, as a replacement (its extra `replaced` row is not the outcome).
     let (old_id, _) = pair_code(m, "box", Some(HINT), None);
@@ -447,6 +453,14 @@ fn resolved_requests_link_to_their_activity_rows() {
                 RequestBody::Get {
                     name: "DEMO_TOKEN".into(),
                     raw,
+                    sentinel: false,
+                    fields: None,
+                    generation: None,
+                    refresh: false,
+                    new_lease: false,
+                    lease_id: None,
+                    refresh_from_version: None,
+                    client_capabilities: vec![],
                     hosts: vec!["api.example.com".into()],
                     reason: "recent link test".into(),
                     agent: "test".into(),
@@ -462,6 +476,7 @@ fn resolved_requests_link_to_their_activity_rows() {
             mode: LeaseMode::Sentinel,
             duration_secs: Some(3600),
             hosts: vec!["api.example.com".into()],
+            generation: None,
         },
     )
     .unwrap();
@@ -530,7 +545,7 @@ fn asm(cli: &Path, config: &Path, args: &[&str]) -> (i32, String, String) {
 
 #[test]
 fn cli_refuses_to_pair_again_while_paired() {
-    let Some(s) = setup() else { return };
+    let s = setup();
     let m = &s.m;
     let cli = build_cli();
     let config = s.tmp.path().join("config");

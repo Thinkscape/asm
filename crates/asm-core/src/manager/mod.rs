@@ -2,13 +2,14 @@
 //! proxy entry set. Request flows live in `requests`, pairing in `pairing`, UI operations
 //! in `admin`, HTTP handlers in `api`, the audit trail in `activity`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asm_proto::wire::LeaseMode;
+use asm_proto::generators::SourceKind;
 use tokio::sync::{Notify, watch};
 
 use crate::error::{CoreError, Result};
@@ -23,8 +24,10 @@ use crate::vault::{VaultConfig, creds};
 
 pub mod activity;
 pub mod admin;
+pub(crate) mod catalog;
 pub mod api;
 pub mod firewall;
+pub mod generation;
 pub mod netinfo;
 pub mod pairing;
 pub mod requests;
@@ -35,6 +38,7 @@ pub const TOPIC_REQUESTS: &str = "requests";
 pub const TOPIC_LEASES: &str = "leases";
 pub const TOPIC_HOSTS: &str = "hosts";
 pub const TOPIC_VAULTS: &str = "vaults";
+pub const TOPIC_GENERATORS: &str = "generators";
 pub const TOPIC_PROXY: &str = "proxy";
 pub const TOPIC_FIREWALL: &str = "firewall";
 pub const TOPIC_SETTINGS: &str = "settings";
@@ -83,13 +87,24 @@ pub struct ProxyState {
     pub entries: BTreeMap<String, Vec<ProxyEntry>>,
     /// Active sentinel leases whose vault cannot be read (lease id → message).
     pub suspended: BTreeMap<String, String>,
+    /// Desired entries have not been successfully published to the proxy.
+    pub dirty: bool,
+    /// Resume transitions await successful publication and are audited after locks.
+    pending_resumed: BTreeMap<String, LeaseRecord>,
 }
 
 impl ProxyState {
     fn flatten(&self) -> Vec<ProxyEntry> {
         self.entries.values().flatten().cloned().collect()
     }
+
+    pub(crate) fn resume(&mut self, lease: &LeaseRecord) {
+        if self.suspended.remove(&lease.id).is_some() {
+            self.pending_resumed.insert(lease.id.clone(), lease.clone());
+        }
+    }
 }
+
 
 struct ApiServer {
     handle: axum_server::Handle<SocketAddr>,
@@ -101,6 +116,10 @@ pub struct Core {
     pub bin_dir: PathBuf,
     pub store: Arc<Store>,
     pub registry: Registry,
+    pub generators: crate::generator::GeneratorRegistry,
+    /// Generation authority linearization; never held during provider calls.
+    pub(crate) authorization: Mutex<()>,
+    pub(crate) generation: Mutex<generation::GenerationState>,
     pub proxy: Arc<ProxySupervisor>,
     pub cert: ServerCert,
     pub settings: RwLock<Settings>,
@@ -169,7 +188,21 @@ mod lock_tests {
         assert_eq!(e.code, asm_proto::error::ErrorCode::Exists);
         assert_eq!(e.message, ALREADY_RUNNING);
         drop(first);
-        lock_data_dir(dir.path()).unwrap();
+        // Other tests in this process spawn children; one forked in the instant after
+        // the lock was taken shares the open file (and its flock) until it execs and
+        // closes the descriptor. Allow that window instead of failing intermittently.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match lock_data_dir(dir.path()) {
+                Ok(_) => break,
+                Err(e) if e.code == asm_proto::error::ErrorCode::Exists
+                    && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                Err(e) => panic!("lock not released: {e:?}"),
+            }
+        }
     }
 }
 
@@ -204,6 +237,9 @@ fn lease_entries(
 fn build_entries(registry: &Registry, leases: &[&LeaseRecord], state: &mut ProxyState) {
     let mut cache: HashMap<(String, String), std::result::Result<Values, String>> = HashMap::new();
     for lease in leases {
+        if lease.source_kind != SourceKind::Vault || !lease.fields.iter().any(|f| f.sentinel.is_some()) {
+            continue;
+        }
         let k = (lease.vault_id.clone(), lease.secret_key.clone());
         let values = cache
             .entry(k)
@@ -288,6 +324,8 @@ impl Core {
                 }
             }
         }
+        let generators = crate::generator::GeneratorRegistry::new();
+        generators.load(store.list_generators()?);
 
         // Proxy entries of active sentinel leases.
         let t = now();
@@ -298,6 +336,12 @@ impl Core {
             .collect();
         let mut proxy_state = ProxyState::default();
         build_entries(&registry, &sentinel, &mut proxy_state);
+        for lease in &active {
+            if lease.source_kind == SourceKind::Generator {
+                proxy_state.suspended.insert(lease.id.clone(),
+                    "credential unavailable; run asm get to generate a token".into());
+            }
+        }
 
         let obs = observer.clone();
         let on_change: Arc<dyn Fn() + Send + Sync> =
@@ -337,6 +381,9 @@ impl Core {
             bin_dir,
             store,
             registry,
+            generators,
+            authorization: Mutex::new(()),
+            generation: Mutex::new(generation::GenerationState::new(Arc::new(now))),
             proxy,
             cert,
             settings: RwLock::new(settings.clone()),
@@ -454,14 +501,10 @@ impl Core {
     /// Wall-clock time until the earliest expiry of an active lease (plus a small margin),
     /// `None` when no active lease expires.
     fn until_next_expiry(&self) -> Option<Duration> {
-        let t = now();
-        let next = self
-            .store
-            .active_leases(t)
-            .ok()?
-            .iter()
-            .filter_map(|l| l.expires_at)
-            .min()?;
+        let t = self.generation_now();
+        let leases = self.store.active_leases(t).ok()?;
+        let live = lock(&self.generation).next_expiry(t);
+        let next = leases.iter().filter_map(|l| l.expires_at).chain(live).min()?;
         Some(
             to_system_time(next)
                 .duration_since(SystemTime::now())
@@ -564,71 +607,133 @@ impl Core {
 
     // ---- proxy entries ----
 
-    /// Bring the proxy entry set in line with the active sentinel leases and apply it when
-    /// anything changed. `mutate` runs first under the state lock (insert entries built from
-    /// values just read, or patch values after an update); `retry_suspended` re-reads
-    /// suspended leases.
-    pub fn sync_proxy_with(&self, retry_suspended: bool, mutate: impl FnOnce(&mut ProxyState)) {
-        let t = now();
-        let active = match self.store.active_leases(t) {
-            Ok(a) => a,
-            Err(e) => {
-                log::error!("sync proxy: {}", e.message);
-                return;
-            }
+    /// Static provider reads run outside every manager state lock. Authorization is
+    /// rechecked before merging their result with live, per-lease generated values.
+    pub(crate) fn reconcile_proxy_with(
+        &self,
+        retry_suspended: bool,
+        mutate: impl FnOnce(&mut ProxyState),
+    ) -> Result<()> {
+        let (snapshot, todo) = {
+            let _authority = lock(&self.authorization);
+            let active = self.store.active_leases(self.generation_now())?;
+            let mut state = lock(&self.proxy_state);
+            mutate(&mut state);
+            // Mutators mark material changes; ordinary sweeps avoid rewriting values.
+            let todo: Vec<LeaseRecord> = active.iter()
+                .filter(|l| l.source_kind == SourceKind::Vault && l.mode == LeaseMode::Sentinel
+                    && l.fields.iter().any(|f| f.sentinel.is_some()))
+                .filter(|l| (!state.entries.contains_key(&l.id) && !state.suspended.contains_key(&l.id))
+                    || (retry_suspended && state.suspended.contains_key(&l.id)))
+                .cloned().collect();
+            (active, todo)
         };
-        let active: Vec<&LeaseRecord> = active
-            .iter()
-            .filter(|l| l.mode == LeaseMode::Sentinel)
-            .collect();
-        let ids: BTreeSet<&str> = active.iter().map(|l| l.id.as_str()).collect();
-        let mut st = lock(&self.proxy_state);
-        let fingerprint = |st: &ProxyState| -> Vec<(String, usize, String, String)> {
-            st.entries
-                .values()
-                .flatten()
-                .map(|e| {
-                    (
-                        e.lease_id.clone(),
-                        e.index,
-                        e.sentinel.clone(),
-                        e.value.clone(),
-                    )
-                })
-                .collect()
-        };
-        let before = (fingerprint(&st), st.suspended.clone());
-        mutate(&mut st);
-        st.entries.retain(|id, _| ids.contains(id.as_str()));
-        st.suspended.retain(|id, _| ids.contains(id.as_str()));
-        let todo: Vec<&LeaseRecord> = active
-            .iter()
-            .copied()
-            .filter(|l| {
-                let known = st.entries.contains_key(&l.id);
-                let suspended = st.suspended.contains_key(&l.id);
-                (!known && !suspended) || (suspended && retry_suspended)
-            })
-            .collect();
-        build_entries(&self.registry, &todo, &mut st);
-        let changed = before != (fingerprint(&st), st.suspended.clone());
-        if changed {
-            for l in &active {
-                let was = before.1.contains_key(&l.id);
-                match st.suspended.get(&l.id) {
-                    Some(why) if !was => self.log_lease_suspended(l, why),
-                    None if was && st.entries.contains_key(&l.id) => self.log_lease_resumed(l),
-                    _ => {}
+        let mut read = ProxyState::default();
+        build_entries(&self.registry, &todo.iter().collect::<Vec<_>>(), &mut read);
+        let result = {
+            let authority = lock(&self.authorization);
+            let active = self.store.active_leases(self.generation_now())?;
+            let mut state = lock(&self.proxy_state);
+            for lease in &active {
+                if lease.source_kind != SourceKind::Vault
+                    || !snapshot.iter().any(|old| old.id == lease.id && old.revoked_at == lease.revoked_at) {
+                    continue;
+                }
+                if let Some(entries) = read.entries.remove(&lease.id) {
+                    state.dirty = true;
+                    state.entries.insert(lease.id.clone(), entries);
+                    state.resume(lease);
+                } else if let Some(why) = read.suspended.remove(&lease.id) {
+                    state.entries.remove(&lease.id);
+                    state.dirty = true;
+                    state.suspended.insert(lease.id.clone(), why);
                 }
             }
-            let entries = st.flatten();
-            if let Err(e) = self.proxy.apply(entries) {
-                log::error!("proxy apply: {}", e.message);
-            }
-            drop(st);
-            self.notify(TOPIC_LEASES);
-            self.notify(TOPIC_PROXY);
+            drop(state);
+            self.publish_proxy_locked(&authority)
+        };
+        self.notify_proxy_changed();
+        self.notify(TOPIC_LEASES);
+        self.notify(TOPIC_PROXY);
+        result
+    }
+
+    pub fn sync_proxy_with(&self, retry_suspended: bool, mutate: impl FnOnce(&mut ProxyState)) {
+        if let Err(e) = self.reconcile_proxy_with(retry_suspended, mutate) {
+            log::error!("proxy apply: {}", e.message);
         }
+    }
+
+    /// Caller owns generation authorization. No observer callback is invoked here.
+    pub(crate) fn publish_proxy_locked(&self, _guard: &MutexGuard<'_, ()>) -> Result<()> {
+        let t = self.generation_now();
+        let active = self.store.active_leases(t)?;
+        let mut state = lock(&self.proxy_state);
+        let ids: HashSet<&str> = active.iter().map(|l| l.id.as_str()).collect();
+        let before = state.entries.len();
+        state.entries.retain(|id, _| ids.contains(id.as_str()));
+        state.dirty |= state.entries.len() != before;
+        state.suspended.retain(|id, _| ids.contains(id.as_str()));
+        let generation = lock(&self.generation);
+        for lease in active.iter().filter(|l| l.source_kind == SourceKind::Generator) {
+            match generation.cached.get(&lease.id).filter(|c|
+                c.version == lease.credential_version && c.current.expires_at > t) {
+                Some(cached) => {
+                    state.resume(lease);
+                    if lease.mode == LeaseMode::Sentinel {
+                        let unchanged = state.entries.get(&lease.id).is_some_and(|entries|
+                            entries.len() == lease.fields.iter().filter(|f| f.sentinel.is_some()).count()
+                                && entries.iter().all(|entry| entry.value == cached.current.token
+                                    && lease.fields.get(entry.index).and_then(|f| f.sentinel.as_ref()) == Some(&entry.sentinel)
+                                    && entry.hosts == lease.hosts));
+                        if !unchanged {
+                            let entries = lease.fields.iter().enumerate().filter_map(|(index, f)|
+                                f.sentinel.as_ref().map(|sentinel| ProxyEntry { lease_id: lease.id.clone(), index,
+                                    sentinel: sentinel.clone(), value: cached.current.token.clone(), hosts: lease.hosts.clone() })).collect();
+                            state.entries.insert(lease.id.clone(), entries);
+                            state.dirty = true;
+                        }
+                    }
+                }
+                None => {
+                    if state.entries.remove(&lease.id).is_some() { state.dirty = true; }
+                    state.suspended.entry(lease.id.clone()).or_insert_with(||
+                        "credential unavailable; run asm get to generate a token".into());
+                }
+            }
+        }
+        drop(generation);
+        if !state.dirty { return Ok(()); }
+        let result = self.proxy.apply_deferred(state.flatten());
+        if result.is_ok() {
+            state.dirty = false;
+        }
+        else {
+            for lease in active.iter().filter(|l| l.source_kind == SourceKind::Generator && l.mode == LeaseMode::Sentinel) {
+                state.suspended.insert(lease.id.clone(), "credential publication failed; run asm get to retry".into());
+            }
+        }
+        result
+    }
+
+    /// Publish callbacks and resume audit rows only after releasing authorization.
+    pub(crate) fn notify_proxy_changed(&self) {
+        let resumed = {
+            let mut state = lock(&self.proxy_state);
+            if state.dirty {
+                Vec::new()
+            } else {
+                let pending = std::mem::take(&mut state.pending_resumed);
+                pending.into_values().filter(|lease| !state.suspended.contains_key(&lease.id)).collect()
+            }
+        };
+        for lease in resumed {
+            if self.store.get_lease(&lease.id).ok().flatten()
+                .is_some_and(|current| current.is_active(self.generation_now())) {
+                self.log_lease_resumed(&lease);
+            }
+        }
+        self.proxy.notify_changed();
     }
 
     pub fn sync_proxy(&self, retry_suspended: bool) {
@@ -647,6 +752,7 @@ impl Core {
     pub fn sweep(&self) {
         let t = now();
         self.expire_requests(t);
+        self.sweep_generated_at(self.generation_now());
         let _ = self.store.prune_history(t - HISTORY_SECS);
         self.prune_activity(t);
         if let Ok(active) = self.store.active_leases(t) {
@@ -695,11 +801,13 @@ impl Core {
     }
 
     pub fn shutdown(&self) {
+        self.begin_generation_shutdown();
         if let Some(api) = lock(&self.api).take() {
             api.handle.shutdown();
         }
         self.proxy.shutdown();
         self.registry.shutdown_all();
+        self.finish_generation_shutdown();
         if let Some(rt) = lock(&self.rt).take() {
             rt.shutdown_background();
         }

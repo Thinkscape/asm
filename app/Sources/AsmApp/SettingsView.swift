@@ -2,13 +2,14 @@ import AppKit
 import SwiftUI
 
 enum SettingsPane: String, CaseIterable, Identifiable, Hashable {
-    case vaults, hosts, leases, proxy, settings
+    case vaults, generators, hosts, leases, proxy, settings
 
     var id: String { rawValue }
 
     var title: LocalizedStringKey {
         switch self {
         case .vaults: "Vaults"
+        case .generators: "Generators"
         case .hosts: "Hosts and Agents"
         case .leases: "Leases"
         case .proxy: "Proxy"
@@ -19,6 +20,7 @@ enum SettingsPane: String, CaseIterable, Identifiable, Hashable {
     var symbol: String {
         switch self {
         case .vaults: "lock.rectangle.stack"
+        case .generators: "key.horizontal"
         case .hosts: "desktopcomputer"
         case .leases: "clock.badge.checkmark"
         case .proxy: "arrow.left.arrow.right"
@@ -31,7 +33,6 @@ struct SettingsView: View {
     let model: AppModel
     @State private var selection: SettingsPane? = .vaults
     @State private var window = WindowRef()
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         NavigationSplitView {
@@ -54,19 +55,6 @@ struct SettingsView: View {
             .toolbar(removing: .sidebarToggle)
         } detail: {
             SettingsDetail(model: model, pane: selection ?? .vaults)
-        }
-        // Every pane shares this toolbar item. A pane without toolbar items (Hosts,
-        // Proxy, Settings) would otherwise remove the window toolbar, shrinking the title
-        // bar: the traffic lights and the sidebar jump when switching panes.
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    ActivationPolicyController.shared.openRegularWindow { openWindow(id: "activity") }
-                } label: {
-                    Label("Activity Log", systemImage: "list.bullet.rectangle")
-                }
-                .help("Show the activity log")
-            }
         }
         .frame(minWidth: 820, minHeight: 520)
         .background(RegularWindowMarker { window.window = $0 })
@@ -146,6 +134,7 @@ private struct SettingsDetail: View {
         VStack {
             switch pane {
             case .vaults: VaultsPane(model: model)
+            case .generators: GeneratorsPane(model: model)
             case .hosts: HostsPane(model: model)
             case .leases: LeasesPane(model: model)
             case .proxy: ProxyPane(model: model)

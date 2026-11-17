@@ -2,9 +2,10 @@
 
 use crate::api::Api;
 use crate::error::{CliError, RERUN_TO_PICK_UP};
-use crate::files::SecretsDir;
+use crate::files::{FileBinding, SecretsDir};
 use crate::state::{self, HostState};
 use asm_proto::error::ErrorCode;
+use asm_proto::generators::{GenerationRequest, GithubPermission, GithubScopeRequest};
 use asm_proto::wire::{
     GetResult, LeaseMode, LeaseStatus, LeasesResponse, MAX_POLL_WAIT_SECS, RequestBody,
     RequestResult, RequestState, RequestStatus, SecretsResponse, WriteResult,
@@ -81,15 +82,20 @@ pub fn list(json: bool) -> Result<(), CliError> {
         let _ = out.write_all(&body);
         let _ = out.write_all(b"\n");
     } else {
+        let mut printed = HashSet::new();
         for secret in &parsed.secrets {
-            let _ = writeln!(out, "{}", secret.name);
+            for name in std::iter::once(&secret.name).chain(secret.aliases.iter()) {
+                if printed.insert(name) {
+                    let _ = writeln!(out, "{name}");
+                }
+            }
         }
     }
     Ok(())
 }
 
 /// Parse `--hosts a,b` values (already split on commas) into normalised patterns.
-fn parse_hosts(hosts: &[String]) -> Result<Vec<String>, CliError> {
+pub(crate) fn parse_hosts(hosts: &[String]) -> Result<Vec<String>, CliError> {
     let raw: Vec<&str> = hosts
         .iter()
         .map(|h| h.trim())
@@ -171,17 +177,14 @@ impl Backoff {
     }
 }
 
-/// Submit a request and wait for its outcome. `wait: None` waits as long as the manager
-/// keeps the request pending (its `expires_at` plus a margin); `Some(w)` stops after `w`
-/// with exit 4 while it is still pending. An unreachable manager is retried until the
-/// earlier of the two.
-fn submit(
+/// Submit without filesystem side effects. One deadline covers POST, polling and backoff.
+pub(crate) fn submit(
     api: &Api,
     body: &RequestBody,
-    wait: Option<Duration>,
+    deadline: Option<Instant>,
 ) -> Result<RequestResult, CliError> {
     let started = Instant::now();
-    let mut state: RequestState = api.post("/requests", body)?;
+    let mut state: RequestState = api.post_until("/requests", body, deadline)?;
     if !asm_proto::crypto::is_uuid(&state.request_id) {
         return Err(CliError::failure("the manager sent an invalid request id"));
     }
@@ -192,7 +195,7 @@ fn submit(
             state.pending_lifetime_secs,
             unix_now(),
         );
-    let hard = wait.map(|w| started + w);
+    let hard = deadline;
     let retry_until = hard.map_or(expected, |h| h.min(expected));
     let mut backoff = Backoff::new();
     // The last connection error, while the manager is unreachable.
@@ -212,15 +215,17 @@ fn submit(
             None => MAX_POLL_WAIT_SECS,
         };
         let polled = Instant::now();
-        match api.get(&format!("/requests/{}?wait={secs}", state.request_id)) {
+        match api.get_until(&format!("/requests/{}?wait={secs}", state.request_id), hard) {
             Ok(s) => {
                 state = s;
                 backoff.reset();
                 last_error = None;
                 if state.status == RequestStatus::Pending {
-                    pace(polled);
+                    let until = hard.unwrap_or(expected);
+                    std::thread::sleep(Duration::from_secs(1).saturating_sub(polled.elapsed()).min(until.saturating_duration_since(Instant::now())));
                 }
             }
+            Err(e) if e.exit == asm_proto::error::EXIT_PENDING => return Err(CliError::pending()),
             Err(e) if e.code == Some(ErrorCode::NotFound) => return Err(CliError::request_lost()),
             Err(e) if e.transient => {
                 if !backoff.wait(retry_until) {
@@ -251,6 +256,40 @@ fn submit(
     }
 }
 
+pub(crate) fn submit_get(api: &Api, body: &RequestBody, deadline: Option<Instant>) -> Result<GetResult, CliError> {
+    let result = match submit(api, body, deadline)? {
+        RequestResult::Get(result) => result,
+        RequestResult::Write(_) => return Err(CliError::failure("the manager sent a write result for a get")),
+    };
+    let RequestBody::Get { fields, sentinel, lease_id, .. } = body else {
+        return Err(CliError::failure("invalid get request"));
+    };
+    let actual: HashSet<&str> = result.files.iter().map(|f| f.field.as_str()).collect();
+    if !asm_proto::crypto::is_uuid(&result.lease_id)
+        || result.files.is_empty()
+        || actual.len() != result.files.len()
+        || fields.as_ref().is_some_and(|wanted| wanted.len() != actual.len() || wanted.iter().any(|f| !actual.contains(f.as_str())))
+        || lease_id.as_ref().is_some_and(|id| id != &result.lease_id)
+        || (*sentinel && result.mode != LeaseMode::Sentinel)
+        || (result.mode == LeaseMode::Raw && result.files.iter().any(|f| f.substituted))
+    {
+        return Err(CliError::failure("the manager sent an inconsistent get result"));
+    }
+    if result.expires_at.as_deref().is_some_and(|expiry| asm_proto::time::parse_unix(expiry).is_none_or(|t| t <= unix_now())) {
+        return Err(CliError::failure("the manager sent an invalid or ended lease"));
+    }
+    if result.generation.is_some() && (result.credential_version.is_none_or(|v| v == 0)
+        || result.credential_expires_at.as_deref().and_then(asm_proto::time::parse_unix).is_none_or(|t| t <= unix_now()))
+    {
+        return Err(CliError::failure("the manager sent invalid generated credential metadata"));
+    }
+    Ok(result)
+}
+
+pub(crate) fn deadline(wait: Option<u64>) -> Option<Instant> {
+    wait.map(|seconds| Instant::now() + Duration::from_secs(seconds))
+}
+
 /// Keep at least one second between polls when the manager answers a long poll early.
 pub fn pace(started: Instant) {
     if let Some(rest) = Duration::from_secs(1).checked_sub(started.elapsed()) {
@@ -271,42 +310,174 @@ struct JsonGet<'a> {
     mode: LeaseMode,
     hosts: &'a [String],
     expires_at: &'a Option<String>,
+    generation: &'a Option<asm_proto::generators::GenerationSelection>,
+    generator_name: &'a Option<String>,
+    credential_expires_at: &'a Option<String>,
+    credential_version: Option<u64>,
     files: Vec<JsonFile<'a>>,
 }
 
+#[derive(clap::Args)]
 pub struct GetArgs {
+    /// Ask for raw values (the operator may choose sentinel delivery instead).
+    #[arg(long, conflicts_with = "sentinel")]
     pub raw: bool,
+    /// Forbid disclosure of raw substitutable values.
+    #[arg(long, conflicts_with = "raw")]
+    pub sentinel: bool,
+    #[arg(long, value_delimiter = ',')]
     pub hosts: Vec<String>,
-    /// `None` = until the request expires on the manager.
+    /// Overall operator/acquisition wait, in seconds.
+    #[arg(long)]
     pub wait: Option<u64>,
+    #[arg(long)]
     pub json: bool,
+    #[arg(long)]
+    pub no_reaper: bool,
+    /// Requested GitHub owner/repository names.
+    #[arg(long, alias = "github-repositories", value_delimiter = ',')]
+    pub repositories: Vec<String>,
+    /// Requested GitHub permission KEY=read|write|admin; repeat for multiple keys.
+    #[arg(long = "permission", alias = "github-permission", value_delimiter = ',')]
+    pub permissions: Vec<String>,
+    /// Renew exactly this host-owned generated lease, without rebinding.
+    #[arg(long, conflicts_with = "new_lease")]
+    pub lease: Option<String>,
+    /// Replace a generated token; may disrupt existing consumers.
+    #[arg(long, conflicts_with = "new_lease")]
+    pub refresh: bool,
+    /// Ask for a new generated authorization instead of reusing one.
+    #[arg(long, conflicts_with_all = ["lease", "refresh"])]
+    pub new_lease: bool,
+    /// [DEST=]SOURCE[::FIELD].
     pub name: String,
+    /// Why you need access.
     pub reason: String,
 }
 
+fn generation_request(a: &GetArgs) -> Result<Option<GenerationRequest>, CliError> {
+    if a.repositories.is_empty() && a.permissions.is_empty() {
+        return Ok(None);
+    }
+    let mut permissions = std::collections::BTreeMap::new();
+    for item in &a.permissions {
+        let (key, value) = item.split_once('=').ok_or_else(|| CliError::invalid("permissions must be KEY=read|write|admin"))?;
+        let level = match value {
+            "read" => GithubPermission::Read,
+            "write" => GithubPermission::Write,
+            "admin" => GithubPermission::Admin,
+            _ => return Err(CliError::invalid("permissions must be KEY=read|write|admin")),
+        };
+        if permissions.insert(key.to_owned(), level).is_some() {
+            return Err(CliError::invalid("duplicate permission key"));
+        }
+    }
+    let mut request = GenerationRequest::GithubApp(GithubScopeRequest {
+        repositories: (!a.repositories.is_empty()).then(|| a.repositories.clone()),
+        permissions: (!a.permissions.is_empty()).then_some(permissions),
+    });
+    request.canonicalize()?;
+    Ok(Some(request))
+}
+
 pub fn get(a: GetArgs) -> Result<(), CliError> {
-    check_name(&a.name)?;
     let reason = asm_proto::rules::validate_reason(&a.reason)?;
     let hosts = parse_hosts(&a.hosts)?;
+    let generation = generation_request(&a)?;
+    let generated_flags = generation.is_some() || a.lease.is_some() || a.refresh || a.new_lease;
     let s = Session::open()?;
     let dir = s.secrets_dir()?;
-    s.sync_leases()?;
-    let body = RequestBody::Get {
-        name: a.name,
-        raw: a.raw,
-        hosts,
-        reason,
-        agent: crate::hostinfo::agent_label(),
-    };
-    let result = match submit(&s.api, &body, a.wait.map(Duration::from_secs))? {
-        RequestResult::Get(r) => r,
-        RequestResult::Write(_) => {
-            return Err(CliError::failure(
-                "the manager sent a write result for a get",
-            ));
+    crate::bindings::require_capabilities(&s.api, generated_flags, a.sentinel || a.lease.is_some())?;
+    let owned = s.sync_leases()?;
+    let mut refresh_from_version = None;
+    let (binding, request_name, generated, fields) = if let Some(id) = &a.lease {
+        if !asm_proto::crypto::is_uuid(id) {
+            return Err(CliError::invalid("invalid lease id"));
+        }
+        let binding = asm_proto::bindings::parse_binding(&a.name)?;
+        let lease = owned.leases.iter().find(|l| &l.lease_id == id)
+            .ok_or_else(|| CliError::from(asm_proto::error::ApiError::new(ErrorCode::NotFound, "lease not found")))?;
+        if lease.generation.is_none() {
+            return Err(CliError::invalid("--lease requires a generated lease"));
+        }
+        if lease.status != LeaseStatus::Active {
+            return Err(CliError::denied(Some("lease ended; request a new lease without --lease")));
+        }
+        if (a.raw && lease.mode != LeaseMode::Raw) || (a.sentinel && lease.mode != LeaseMode::Sentinel) {
+            return Err(CliError::invalid("delivery mode conflicts with the selected lease"));
+        }
+        let field = binding.field.clone().or_else(|| (binding.destination.is_some() && lease.fields.len() == 1).then(|| lease.fields[0].clone()));
+        if binding.destination.is_some() && field.is_none() {
+            return Err(CliError::invalid(format!("select a field; available fields: {}", lease.fields.join(", "))));
+        }
+        if field.as_ref().is_some_and(|f| !lease.fields.contains(f)) {
+            return Err(CliError::invalid("the selected field is not authorized by this lease"));
+        }
+        refresh_from_version = a.refresh.then_some(lease.credential_version)
+            .flatten().filter(|v| *v > 0);
+        if a.refresh && refresh_from_version.is_none() {
+            return Err(CliError::failure("the manager sent invalid generated credential metadata"));
+        }
+        let name = binding.source.clone();
+        (binding, name, true, field.map(|f| vec![f]))
+    } else {
+        let entries = crate::bindings::catalog(&s.api)?;
+        let binding = asm_proto::bindings::parse_get_binding(&a.name, &entries)?;
+        let resolved = crate::bindings::resolve(binding.clone(), &entries);
+        // Whole-item static gets retain the manager's historical leased-name
+        // fallback. Generated spellings must not reach that fallback, even when
+        // their colliding bare alias was omitted from the public generated row.
+        let generated_spelling = matches!(
+            binding.source.as_str(),
+            asm_proto::generators::GITHUB_TOKEN_NAME | asm_proto::generators::GITHUB_TOKEN_ALIAS
+        ) && entries.iter().any(|entry| {
+            entry.source_kind == asm_proto::generators::SourceKind::Generator
+                && !entry.generators.is_empty()
+        });
+        match resolved {
+            Ok(resolved) => {
+                let fields = binding.field.clone().or_else(|| binding.destination.as_ref().map(|_| resolved.available_fields[0].clone())).map(|f| vec![f]);
+                (binding, resolved.request_name, resolved.generated, fields)
+            }
+            Err(e) if matches!(e.code, Some(ErrorCode::NotFound | ErrorCode::Ambiguous))
+                && binding.destination.is_none() && binding.field.is_none()
+                && !generated_flags && !generated_spelling => {
+                let name = binding.source.clone();
+                (binding, name, false, None)
+            }
+            Err(e) => return Err(e),
         }
     };
-    let stored = dir.store(&result)?;
+    check_name(&request_name)?;
+    if generated_flags && !generated {
+        return Err(CliError::invalid("generation options require a generated secret"));
+    }
+    crate::bindings::require_capabilities(&s.api, generated, fields.is_some() || a.sentinel || (generated && binding.source.ends_with("GITHUB_TOKEN")))?;
+    let mut body = RequestBody::Get {
+        name: request_name,
+        raw: a.raw,
+        sentinel: a.sentinel,
+        fields,
+        generation,
+        refresh: a.refresh,
+        refresh_from_version,
+        new_lease: a.new_lease,
+        lease_id: a.lease.clone(),
+        client_capabilities: crate::bindings::capabilities(),
+        hosts,
+        reason: reason.clone(),
+        agent: crate::hostinfo::agent_label(),
+    };
+    body.canonicalize()?;
+    let result = submit_get(&s.api, &body, deadline(a.wait)).map_err(|e| if e.message == CliError::acquisition_elapsed().message { CliError::pending() } else { e })?;
+    if generated && result.generation.is_none() {
+        return Err(CliError::failure("the manager omitted generated credential metadata"));
+    }
+    let views = result.files.iter().map(|f| FileBinding {
+        field: f.field.clone(),
+        requested_path: binding.destination.clone().unwrap_or_else(|| if generated { binding.source.clone() } else { f.relative_path.clone() }),
+    }).collect::<Vec<_>>();
+    let stored = if generated || binding.destination.is_some() { dir.store_bindings(&result, &views)? } else { dir.store(&result)? };
     crate::reaper::ensure_running(dir);
     let mut out = std::io::stdout().lock();
     if a.json {
@@ -315,6 +486,10 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
             mode: result.mode,
             hosts: &result.hosts,
             expires_at: &result.expires_at,
+            generation: &result.generation,
+            generator_name: &result.generator_name,
+            credential_expires_at: &result.credential_expires_at,
+            credential_version: result.credential_version,
             files: stored
                 .iter()
                 .map(|f| JsonFile {
@@ -339,6 +514,13 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
             )
         );
     }
+    if result.generation.is_some() {
+        let mode = if result.mode == LeaseMode::Sentinel { " --sentinel" } else { "" };
+        eprintln!("refresh: asm get --lease {} --refresh{} {} {}", result.lease_id, mode, crate::bindings::shell_quote(&a.name), crate::bindings::shell_quote(&reason));
+        if a.refresh {
+            eprintln!("warning: explicit refresh can invalidate tokens used by running consumers");
+        }
+    }
     Ok(())
 }
 
@@ -354,6 +536,14 @@ fn get_block(r: &GetResult, paths: &[PathBuf]) -> String {
     };
     let expires = r.expires_at.as_deref().unwrap_or("never");
     let mut s = format!("mode: {mode}\nhosts: {hosts}\nexpires: {expires}\n");
+    if let Some(generation) = &r.generation {
+        s.push_str(&format!("lease: {}\ngenerator: {}\ngrant: {}\ncredential expires: {}\ncredential version: {}\n",
+            r.lease_id,
+            r.generator_name.as_deref().unwrap_or(&generation.generator_id),
+            serde_json::to_string(&generation.grant).expect("grant serializes"),
+            r.credential_expires_at.as_deref().unwrap_or("unknown"),
+            r.credential_version.unwrap_or(0)));
+    }
     for p in paths {
         s.push_str(&p.to_string_lossy());
         s.push('\n');
@@ -389,7 +579,7 @@ pub fn update(field: Option<String>, wait: Option<u64>, name: String) -> Result<
         value,
         agent: crate::hostinfo::agent_label(),
     };
-    let w = write_result(submit(&s.api, &body, wait.map(Duration::from_secs))?)?;
+    let w = write_result(submit(&s.api, &body, deadline(wait))?)?;
     // Raw leases on this secret were revoked by the update: remove their files.
     if let Err(e) = s.sync_leases() {
         eprintln!("warning: {}", e.message);
@@ -412,7 +602,7 @@ pub fn add(wait: Option<u64>, name: String) -> Result<(), CliError> {
         value,
         agent: crate::hostinfo::agent_label(),
     };
-    let w = write_result(submit(&s.api, &body, wait.map(Duration::from_secs))?)?;
+    let w = write_result(submit(&s.api, &body, deadline(wait))?)?;
     println!("added {} to {}; run asm get to use it", w.name, w.vault);
     Ok(())
 }
@@ -429,10 +619,15 @@ mod tests {
             mode: LeaseMode::Sentinel,
             hosts: vec!["api.github.com".into(), "*.githubusercontent.com".into()],
             expires_at: Some("2026-11-16T12:34:56Z".into()),
+            generation: None,
+            credential_expires_at: None,
+            credential_version: None,
+            generator_name: None,
             files: vec![ResultFile {
                 field: "value".into(),
                 relative_path: "T".into(),
                 content: "x".into(),
+                substituted: false,
             }],
         };
         let p = vec![PathBuf::from("/run/user/1000/asm/secrets/GITHUB_TOKEN")];

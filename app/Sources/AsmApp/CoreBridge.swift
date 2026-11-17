@@ -19,7 +19,7 @@ final class ObserverBridge: ManagerObserver, @unchecked Sendable {
 /// these off the main thread. `Manager` is an `Arc` of a thread-safe Rust object.
 final class CoreBridge: @unchecked Sendable {
     /// Observer topics, in initial-load order.
-    static let topics = ["settings", "vaults", "hosts", "leases", "proxy", "firewall", "requests"]
+    static let topics = ["settings", "vaults", "generators", "hosts", "leases", "proxy", "firewall", "requests"]
 
     /// Lease duration choices, in display order (`id` 0 = unlimited).
     static let leaseDurations: [LeaseDuration] = AsmCore.leaseDurations().map {
@@ -86,7 +86,9 @@ final class CoreBridge: @unchecked Sendable {
         let core: Decision = switch decision {
         case let .deny(reason): .deny(reason: reason)
         case let .approvePair(name, replace): .approvePair(name: name, replace: replace)
-        case let .approveGet(raw, durationSecs, hosts): .approveGet(mode: raw ? .raw : .sentinel, durationSecs: durationSecs, hosts: hosts)
+        case let .approveGet(raw, durationSecs, hosts, generation):
+            .approveGet(mode: raw ? .raw : .sentinel, durationSecs: durationSecs, hosts: hosts,
+                        generation: generation.map(GenerationSelection.init))
         case let .approveWrite(vaultID, collectionID): .approveWrite(vaultId: vaultID, collectionId: collectionID)
         }
         try Self.mapped { try manager.resolveRequest(id: id, decision: core) }
@@ -121,6 +123,24 @@ final class CoreBridge: @unchecked Sendable {
 
     func unlockVault(_ id: String, masterPassword: String) throws {
         try Self.mapped { try manager.unlockVault(vaultId: id, masterPassword: masterPassword) }
+    }
+
+    // MARK: Generators
+
+    func listGenerators() throws -> [GeneratorItem] {
+        manager.listGenerators().map(GeneratorItem.init)
+    }
+
+    func saveGenerator(_ draft: GeneratorDraftItem) throws -> GeneratorItem {
+        GeneratorItem(try Self.mapped { try manager.saveGenerator(draft: GeneratorDraft(draft)) })
+    }
+
+    func removeGenerator(_ id: String) throws {
+        try Self.mapped { try manager.removeGenerator(id: id) }
+    }
+
+    func githubConnect(_ draft: GeneratorDraftItem) throws -> GithubInstallationItem {
+        GithubInstallationItem(try Self.mapped { try manager.githubConnect(draft: GeneratorDraft(draft)) })
     }
 
     // MARK: Hosts and pairing codes
@@ -316,13 +336,18 @@ private extension PendingItem {
         let detail: RequestDetail = switch r.detail {
         case let .pair(hostInfo, observedAddress, code, repair):
             .pair(info: HostInfoItem(hostInfo), observedAddress: observedAddress, code: code, repair: repair.flatMap(RepairItem.init))
-        case let .get(name, _, vaultName, _, fields, reason, rawRequested, requestedHosts, initialHosts, suggestedHosts, defaultDurationSecs):
+        case let .get(name, vaultID, vaultName, _, fields, reason, rawRequested, requestedHosts,
+                      initialHosts, suggestedHosts, defaultDurationSecs, generatorChoices,
+                      requestedGeneration, sentinelRequired, hasSubstitutableFields):
             .get(GetDetail(
-                name: name, vaultName: vaultName, fields: fields, reason: reason, rawRequested: rawRequested,
+                name: name, vaultID: vaultID, vaultName: vaultName, fields: fields, reason: reason, rawRequested: rawRequested,
                 requestedHosts: requestedHosts,
                 initialHosts: initialHosts.map(HostPatternCheckItem.init),
                 suggestedHosts: suggestedHosts.map(HostPatternCheckItem.init),
-                defaultDurationSecs: defaultDurationSecs
+                defaultDurationSecs: defaultDurationSecs,
+                generatorChoices: generatorChoices.map(GeneratorApprovalChoiceItem.init),
+                requestedGeneration: requestedGeneration.map(GenerationRequestItem.init),
+                sentinelRequired: sentinelRequired, hasSubstitutableFields: hasSubstitutableFields
             ))
         case let .update(name, vaultId, vaultName, field, oldValue, newValue):
             .update(name: name, vaultID: vaultId, vaultName: vaultName, field: field, oldValue: oldValue, newValue: newValue)
@@ -438,7 +463,11 @@ private extension LeaseItem {
         self.init(
             id: l.leaseId, hostLabel: l.hostLabel, hostname: l.hostname, source: l.vaultName, name: l.name,
             mode: l.mode == .raw ? .raw : .sentinel, hosts: l.hosts, createdAt: l.createdAt,
-            expiresAt: l.expiresAt, status: status, suspended: l.suspended, rawDelivered: l.rawDelivered
+            expiresAt: l.expiresAt, status: status, suspended: l.suspended, rawDelivered: l.rawDelivered,
+            sourceKind: l.sourceKind == .generator ? .generator : .vault, sourceID: l.vaultId, fields: l.fields,
+            generation: l.generation.map(GenerationSelectionItem.init), generatorName: l.generatorName,
+            credentialExpiresAt: l.credentialExpiresAt, credentialVersion: l.credentialVersion,
+            suspensionReason: l.suspensionReason
         )
     }
 }
@@ -532,5 +561,169 @@ private extension GeneralSettingsItem {
             pendingLifetimeSecs: s.pendingLifetimeSecs, bwPath: s.bwPath ?? "", version: s.version,
             certSHA256: s.certSha256, listeningOn: s.listeningOn
         )
+    }
+}
+
+// MARK: - Generator record mapping
+
+private extension GithubPermissionLevel {
+    init(_ level: AsmCore.GithubPermission) {
+        switch level {
+        case .read: self = .read
+        case .write: self = .write
+        case .admin: self = .admin
+        }
+    }
+}
+
+private extension AsmCore.GithubPermission {
+    init(_ level: GithubPermissionLevel) {
+        switch level {
+        case .read: self = .read
+        case .write: self = .write
+        case .admin: self = .admin
+        }
+    }
+}
+
+private extension GithubPermissionItem {
+    init(_ permission: GithubPermissionEntry) {
+        self.init(name: permission.name, level: GithubPermissionLevel(permission.level))
+    }
+}
+
+private extension GithubPermissionEntry {
+    init(_ permission: GithubPermissionItem) {
+        self.init(name: permission.name, level: AsmCore.GithubPermission(permission.level))
+    }
+}
+
+private extension GithubRepositoryItem {
+    init(_ repository: GithubRepository) {
+        self.init(id: repository.id, fullName: repository.fullName)
+    }
+}
+
+private extension GithubRepository {
+    init(_ repository: GithubRepositoryItem) {
+        self.init(id: repository.id, fullName: repository.fullName)
+    }
+}
+
+private extension GithubGrantItem {
+    init(_ grant: GithubGrant) {
+        self.init(installationID: grant.installationId, repositories: grant.repositories.map(GithubRepositoryItem.init),
+                  permissions: grant.permissions.map(GithubPermissionItem.init))
+    }
+}
+
+private extension GithubGrant {
+    init(_ grant: GithubGrantItem) {
+        self.init(installationId: grant.installationID, repositories: grant.repositories.map(GithubRepository.init),
+                  permissions: grant.permissions.map(GithubPermissionEntry.init))
+    }
+}
+
+private extension GenerationGrantItem {
+    init(_ grant: GenerationGrant) {
+        switch grant {
+        case let .githubApp(scope): self = .githubApp(GithubGrantItem(scope))
+        }
+    }
+}
+
+private extension GenerationGrant {
+    init(_ grant: GenerationGrantItem) {
+        switch grant {
+        case let .githubApp(scope): self = .githubApp(scope: GithubGrant(scope))
+        }
+    }
+}
+
+private extension GenerationRequestItem {
+    init(_ request: GenerationRequest) {
+        switch request {
+        case let .githubApp(scope):
+            self = .githubApp(GithubScopeRequestItem(
+                repositories: scope.repositories, permissions: scope.permissions?.map(GithubPermissionItem.init)
+            ))
+        }
+    }
+}
+
+private extension GenerationChoiceItem {
+    init(_ choice: GenerationChoice) {
+        self.init(id: choice.generatorId, name: choice.name, revision: choice.revision,
+                  ceiling: GenerationGrantItem(choice.ceiling), available: choice.available,
+                  unavailableReason: choice.unavailableReason)
+    }
+}
+
+private extension GeneratorApprovalChoiceItem {
+    init(_ choice: GeneratorApprovalChoice) {
+        self.init(choice: GenerationChoiceItem(choice.choice),
+                  suggestedHosts: choice.suggestedHosts.map(HostPatternCheckItem.init), scopeIssues: choice.scopeIssues)
+    }
+}
+
+private extension GenerationSelectionItem {
+    init(_ selection: GenerationSelection) {
+        self.init(generatorID: selection.generatorId, generatorRevision: selection.generatorRevision,
+                  grant: GenerationGrantItem(selection.grant))
+    }
+}
+
+private extension GenerationSelection {
+    init(_ selection: GenerationSelectionItem) {
+        self.init(generatorId: selection.generatorID, generatorRevision: selection.generatorRevision,
+                  grant: GenerationGrant(selection.grant))
+    }
+}
+
+private extension GeneratorConfigItem {
+    init(_ config: GeneratorConfig) {
+        switch config {
+        case let .githubApp(config):
+            self = .githubApp(GithubAppConfigItem(
+                clientID: config.clientId, installationID: config.installationId, ceiling: GithubGrantItem(config.ceiling)
+            ))
+        }
+    }
+}
+
+private extension GeneratorConfig {
+    init(_ config: GeneratorConfigItem) {
+        switch config {
+        case let .githubApp(config):
+            self = .githubApp(config: GithubAppConfig(
+                clientId: config.clientID, installationId: config.installationID, ceiling: GithubGrant(config.ceiling)
+            ))
+        }
+    }
+}
+
+private extension GeneratorItem {
+    init(_ generator: GeneratorInfo) {
+        let state: VaultState = switch generator.status {
+        case .ready: .ready
+        case let .error(message): .error(message)
+        case .locked: .error("Signing key unavailable")
+        }
+        self.init(id: generator.id, name: generator.name, config: GeneratorConfigItem(generator.config),
+                  revision: generator.revision, state: state, warning: generator.warning)
+    }
+}
+
+private extension GeneratorDraft {
+    init(_ draft: GeneratorDraftItem) {
+        self.init(id: draft.id, name: draft.name, config: GeneratorConfig(draft.config), privateKeyPem: draft.privateKeyPEM)
+    }
+}
+
+private extension GithubInstallationItem {
+    init(_ installation: GithubInstallation) {
+        self.init(installationID: installation.installationId, accountLogin: installation.accountLogin,
+                  repositories: installation.repositories.map(GithubRepositoryItem.init),
+                  permissions: installation.permissions.map(GithubPermissionItem.init), warning: installation.warning)
     }
 }

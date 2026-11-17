@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Toolbar filter of the Activity Log.
 private enum ActivityTab: String, CaseIterable, Identifiable {
-    case all, requests, leases, proxy, pairing, vaults
+    case all, requests, leases, proxy, pairing, vaults, generators
 
     var id: String { rawValue }
 
@@ -101,7 +101,7 @@ struct ActivityView: View {
                         Text(tab.title).tag(tab)
                     }
                 }
-                .pickerStyle(.segmented)
+                .pickerStyle(.menu)
                 Picker("Host", selection: $hostID) {
                     Text("All hosts").tag("")
                     if !hostID.isEmpty, !model.hosts.contains(where: { $0.id == hostID }) {

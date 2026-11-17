@@ -274,11 +274,14 @@ private struct VaultStatusCell: View {
 }
 
 /// Vault names: 1–64 characters, no `/` (plan step 4).
-private func vaultNameProblem(_ name: String) -> String? {
+func vaultNameProblem(_ name: String) -> String? {
     let trimmed = name.trimmingCharacters(in: .whitespaces)
     if trimmed.isEmpty { return "Enter a name." }
     if trimmed.count > 64 { return "Names have at most 64 characters." }
     if trimmed.contains("/") { return "Names cannot contain “/”." }
+    if trimmed.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
+        return "Names cannot contain control characters."
+    }
     return nil
 }
 

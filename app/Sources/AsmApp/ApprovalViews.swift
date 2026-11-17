@@ -11,12 +11,18 @@ struct ApprovalRoot: View {
     let close: () -> Void
     @State private var armed = false
     @State private var hovering = false
+    @State private var contentHeight: CGFloat = 120
 
     var body: some View {
-        ApprovalContent(model: model, armed: armed)
-            .padding(18)
-            .frame(width: 400)
-            .fixedSize(horizontal: false, vertical: true)
+        ScrollView {
+            ApprovalContent(model: model, armed: armed)
+                .padding(18)
+                .onGeometryChange(for: CGFloat.self) { geometry in geometry.size.height } action: { height in
+                    contentHeight = height
+                }
+        }
+            .frame(width: 400, height: min(contentHeight, maximumPanelHeight))
+            .scrollBounceBehavior(.basedOnSize)
             .modifier(PanelBackground())
             // Top-aligned, so while the panel animates a height change the content is
             // revealed or hidden at the bottom edge.
@@ -33,6 +39,10 @@ struct ApprovalRoot: View {
                 try? await Task.sleep(for: .seconds(1))
                 armed = !Task.isCancelled
             }
+    }
+
+    private var maximumPanelHeight: CGFloat {
+        max(180, (NSScreen.screens.lazy.map(\.visibleFrame.height).min() ?? 800) - 40)
     }
 }
 
@@ -171,6 +181,7 @@ private struct ApprovalBody: View {
 private struct ApprovalScaffold<Header: View, Content: View, Details: View, Actions: View>: View {
     let error: String?
     let footnote: Text?
+    let contentHeight: CGFloat?
     let header: Header
     let content: Content
     let details: Details
@@ -179,6 +190,7 @@ private struct ApprovalScaffold<Header: View, Content: View, Details: View, Acti
     init(
         error: String?,
         footnote: Text?,
+        contentHeight: CGFloat? = nil,
         @ViewBuilder header: () -> Header,
         @ViewBuilder content: () -> Content,
         @ViewBuilder details: () -> Details,
@@ -186,6 +198,7 @@ private struct ApprovalScaffold<Header: View, Content: View, Details: View, Acti
     ) {
         self.error = error
         self.footnote = footnote
+        self.contentHeight = contentHeight
         self.header = header()
         self.content = content()
         self.details = details()
@@ -195,7 +208,16 @@ private struct ApprovalScaffold<Header: View, Content: View, Details: View, Acti
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
-            content
+            if let contentHeight {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) { content }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: contentHeight)
+                .scrollBounceBehavior(.basedOnSize)
+            } else {
+                content
+            }
             DetailsDisclosure { details }
             if let error {
                 ErrorLine(message: error)
@@ -203,7 +225,7 @@ private struct ApprovalScaffold<Header: View, Content: View, Details: View, Acti
             actions
             if let footnote {
                 footnote
-                    .font(.system(size: 11))
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -348,23 +370,29 @@ private enum ValueMode: Hashable {
 /// Footnote under the action row: what the chosen mode gives the agent.
 private struct ValueModeCaption: View {
     let mode: ValueMode
+    var generated = false
+    var plainOnly = false
 
     var body: some View {
         Group {
             switch mode {
             case .proxied:
-                Text("The agent gets a token that works only through the proxy, over HTTPS, for the hosts above.")
+                Text(plainOnly
+                     ? "These fields are delivered plainly. No proxy or destination-host approval is needed."
+                     : "The agent gets a sentinel that works only through the proxy, over HTTPS, for the hosts above.")
                     .foregroundStyle(.secondary)
             case .realValue:
                 Label {
-                    Text("The agent receives the real value and keeps it. It cannot be taken back.")
+                    Text(generated
+                         ? "The agent receives a real GitHub token. ASM attempts revocation, but delivered copies may remain usable until GitHub expiry if revocation fails or the manager crashes."
+                         : "The agent receives the real value and keeps it. It cannot be taken back.")
                 } icon: {
                     Image(systemName: "exclamationmark.triangle.fill")
                 }
-                .foregroundStyle(.orange)
+                .foregroundStyle(.primary)
             }
         }
-        .font(.system(size: 11))
+        .font(.caption)
         .fixedSize(horizontal: false, vertical: true)
     }
 }
@@ -378,7 +406,7 @@ private struct SectionLabel: View {
 
     var body: some View {
         Text(title)
-            .font(.system(size: 12, weight: .medium))
+            .font(.caption.weight(.medium))
             .foregroundStyle(.secondary)
     }
 }
@@ -672,6 +700,7 @@ private struct AllowSplitButton: View {
     /// The primary segment; the chevron always works.
     let enabled: Bool
     let isDefault: Bool
+    var sentinelRequired = false
     let allow: () -> Void
 
     private var realValue: Bool { mode == .realValue }
@@ -690,14 +719,17 @@ private struct AllowSplitButton: View {
             .disabled(!enabled)
             SegmentDivider(style: realValue ? AnyShapeStyle(.black.opacity(0.25)) : AnyShapeStyle(.white.opacity(0.45)))
             SplitChevron(label: "Approval mode") {
-                [
+                var items = [
                     SplitMenuItem(title: "Allow through proxy (hidden)", checked: mode == .proxied) {
                         mode = .proxied
                     },
-                    SplitMenuItem(title: "Allow real value…", checked: mode == .realValue, tint: .systemOrange) {
-                        mode = .realValue
-                    },
                 ]
+                if !sentinelRequired {
+                    items.append(SplitMenuItem(title: "Allow real value…", checked: mode == .realValue, tint: .systemOrange) {
+                        mode = .realValue
+                    })
+                }
+                return items
             }
             .help("Choose how the agent gets the secret")
         }
@@ -936,7 +968,7 @@ private struct PairApproval: View {
     var body: some View {
         ApprovalScaffold(
             error: context.error,
-            footnote: Text("Pairing lets this device ask for secrets. You still approve every request.")
+            footnote: Text("Pairing authorizes this host to request secrets. You approve access; eligible leases may be reused within that authorization.")
         ) {
             ApprovalHeader(title: title, subtitle: subtitle, queue: context.queue) {
                 Image(systemName: deviceSymbol)
@@ -1113,6 +1145,15 @@ private struct HostEntry: Identifiable, Equatable {
     var id: String { pattern }
 }
 
+private struct GetApprovalGuard: Equatable {
+    var mode: ValueMode
+    var generatorID: String?
+    var revision: UInt64?
+    var claims: GithubClaimsSelection
+    var unmetAcknowledged: Bool
+    var unmetClaims: [String]
+}
+
 private struct GetApproval: View {
     let context: RequestContext
     let detail: GetDetail
@@ -1127,8 +1168,11 @@ private struct GetApproval: View {
     @State private var hostError: String?
     @State private var editingReason = false
     @State private var mode: ValueMode
-    /// Restarts with every mode flip, so a quick flip plus click cannot approve.
-    @State private var modeArmed = false
+    @State private var selectedGeneratorID: String?
+    @State private var selectedRevision: UInt64?
+    @State private var claims: GithubClaimsSelection
+    @State private var unmetAcknowledged = false
+    @State private var armedGuard: GetApprovalGuard?
     @FocusState private var hostFieldFocused: Bool
 
     init(
@@ -1143,27 +1187,54 @@ private struct GetApproval: View {
         self.check = check
         _hosts = State(initialValue: detail.initialHosts.map { HostEntry(pattern: $0.normalized, broad: $0.broad) })
         _duration = State(initialValue: detail.defaultDurationSecs ?? 0)
-        _mode = State(initialValue: detail.rawRequested ? .realValue : .proxied)
+        _mode = State(initialValue: detail.rawRequested && !detail.sentinelRequired ? .realValue : .proxied)
+        // Total candidates matter: one ready app among several must never become a default identity.
+        let sole = detail.generatorChoices.count == 1 ? detail.generatorChoices.first : nil
+        let initial = sole.flatMap { $0.choice.available && $0.scopeIssues.isEmpty ? $0 : nil }
+        _selectedGeneratorID = State(initialValue: initial?.id)
+        _selectedRevision = State(initialValue: initial?.choice.revision)
+        _claims = State(initialValue: initial.map {
+            GithubClaimsSelection.requested(detail.requestedGeneration?.github, within: $0.choice.ceiling.github)
+        } ?? GithubClaimsSelection())
     }
 
-    private var raw: Bool { detail.rawRequested }
+    private var generated: Bool { detail.isGenerated }
     private var durationSecs: UInt64? { duration == 0 ? nil : duration }
-    private var armed: Bool { context.armed && modeArmed }
-    private var canAllow: Bool {
-        switch mode {
-        case .proxied: armed && (anyHost || !hosts.isEmpty)
-        case .realValue: armed
+    private var selected: GeneratorApprovalChoiceItem? {
+        detail.generatorChoices.first {
+            $0.id == selectedGeneratorID && $0.choice.revision == selectedRevision && $0.choice.available
         }
     }
-    /// Return allows only in Proxied mode, and never while typing.
-    private var allowIsDefault: Bool { mode == .proxied && !hostFieldFocused && !editingReason }
+    private var selectedGrant: GithubGrantItem? { selected.map { claims.grant(within: $0.choice.ceiling.github) } }
+    private var unmetClaims: [String] { selectedGrant?.unmetClaims(detail.requestedGeneration?.github) ?? [] }
+    private var selection: GenerationSelectionItem? {
+        guard let selected, let selectedGrant else { return nil }
+        return GenerationSelectionItem(generatorID: selected.id, generatorRevision: selected.choice.revision, grant: .githubApp(selectedGrant))
+    }
+    private var guardValue: GetApprovalGuard {
+        GetApprovalGuard(mode: mode, generatorID: selectedGeneratorID, revision: selectedRevision,
+                         claims: claims, unmetAcknowledged: unmetAcknowledged, unmetClaims: unmetClaims)
+    }
+    private var armed: Bool { context.armed && armedGuard == guardValue }
+    private var canAllow: Bool {
+        guard armed, !(detail.sentinelRequired && mode == .realValue) else { return false }
+        if generated {
+            guard let selectedGrant, !selectedGrant.repositories.isEmpty,
+                  selectedGrant.repositories.count <= 500,
+                  selectedGrant.permissions.contains(where: { $0.name == "metadata" && $0.level == .read }),
+                  unmetClaims.isEmpty || unmetAcknowledged else { return false }
+        }
+        return mode == .realValue || !detail.hasSubstitutableFields || anyHost || !hosts.isEmpty
+    }
+    // Generated claims and app pickers never authorize through Return, even while their menus own focus.
+    private var allowIsDefault: Bool { !generated && mode == .proxied && !hostFieldFocused && !editingReason }
 
-    /// Requested hosts and the secret's remembered/URI hosts that are not chosen yet.
     private var suggestions: [HostEntry] {
         let present = Set(hosts.map(\.pattern))
         var seen = Set<String>()
-        let broad = Dictionary(detail.suggestedHosts.map { ($0.normalized, $0.broad) }, uniquingKeysWith: { a, _ in a })
-        let candidates = detail.requestedHosts + detail.suggestedHosts.map(\.normalized)
+        let sourceSuggestions = detail.suggestedHosts + (selected?.suggestedHosts ?? [])
+        let broad = Dictionary(sourceSuggestions.map { ($0.normalized, $0.broad) }, uniquingKeysWith: { a, _ in a })
+        let candidates = detail.requestedHosts + sourceSuggestions.map(\.normalized)
         return candidates
             .filter { $0 != "*" && !present.contains($0) && seen.insert($0).inserted }
             .map { HostEntry(pattern: $0, broad: broad[$0] ?? false) }
@@ -1171,94 +1242,127 @@ private struct GetApproval: View {
 
     private var subtitle: Text {
         let name = Text(verbatim: detail.name).fontWeight(.bold)
-        if raw {
-            let realValue = Text("real value").foregroundStyle(.orange).fontWeight(.semibold)
-            return Text("wants the \(realValue) of \(name)")
-        }
-        return Text("wants to use \(name)")
+        return detail.rawRequested ? Text("wants the real value of \(name)") : Text("wants to use \(name)")
     }
 
     private var approvedHostsLine: String {
         if mode == .realValue { return String(localized: "none (real value)") }
+        if !detail.hasSubstitutableFields { return String(localized: "not required (plain fields)") }
         return anyHost ? String(localized: "any host") : hosts.map(\.pattern).joined(separator: ", ")
     }
 
     var body: some View {
-        ApprovalScaffold(error: context.error, footnote: nil) {
-            ApprovalHeader(title: context.requesterTitle, subtitle: subtitle, queue: context.queue) {
-                AppIconImage()
-            }
+        ApprovalScaffold(
+            error: context.error,
+            footnote: generated ? Text("Access is authorized to this paired host. Agent labels identify the requester but are not a security boundary.") : nil,
+            contentHeight: generated ? max(160, min(340, (NSScreen.main?.visibleFrame.height ?? 800) - 460)) : nil
+        ) {
+            ApprovalHeader(title: context.requesterTitle, subtitle: subtitle, queue: context.queue) { AppIconImage() }
         } content: {
             ReasonBlock(reason: detail.reason)
-            // Real value: the hosts do not apply, so the section leaves the layout. Its
-            // state stays here, so switching back restores what the operator had.
-            if mode == .proxied {
-                HostsSection(
-                    hosts: $hosts,
-                    anyHost: $anyHost,
-                    editing: $editingHost,
-                    newHost: $newHost,
-                    error: $hostError,
-                    fieldFocused: $hostFieldFocused,
-                    suggestions: suggestions,
-                    add: add
+            if generated {
+                GeneratorApprovalSection(
+                    choices: detail.generatorChoices, pinnedID: detail.vaultID,
+                    selected: selected, selectedID: selectedGeneratorID, claims: $claims,
+                    request: detail.requestedGeneration?.github, unmetClaims: unmetClaims,
+                    unmetAcknowledged: $unmetAcknowledged, select: { id in selectGenerator(id) }
                 )
+            }
+            if mode == .proxied {
+                if detail.hasSubstitutableFields {
+                    HostsSection(hosts: $hosts, anyHost: $anyHost, editing: $editingHost,
+                                 newHost: $newHost, error: $hostError, fieldFocused: $hostFieldFocused,
+                                 suggestions: suggestions, add: add)
+                } else {
+                    Text("Only plain fields are selected. Destination-host controls and proxy setup are not needed.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
             }
             HStack(alignment: .center, spacing: 10) {
                 SectionLabel("For")
                 Picker("For", selection: $duration) {
-                    ForEach(durations) { option in
-                        Text(verbatim: option.title).tag(option.id)
-                    }
+                    ForEach(durations) { option in Text(verbatim: option.title).tag(option.id) }
                 }
                 .labelsHidden()
-                .fixedSize()
                 Spacer(minLength: 0)
             }
+            if generated {
+                Text("GitHub tokens expire after one hour. Run asm get again to refresh within this lease. Renewal does not extend the authorization deadline.")
+                    .font(.callout).fixedSize(horizontal: false, vertical: true)
+                if detail.rawRequested && !detail.sentinelRequired {
+                    Text("Generated credentials default to real-value delivery. You may choose proxy delivery instead.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if detail.sentinelRequired {
+                Text("The requester requires sentinel delivery. Real-value disclosure is disabled.")
+                    .font(.callout)
+            }
         } details: {
-            InfoRow(label: "Vault", value: detail.vaultName)
+            InfoRow(label: generated ? "Generator" : "Vault", value: selected?.choice.name ?? detail.vaultName)
             InfoRow(label: "Fields", value: detail.fields.joined(separator: ", "))
             InfoRow(label: "Requested hosts", value: detail.requestedHosts.joined(separator: ", "))
             InfoRow(label: "Approved hosts", value: approvedHostsLine)
-            InfoRow(label: "Requested mode", value: raw ? String(localized: "real value") : String(localized: "proxied (sentinel)"))
+            InfoRow(label: "Requested mode", value: detail.rawRequested ? String(localized: "real value") : String(localized: "proxied (sentinel)"))
             RequestMetaRows(context: context)
         } actions: {
-            ApprovalActions(
-                cannedReasons: ["host selection too open", "provide a better reason"],
-                armed: context.armed,
-                escapeDenies: !hostFieldFocused,
-                editingReason: $editingReason,
-                deny: context.deny
-            ) {
-                AllowSplitButton(mode: $mode, enabled: canAllow, isDefault: allowIsDefault, allow: allow)
+            ApprovalActions(cannedReasons: ["host selection too open", "provide a better reason"],
+                            armed: context.armed, escapeDenies: !hostFieldFocused,
+                            editingReason: $editingReason, deny: context.deny) {
+                AllowSplitButton(mode: $mode, enabled: canAllow, isDefault: allowIsDefault,
+                                 sentinelRequired: detail.sentinelRequired, allow: allow)
             }
-            ValueModeCaption(mode: mode)
+            ValueModeCaption(mode: mode, generated: generated, plainOnly: !detail.hasSubstitutableFields)
         }
-        .task(id: mode) {
-            modeArmed = false
+        .task(id: guardValue) {
+            armedGuard = nil
+            let expected = guardValue
             try? await Task.sleep(for: .seconds(1))
-            modeArmed = !Task.isCancelled
+            if !Task.isCancelled { armedGuard = expected }
         }
         .onChange(of: mode) { _, newMode in
-            if newMode == .realValue {
-                editingHost = false
-                newHost = ""
-                hostError = nil
+            if newMode == .realValue { editingHost = false; newHost = ""; hostError = nil }
+        }
+        .onChange(of: claims) { _, _ in unmetAcknowledged = false }
+        .onChange(of: unmetClaims) { _, _ in unmetAcknowledged = false }
+        .onChange(of: detail.generatorChoices) { _, updated in
+            guard let id = selectedGeneratorID else { return }
+            if !updated.contains(where: { $0.id == id && $0.choice.revision == selectedRevision && $0.choice.available }) {
+                selectedGeneratorID = nil
+                selectedRevision = nil
+                claims = GithubClaimsSelection()
+                unmetAcknowledged = false
             }
         }
+        .onChange(of: detail.requestedGeneration) { _, _ in unmetAcknowledged = false }
+        .onChange(of: detail.sentinelRequired) { _, required in if required { mode = .proxied } }
+    }
+
+    private func selectGenerator(_ id: String?) {
+        if id == nil {
+            selectedGeneratorID = nil
+            selectedRevision = nil
+            claims = GithubClaimsSelection()
+            unmetAcknowledged = false
+            return
+        }
+        guard let candidate = detail.generatorChoices.first(where: { $0.id == id && $0.choice.available }),
+              detail.vaultID == nil || candidate.id == detail.vaultID else { return }
+        selectedGeneratorID = candidate.id
+        selectedRevision = candidate.choice.revision
+        claims = .requested(detail.requestedGeneration?.github, within: candidate.choice.ceiling.github)
+        unmetAcknowledged = false
     }
 
     private func allow() {
         guard canAllow else { return }
-        switch mode {
-        case .proxied:
-            context.resolve(.approveGet(raw: false, durationSecs: durationSecs, hosts: anyHost ? ["*"] : hosts.map(\.pattern)))
-        case .realValue:
-            context.resolve(.approveGet(raw: true, durationSecs: durationSecs, hosts: []))
-        }
+        context.resolve(.approveGet(
+            raw: mode == .realValue, durationSecs: durationSecs,
+            hosts: mode == .realValue || !detail.hasSubstitutableFields ? [] : (anyHost ? ["*"] : hosts.map(\.pattern)),
+            generation: selection
+        ))
     }
 
-    /// Validates with the core's rule; `*` turns on "Any host".
     private func add(_ pattern: String) -> Bool {
         switch check(pattern) {
         case let .success(result):
@@ -1273,6 +1377,87 @@ private struct GetApproval: View {
         case let .failure(error):
             hostError = error.message
             return false
+        }
+    }
+}
+
+private struct GeneratorApprovalSection: View {
+    let choices: [GeneratorApprovalChoiceItem]
+    let pinnedID: String?
+    let selected: GeneratorApprovalChoiceItem?
+    let selectedID: String?
+    @Binding var claims: GithubClaimsSelection
+    let request: GithubScopeRequestItem?
+    let unmetClaims: [String]
+    @Binding var unmetAcknowledged: Bool
+    let select: @MainActor @Sendable (String?) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionLabel("GitHub App")
+            if let pinnedID, let pinned = choices.first(where: { $0.id == pinnedID }) {
+                Text("\(pinned.choice.name) · installation \(pinned.choice.ceiling.github.installationID)")
+                    .font(.headline)
+                if selected == nil {
+                    Button("Select this app") { select(pinnedID) }.disabled(!pinned.choice.available)
+                }
+            } else {
+                Picker("GitHub App", selection: Binding(get: { selectedID }, set: { value in select(value) })) {
+                    Text("Choose an app…").tag(Optional<String>.none)
+                    ForEach(choices) { option in
+                        Text("\(option.choice.name) · \(option.choice.ceiling.github.installationID)\(option.choice.available ? "" : " (unavailable)")")
+                            .tag(Optional(option.id)).disabled(!option.choice.available)
+                    }
+                }
+            }
+            ForEach(choices) { option in
+                if !option.choice.available {
+                    Text("\(option.choice.name): \(option.choice.unavailableReason ?? "Unavailable")")
+                        .font(.callout)
+                }
+            }
+            if let selected {
+                if !selected.scopeIssues.isEmpty {
+                    Text("This app cannot satisfy all requested scope. You may deliberately approve different or narrower claims.")
+                        .font(.callout)
+                    ForEach(selected.scopeIssues, id: \.self) { issue in Text(issue).font(.caption) }
+                }
+                LabeledContent("Selected installation", value: String(selected.choice.ceiling.github.installationID))
+                Text("Claims to approve").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+                GithubClaimsEditor(ceiling: selected.choice.ceiling.github, selection: $claims)
+                RequestedGithubClaims(request: request)
+                if !unmetClaims.isEmpty {
+                    Text("Unmet requested claims").font(.subheadline.weight(.semibold))
+                        .accessibilityAddTraits(.isHeader)
+                    ForEach(unmetClaims, id: \.self) { issue in Text(issue).font(.callout) }
+                    Toggle("Approve the selected claims instead of the unmet requested claims", isOn: $unmetAcknowledged)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                Text("Select a GitHub App before choosing its claims. No permissions are combined across apps.")
+                    .font(.callout).foregroundStyle(.secondary)
+                RequestedGithubClaims(request: request)
+            }
+        }
+    }
+}
+
+private struct RequestedGithubClaims: View {
+    let request: GithubScopeRequestItem?
+
+    var body: some View {
+        if let request {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Requested claims").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+                if let repositories = request.repositories {
+                    Text("Repositories: \(repositories.formatted())").font(.callout)
+                }
+                if let permissions = request.permissions {
+                    ForEach(permissions) { permission in
+                        Text("\(permission.scopeLabel): \(permission.level.rawValue)").font(.callout)
+                    }
+                }
+            }
         }
     }
 }

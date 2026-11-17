@@ -18,6 +18,10 @@ axum-server.workspace = true
 rusqlite.workspace = true
 rcgen.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-no-provider"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["use_pem", "rust_crypto"] }
+# Keep the parsed RSA signer live: jsonwebtoken's encode reparses DER per call.
+rsa = { version = "0.10", features = ["getrandom", "pkcs1v15"] }
+jwt-sha2 = { package = "sha2", version = "0.11", features = ["oid"] }
 rustls = { workspace = true, features = ["ring", "std", "tls12"] }
 security-framework.workspace = true
 security-framework-sys = "2.17"
@@ -33,3 +37,4 @@ log = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+rand = { version = "0.10", default-features = false, features = ["std", "thread_rng"] }

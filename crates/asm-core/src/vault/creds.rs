@@ -1,8 +1,8 @@
-//! Vault credentials in the login keychain: generic passwords with service
-//! `net.thinkscape.asm` and account `<vault_id>:<kind>`. The only kind stored is
-//! `client_secret`; the Bitwarden master password is never stored. Earlier builds stored
-//! `master_password`: it is deleted at start-up and with its vault. The keychain vault
-//! provider never exposes this service.
+//! Manager credentials in the login keychain: generic passwords with service
+//! `net.thinkscape.asm` and account `<source_id>:<kind>`. Bitwarden client secrets
+//! and GitHub App private keys are manager-only. The Bitwarden master password is
+//! never stored; earlier builds' copies are removed at startup and source deletion.
+//! The keychain vault provider never exposes this service.
 
 use security_framework::passwords;
 use security_framework_sys::base::errSecItemNotFound;
@@ -11,6 +11,7 @@ use crate::error::{CoreError, Result};
 
 pub const SERVICE: &str = "net.thinkscape.asm";
 pub const CLIENT_SECRET: &str = "client_secret";
+pub const GITHUB_PRIVATE_KEY: &str = "github_private_key";
 /// Written by earlier builds only; never written now.
 const LEGACY_MASTER_PASSWORD: &str = "master_password";
 
@@ -27,6 +28,12 @@ pub fn set(vault_id: &str, kind: &str, value: &str) -> Result<()> {
         .map_err(|e| err("write", e))
 }
 
+/// Validate before touching the credential store. Manager save owns rollback.
+pub fn set_github_private_key(generator_id: &str, pem: &str) -> Result<()> {
+    crate::generator::github::validate_private_key(pem)?;
+    set(generator_id, GITHUB_PRIVATE_KEY, pem)
+}
+
 pub fn get(vault_id: &str, kind: &str) -> Result<Option<String>> {
     match passwords::generic_password(passwords::PasswordOptions::new_generic_password(
         SERVICE,
@@ -40,7 +47,7 @@ pub fn get(vault_id: &str, kind: &str) -> Result<Option<String>> {
     }
 }
 
-fn delete(vault_id: &str, kind: &str) -> Result<()> {
+pub fn delete(vault_id: &str, kind: &str) -> Result<()> {
     match passwords::delete_generic_password(SERVICE, &account(vault_id, kind)) {
         Ok(()) => Ok(()),
         Err(e) if e.code() == errSecItemNotFound => Ok(()),
@@ -54,7 +61,7 @@ pub fn delete_legacy_master_password(vault_id: &str) -> Result<()> {
 }
 
 pub fn delete_all(vault_id: &str) -> Result<()> {
-    for kind in [CLIENT_SECRET, LEGACY_MASTER_PASSWORD] {
+    for kind in [CLIENT_SECRET, GITHUB_PRIVATE_KEY, LEGACY_MASTER_PASSWORD] {
         delete(vault_id, kind)?;
     }
     Ok(())
@@ -63,6 +70,13 @@ pub fn delete_all(vault_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_github_key_never_reaches_keychain() {
+        let error = set_github_private_key("not-a-real-source", "invalid-private-key").unwrap_err();
+        assert_eq!(error.code, asm_proto::ErrorCode::Invalid);
+        assert!(!error.message.contains("invalid-private-key"));
+    }
 
     /// Touches the real login keychain (may prompt); run with `--ignored`.
     #[test]

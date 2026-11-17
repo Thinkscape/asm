@@ -511,3 +511,421 @@ fn orphan_with_our_config_is_killed_at_start() {
     });
     sup.shutdown();
 }
+
+/// A real, inert child records exactly the config/value material it was started with.
+/// No monitor thread, network service, external proxy binary or credential store is used.
+fn publication_supervisor(
+    tmp: &Path,
+    on_change: Arc<dyn Fn() + Send + Sync>,
+) -> Arc<ProxySupervisor> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dirs = DataDirs::create(&tmp.join("data"), Some(tmp)).unwrap();
+    let binary = tmp.join("iron-proxy");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\n\
+         cp iron-proxy.yaml started.yaml || exit 1\n\
+         cat ../../net.thinkscape.asm/values/* > started.values 2>/dev/null\n\
+         echo started >> starts\n\
+         exec /bin/sleep 60\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_, on_event) = events();
+    Arc::new(ProxySupervisor {
+        binary,
+        ca: ca::CaPaths::new(&dirs.proxy),
+        ca_expiry: None,
+        logs: Arc::new(logs::LogSink::new(dirs.logs.join("proxy.log"))),
+        on_change,
+        on_event,
+        ops: Mutex::new(()),
+        state: Mutex::new(State {
+            cfg: loopback_config(),
+            entries: Vec::new(),
+            apply_pending: false,
+            sentinels: files::SentinelStore::default(),
+            child: None,
+            health: health::Health::default(),
+            last_phase: Phase::Starting,
+            killed_port_holder: false,
+            last_reload: None,
+            error: None,
+            backoff: BACKOFF_MIN,
+            restart_at: None,
+            shutdown: false,
+            spawns: 0,
+        }),
+        dirs,
+    })
+}
+
+fn publication_entry(value: &str) -> ProxyEntry {
+    ProxyEntry {
+        lease_id: "generated-lease".into(),
+        index: 0,
+        sentinel: new_sentinel(),
+        value: value.into(),
+        hosts: vec!["api.github.com".into()],
+    }
+}
+
+fn wait_for_publication(sup: &ProxySupervisor, starts: usize) {
+    wait_for("child config snapshot", Duration::from_secs(3), || {
+        std::fs::read_to_string(sup.dirs.proxy.join("starts"))
+            .is_ok_and(|s| s.lines().count() == starts)
+    });
+}
+
+fn retry_publication(sup: &ProxySupervisor) {
+    lock(&sup.state).restart_at = Some(Instant::now());
+    assert!(sup.tick(false));
+}
+
+/// Renaming over a directory fails even for privileged test runners.
+fn block_publication_file(path: &Path) {
+    std::fs::rename(path, path.with_extension("saved")).unwrap();
+    std::fs::create_dir(path).unwrap();
+}
+
+#[test]
+fn rotation_value_write_failure_stops_child_and_rewrites_before_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, cb) = counter();
+    let sup = publication_supervisor(tmp.path(), cb);
+    let initial = publication_entry(REAL);
+    sup.apply(vec![initial.clone()]).unwrap();
+    wait_for_publication(&sup, 1);
+    let pid = sup.status().pid.unwrap();
+    let value_path = sup
+        .dirs
+        .values
+        .join(files::value_file_name(&initial.lease_id, initial.index));
+    block_publication_file(&value_path);
+    let replacement = ProxyEntry {
+        value: "replacement-token".into(),
+        ..initial
+    };
+
+    assert!(sup.apply(vec![replacement]).is_err());
+    assert!(!sup.status().running);
+    assert!(!pid_alive(pid));
+    assert!(lock(&sup.state).apply_pending);
+    assert_eq!(lock(&sup.state).entries[0].value, "replacement-token");
+    // The old readable config must not be used while its value rewrite still fails.
+    retry_publication(&sup);
+    assert!(!sup.status().running);
+    assert_eq!(lock(&sup.state).spawns, 1);
+    assert!(lock(&sup.state).apply_pending);
+
+    std::fs::remove_dir(&value_path).unwrap();
+    retry_publication(&sup);
+    wait_for_publication(&sup, 2);
+    assert!(!lock(&sup.state).apply_pending);
+    assert_eq!(
+        std::fs::read_to_string(sup.dirs.proxy.join("started.values")).unwrap(),
+        "replacement-token"
+    );
+    assert_eq!(std::fs::read_to_string(value_path).unwrap(), "replacement-token");
+    sup.shutdown();
+}
+
+#[test]
+fn removal_rewrite_failures_never_restart_the_old_grant() {
+    // Exercise both the sentinel-store write and the final YAML write.
+    for blocked_name in ["sentinels.json", "iron-proxy.yaml"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, cb) = counter();
+        let sup = publication_supervisor(tmp.path(), cb);
+        let initial = publication_entry(REAL);
+        let sentinel = initial.sentinel.clone();
+        sup.apply(vec![initial]).unwrap();
+        wait_for_publication(&sup, 1);
+        let pid = sup.status().pid.unwrap();
+        let blocked = sup.dirs.proxy.join(blocked_name);
+        block_publication_file(&blocked);
+
+        assert!(sup.apply(vec![]).is_err());
+        assert!(!sup.status().running);
+        assert!(!pid_alive(pid));
+        assert!(lock(&sup.state).entries.is_empty());
+        assert!(lock(&sup.state).apply_pending);
+        retry_publication(&sup);
+        assert!(!sup.status().running);
+        assert_eq!(lock(&sup.state).spawns, 1);
+
+        std::fs::remove_dir(&blocked).unwrap();
+        retry_publication(&sup);
+        wait_for_publication(&sup, 2);
+        let yaml = std::fs::read_to_string(sup.dirs.proxy.join("started.yaml")).unwrap();
+        assert!(yaml.contains(&sentinel));
+        assert!(yaml.contains("ended: true"));
+        assert!(!yaml.contains("source:"));
+        assert_eq!(
+            std::fs::read_to_string(sup.dirs.proxy.join("started.values")).unwrap(),
+            ""
+        );
+        assert!(!lock(&sup.state).apply_pending);
+        sup.shutdown();
+    }
+}
+
+#[test]
+fn failed_rotation_followed_by_removal_cannot_recover_the_rotated_grant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, cb) = counter();
+    let sup = publication_supervisor(tmp.path(), cb);
+    let initial = publication_entry(REAL);
+    sup.apply(vec![initial.clone()]).unwrap();
+    wait_for_publication(&sup, 1);
+    let value_path = sup
+        .dirs
+        .values
+        .join(files::value_file_name(&initial.lease_id, initial.index));
+    block_publication_file(&value_path);
+    assert!(
+        sup.apply(vec![ProxyEntry {
+            value: "never-published-token".into(),
+            ..initial
+        }])
+        .is_err()
+    );
+    let blocked = sup.dirs.proxy.join("sentinels.json");
+    block_publication_file(&blocked);
+    assert!(sup.apply(vec![]).is_err());
+    retry_publication(&sup);
+    assert_eq!(lock(&sup.state).spawns, 1);
+    assert!(lock(&sup.state).entries.is_empty());
+    std::fs::remove_dir(&blocked).unwrap();
+    std::fs::remove_dir(&value_path).unwrap();
+    retry_publication(&sup);
+    wait_for_publication(&sup, 2);
+    assert_eq!(
+        std::fs::read_to_string(sup.dirs.proxy.join("started.values")).unwrap(),
+        ""
+    );
+    assert!(
+        !std::fs::read_to_string(sup.dirs.proxy.join("started.yaml"))
+            .unwrap()
+            .contains("source:")
+    );
+    sup.shutdown();
+}
+
+#[test]
+fn explicit_restart_cannot_bypass_a_pending_value_rewrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, cb) = counter();
+    let sup = publication_supervisor(tmp.path(), cb);
+    let initial = publication_entry(REAL);
+    sup.apply(vec![initial.clone()]).unwrap();
+    wait_for_publication(&sup, 1);
+    let value_path = sup
+        .dirs
+        .values
+        .join(files::value_file_name(&initial.lease_id, initial.index));
+    block_publication_file(&value_path);
+    assert!(
+        sup.apply(vec![ProxyEntry {
+            value: "replacement-token".into(),
+            ..initial
+        }])
+        .is_err()
+    );
+    assert!(sup.restart().is_err());
+    assert!(!sup.status().running);
+    assert_eq!(lock(&sup.state).spawns, 1);
+    assert!(lock(&sup.state).apply_pending);
+    sup.shutdown();
+}
+
+#[test]
+fn deferred_apply_notifies_only_after_caller_releases_locks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let authorization = Arc::new(Mutex::new(()));
+    let subject: Arc<Mutex<Option<Weak<ProxySupervisor>>>> = Arc::new(Mutex::new(None));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cb: Arc<dyn Fn() + Send + Sync> = {
+        let authorization = authorization.clone();
+        let subject = subject.clone();
+        let calls = calls.clone();
+        Arc::new(move || {
+            let _authorization = authorization.try_lock().expect("authorization still held");
+            let sup = lock(&subject).as_ref().unwrap().upgrade().unwrap();
+            let _ops = sup.ops.try_lock().expect("supervisor ops still held");
+            let _state = sup.state.try_lock().expect("supervisor state still held");
+            calls.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let sup = publication_supervisor(tmp.path(), cb);
+    *lock(&subject) = Some(Arc::downgrade(&sup));
+    let initial = publication_entry(REAL);
+    {
+        let _authorization = lock(&authorization);
+        sup.apply_deferred(vec![initial]).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+    sup.notify_changed();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    wait_for_publication(&sup, 1);
+    let blocked = sup.dirs.proxy.join("iron-proxy.yaml");
+    block_publication_file(&blocked);
+    {
+        let _authorization = lock(&authorization);
+        assert!(sup.apply_deferred(vec![]).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    sup.notify_changed();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    std::fs::remove_dir(blocked).unwrap();
+    sup.apply(vec![]).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    sup.shutdown();
+}
+
+#[test]
+fn invalid_desired_entries_stop_child_and_cannot_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, cb) = counter();
+    let sup = publication_supervisor(tmp.path(), cb);
+    let initial = publication_entry(REAL);
+    sup.apply(vec![initial.clone()]).unwrap();
+    wait_for_publication(&sup, 1);
+    let pid = sup.status().pid.unwrap();
+    assert!(
+        sup.apply(vec![ProxyEntry {
+            value: String::new(),
+            ..initial
+        }])
+        .is_err()
+    );
+    assert!(!sup.status().running);
+    assert!(!pid_alive(pid));
+    assert!(lock(&sup.state).apply_pending);
+    retry_publication(&sup);
+    assert!(!sup.status().running);
+    assert_eq!(lock(&sup.state).spawns, 1);
+    sup.apply(vec![]).unwrap();
+    wait_for_publication(&sup, 2);
+    assert!(!lock(&sup.state).apply_pending);
+    sup.shutdown();
+}
+
+#[test]
+fn failed_restart_retains_the_new_desired_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, cb) = counter();
+    let sup = publication_supervisor(tmp.path(), cb);
+    let initial = publication_entry(REAL);
+    sup.apply(vec![initial.clone()]).unwrap();
+    wait_for_publication(&sup, 1);
+    let binary_backup = sup.binary.with_extension("saved");
+    std::fs::rename(&sup.binary, &binary_backup).unwrap();
+    assert!(
+        sup.apply(vec![ProxyEntry {
+            value: "replacement-token".into(),
+            ..initial
+        }])
+        .is_err()
+    );
+    assert!(!sup.status().running);
+    assert!(lock(&sup.state).apply_pending);
+    retry_publication(&sup);
+    assert!(!sup.status().running);
+    assert_eq!(lock(&sup.state).spawns, 1);
+    std::fs::rename(binary_backup, &sup.binary).unwrap();
+    retry_publication(&sup);
+    wait_for_publication(&sup, 2);
+    assert!(!lock(&sup.state).apply_pending);
+    assert_eq!(
+        std::fs::read_to_string(sup.dirs.proxy.join("started.values")).unwrap(),
+        "replacement-token"
+    );
+    sup.shutdown();
+}
+
+#[test]
+fn rewrite_failures_stop_forwarding_and_never_recover_an_old_grant() {
+    let binary = bin_dir().join("iron-proxy");
+    assert!(
+        binary.exists(),
+        "missing prerequisite {}; run just proxy before supervisor integration tests",
+        binary.display()
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, cb) = counter();
+    let mut sup = publication_supervisor(tmp.path(), cb);
+    {
+        let sup = Arc::get_mut(&mut sup).unwrap();
+        sup.binary = binary;
+        sup.ca = ca::ensure(&sup.binary, &sup.dirs.proxy).unwrap();
+        let mut st = lock(&sup.state);
+        st.cfg.allow_plain_http = true;
+        st.cfg.upstream_deny_cidrs = Some(vec!["192.0.2.0/24".into()]);
+    }
+    let cfg = sup.config();
+    let ready = || {
+        http::request(
+            cfg.metrics_port,
+            "GET",
+            "/healthz",
+            None,
+            Duration::from_millis(100),
+        )
+        .is_ok_and(|r| r.status == 200)
+    };
+    let initial = ProxyEntry {
+        hosts: vec!["127.0.0.1".into()],
+        ..publication_entry(REAL)
+    };
+    let sentinel = initial.sentinel.clone();
+    let (echo_port, seen) = echo_server();
+    sup.apply(vec![initial.clone()]).unwrap();
+    wait_for("initial proxy", Duration::from_secs(10), ready);
+    assert_eq!(via_proxy(cfg.port, echo_port, &sentinel).0, 200);
+    assert_eq!(lock(&seen).last().map(String::as_str), Some(REAL));
+
+    let value_path = sup
+        .dirs
+        .values
+        .join(files::value_file_name(&initial.lease_id, initial.index));
+    block_publication_file(&value_path);
+    assert!(
+        sup.apply(vec![ProxyEntry {
+            value: "replacement-token".into(),
+            ..initial
+        }])
+        .is_err()
+    );
+    assert!(!sup.status().running);
+    assert!(TcpStream::connect(("127.0.0.1", cfg.port)).is_err());
+    retry_publication(&sup);
+    assert!(!sup.status().running);
+    std::fs::remove_dir(&value_path).unwrap();
+    retry_publication(&sup);
+    wait_for("rotated proxy", Duration::from_secs(10), ready);
+    assert_eq!(via_proxy(cfg.port, echo_port, &sentinel).0, 200);
+    assert_eq!(
+        lock(&seen).last().map(String::as_str),
+        Some("replacement-token")
+    );
+
+    // Keep the old YAML readable while the sentinel-state write fails. Recovery
+    // must rewrite a blocked sentinel instead of restarting with that old grant.
+    let blocked = sup.dirs.proxy.join("sentinels.json");
+    block_publication_file(&blocked);
+    assert!(sup.apply(vec![]).is_err());
+    assert!(!sup.status().running);
+    assert!(TcpStream::connect(("127.0.0.1", cfg.port)).is_err());
+    retry_publication(&sup);
+    assert!(!sup.status().running);
+    std::fs::remove_dir(blocked).unwrap();
+    retry_publication(&sup);
+    wait_for("reduced proxy", Duration::from_secs(10), ready);
+    let calls = lock(&seen).len();
+    assert_eq!(via_proxy(cfg.port, echo_port, &sentinel).0, 403);
+    assert_eq!(lock(&seen).len(), calls);
+    assert!(!lock(&sup.state).apply_pending);
+    sup.shutdown();
+}

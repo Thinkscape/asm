@@ -10,22 +10,23 @@
 [![CI](https://github.com/Thinkscape/asm/actions/workflows/ci.yml/badge.svg)](https://github.com/Thinkscape/asm/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Thinkscape/asm)](https://github.com/Thinkscape/asm/releases/latest)
 
-Coding agents need API keys and passwords. asm lets them ask for these without the real values ending up in prompts, logs or files on the agent machine:
+Coding agents need API keys and passwords. asm provides operator-approved access through static vaults and scoped dynamic credentials:
 
-- a **macOS menu-bar app** (the *manager*) reads secrets from your vaults (Bitwarden/Vaultwarden, `.env` files, the macOS login keychain) and shows an approval popup for every request;
+- a **macOS menu-bar app** (the *manager*) reads static vaults (Bitwarden/Vaultwarden, `.env` files, the macOS login keychain), generates GitHub App installation tokens, and approves access;
 - the **`asm` CLI** runs on agent machines (Linux or macOS), pairs with the manager and requests secrets;
 - a **patched [iron-proxy](https://github.com/paradigmxyz/iron-proxy)**, run by the manager, puts the real value into requests on the way out;
 - an **agent skill** ([`skill/asm/SKILL.md`](skill/asm/SKILL.md)) teaches agents the workflow.
 
-By default the agent gets a **sentinel** (`asm_` + 40 random characters) instead of the value. The proxy replaces the sentinel with the real value only on HTTPS requests to the hosts you approved.
+Static secrets default to **sentinel** delivery (`asm_` + 40 random characters): the proxy substitutes the real value only on approved HTTPS hosts. Generated GitHub tokens default to raw delivery, with optional `--sentinel`. `asm exec` injects approved values directly into a child environment without token files.
 
 ## Security model
 
 - **A sentinel is a bearer capability.** The proxy has no authentication, so anyone who can reach the proxy and knows a sentinel can use it, but only with the hosts approved for that lease and only until the lease ends. Keep the proxy on a trusted network (LAN, Tailscale).
 - **Bound to approved hosts and HTTPS.** A sentinel is replaced only when the destination matches the approved host patterns and the request uses TLS. A request that carries a sentinel in a header, the URL path or the query string to any other host, or over plain HTTP, is refused with `403 asm: sentinel not valid for this host or scheme`. Sentinels are never replaced in WebSocket upgrades, because the proxy cannot redact WebSocket frames (403).
 - **Redaction is best effort.** If an upstream response echoes a real value (raw, URL-escaped, JSON-escaped, base64 or hex), the proxy replaces it with the sentinel in headers, trailers and the body. Values of other leases become `asm_redacted`. Values shorter than 8 bytes are not redacted. A host you approved can still return the value in some other form. Approving "Any host" amounts to giving the agent the value.
-- **Raw values are opt-in per request.** `asm get --raw` asks for the real value. It is written to a file on the agent machine, cannot be recalled, and is never stored on the Mac.
+- **Raw delivery exposes the value to the consumer.** `get` writes private files; `exec` uses child memory/environment without credential files or argv. Generated GitHub tokens support provider revocation, but failed revocation or a manager crash can leave delivered copies usable until provider expiry. Static raw values cannot be recalled. Static raw requests require approval each time; generated raw leases allow reuse and renewal.
 - **Same-user processes on the Mac can read vault data.** Run agents as another user, in a VM or in a container.
+- **Host authorization, not agent isolation.** Pairing is the authorization boundary. Agent labels provide attribution and routing affinity; separate hostile agents need separate paired hosts.
 
 ## Architecture
 
@@ -66,9 +67,9 @@ flowchart LR
 ```
 
 1. `asm pair` pairs a machine with the manager: a matching 6-digit code on both sides, or a pre-generated pairing code. The CLI pins the manager's TLS certificate.
-2. `asm get NAME "reason"` creates a request. The popup on the Mac shows the host, the agent, the reason and the requested hosts. You approve it with a sentinel (choosing the allowed hosts and the duration), approve it with the raw value, or deny it with a reason.
-3. The CLI writes one file per field to the secrets directory and prints the paths.
-4. Agent HTTP clients use the proxy (`eval "$(asm proxy-env)"`). The proxy terminates TLS with its own CA, replaces sentinels for approved hosts and redacts echoes in responses.
+2. `asm get BINDING "reason"` or `asm exec BINDINGS -- command args...` requests access. Compatible leases may be reused; fresh approvals choose fields, mode, duration and hosts, plus the app/repositories/permissions for generated credentials.
+3. Get writes files and prints paths; exec obtains all bindings before replacing itself with the child, passing argv directly without a shell. No credential values are printed by ASM.
+4. Exec configures proxy/CA environment for substituted fields automatically. File-based sentinel consumers use `eval "$(asm proxy-env)"`.
 
 Default ports (changeable in the app): manager API `7411`, proxy `7412`, iron-proxy's internal loopback listeners `7413`–`7416`.
 
@@ -169,7 +170,7 @@ The app lives in the menu bar (key icon) and has no Dock icon.
 On the Mac:
 
 1. Open **Agents Secrets Manager** and choose **Settings…** from the menu bar item.
-2. In **Vaults**, add a vault: **Bitwarden…**, **.env file…** or **macOS Keychain**.
+2. In **Vaults**, add a static source, or in **Generators**, connect a GitHub App using its client ID, installation ID and RSA private key, then choose explicit repository and permission ceilings.
 3. In **Proxy**, add hostname hints that agent machines can reach (for example a Tailscale name). `asm proxy-info` offers these to clients.
 
 On the agent machine:
@@ -180,16 +181,13 @@ asm pair my-mac.tailnet.ts.net
 # … approve the pairing popup on the Mac after checking the code matches …
 # paired: 6f1c…
 
-asm doctor                  # every line should say ok
-eval "$(asm proxy-env)"     # HTTPS_PROXY, CA bundle variables, NO_PROXY for the manager
-asm list
-asm get --hosts api.github.com GITHUB_TOKEN "Open a PR on acme/web for the login fix; needs the GitHub API"
-# mode: sentinel
-# hosts: api.github.com
-# expires: 2026-11-16T12:34:56Z
-# /run/user/1000/asm/secrets/GITHUB_TOKEN
+asm doctor
+asm list --json
+asm exec GH_TOKEN -- gh pr list --repo acme/web
+# Approve the app, repository/permission grant, delivery mode and lease duration.
+# Both GH_TOKEN and GITHUB_TOKEN are injected with the same value; no token files.
 
-curl -H "Authorization: Bearer $(cat /run/user/1000/asm/secrets/GITHUB_TOKEN)" https://api.github.com/user
+asm exec --sentinel --hosts api.github.com GITHUB_TOKEN -- gh api repos/acme/web
 ```
 
 To pair without a popup (scripts, containers), use **Hosts and Agents → Pairing codes → Generate…** in the app. It shows a ready-to-run command:
@@ -215,6 +213,22 @@ A lease ends when it expires or the operator revokes it (also when its host is r
 
 The lease files on the agent machine are deleted by the CLI: at expiry by a background `asm` process, and on revocation within about a minute.
 
+Generated tokens have a separate provider deadline. A 12-hour lease can renew one-hour
+tokens from the same app and immutable approved grant without extending authorization.
+Raw token expiry removes file material but retains local alias reservations until the lease
+ends. Repeat get to refresh file views; exec never updates them or renews a running child.
+Routine renewal leaves old copies usable until natural expiry; explicit `--refresh` revokes
+known predecessors and may disrupt consumers. `--lease ID` pins an existing generated grant;
+`--new-lease` requests a fresh decision. After restart, generated grants remain but require
+explicit acquisition to mint token material again.
+
+Bindings use `[DEST=]SOURCE[::FIELD]`: for example
+`asm get 'GOOGLE_USER=Vaultwarden/google::username' 'Sign in'`.
+Exec takes comma-separated bindings and literal `--` before argv. Use single quotes to
+preserve parser escapes (`\\`, `\,`, `\=`, `\:\:`); dots are literal. Multi-field exec
+bindings require explicit destinations and selectors. See the
+[agent workflow](skill/asm/SKILL.md) for scope, alias and collision examples.
+
 ## CLI reference
 
 ```text
@@ -224,6 +238,7 @@ Commands:
   pair        Pair this machine with a manager (default port 7411)
   list        List the secrets you can request
   get         Request a lease on a secret and write its files
+  exec        Run a command with approved credentials in its environment
   update      Change a secret; the new value is read from stdin
   add         Add a new secret; the value is read from stdin
   proxy-info  Show the proxy addresses, which one is reachable, and the CA files (information only)
@@ -236,7 +251,8 @@ Commands:
 |---|---|---|
 |`asm pair <MANAGER> [PAIRING_CODE]`|`--force`: pair again although the current pairing still works|`MANAGER` is `<hostname>[:port]`. `PAIRING_CODE` (`asm-…`) is the unattended code; it is also read from `$ASM_PAIRING_CODE`. Without a code the CLI prints `verification code: 123 456` and waits for approval. Prints `paired: <host id>`, or `already paired with …` (exit 0) when the manager still accepts this machine's pairing. See [Pairing the same machine again](#pairing-the-same-machine-again).|
 |`asm list`|`--json`: print the manager's JSON answer|One name per line. Names are vault-prefixed (`work/GITHUB_TOKEN`) when two vaults share a name.|
-|`asm get <NAME> <REASON>`|`--raw`: ask for the real value instead of a sentinel<br>`--hosts <HOSTS>`: hosts the sentinel will be used with (comma-separated patterns)<br>`--wait <WAIT>`: stop waiting after this many seconds (exit 4 while still pending); default: until the request expires on the manager (typically 10 min)<br>`--json`: print the result as JSON<br>`--no-reaper`: do not start the background cleanup process|`REASON` is shown to the operator (at most 250 characters). Prints `mode:`, `hosts:` (as approved, which may differ from the request), `expires:` and one absolute file path per field. A repeated sentinel `get` covered by an active lease returns without a popup.|
+|`asm get <BINDING> <REASON>`|`--raw` / `--sentinel`, `--hosts`, `--wait`, `--json`, `--no-reaper`; generated grant and lease options in `asm get --help`|Prints paths and nonsecret lease/grant/version metadata. `[DEST=]SOURCE[::FIELD]` selects fields and local file views. Static raw requests always need approval.|
+|`asm exec <BINDINGS> -- <COMMAND> [ARG...]`|`--raw` / `--sentinel`, `--hosts`, `--reason`, `--wait`|Sequential acquisitions share one wait deadline; any failure prevents launch. Discovery, proxy preparation and child runtime are outside that budget. No token files, reaper or in-process renewal.|
 |`asm update <NAME>`|`--field <FIELD>`: field to change (default: `password` for logins, the only field otherwise)<br>`--wait <WAIT>`|Reads the new value from stdin. Prints `updated <name> in <vault>`. Raw leases on that secret are revoked.|
 |`asm add <NAME>`|`--wait <WAIT>`|Reads the value from stdin. The operator picks the vault. Prints `added <name> to <vault>; run asm get to use it`.|
 |`asm proxy-info`|`--json`|Proxy URLs (`http://` and `socks5h://` per hostname hint, the first reachable one marked `(recommended)`), CA certificate and CA bundle paths. Refreshes the CA files.|
@@ -268,7 +284,7 @@ Files on the agent machine:
 |`${XDG_CONFIG_HOME:-~/.config}/asm/ca.crt`, `ca-bundle.crt`|proxy CA, and system roots plus the proxy CA|
 |`$ASM_SECRETS_DIR`, else `$XDG_RUNTIME_DIR/asm/secrets`, else `~/.asm/secrets`|lease files (0600); deleted when leases expire or are revoked (see below), plus the manifest `.leases.json` and the lock files `.leases.lock` and `.reaper.lock`|
 
-Lease files are deleted on time by a background process, the hidden command `asm reap`: `get` (and every command that talks to the manager while leases remain) starts one per secrets directory, detached from the terminal, kept single by a lock on `.reaper.lock`. It deletes a lease's files at its expiry, asks the manager every minute which leases were revoked, and exits once no lease is left. Leases without an expiry stay until revoked. With `--no-reaper` or `ASM_NO_REAPER=1` nothing runs in the background, and ended leases' files are removed by the next `asm` command.
+File-based commands start one detached `asm reap` per secrets directory, held single by `.reaper.lock`. It removes material at lease expiry or raw generated-token expiry and polls revocations about once a minute. Generated token cleanup retains bindings/version reservations until authorization ends. `--no-reaper` or `ASM_NO_REAPER=1` leaves cleanup to later file-aware commands. File-free exec does not read/write secret manifests, clean secret files or start the reaper.
 
 Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets directory), `ASM_AGENT` (agent label shown to the operator; defaults to the CLI's parent process name), `ASM_NO_REAPER=1` (no background cleanup) and `ASM_REAPER_LOG` (a file the background cleanup logs to, for debugging).
 
@@ -279,11 +295,12 @@ Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets
 - **Settings window**:
   - **Vaults**: Bitwarden/Vaultwarden (server, API key, exposed collections, personal vault; master password held in memory only), `.env` files (every key is exposed), the macOS login keychain (generic and internet passwords, secure notes).
     The table sizes **Name** to the longest vault name (150pt minimum), keeps **Kind**, **Status** and **Secrets** compact, and gives **Details** the remaining width for the Bitwarden server URL or `.env` file path.
+  - **Generators**: use **+** to choose a generator type (currently **GitHub App**). Configurations expose fixed `GH_TOKEN` / `GITHUB_TOKEN` aliases, installation discovery, explicit repository/permission ceilings and availability. Multiple apps share the logical output; approvals select one app.
   - **Hosts and Agents**: paired machines (OS, addresses, agents seen, active leases), renaming and revocation; pairing codes.
-  - **Leases**: active and ended leases with host, source, secret, mode, allowed hosts and expiry; search and revocation.
+  - **Leases**: active and ended grants with host, source, mode, fields and hosts; generated details show the selected app, approved repositories/permissions, authorization deadline and provider-token deadline.
   - **Proxy**: status (running, starting, not running with the cause and since when, not responding), failed starts, health and CA expiry; network access (whether the proxy and the API listen for other machines, and what the macOS Firewall does to iron-proxy and the app); listener address and port; hostname hints; advanced ports, request body limit and plain-HTTP substitution (off by default); the CA certificate; the proxy log. The sidebar marks **Proxy** while it is down or blocked by the firewall.
   - **Settings**: manager API address and port, default lease duration, pending request lifetime, launch at login, the `bw` path, version.
-- **Activity Log** (Window ▸ Show Activity Log, ⌘L): a persistent audit trail of pairing, requests, leases, proxy substitutions and vault events, filterable by category.
+- **Activity Log** (Window ▸ Show Activity Log, ⌘L): a persistent audit trail of pairing, requests, leases, proxy substitutions, vault and generator events, filterable by category. Generator events contain grant metadata and sanitized status, never keys or tokens.
 
 Data lives in `~/Library/Application Support/asm/`. Vault credentials are kept in the login keychain under the service `net.thinkscape.asm`. One manager runs per data directory (`manager.lock`): a second copy shows an alert and quits.
 
@@ -309,6 +326,8 @@ just test      # cargo test --workspace, and go test for the patched iron-proxy
 Individual recipes: `just proxy` (universal `dist/bin/iron-proxy`), `just core` (Rust static library, Swift bindings, xcframework), `just app` (signed `dist/Agents Secrets Manager.app`; set `ASM_CODESIGN_IDENTITY`, or `-` for ad hoc signing), `just cli` (`dist/cli/asm-linux-x86_64`, `asm-linux-aarch64`, `asm-macos-universal`), `just packages` (release tarballs, `.deb`/`.rpm`/`.apk`/Arch packages and `SHA256SUMS` in `dist/release`; needs [nfpm](https://nfpm.goreleaser.com)), `just install-cli`, `just install-cli-remote <ssh-host>`, `just lint-ci` (actionlint and shellcheck).
 
 The headless end-to-end test (`crates/asm-core/tests/e2e.rs`) needs `dist/bin/iron-proxy` and skips itself without it. Tests that touch the real login keychain or a real `bw` are `#[ignore]`d; run them with `cargo test -p asm-core -- --ignored`.
+
+Branding: edit the Signal source at `docs/assets/src/appicon.svg`, then run `swift scripts/brand-assets.swift docs/assets/src/appicon.svg` from the repository root on macOS. AppKit loads the SVG natively; the script writes `app/Bundle/AppIcon.icns`, `docs/assets/icon.png`, `docs/assets/logotype.png` and `docs/assets/logotype-dark.png`. The menu-bar glyph stays monochrome.
 
 ### Releases
 

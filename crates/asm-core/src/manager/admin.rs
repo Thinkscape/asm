@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use asm_proto::crypto::new_uuid_v4;
+use asm_proto::generators::{GenerationSelection, SourceKind};
 use asm_proto::pairing::UnattendedCode;
 use asm_proto::rules::validate_agent_text;
 use asm_proto::wire::LeaseMode;
@@ -374,7 +375,7 @@ impl Core {
             .store
             .active_leases(t)?
             .into_iter()
-            .filter(|l| l.vault_id == id)
+            .filter(|l| l.source_kind == SourceKind::Vault && l.vault_id == id)
         {
             if self.store.revoke_lease(&l.id, t)? {
                 revoked = true;
@@ -628,33 +629,30 @@ impl Core {
 
     /// Invalidate the host's token, cancel its pending requests and revoke its leases.
     pub fn revoke_host(&self, host_id: &str) -> Result<()> {
-        let t = now();
-        if !self.store.revoke_host(host_id, t)? {
-            return Err(CoreError::not_found("no such host"));
-        }
-        if let Some(h) = self.store.get_host(host_id)? {
-            self.log(
-                Event::new(
-                    Category::Pairing,
-                    "revoked",
-                    format!("host {} revoked", h.label()),
-                )
-                .host(Some(host_id))
-                .detail(serde_json::json!({ "hostname": h.info.hostname, "address": h.address })),
-            );
+        let t = self.generation_now();
+        let tokens = {
+            let authority = lock(&self.authorization);
+            if !self.store.revoke_host(host_id, t)? {
+                return Err(CoreError::not_found("no such host"));
+            }
+            let mut tokens = Vec::new();
+            for lease in self.store.leases_of_host(host_id)? {
+                if lease.is_active(t) && self.store.revoke_lease(&lease.id, t)? {
+                    self.log_lease_revoked(&lease, "host revoked");
+                }
+                if lease.source_kind == SourceKind::Generator {
+                    tokens.extend(self.evict_generated_locked(&lease, &authority));
+                }
+            }
+            tokens
+        };
+        if let Some(host) = self.store.get_host(host_id)? {
+            self.log(Event::new(Category::Pairing, "revoked", format!("host {} revoked", host.label()))
+                .host(Some(host_id)).detail(serde_json::json!({ "hostname": host.info.hostname, "address": host.address })));
         }
         self.cancel_host_requests(host_id);
-        for l in self
-            .store
-            .leases_of_host(host_id)?
-            .into_iter()
-            .filter(|l| l.is_active(t))
-        {
-            if self.store.revoke_lease(&l.id, t)? {
-                self.log_lease_revoked(&l, "host revoked");
-            }
-        }
         self.sync_proxy(false);
+        self.revoke_tokens(tokens, None);
         self.notify(TOPIC_HOSTS);
         self.notify(TOPIC_LEASES);
         Ok(())
@@ -795,6 +793,14 @@ impl Core {
                 let (host_label, hostname) = names.get(&l.host_id).cloned().unwrap_or_default();
                 let status = l.status(t);
                 ffi::LeaseInfo {
+                    source_kind: l.source_kind.into(),
+                    generation: l.generation.clone().map(|grant| GenerationSelection {
+                        generator_id: l.vault_id.clone(), generator_revision: l.generator_revision.unwrap_or(0), grant,
+                    }.into()),
+                    generator_name: (l.source_kind == SourceKind::Generator).then(|| l.vault_name.clone()),
+                    credential_expires_at: l.credential_expires_at.map(to_system_time),
+                    credential_version: (l.source_kind == SourceKind::Generator).then_some(l.credential_version),
+                    suspension_reason: suspended.get(&l.id).cloned(),
                     suspended: status == asm_proto::wire::LeaseStatus::Active
                         && suspended.contains_key(&l.id),
                     raw_delivered: l.mode == LeaseMode::Raw,
@@ -819,15 +825,19 @@ impl Core {
     }
 
     pub fn revoke_lease(&self, id: &str) -> Result<()> {
-        let lease = self
-            .store
-            .get_lease(id)?
-            .ok_or_else(|| CoreError::not_found("no such lease"))?;
-        if self.store.revoke_lease(&lease.id, now())? {
-            self.log_lease_revoked(&lease, "operator");
-            self.sync_proxy(false);
-            self.notify(TOPIC_LEASES);
-        }
+        let tokens = {
+            let authority = lock(&self.authorization);
+            let lease = self.store.get_lease(id)?.ok_or_else(|| CoreError::not_found("no such lease"))?;
+            if self.store.revoke_lease(&lease.id, self.generation_now())? {
+                self.log_lease_revoked(&lease, "operator");
+            }
+            if lease.source_kind == SourceKind::Generator {
+                self.evict_generated_locked(&lease, &authority)
+            } else { Vec::new() }
+        };
+        self.sync_proxy(false);
+        self.revoke_tokens(tokens, None);
+        self.notify(TOPIC_LEASES);
         Ok(())
     }
 

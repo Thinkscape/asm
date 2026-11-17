@@ -9,7 +9,7 @@ use crate::error::CoreError;
 use crate::manager::{Core, StartOptions};
 
 /// Change notifications. Topics: `requests`, `leases`, `hosts`, `vaults`, `proxy`,
-/// `firewall`, `settings`, `activity`.
+/// `generators`, `firewall`, `settings`, `activity`.
 /// Called from manager threads; never while the manager holds a lock.
 #[uniffi::export(with_foreign)]
 pub trait ManagerObserver: Send + Sync {
@@ -34,6 +34,335 @@ impl From<CoreError> for ManagerError {
 }
 
 pub type FfiResult<T> = Result<T, ManagerError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SourceKind {
+    Vault,
+    Generator,
+}
+
+impl From<asm_proto::generators::SourceKind> for SourceKind {
+    fn from(kind: asm_proto::generators::SourceKind) -> Self {
+        match kind {
+            asm_proto::generators::SourceKind::Vault => Self::Vault,
+            asm_proto::generators::SourceKind::Generator => Self::Generator,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum GithubPermission {
+    Read,
+    Write,
+    Admin,
+}
+
+impl From<asm_proto::generators::GithubPermission> for GithubPermission {
+    fn from(level: asm_proto::generators::GithubPermission) -> Self {
+        match level {
+            asm_proto::generators::GithubPermission::Read => Self::Read,
+            asm_proto::generators::GithubPermission::Write => Self::Write,
+            asm_proto::generators::GithubPermission::Admin => Self::Admin,
+        }
+    }
+}
+
+impl From<GithubPermission> for asm_proto::generators::GithubPermission {
+    fn from(level: GithubPermission) -> Self {
+        match level {
+            GithubPermission::Read => Self::Read,
+            GithubPermission::Write => Self::Write,
+            GithubPermission::Admin => Self::Admin,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GithubPermissionEntry {
+    pub name: String,
+    pub level: GithubPermission,
+}
+
+fn permission_entries(
+    permissions: std::collections::BTreeMap<String, asm_proto::generators::GithubPermission>,
+) -> Vec<GithubPermissionEntry> {
+    permissions.into_iter().map(|(name, level)| GithubPermissionEntry {
+        name,
+        level: level.into(),
+    }).collect()
+}
+
+fn permission_map(
+    entries: Vec<GithubPermissionEntry>,
+) -> Result<std::collections::BTreeMap<String, asm_proto::generators::GithubPermission>, CoreError> {
+    let mut permissions = std::collections::BTreeMap::new();
+    for entry in entries {
+        if permissions.insert(entry.name, entry.level.into()).is_some() {
+            return Err(CoreError::invalid("duplicate GitHub permission"));
+        }
+    }
+    Ok(permissions)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GithubRepository {
+    pub id: u64,
+    pub full_name: String,
+}
+
+impl From<asm_proto::generators::GithubRepository> for GithubRepository {
+    fn from(repository: asm_proto::generators::GithubRepository) -> Self {
+        Self { id: repository.id, full_name: repository.full_name }
+    }
+}
+
+impl From<GithubRepository> for asm_proto::generators::GithubRepository {
+    fn from(repository: GithubRepository) -> Self {
+        Self { id: repository.id, full_name: repository.full_name }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GithubScopeRequest {
+    pub repositories: Option<Vec<String>>,
+    pub permissions: Option<Vec<GithubPermissionEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum GenerationRequest {
+    GithubApp { scope: GithubScopeRequest },
+}
+
+impl From<asm_proto::generators::GenerationRequest> for GenerationRequest {
+    fn from(request: asm_proto::generators::GenerationRequest) -> Self {
+        match request {
+            asm_proto::generators::GenerationRequest::GithubApp(scope) => Self::GithubApp {
+                scope: GithubScopeRequest {
+                    repositories: scope.repositories,
+                    permissions: scope.permissions.map(permission_entries),
+                },
+            },
+        }
+    }
+}
+
+impl TryFrom<GenerationRequest> for asm_proto::generators::GenerationRequest {
+    type Error = CoreError;
+
+    fn try_from(request: GenerationRequest) -> Result<Self, Self::Error> {
+        let mut request = match request {
+            GenerationRequest::GithubApp { scope } => Self::GithubApp(
+                asm_proto::generators::GithubScopeRequest {
+                    repositories: scope.repositories,
+                    permissions: scope.permissions.map(permission_map).transpose()?,
+                },
+            ),
+        };
+        request.canonicalize()?;
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GithubGrant {
+    pub installation_id: u64,
+    pub repositories: Vec<GithubRepository>,
+    pub permissions: Vec<GithubPermissionEntry>,
+}
+
+impl From<asm_proto::generators::GithubGrant> for GithubGrant {
+    fn from(grant: asm_proto::generators::GithubGrant) -> Self {
+        Self {
+            installation_id: grant.installation_id,
+            repositories: grant.repositories.into_iter().map(Into::into).collect(),
+            permissions: permission_entries(grant.permissions),
+        }
+    }
+}
+
+impl TryFrom<GithubGrant> for asm_proto::generators::GithubGrant {
+    type Error = CoreError;
+
+    fn try_from(grant: GithubGrant) -> Result<Self, Self::Error> {
+        let mut grant = asm_proto::generators::GenerationGrant::GithubApp(Self {
+            installation_id: grant.installation_id,
+            repositories: grant.repositories.into_iter().map(Into::into).collect(),
+            permissions: permission_map(grant.permissions)?,
+        });
+        grant.canonicalize()?;
+        let asm_proto::generators::GenerationGrant::GithubApp(grant) = grant;
+        Ok(grant)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum GenerationGrant {
+    GithubApp { scope: GithubGrant },
+}
+
+impl From<asm_proto::generators::GenerationGrant> for GenerationGrant {
+    fn from(grant: asm_proto::generators::GenerationGrant) -> Self {
+        match grant {
+            asm_proto::generators::GenerationGrant::GithubApp(scope) => Self::GithubApp { scope: scope.into() },
+        }
+    }
+}
+
+impl TryFrom<GenerationGrant> for asm_proto::generators::GenerationGrant {
+    type Error = CoreError;
+
+    fn try_from(grant: GenerationGrant) -> Result<Self, Self::Error> {
+        match grant {
+            GenerationGrant::GithubApp { scope } => Ok(Self::GithubApp(scope.try_into()?)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GenerationChoice {
+    pub generator_id: String,
+    pub name: String,
+    pub revision: u64,
+    pub ceiling: GenerationGrant,
+    pub available: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+impl From<asm_proto::generators::GenerationChoice> for GenerationChoice {
+    fn from(choice: asm_proto::generators::GenerationChoice) -> Self {
+        Self {
+            generator_id: choice.generator_id, name: choice.name, revision: choice.revision,
+            ceiling: choice.ceiling.into(), available: choice.available,
+            unavailable_reason: choice.unavailable_reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GenerationSelection {
+    pub generator_id: String,
+    pub generator_revision: u64,
+    pub grant: GenerationGrant,
+}
+
+impl From<asm_proto::generators::GenerationSelection> for GenerationSelection {
+    fn from(selection: asm_proto::generators::GenerationSelection) -> Self {
+        Self {
+            generator_id: selection.generator_id, generator_revision: selection.generator_revision,
+            grant: selection.grant.into(),
+        }
+    }
+}
+
+impl TryFrom<GenerationSelection> for asm_proto::generators::GenerationSelection {
+    type Error = CoreError;
+
+    fn try_from(selection: GenerationSelection) -> Result<Self, Self::Error> {
+        let selection = Self {
+            generator_id: selection.generator_id, generator_revision: selection.generator_revision,
+            grant: selection.grant.try_into()?,
+        };
+        selection.validate()?;
+        Ok(selection)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GeneratorApprovalChoice {
+    pub choice: GenerationChoice,
+    pub suggested_hosts: Vec<HostPatternCheck>,
+    pub scope_issues: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GithubAppConfig {
+    pub client_id: String,
+    pub installation_id: u64,
+    pub ceiling: GithubGrant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum GeneratorConfig {
+    GithubApp { config: GithubAppConfig },
+}
+
+impl From<crate::generator::GeneratorConfig> for GeneratorConfig {
+    fn from(config: crate::generator::GeneratorConfig) -> Self {
+        match config {
+            crate::generator::GeneratorConfig::GithubApp(config) => Self::GithubApp {
+                config: GithubAppConfig {
+                    client_id: config.client_id, installation_id: config.installation_id,
+                    ceiling: config.ceiling.into(),
+                },
+            },
+        }
+    }
+}
+
+impl TryFrom<GeneratorConfig> for crate::generator::GeneratorConfig {
+    type Error = CoreError;
+
+    fn try_from(config: GeneratorConfig) -> Result<Self, Self::Error> {
+        match config {
+            GeneratorConfig::GithubApp { config } => Ok(Self::GithubApp(
+                crate::generator::GithubAppConfig {
+                    client_id: config.client_id, installation_id: config.installation_id,
+                    ceiling: asm_proto::generators::GithubGrant {
+                        installation_id: config.ceiling.installation_id,
+                        repositories: config.ceiling.repositories.into_iter().map(Into::into).collect(),
+                        permissions: permission_map(config.ceiling.permissions)?,
+                    },
+                },
+            )),
+        }
+    }
+}
+
+/// Only an operator's transient draft contains a root signing key.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GeneratorDraft {
+    pub id: Option<String>,
+    pub name: String,
+    pub config: GeneratorConfig,
+    pub private_key_pem: String,
+}
+
+impl std::fmt::Debug for GeneratorDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratorDraft")
+            .field("id", &self.id).field("name", &self.name).field("config", &self.config)
+            .field("private_key_pem", &"[REDACTED]").finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GeneratorInfo {
+    pub id: String,
+    pub name: String,
+    pub config: GeneratorConfig,
+    pub revision: u64,
+    pub status: VaultStatus,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GithubInstallation {
+    pub installation_id: u64,
+    pub account_login: String,
+    pub repositories: Vec<GithubRepository>,
+    pub permissions: Vec<GithubPermissionEntry>,
+    pub warning: Option<String>,
+}
+
+impl From<crate::generator::GithubInstallation> for GithubInstallation {
+    fn from(installation: crate::generator::GithubInstallation) -> Self {
+        Self {
+            installation_id: installation.installation_id, account_login: installation.account_login,
+            repositories: installation.repositories.into_iter().map(Into::into).collect(),
+            permissions: permission_entries(installation.permissions), warning: installation.warning,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum LeaseMode {
@@ -75,6 +404,7 @@ pub enum Decision {
         mode: LeaseMode,
         duration_secs: Option<u64>,
         hosts: Vec<String>,
+        generation: Option<GenerationSelection>,
     },
     /// `update`: `vault_id` must be the secret's vault. `add`: the chosen target vault and,
     /// for Bitwarden, collection (`None` = personal vault).
@@ -196,7 +526,7 @@ pub enum RequestDetail {
     },
     Get {
         name: String,
-        vault_id: String,
+        vault_id: Option<String>,
         vault_name: String,
         kind: SecretKind,
         fields: Vec<String>,
@@ -208,6 +538,10 @@ pub enum RequestDetail {
         /// Offered but not pre-filled.
         suggested_hosts: Vec<HostPatternCheck>,
         default_duration_secs: Option<u64>,
+        generator_choices: Vec<GeneratorApprovalChoice>,
+        requested_generation: Option<GenerationRequest>,
+        sentinel_required: bool,
+        has_substitutable_fields: bool,
     },
     Update {
         name: String,
@@ -487,10 +821,16 @@ pub struct LeaseInfo {
     /// `None` = unlimited.
     pub expires_at: Option<SystemTime>,
     pub status: LeaseStatus,
-    /// Active sentinel lease whose vault cannot be read: the proxy rejects its sentinel.
+    /// Active lease whose material or proxy publication is unavailable; local substitution fails closed.
     pub suspended: bool,
-    /// Raw lease: the value was delivered and cannot be recalled.
+    /// A raw value has been delivered. Generated provider revocation is best effort.
     pub raw_delivered: bool,
+    pub source_kind: SourceKind,
+    pub generation: Option<GenerationSelection>,
+    pub generator_name: Option<String>,
+    pub credential_expires_at: Option<SystemTime>,
+    pub credential_version: Option<u64>,
+    pub suspension_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -768,6 +1108,22 @@ impl Manager {
         Ok(self.core.remove_vault(&id)?)
     }
 
+    pub fn list_generators(&self) -> Vec<GeneratorInfo> {
+        self.core.list_generators()
+    }
+
+    pub fn save_generator(&self, draft: GeneratorDraft) -> FfiResult<GeneratorInfo> {
+        Ok(self.core.save_generator(draft)?)
+    }
+
+    pub fn remove_generator(&self, id: String) -> FfiResult<()> {
+        Ok(self.core.remove_generator(&id)?)
+    }
+
+    pub fn github_connect(&self, draft: GeneratorDraft) -> FfiResult<GithubInstallation> {
+        Ok(self.core.github_connect(draft)?)
+    }
+
     /// "Connect" in the Bitwarden sheet: log in with the draft and list collections.
     pub fn bitwarden_connect(&self, draft: VaultDraft) -> FfiResult<Vec<CollectionInfo>> {
         Ok(self.core.bitwarden_connect(draft)?)
@@ -896,5 +1252,63 @@ impl Manager {
     /// Stop the API, the proxy (deleting value files) and vault helpers.
     pub fn shutdown(&self) {
         self.core.shutdown()
+    }
+}
+
+#[cfg(test)]
+mod generator_ffi_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_permission_vectors_are_rejected() {
+        let duplicate = vec![
+            GithubPermissionEntry { name: "metadata".into(), level: GithubPermission::Read },
+            GithubPermissionEntry { name: "metadata".into(), level: GithubPermission::Read },
+        ];
+        let config = GeneratorConfig::GithubApp {
+            config: GithubAppConfig {
+                client_id: "Iv1.test".into(),
+                installation_id: 1,
+                ceiling: GithubGrant { installation_id: 1, repositories: vec![], permissions: duplicate },
+            },
+        };
+        assert!(crate::generator::GeneratorConfig::try_from(config).is_err());
+    }
+
+    #[test]
+    fn connection_draft_can_have_an_empty_ceiling_and_redacts_its_key() {
+        let draft = GeneratorDraft {
+            id: None,
+            name: "test".into(),
+            config: GeneratorConfig::GithubApp {
+                config: GithubAppConfig {
+                    client_id: "Iv1.test".into(),
+                    installation_id: 1,
+                    ceiling: GithubGrant {
+                        installation_id: 1, repositories: vec![],
+                        permissions: vec![GithubPermissionEntry { name: "metadata".into(), level: GithubPermission::Read }],
+                    },
+                },
+            },
+            private_key_pem: "PRIVATE_FIXTURE_DO_NOT_DISCLOSE".into(),
+        };
+        assert!(!format!("{draft:?}").contains(&draft.private_key_pem));
+        assert!(crate::generator::GeneratorConfig::try_from(draft.config).is_ok());
+    }
+
+    #[test]
+    fn generator_selection_rejects_missing_identity() {
+        let selection = GenerationSelection {
+            generator_id: String::new(),
+            generator_revision: 0,
+            grant: GenerationGrant::GithubApp {
+                scope: GithubGrant {
+                    installation_id: 1,
+                    repositories: vec![GithubRepository { id: 7, full_name: "acme/web".into() }],
+                    permissions: vec![GithubPermissionEntry { name: "metadata".into(), level: GithubPermission::Read }],
+                },
+            },
+        };
+        assert!(asm_proto::generators::GenerationSelection::try_from(selection).is_err());
     }
 }

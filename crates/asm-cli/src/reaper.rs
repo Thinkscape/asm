@@ -1,11 +1,11 @@
-//! Background reaper (`asm reap`, hidden): deletes the files of a lease when it ends,
-//! so an agent that finds a secret file missing knows to run `asm get` again.
+//! Background reaper (`asm reap`, hidden): deletes ended lease files and expired
+//! raw generated credentials. Missing generated material may need renewal rather
+//! than a new authorization.
 //!
 //! Commands that leave leases in the manifest start one detached reaper per secrets
 //! directory (double fork, new session, stdio on /dev/null). An exclusive `flock` on
-//! `<secrets dir>/.reaper.lock` keeps it single. The reaper deletes a lease's files at
-//! its `expires_at`, asks the manager every minute which leases are still active
-//! (revocations), and exits once the manifest holds no lease.
+//! `<secrets dir>/.reaper.lock` keeps it single. Authorization reservations survive
+//! token cleanup; manager polling removes revoked leases.
 
 use crate::api::Api;
 use crate::error::CliError;
@@ -201,21 +201,29 @@ fn reap(
     }
 }
 
-/// Sleep until the earliest expiry or the next poll, at most `POLL_INTERVAL`. An
-/// expiry already passed (its deletion failed) waits for the next poll.
+/// Sleep until the next authorization or live raw-token expiry, capped by the
+/// manager poll. Cleared material and past deadlines must not cause a busy loop
+/// or hide another lease's upcoming deadline.
 fn next_sleep(m: &Manifest, now: SystemTime, until_poll: Duration) -> Duration {
-    let earliest = m
+    let until_expiry = m
         .values()
-        .filter_map(|e| e.expires_at.as_deref())
+        .flat_map(|entry| {
+            let credential = (entry.mode == asm_proto::wire::LeaseMode::Raw
+                && entry.material_present
+                && entry.credential_version.is_some())
+                .then_some(entry.credential_expires_at.as_deref())
+                .flatten();
+            [entry.expires_at.as_deref(), credential]
+        })
+        .flatten()
         .filter_map(asm_proto::time::parse_unix)
+        .filter_map(|t| u64::try_from(t).ok())
+        .filter_map(|t| UNIX_EPOCH.checked_add(Duration::from_secs(t)))
+        .filter_map(|t| t.duration_since(now).ok())
+        .filter(|duration| !duration.is_zero())
         .min();
-    let until_expiry = earliest
-        .and_then(|t| u64::try_from(t).ok())
-        .map(|t| UNIX_EPOCH + Duration::from_secs(t))
-        .and_then(|t| t.duration_since(now).ok())
-        .filter(|d| !d.is_zero());
     until_expiry
-        .map_or(until_poll, |d| d.min(until_poll))
+        .map_or(until_poll, |duration| duration.min(until_poll))
         .min(POLL_INTERVAL)
 }
 
@@ -273,6 +281,10 @@ mod tests {
                 mode: LeaseMode::Sentinel,
                 expires_at: expires.map(asm_proto::time::fmt_unix),
                 paths: vec![file.into()],
+                bindings: Vec::new(),
+                credential_version: None,
+                credential_expires_at: None,
+                material_present: true,
             },
         );
         dir.save_manifest(&m).unwrap();
@@ -378,6 +390,10 @@ mod tests {
                     victim.to_string_lossy().into_owned(),
                     "link/f".into(),
                 ],
+                bindings: Vec::new(),
+                credential_version: None,
+                credential_expires_at: None,
+                material_present: true,
             },
         );
         m.insert(
@@ -386,6 +402,10 @@ mod tests {
                 mode: LeaseMode::Raw,
                 expires_at: None,
                 paths: vec!["a/../../victim".into(), "link".into()],
+                bindings: Vec::new(),
+                credential_version: None,
+                credential_expires_at: None,
+                material_present: true,
             },
         );
         dir.save_manifest(&m).unwrap();
@@ -408,6 +428,10 @@ mod tests {
             mode: LeaseMode::Sentinel,
             expires_at: t.map(asm_proto::time::fmt_unix),
             paths: vec![],
+            bindings: Vec::new(),
+            credential_version: None,
+            credential_expires_at: None,
+            material_present: true,
         };
         let mut m = Manifest::new();
         m.insert(L1.into(), entry(None));
@@ -424,6 +448,61 @@ mod tests {
         assert_eq!(
             next_sleep(&m, now, Duration::from_secs(9)),
             Duration::from_secs(9)
+        );
+    }
+
+    #[test]
+    fn raw_generated_expiry_wakes_only_while_material_is_present() {
+        let now = UNIX_EPOCH + Duration::from_millis(1_000_000_250);
+        let mut manifest = Manifest::new();
+        manifest.insert(L1.into(), ManifestEntry {
+            mode: LeaseMode::Raw,
+            expires_at: Some(asm_proto::time::fmt_unix(1_003_600)),
+            paths: vec!["GH_TOKEN".into()],
+            bindings: Vec::new(),
+            credential_version: Some(7),
+            credential_expires_at: Some(asm_proto::time::fmt_unix(1_000_005)),
+            material_present: true,
+        });
+        assert_eq!(
+            next_sleep(&manifest, now, POLL_INTERVAL), Duration::from_millis(4_750),
+        );
+        manifest.get_mut(L1).unwrap().material_present = false;
+        assert_eq!(next_sleep(&manifest, now, POLL_INTERVAL), POLL_INTERVAL);
+        manifest.get_mut(L1).unwrap().material_present = true;
+        manifest.get_mut(L1).unwrap().mode = LeaseMode::Sentinel;
+        assert_eq!(next_sleep(&manifest, now, POLL_INTERVAL), POLL_INTERVAL);
+        manifest.get_mut(L1).unwrap().mode = LeaseMode::Raw;
+        manifest.get_mut(L1).unwrap().credential_version = None;
+        assert_eq!(next_sleep(&manifest, now, POLL_INTERVAL), POLL_INTERVAL);
+    }
+
+    #[test]
+    fn stale_deadlines_do_not_mask_other_upcoming_expiries() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut manifest = Manifest::new();
+        manifest.insert(L1.into(), ManifestEntry {
+            mode: LeaseMode::Raw,
+            expires_at: Some(asm_proto::time::fmt_unix(999_999)),
+            paths: Vec::new(),
+            bindings: Vec::new(),
+            credential_version: Some(1),
+            credential_expires_at: Some(asm_proto::time::fmt_unix(999_998)),
+            material_present: true,
+        });
+        let mut upcoming = manifest[L1].clone();
+        upcoming.expires_at = Some(asm_proto::time::fmt_unix(1_000_020));
+        upcoming.credential_expires_at = Some(asm_proto::time::fmt_unix(1_000_040));
+        manifest.insert(L2.into(), upcoming);
+        assert_eq!(
+            next_sleep(&manifest, now, POLL_INTERVAL), Duration::from_secs(20),
+        );
+        manifest.get_mut(L2).unwrap().expires_at = None;
+        assert_eq!(
+            next_sleep(&manifest, now, POLL_INTERVAL), Duration::from_secs(40),
+        );
+        assert_eq!(
+            next_sleep(&manifest, now, Duration::from_secs(3)), Duration::from_secs(3),
         );
     }
 }

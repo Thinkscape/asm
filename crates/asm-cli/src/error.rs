@@ -66,6 +66,10 @@ impl CliError {
             "pending: run the same command again to keep waiting",
         )
     }
+    /// A shared exec acquisition deadline elapsed between completed acquisitions.
+    pub fn acquisition_elapsed() -> Self {
+        Self::new(EXIT_PENDING, "credential acquisition deadline elapsed; rerun asm exec")
+    }
     /// Exit 1: the manager no longer knows the request (restart).
     pub fn request_lost() -> Self {
         Self::new(EXIT_FAILURE, "request lost; run the command again")

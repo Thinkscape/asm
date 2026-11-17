@@ -82,6 +82,7 @@ struct RepairItem: Equatable, Sendable {
 
 struct GetDetail: Equatable, Sendable {
     var name: String
+    var vaultID: String?
     var vaultName: String
     var fields: [String]
     var reason: String
@@ -92,6 +93,12 @@ struct GetDetail: Equatable, Sendable {
     /// Offered but not pre-filled.
     var suggestedHosts: [HostPatternCheckItem]
     var defaultDurationSecs: UInt64?
+    var generatorChoices: [GeneratorApprovalChoiceItem] = []
+    var requestedGeneration: GenerationRequestItem?
+    var sentinelRequired: Bool = false
+    var hasSubstitutableFields: Bool = true
+
+    var isGenerated: Bool { !generatorChoices.isEmpty || requestedGeneration != nil }
 }
 
 struct PendingItem: Identifiable, Equatable, Sendable {
@@ -122,6 +129,207 @@ struct RecentItem: Identifiable, Equatable, Sendable {
     var resolvedAt: Date
 }
 
+
+enum SourceKindItem: Equatable, Sendable {
+    case vault, generator
+}
+
+enum GithubPermissionLevel: String, CaseIterable, Comparable, Hashable, Sendable {
+    case read, write, admin
+
+    private var rank: Int {
+        switch self {
+        case .read: 1
+        case .write: 2
+        case .admin: 3
+        }
+    }
+
+    static func < (lhs: Self, rhs: Self) -> Bool { lhs.rank < rhs.rank }
+}
+
+struct GithubPermissionItem: Identifiable, Hashable, Sendable {
+    var id: String { name }
+    var name: String
+    var level: GithubPermissionLevel
+
+    var scopeLabel: String {
+        if name.hasPrefix("organization_") || name == "members" {
+            return "\(name) (organization-wide)"
+        }
+        if name.hasPrefix("enterprise_") { return "\(name) (enterprise-wide)" }
+        if Self.accountPermissions.contains(name) {
+            return "\(name) (account-wide)"
+        }
+        if Self.repositoryPermissions.contains(name) { return name }
+        return "\(name) (not assumed repository-scoped)"
+    }
+
+    var allowedLevels: [GithubPermissionLevel] {
+        if name == "metadata" { return [.read] }
+        if name == "workflows" || name == "profile" {
+            return level >= .write ? [.write] : []
+        }
+        return GithubPermissionLevel.allCases.filter { $0 <= level }
+    }
+
+    private static let accountPermissions: Set<String> = [
+        "blocking", "codespaces_user_secrets", "emails", "followers", "gists", "gpg_keys",
+        "git_signing_ssh_public_keys", "interaction_limits", "keys", "plan", "profile",
+        "repository_invitations", "starring", "user_events", "watching",
+    ]
+
+    private static let repositoryPermissions: Set<String> = [
+        "actions", "administration", "artifact_metadata", "attestations", "checks", "codespaces",
+        "codespaces_lifecycle_admin", "codespaces_metadata", "codespaces_secrets", "commit_statuses",
+        "contents", "custom_properties", "dependabot_secrets", "deployments", "discussions",
+        "environments", "issues", "merge_queues", "metadata", "packages", "pages", "projects",
+        "pull_requests", "repository_advisories", "repository_custom_properties", "repository_hooks",
+        "repository_projects", "secret_scanning_alerts", "secrets", "security_events", "single_file",
+        "statuses", "vulnerability_alerts", "workflows",
+    ]
+}
+
+struct GithubRepositoryItem: Identifiable, Hashable, Sendable {
+    var id: UInt64
+    var fullName: String
+}
+
+struct GithubScopeRequestItem: Equatable, Sendable {
+    var repositories: [String]?
+    var permissions: [GithubPermissionItem]?
+}
+
+enum GenerationRequestItem: Equatable, Sendable {
+    case githubApp(GithubScopeRequestItem)
+
+    var github: GithubScopeRequestItem {
+        switch self { case let .githubApp(scope): scope }
+    }
+}
+
+struct GithubGrantItem: Equatable, Sendable {
+    var installationID: UInt64
+    var repositories: [GithubRepositoryItem]
+    var permissions: [GithubPermissionItem]
+
+    func unmetClaims(_ request: GithubScopeRequestItem?) -> [String] {
+        guard let request else { return [] }
+        let names = Set(repositories.map { $0.fullName.lowercased() })
+        var issues = (request.repositories ?? []).filter { !names.contains($0.lowercased()) }
+            .map { "Repository not selected: \($0)" }
+        let levels = Dictionary(permissions.map { ($0.name, $0.level) }, uniquingKeysWith: { a, _ in a })
+        for permission in request.permissions ?? [] where levels[permission.name].map({ $0 >= permission.level }) != true {
+            issues.append("Permission not selected: \(permission.name): \(permission.level.rawValue)")
+        }
+        return issues
+    }
+}
+
+enum GenerationGrantItem: Equatable, Sendable {
+    case githubApp(GithubGrantItem)
+
+    var github: GithubGrantItem {
+        switch self { case let .githubApp(grant): grant }
+    }
+}
+
+struct GenerationChoiceItem: Identifiable, Equatable, Sendable {
+    var id: String
+    var name: String
+    var revision: UInt64
+    var ceiling: GenerationGrantItem
+    var available: Bool
+    var unavailableReason: String?
+}
+
+struct GeneratorApprovalChoiceItem: Identifiable, Equatable, Sendable {
+    var id: String { choice.id }
+    var choice: GenerationChoiceItem
+    var suggestedHosts: [HostPatternCheckItem]
+    var scopeIssues: [String]
+}
+
+struct GenerationSelectionItem: Equatable, Sendable {
+    var generatorID: String
+    var generatorRevision: UInt64
+    var grant: GenerationGrantItem
+}
+
+struct GithubAppConfigItem: Equatable, Sendable {
+    var clientID: String
+    var installationID: UInt64
+    var ceiling: GithubGrantItem
+}
+
+enum GeneratorConfigItem: Equatable, Sendable {
+    case githubApp(GithubAppConfigItem)
+
+    var github: GithubAppConfigItem {
+        switch self { case let .githubApp(config): config }
+    }
+}
+
+struct GeneratorItem: Identifiable, Equatable, Sendable {
+    var id: String
+    var name: String
+    var config: GeneratorConfigItem
+    var revision: UInt64
+    var state: VaultState
+    var warning: String?
+}
+
+struct GeneratorDraftItem: Sendable {
+    var id: String?
+    var name: String
+    var config: GeneratorConfigItem
+    var privateKeyPEM: String
+}
+
+struct GithubInstallationItem: Equatable, Sendable {
+    var installationID: UInt64
+    var accountLogin: String
+    var repositories: [GithubRepositoryItem]
+    var permissions: [GithubPermissionItem]
+    var warning: String?
+}
+
+/// Repository IDs, not editable display names, are the authority in a selected scope.
+struct GithubClaimsSelection: Equatable {
+    var repositoryIDs: Set<UInt64> = []
+    var permissions: [String: GithubPermissionLevel] = ["metadata": .read]
+
+    subscript(repository id: UInt64) -> Bool {
+        get { repositoryIDs.contains(id) }
+        set {
+            if newValue { repositoryIDs.insert(id) } else { repositoryIDs.remove(id) }
+        }
+    }
+
+    func grant(within ceiling: GithubGrantItem) -> GithubGrantItem {
+        GithubGrantItem(
+            installationID: ceiling.installationID,
+            repositories: ceiling.repositories.filter { repositoryIDs.contains($0.id) },
+            permissions: ceiling.permissions.compactMap { permission in
+                guard let level = permissions[permission.name], level <= permission.level else { return nil }
+                return GithubPermissionItem(name: permission.name, level: level)
+            }
+        )
+    }
+
+    static func requested(_ request: GithubScopeRequestItem?, within ceiling: GithubGrantItem) -> Self {
+        let names = Set((request?.repositories ?? []).map { $0.lowercased() })
+        var selection = Self()
+        selection.repositoryIDs = Set(ceiling.repositories.filter { names.contains($0.fullName.lowercased()) }.map(\.id))
+        for permission in request?.permissions ?? [] {
+            if let maximum = ceiling.permissions.first(where: { $0.name == permission.name }),
+               maximum.allowedLevels.contains(permission.level) {
+                selection.permissions[permission.name] = permission.level
+            }
+        }
+        return selection
+    }
+}
 enum VaultKind: String, Equatable, Sendable {
     case bitwarden, envFile, keychain
 
@@ -243,6 +451,14 @@ struct LeaseItem: Identifiable, Equatable, Sendable {
     var status: LeaseStatus
     var suspended: Bool
     var rawDelivered: Bool
+    var sourceKind: SourceKindItem = .vault
+    var sourceID: String = ""
+    var fields: [String] = []
+    var generation: GenerationSelectionItem?
+    var generatorName: String?
+    var credentialExpiresAt: Date?
+    var credentialVersion: UInt64?
+    var suspensionReason: String?
 
     // Sort keys for `Table` columns.
     var hostsLine: String {
@@ -254,7 +470,9 @@ struct LeaseItem: Identifiable, Equatable, Sendable {
         return rawDelivered ? "raw value delivered" : "raw"
     }
     var statusLine: String {
-        if status == .active && suspended { return "suspended (vault unavailable)" }
+        if status == .active && suspended {
+            return "suspended (\(suspensionReason ?? (sourceKind == .generator ? "credential unavailable" : "vault unavailable")))"
+        }
         return status.rawValue
     }
     /// Unlimited leases sort after every dated one in ascending order.
@@ -429,7 +647,7 @@ enum DecisionItem: Sendable {
     /// `replace`: revoke the matching old pairing (`same_machine`); `same_install` re-pairs
     /// the same record whatever it says.
     case approvePair(name: String, replace: Bool)
-    case approveGet(raw: Bool, durationSecs: UInt64?, hosts: [String])
+    case approveGet(raw: Bool, durationSecs: UInt64?, hosts: [String], generation: GenerationSelectionItem?)
     case approveWrite(vaultID: String, collectionID: String?)
 }
 
@@ -448,7 +666,7 @@ struct LeaseDuration: Identifiable, Hashable, Sendable {
 
 /// Categories of the activity log (core `ActivityEntry.category`).
 enum ActivityCategory: String, CaseIterable, Identifiable, Sendable {
-    case requests, leases, proxy, pairing, vaults
+    case requests, leases, proxy, pairing, vaults, generators
 
     var id: String { rawValue }
 
@@ -459,6 +677,7 @@ enum ActivityCategory: String, CaseIterable, Identifiable, Sendable {
         case .proxy: "Proxy"
         case .pairing: "Pairing"
         case .vaults: "Vaults"
+        case .generators: "Generators"
         }
     }
 
@@ -469,6 +688,7 @@ enum ActivityCategory: String, CaseIterable, Identifiable, Sendable {
         case .proxy: "arrow.left.arrow.right"
         case .pairing: "link"
         case .vaults: "lock.rectangle.stack"
+        case .generators: "key.horizontal"
         }
     }
 }

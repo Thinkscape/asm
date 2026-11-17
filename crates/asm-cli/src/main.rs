@@ -1,7 +1,9 @@
 //! `asm`: the Agents Secrets Manager CLI for agent machines.
 
 mod api;
+mod bindings;
 mod error;
+mod exec;
 mod files;
 mod hostinfo;
 mod pair;
@@ -46,29 +48,9 @@ enum Command {
         json: bool,
     },
     /// Request a lease on a secret and write its files.
-    Get {
-        /// Ask for the real value instead of a sentinel.
-        #[arg(long)]
-        raw: bool,
-        /// Hosts the sentinel will be used with (comma-separated patterns).
-        #[arg(long, value_delimiter = ',')]
-        hosts: Vec<String>,
-        /// Stop waiting for the operator after this many seconds (exit 4 while still
-        /// pending). Default: until the request expires on the manager (typically 10 min).
-        #[arg(long)]
-        wait: Option<u64>,
-        /// Print the result as JSON.
-        #[arg(long)]
-        json: bool,
-        /// Do not start the background process that deletes the files when the lease
-        /// ends (also `ASM_NO_REAPER=1`); later asm commands still delete them.
-        #[arg(long)]
-        no_reaper: bool,
-        /// Secret name as shown by `asm list`.
-        name: String,
-        /// Why you need it (shown to the operator; at most 250 characters).
-        reason: String,
-    },
+    Get(requests::GetArgs),
+    /// Run a command with approved credentials in its environment, without token files.
+    Exec(exec::ExecArgs),
     /// Change a secret; the new value is read from stdin.
     Update {
         /// Field to change (default: password for logins, the only field otherwise).
@@ -131,27 +113,13 @@ fn main() {
             pairing_code,
         } => pair::run(&manager, pairing_code, force),
         Command::List { json } => requests::list(json),
-        Command::Get {
-            raw,
-            hosts,
-            wait,
-            json,
-            no_reaper,
-            name,
-            reason,
-        } => {
-            if no_reaper {
+        Command::Get(args) => {
+            if args.no_reaper {
                 reaper::disable();
             }
-            requests::get(requests::GetArgs {
-                raw,
-                hosts,
-                wait,
-                json,
-                name,
-                reason,
-            })
+            requests::get(args)
         }
+        Command::Exec(args) => exec::run(args),
         Command::Update { field, wait, name } => requests::update(field, wait, name),
         Command::Add { wait, name } => requests::add(wait, name),
         Command::ProxyInfo { json } => proxy::proxy_info(json),

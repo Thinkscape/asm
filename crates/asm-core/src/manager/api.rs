@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asm_proto::ApiError;
+use asm_proto::generators::{GenerationSelection, SourceKind};
 use asm_proto::wire::{
+    CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_SECRET_FIELDS_V1,
     HealthResponse, LeaseBrief, LeaseInfo, LeasesResponse, MANAGER_NAME, MAX_POLL_WAIT_SECS,
     PairPollQuery, PairRequest, PairResponse, ProxyInfo, RequestBody, RequestState, RequestStatus,
-    RevealRequest, SecretEntry, SecretsResponse, WaitQuery,
+    RevealRequest, SecretsResponse, WaitQuery,
 };
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
@@ -21,9 +23,7 @@ use tokio::time::Instant;
 
 use super::{Core, lock, now};
 use crate::error::{CoreError, Result};
-use crate::store::HostRecord;
-use crate::vault::VaultStatus;
-use crate::vault::names::compute_names;
+use crate::store::{HostRecord, LeaseRecord};
 
 type Shared = State<Arc<Core>>;
 
@@ -153,6 +153,10 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         name: MANAGER_NAME.to_string(),
         version: asm_proto::VERSION.to_string(),
+        capabilities: vec![
+            CAPABILITY_GENERATED_CREDENTIALS_V1.into(),
+            CAPABILITY_SECRET_FIELDS_V1.into(),
+        ],
     })
 }
 
@@ -204,54 +208,53 @@ async fn pair_poll(
     Ok(Json(r))
 }
 
+fn lease_generation(lease: &LeaseRecord) -> Option<GenerationSelection> {
+    Some(GenerationSelection {
+        generator_id: lease.vault_id.clone(),
+        generator_revision: lease.generator_revision?,
+        grant: lease.generation.clone()?,
+    })
+}
+
+fn lease_brief(lease: &LeaseRecord) -> LeaseBrief {
+    LeaseBrief {
+        lease_id: lease.id.clone(),
+        mode: lease.mode,
+        expires_at: lease.expires_at.map(asm_proto::time::fmt_unix),
+        generation: lease_generation(lease),
+        credential_expires_at: lease.credential_expires_at.map(asm_proto::time::fmt_unix),
+        credential_version: (lease.source_kind == SourceKind::Generator).then_some(lease.credential_version),
+        generator_name: (lease.source_kind == SourceKind::Generator).then(|| lease.vault_name.clone()),
+    }
+}
+
 async fn secrets(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<SecretsResponse>> {
     let host = auth(&core, &headers).await?;
     let r = blocking(move || {
-        let (listings, mut warnings) = core.registry.listings();
-        for v in core.registry.all() {
-            match v.provider.status() {
-                VaultStatus::Ready => {}
-                VaultStatus::Locked => warnings.push(format!("{}: vault is locked", v.name)),
-                VaultStatus::Error(e) => warnings.push(format!("{}: {e}", v.name)),
-            }
-        }
-        warnings.dedup();
+        let mut catalog = core.secret_catalog()?;
         let t = now();
-        let leases: Vec<_> = core
-            .store
-            .leases_of_host(&host.id)?
-            .into_iter()
-            .filter(|l| l.is_active(t))
-            .collect();
-        let secrets = compute_names(&listings)
-            .into_iter()
-            .map(|n| {
-                let lease = leases
-                    .iter()
-                    .filter(|l| l.vault_id == n.vault_id && l.secret_key == n.meta.key)
-                    .max_by_key(|l| {
-                        (
-                            l.mode == asm_proto::wire::LeaseMode::Sentinel,
-                            l.expires_at.unwrap_or(i64::MAX),
-                        )
-                    })
-                    .map(|l| LeaseBrief {
-                        lease_id: l.id.clone(),
-                        mode: l.mode,
-                        expires_at: l.expires_at.map(asm_proto::time::fmt_unix),
-                    });
-                SecretEntry {
-                    name: n.display,
-                    vault: n.vault_name,
-                    kind: n.meta.kind,
-                    fields: n.meta.fields,
-                    lease,
-                }
-            })
-            .collect();
-        Ok(SecretsResponse { secrets, warnings })
-    })
-    .await?;
+        let leases = core.store.leases_of_host(&host.id)?;
+        for (index, entry) in catalog.wire_entries.iter_mut().enumerate() {
+            entry.lease = if entry.source_kind == SourceKind::Vault {
+                let source = &catalog.static_entries[index];
+                leases.iter().filter(|lease| {
+                    lease.source_kind == SourceKind::Vault && lease.is_active(t)
+                        && lease.vault_id == source.vault_id && lease.secret_key == source.meta.key
+                }).max_by_key(|lease| (
+                    lease.mode == asm_proto::wire::LeaseMode::Sentinel,
+                    lease.expires_at.unwrap_or(i64::MAX),
+                )).map(lease_brief)
+            } else {
+                // Ended latest approvals deliberately hide older active identities.
+                leases.iter().filter(|lease| {
+                    lease.source_kind == SourceKind::Generator
+                        && entry.generators.iter().any(|g| g.generator_id == lease.vault_id)
+                }).max_by_key(|lease| lease.approval_order)
+                    .filter(|lease| lease.is_active(t)).map(lease_brief)
+            };
+        }
+        Ok(SecretsResponse { secrets: catalog.wire_entries, warnings: catalog.warnings })
+    }).await?;
     Ok(Json(r))
 }
 
@@ -320,6 +323,12 @@ async fn leases(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<Lease
             .leases_of_host(&host.id)?
             .into_iter()
             .map(|l| LeaseInfo {
+                source_kind: l.source_kind,
+                generation: lease_generation(&l),
+                credential_expires_at: l.credential_expires_at.map(asm_proto::time::fmt_unix),
+                credential_version: (l.source_kind == SourceKind::Generator).then_some(l.credential_version),
+                generator_name: (l.source_kind == SourceKind::Generator).then(|| l.vault_name.clone()),
+                fields: l.fields.iter().map(|f| f.field.clone()).collect(),
                 status: l.status(t),
                 lease_id: l.id,
                 name: l.name,

@@ -2,6 +2,7 @@
 //! RFC 3339 UTC strings, `None`/`null` meaning unlimited.
 
 use crate::error::ApiError;
+use crate::generators::{GenerationRequest, GenerationSelection, SourceKind};
 use crate::rules::validate_agent_text;
 use serde::{Deserialize, Serialize};
 
@@ -15,11 +16,16 @@ pub const DEFAULT_API_PORT: u16 = 7411;
 pub const DEFAULT_PROXY_PORT: u16 = 7412;
 /// Upper bound the manager applies to `?wait=` long polls, in seconds.
 pub const MAX_POLL_WAIT_SECS: u64 = 25;
+/// Scope-aware generated-credential requests and durable credential versions.
+pub const CAPABILITY_GENERATED_CREDENTIALS_V1: &str = "generated_credentials_v1";
+/// Field authorization, catalog aliases and per-field substitution metadata.
+pub const CAPABILITY_SECRET_FIELDS_V1: &str = "secret_fields_v1";
 /// Lease duration choices: label and seconds (`None` = unlimited).
 pub const LEASE_DURATIONS: &[(&str, Option<u64>)] = &[
     ("5 min", Some(300)),
     ("15 min", Some(900)),
     ("1 h", Some(3600)),
+    ("12 h", Some(43_200)),
     ("24 h", Some(86_400)),
     ("3 days", Some(259_200)),
     ("7 days", Some(604_800)),
@@ -35,6 +41,20 @@ pub const DEFAULT_LEASE_SECS: u64 = 3600;
 pub struct HealthResponse {
     pub name: String,
     pub version: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+impl HealthResponse {
+    /// Check the pinned manager before sending a request it might misunderstand.
+    pub fn require_capability(&self, capability: &str) -> Result<(), ApiError> {
+        if !self.capabilities.iter().any(|c| c == capability) {
+            return Err(ApiError::invalid(format!(
+                "manager does not support {capability}; upgrade the manager"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Facts about the agent machine, sent when pairing.
@@ -199,6 +219,38 @@ pub enum LeaseMode {
     Raw,
 }
 
+/// A request preference is distinct from the operator's final lease mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RequestedMode {
+    #[default]
+    Default,
+    Raw,
+    Sentinel,
+}
+
+impl RequestedMode {
+    pub fn from_flags(raw: bool, sentinel: bool) -> Result<Self, ApiError> {
+        match (raw, sentinel) {
+            (false, false) => Ok(Self::Default),
+            (true, false) => Ok(Self::Raw),
+            (false, true) => Ok(Self::Sentinel),
+            (true, true) => Err(ApiError::invalid("raw and sentinel are mutually exclusive")),
+        }
+    }
+
+    /// Initial approval preference only; existing generated leases keep their mode.
+    pub fn default_mode(self, source: SourceKind) -> LeaseMode {
+        match self {
+            Self::Raw => LeaseMode::Raw,
+            Self::Sentinel => LeaseMode::Sentinel,
+            Self::Default => match source {
+                SourceKind::Vault => LeaseMode::Sentinel,
+                SourceKind::Generator => LeaseMode::Raw,
+            },
+        }
+    }
+}
+
 /// Lease status, derived from the wall clock and revocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -214,6 +266,14 @@ pub struct LeaseBrief {
     pub lease_id: String,
     pub mode: LeaseMode,
     pub expires_at: Option<String>,
+    #[serde(default)]
+    pub generation: Option<GenerationSelection>,
+    #[serde(default)]
+    pub credential_expires_at: Option<String>,
+    #[serde(default)]
+    pub credential_version: Option<u64>,
+    #[serde(default)]
+    pub generator_name: Option<String>,
 }
 
 /// One entry of `GET /secrets`.
@@ -224,6 +284,20 @@ pub struct SecretEntry {
     pub kind: SecretKind,
     pub fields: Vec<String>,
     pub lease: Option<LeaseBrief>,
+    #[serde(default)]
+    pub source_kind: SourceKind,
+    #[serde(default)]
+    pub generators: Vec<GeneratorOption>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+/// Public generator choice: ceilings remain in the manager's approval details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratorOption {
+    pub generator_id: String,
+    pub name: String,
+    pub available: bool,
 }
 
 /// `GET /secrets` response.
@@ -242,6 +316,24 @@ pub enum RequestBody {
         name: String,
         #[serde(default)]
         raw: bool,
+        #[serde(default)]
+        sentinel: bool,
+        /// None selects all current fields; Some is an exact authorization set.
+        #[serde(default)]
+        fields: Option<Vec<String>>,
+        #[serde(default)]
+        generation: Option<GenerationRequest>,
+        #[serde(default)]
+        refresh: bool,
+        #[serde(default)]
+        new_lease: bool,
+        #[serde(default)]
+        lease_id: Option<String>,
+        /// Conditional force rotation against an observed durable version.
+        #[serde(default)]
+        refresh_from_version: Option<u64>,
+        #[serde(default)]
+        client_capabilities: Vec<String>,
         #[serde(default)]
         hosts: Vec<String>,
         reason: String,
@@ -290,6 +382,61 @@ impl RequestBody {
             | RequestBody::Update { agent, .. }
             | RequestBody::Add { agent, .. } => agent,
         }
+    }
+
+    /// Canonicalize shared get syntax before target lookup. Source-specific
+    /// authority checks (including unknown fields) still belong to the manager.
+    pub fn canonicalize(&mut self) -> Result<(), ApiError> {
+        if let Self::Get {
+            raw, sentinel, fields, generation, refresh, new_lease, lease_id,
+            refresh_from_version, ..
+        } = self
+        {
+            RequestedMode::from_flags(*raw, *sentinel)?;
+            if *new_lease && (lease_id.is_some() || *refresh) {
+                return Err(ApiError::invalid("new_lease conflicts with lease_id and refresh"));
+            }
+            if lease_id.as_ref().is_some_and(|id| id.is_empty()) {
+                return Err(ApiError::invalid("lease_id must not be empty"));
+            }
+            if let Some(version) = refresh_from_version {
+                if !*refresh || lease_id.is_none() || *version == 0 {
+                    return Err(ApiError::invalid("refresh_from_version requires refresh, lease_id and a positive version"));
+                }
+            }
+            if let Some(fields) = fields {
+                if fields.is_empty() || fields.iter().any(String::is_empty) {
+                    return Err(ApiError::invalid("fields must be a nonempty list of exact field names"));
+                }
+                fields.sort_unstable();
+                fields.dedup();
+            }
+            if let Some(generation) = generation {
+                generation.canonicalize()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Negotiate only features that change request meaning, not arbitrary
+    /// unknown JSON fields. Legacy static whole-item requests remain accepted.
+    pub fn validate_get_capabilities(&self, source: SourceKind) -> Result<(), ApiError> {
+        if let Self::Get { fields, sentinel, client_capabilities, .. } = self {
+            let require = |capability| {
+                if client_capabilities.iter().any(|c| c == capability) {
+                    Ok(())
+                } else {
+                    Err(ApiError::invalid(format!("request requires {capability}; upgrade the CLI")))
+                }
+            };
+            if source == SourceKind::Generator {
+                require(CAPABILITY_GENERATED_CREDENTIALS_V1)?;
+            }
+            if fields.is_some() || *sentinel {
+                require(CAPABILITY_SECRET_FIELDS_V1)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -355,6 +502,36 @@ pub struct GetResult {
     pub hosts: Vec<String>,
     pub expires_at: Option<String>,
     pub files: Vec<ResultFile>,
+    #[serde(default)]
+    pub generation: Option<GenerationSelection>,
+    #[serde(default)]
+    pub credential_expires_at: Option<String>,
+    #[serde(default)]
+    pub credential_version: Option<u64>,
+    #[serde(default)]
+    pub generator_name: Option<String>,
+}
+
+impl GetResult {
+    /// Validate generated delivery metadata before publishing values locally.
+    /// Authorization/provider freshness is checked separately against the clock.
+    pub fn validate(&self) -> Result<(), ApiError> {
+        match &self.generation {
+            Some(selection) => {
+                selection.validate()?;
+                if self.credential_version.is_none_or(|version| version == 0)
+                    || self.credential_expires_at.as_deref().and_then(crate::time::parse_unix).is_none()
+                {
+                    return Err(ApiError::invalid("generated result requires a positive credential version and provider expiry"));
+                }
+            }
+            None if self.credential_version.is_some() || self.credential_expires_at.is_some() || self.generator_name.is_some() => {
+                return Err(ApiError::invalid("credential metadata requires a generation selection"));
+            }
+            None => {}
+        }
+        Ok(())
+    }
 }
 
 /// One file of a `get` result.
@@ -365,6 +542,9 @@ pub struct ResultFile {
     pub relative_path: String,
     /// Sentinel, raw value, or the plain username.
     pub content: String,
+    /// True only when the manager substituted this field with a sentinel.
+    #[serde(default)]
+    pub substituted: bool,
 }
 
 /// Result of an approved `update` or `add`.
@@ -383,6 +563,18 @@ pub struct LeaseInfo {
     pub hosts: Vec<String>,
     pub expires_at: Option<String>,
     pub status: LeaseStatus,
+    #[serde(default)]
+    pub source_kind: SourceKind,
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub generation: Option<GenerationSelection>,
+    #[serde(default)]
+    pub credential_expires_at: Option<String>,
+    #[serde(default)]
+    pub credential_version: Option<u64>,
+    #[serde(default)]
+    pub generator_name: Option<String>,
 }
 
 /// `GET /leases` response.
@@ -485,7 +677,8 @@ mod tests {
     fn request_states() {
         let get = json!({"request_id":"r","kind":"get","status":"approved","deny_reason":null,
             "result":{"lease_id":"l","mode":"sentinel","hosts":["a.com"],"expires_at":null,
-                      "files":[{"field":"value","relative_path":"X","content":"asm_x"}]},
+                      "files":[{"field":"value","relative_path":"X","content":"asm_x","substituted":false}],
+                      "generation":null,"credential_expires_at":null,"credential_version":null,"generator_name":null},
             "expires_at":null,"pending_lifetime_secs":600});
         let s: RequestState = serde_json::from_value(get.clone()).unwrap();
         assert!(matches!(
@@ -530,7 +723,14 @@ mod tests {
                     lease_id: "l".into(),
                     mode: LeaseMode::Raw,
                     expires_at: None,
+                    generation: None,
+                    credential_expires_at: None,
+                    credential_version: None,
+                    generator_name: None,
                 }),
+                source_kind: SourceKind::Vault,
+                generators: vec![],
+                aliases: vec![],
             }],
             warnings: vec![],
         };
@@ -599,5 +799,130 @@ mod tests {
             to_value(&new).unwrap(),
             json!({"port":7412,"hints":["mac"],"ca_sha256":"ab","firewall_blocks_proxy":true})
         );
+    }
+
+    #[test]
+    fn old_static_wire_records_default_to_no_generation() {
+        let health: HealthResponse = from_str(r#"{"name":"asm-manager","version":"old"}"#).unwrap();
+        assert!(health.capabilities.is_empty());
+        let entry: SecretEntry = from_str(r#"{"name":"X","vault":"work","kind":"single","fields":["value"],"lease":null}"#).unwrap();
+        assert_eq!(entry.source_kind, SourceKind::Vault);
+        assert!(entry.generators.is_empty() && entry.aliases.is_empty());
+        let brief: LeaseBrief = from_str(r#"{"lease_id":"l","mode":"sentinel","expires_at":null}"#).unwrap();
+        assert_eq!((brief.generation, brief.credential_expires_at, brief.credential_version, brief.generator_name), (None, None, None, None));
+        let lease: LeaseInfo = from_str(r#"{"lease_id":"l","name":"X","mode":"sentinel","hosts":["*"],"expires_at":null,"status":"active"}"#).unwrap();
+        assert_eq!(lease.source_kind, SourceKind::Vault);
+        assert!(lease.fields.is_empty());
+        assert_eq!((lease.generation, lease.credential_expires_at, lease.credential_version, lease.generator_name), (None, None, None, None));
+        let result: GetResult = from_str(r#"{"lease_id":"l","mode":"sentinel","hosts":["*"],"expires_at":null,"files":[{"field":"value","relative_path":"X","content":"asm_fixture"}]}"#).unwrap();
+        assert!(!result.files[0].substituted);
+        assert_eq!((result.generation.as_ref(), result.credential_expires_at.as_ref(), result.credential_version, result.generator_name.as_ref()), (None, None, None, None));
+        result.validate().unwrap();
+    }
+
+    fn get_body(extra: serde_json::Value) -> RequestBody {
+        let mut value = json!({"kind":"get","name":"GH_TOKEN","reason":"Read repository"});
+        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn get_fields_and_scope_canonicalize_without_guessing_field_names() {
+        let mut body = get_body(json!({
+            "fields":["password","Username","password"],
+            "generation":{"provider":"github_app","scope":{"repositories":[" Acme/Web ","acme/web"],"permissions":{}}}
+        }));
+        body.canonicalize().unwrap();
+        let RequestBody::Get { fields, generation, .. } = body else { panic!() };
+        assert_eq!(fields.unwrap(), ["Username", "password"]);
+        let Some(GenerationRequest::GithubApp(scope)) = generation else { panic!() };
+        assert_eq!(scope.repositories.unwrap(), ["acme/web"]);
+        assert_eq!(scope.permissions.unwrap().get("metadata"), Some(&crate::generators::GithubPermission::Read));
+        for fields in [json!([]), json!([""])] {
+            assert!(get_body(json!({"fields":fields})).canonicalize().is_err());
+        }
+        let mut exact = get_body(json!({"fields":[" value "]}));
+        exact.canonicalize().unwrap();
+        let RequestBody::Get { fields, .. } = exact else { panic!() };
+        assert_eq!(fields.unwrap(), [" value "], "field names are exact and never trimmed");
+    }
+
+    #[test]
+    fn get_flag_and_conditional_refresh_conflicts_fail_locally() {
+        for extra in [
+            json!({"raw":true,"sentinel":true}),
+            json!({"new_lease":true,"lease_id":"l"}),
+            json!({"new_lease":true,"refresh":true}),
+            json!({"lease_id":""}),
+            json!({"refresh_from_version":1}),
+            json!({"refresh":true,"refresh_from_version":1}),
+            json!({"lease_id":"l","refresh_from_version":1}),
+            json!({"lease_id":"l","refresh":true,"refresh_from_version":0}),
+        ] {
+            assert!(get_body(extra.clone()).canonicalize().is_err(), "{extra}");
+        }
+        get_body(json!({"lease_id":"l","refresh":true,"refresh_from_version":9})).canonicalize().unwrap();
+        get_body(json!({"refresh":true})).canonicalize().unwrap();
+        let mut old = get_body(json!({"unknown_future_field":true}));
+        old.canonicalize().unwrap();
+        let RequestBody::Get { sentinel, fields, generation, refresh, new_lease, lease_id, refresh_from_version, client_capabilities, .. } = old else { panic!() };
+        assert!(!sentinel && !refresh && !new_lease);
+        assert_eq!((fields, generation, lease_id, refresh_from_version), (None, None, None, None));
+        assert!(client_capabilities.is_empty());
+    }
+
+    #[test]
+    fn capability_checks_are_targeted_and_do_not_break_legacy_static_requests() {
+        let old = get_body(json!({}));
+        old.validate_get_capabilities(SourceKind::Vault).unwrap();
+        assert!(old.validate_get_capabilities(SourceKind::Generator).is_err());
+        for extra in [json!({"fields":["value"]}), json!({"sentinel":true})] {
+            assert!(get_body(extra).validate_get_capabilities(SourceKind::Vault).is_err());
+        }
+        let capable = get_body(json!({
+            "sentinel":true,"fields":["value"],
+            "client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1,CAPABILITY_SECRET_FIELDS_V1,"future"]
+        }));
+        capable.validate_get_capabilities(SourceKind::Generator).unwrap();
+        let health = HealthResponse { name: MANAGER_NAME.into(), version: "new".into(), capabilities: vec![CAPABILITY_SECRET_FIELDS_V1.into()] };
+        health.require_capability(CAPABILITY_SECRET_FIELDS_V1).unwrap();
+        let error = health.require_capability(CAPABILITY_GENERATED_CREDENTIALS_V1).unwrap_err();
+        assert_eq!(error.code, crate::ErrorCode::Invalid);
+        assert!(error.message.contains("upgrade the manager"));
+    }
+
+    #[test]
+    fn source_defaults_and_twelve_hour_duration_are_shared() {
+        assert_eq!(RequestedMode::from_flags(false, false).unwrap().default_mode(SourceKind::Vault), LeaseMode::Sentinel);
+        assert_eq!(RequestedMode::Default.default_mode(SourceKind::Generator), LeaseMode::Raw);
+        assert_eq!(RequestedMode::Sentinel.default_mode(SourceKind::Generator), LeaseMode::Sentinel);
+        assert_eq!(RequestedMode::Raw.default_mode(SourceKind::Vault), LeaseMode::Raw);
+        assert_eq!(LEASE_DURATIONS.iter().find(|(label, _)| *label == "12 h"), Some(&("12 h", Some(43_200))));
+    }
+
+    #[test]
+    fn generated_results_require_durable_version_and_parseable_provider_expiry() {
+        let mut value = json!({
+            "lease_id":"l","mode":"raw","hosts":[],"expires_at":"2026-11-18T00:00:00Z",
+            "files":[{"field":"value","relative_path":"GITHUB_TOKEN","content":"fixture","substituted":false}],
+            "generation":{"generator_id":"g","generator_revision":1,"grant":{"provider":"github_app","scope":{
+                "installation_id":42,"repositories":[{"id":7,"full_name":"acme/web"}],"permissions":{"metadata":"read"}
+            }}},
+            "credential_expires_at":"2026-11-17T13:00:00Z","credential_version":1,"generator_name":"review-bot"
+        });
+        let result: GetResult = serde_json::from_value(value.clone()).unwrap();
+        result.validate().unwrap();
+        assert_eq!(to_value(&result).unwrap(), value);
+        for version in [json!(null), json!(0)] {
+            value["credential_version"] = version;
+            assert!(serde_json::from_value::<GetResult>(value.clone()).unwrap().validate().is_err());
+        }
+        value["credential_version"] = json!(2);
+        for expiry in [json!(null), json!("not a time")] {
+            value["credential_expires_at"] = expiry;
+            assert!(serde_json::from_value::<GetResult>(value.clone()).unwrap().validate().is_err());
+        }
+        value["generation"] = json!(null);
+        assert!(serde_json::from_value::<GetResult>(value).unwrap().validate().is_err());
     }
 }

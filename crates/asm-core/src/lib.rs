@@ -3,6 +3,7 @@ uniffi::setup_scaffolding!();
 
 pub mod error;
 pub mod ffi;
+pub mod generator;
 pub mod manager;
 pub mod paths;
 pub mod proxy;

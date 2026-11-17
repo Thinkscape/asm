@@ -40,6 +40,7 @@ pub enum Category {
     Leases,
     Proxy,
     Vaults,
+    Generators,
 }
 
 impl Category {
@@ -50,6 +51,7 @@ impl Category {
             Category::Leases => "leases",
             Category::Proxy => "proxy",
             Category::Vaults => "vaults",
+            Category::Generators => "generators",
         }
     }
 }
@@ -351,6 +353,11 @@ fn lease_event(kind: &'static str, l: &LeaseRecord, summary: String) -> Event {
             "fields": l.fields.iter().map(|f| f.field.as_str()).collect::<Vec<_>>(),
             "created_at": fmt_unix(l.created_at),
             "expires_at": l.expires_at.map(fmt_unix),
+            "source_kind": l.source_kind,
+            "generation": l.generation,
+            "generator_revision": l.generator_revision,
+            "credential_expires_at": l.credential_expires_at.map(fmt_unix),
+            "credential_version": l.credential_version,
             "agent": l.agent,
             "reason": l.reason,
         }))
@@ -384,8 +391,16 @@ fn request_detail(p: &Pending) -> Map<String, Value> {
             }
         }
         Detail::Get(g) => {
-            d.insert("vault".into(), json!(g.secret.vault_name));
-            d.insert("raw_requested".into(), json!(g.raw));
+            match &g.target {
+                super::requests::GetTarget::Vault(s) => { d.insert("vault".into(), json!(s.vault_name)); }
+                super::requests::GetTarget::Generated(target) => {
+                    d.insert("generator_choices".into(), json!(target.candidates.iter()
+                        .map(|c| (&c.generator_id, c.revision)).collect::<Vec<_>>()));
+                    d.insert("requested_generation".into(), json!(target.requested_generation));
+                }
+            }
+            d.insert("fields".into(), json!(g.wanted_fields));
+            d.insert("raw_requested".into(), json!(g.mode == super::requests::RequestedMode::Raw));
             d.insert("requested_hosts".into(), json!(g.requested_hosts));
             d.insert("reason".into(), json!(g.reason));
         }
@@ -406,7 +421,7 @@ fn request_detail(p: &Pending) -> Map<String, Value> {
 fn request_event(p: &Pending, kind: &'static str, summary: String, extra: Value) -> Event {
     let (category, secret) = match &p.detail {
         Detail::Pair { .. } => (Category::Pairing, None),
-        Detail::Get(g) => (Category::Requests, Some(g.secret.display.as_str())),
+        Detail::Get(g) => (Category::Requests, Some(g.target.display())),
         Detail::Update(u) => (Category::Requests, Some(u.secret.display.as_str())),
         Detail::Add(a) => (Category::Requests, Some(a.name.as_str())),
     };
@@ -498,6 +513,9 @@ pub(crate) fn approved(p: &Pending, result: Option<&RequestResult>, t: i64) -> E
                     "approved_hosts": g.hosts,
                     "duration_secs": secs,
                     "expires_at": g.expires_at,
+                    "generation": g.generation,
+                    "credential_expires_at": g.credential_expires_at,
+                    "credential_version": g.credential_version,
                 }),
             )
         }
@@ -798,6 +816,13 @@ mod tests {
             created_at: 100,
             expires_at: Some(3700),
             revoked_at: None,
+            source_kind: asm_proto::generators::SourceKind::Vault,
+            generation: None,
+            generator_revision: None,
+            credential_expires_at: None,
+            approval_order: None,
+            credential_version: 0,
+            requested_generation: None,
         }
     }
 

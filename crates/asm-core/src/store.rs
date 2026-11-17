@@ -1,17 +1,19 @@
-//! SQLite store (`<data>/asm.db`). Holds settings, vault configs, hosts, pairing codes,
+//! SQLite store (`<data>/asm.db`). Holds settings, source configs, hosts, pairing codes,
 //! resolved request history, lease metadata and the activity log. Never holds secret
-//! values: leases keep sentinels and file paths only, host tokens and pairing codes are
-//! stored as SHA-256.
+//! values: generated credentials keep only grant/version/expiry metadata, leases keep
+//! sentinels and file paths, and host tokens and pairing codes are stored as SHA-256.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Mutex;
 
+use asm_proto::generators::{GenerationGrant, GenerationRequest, SourceKind};
 use asm_proto::wire::{HostInfo, LeaseMode, LeaseStatus};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
+use crate::generator::GeneratorConfig;
 use crate::vault::VaultConfig;
 
 const SCHEMA: &str = "
@@ -23,6 +25,13 @@ CREATE TABLE IF NOT EXISTS vaults(
     id       TEXT PRIMARY KEY,
     name     TEXT NOT NULL UNIQUE,
     config   TEXT NOT NULL,
+    position INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS generators(
+    id       TEXT PRIMARY KEY,
+    name     TEXT NOT NULL UNIQUE,
+    config   TEXT NOT NULL,
+    revision INTEGER NOT NULL,
     position INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS hosts(
@@ -79,7 +88,14 @@ CREATE TABLE IF NOT EXISTS leases(
     agent      TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     expires_at INTEGER,
-    revoked_at INTEGER
+    revoked_at INTEGER,
+    source_kind TEXT NOT NULL DEFAULT 'vault',
+    generation TEXT,
+    generator_revision INTEGER,
+    credential_expires_at INTEGER,
+    approval_order INTEGER,
+    credential_version INTEGER NOT NULL DEFAULT 0,
+    requested_generation TEXT
 );
 CREATE INDEX IF NOT EXISTS leases_secret ON leases(vault_id, secret_key);
 CREATE TABLE IF NOT EXISTS secret_hosts(
@@ -95,6 +111,16 @@ pub struct VaultRecord {
     pub id: String,
     pub name: String,
     pub config: VaultConfig,
+    pub position: i64,
+}
+
+/// A configured generator; credentials are stored separately in the keychain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratorRecord {
+    pub id: String,
+    pub name: String,
+    pub config: GeneratorConfig,
+    pub revision: u64,
     pub position: i64,
 }
 
@@ -194,6 +220,15 @@ pub struct LeaseRecord {
     pub created_at: i64,
     pub expires_at: Option<i64>,
     pub revoked_at: Option<i64>,
+    pub source_kind: SourceKind,
+    pub generation: Option<GenerationGrant>,
+    pub generator_revision: Option<u64>,
+    /// Last issued provider expiry; not evidence that a live credential is cached.
+    pub credential_expires_at: Option<i64>,
+    pub approval_order: Option<u64>,
+    /// Durable high-water mark; generated credentials never reset it after restart.
+    pub credential_version: u64,
+    pub requested_generation: Option<GenerationRequest>,
 }
 
 impl LeaseRecord {
@@ -219,11 +254,108 @@ fn mode_str(m: LeaseMode) -> &'static str {
     }
 }
 
-fn parse_mode(s: &str) -> LeaseMode {
-    if s == "raw" {
-        LeaseMode::Raw
-    } else {
-        LeaseMode::Sentinel
+fn parse_mode(s: &str) -> Result<LeaseMode> {
+    match s {
+        "raw" => Ok(LeaseMode::Raw),
+        "sentinel" => Ok(LeaseMode::Sentinel),
+        _ => Err(CoreError::internal("invalid persisted lease mode")),
+    }
+}
+
+fn source_kind_str(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Vault => "vault",
+        SourceKind::Generator => "generator",
+    }
+}
+
+fn parse_source_kind(s: &str) -> Result<SourceKind> {
+    match s {
+        "vault" => Ok(SourceKind::Vault),
+        "generator" => Ok(SourceKind::Generator),
+        _ => Err(CoreError::internal("invalid persisted lease source kind")),
+    }
+}
+
+fn sqlite_u64(value: u64, label: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| CoreError::internal(format!("{label} exceeds SQLite integer range")))
+}
+
+fn positive_u64(value: i64, label: &str) -> Result<u64> {
+    if value <= 0 {
+        return Err(CoreError::internal(format!("invalid persisted {label}")));
+    }
+    Ok(value as u64)
+}
+
+/// A malformed generated row must never fall back to ordinary vault authority.
+fn validate_lease_generation(lease: &LeaseRecord) -> Result<()> {
+    match lease.source_kind {
+        SourceKind::Vault => {
+            if lease.generation.is_some()
+                || lease.generator_revision.is_some()
+                || lease.credential_expires_at.is_some()
+                || lease.approval_order.is_some()
+                || lease.credential_version != 0
+                || lease.requested_generation.is_some()
+            {
+                return Err(CoreError::internal("vault lease contains generated metadata"));
+            }
+        }
+        SourceKind::Generator => {
+            let grant = lease
+                .generation
+                .as_ref()
+                .ok_or_else(|| CoreError::internal("generated lease has no grant"))?;
+            grant
+                .validate()
+                .map_err(|_| CoreError::internal("invalid generated lease grant"))?;
+            let revision = lease
+                .generator_revision
+                .filter(|n| *n > 0)
+                .ok_or_else(|| CoreError::internal("generated lease has no generator revision"))?;
+            let order = lease
+                .approval_order
+                .filter(|n| *n > 0)
+                .ok_or_else(|| CoreError::internal("generated lease has no approval order"))?;
+            if lease.credential_version == 0 {
+                return Err(CoreError::internal("generated lease has no credential version"));
+            }
+            sqlite_u64(revision, "generator revision")?;
+            sqlite_u64(order, "generator approval order")?;
+            sqlite_u64(lease.credential_version, "credential version")?;
+            if !lease.credential_expires_at.is_some_and(|n| n > 0) {
+                return Err(CoreError::internal("generated lease has no credential expiry"));
+            }
+            if lease.expires_at.is_some_and(|n| n <= lease.created_at) {
+                return Err(CoreError::internal("generated lease has no authorization duration"));
+            }
+            if let Some(request) = &lease.requested_generation {
+                let mut canonical = request.clone();
+                canonical
+                    .canonicalize()
+                    .map_err(|_| CoreError::internal("invalid generated lease request"))?;
+                if &canonical != request {
+                    return Err(CoreError::internal("noncanonical generated lease request"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn source_name_error(name: &str) -> CoreError {
+    CoreError::exists(format!("a source named {name:?} already exists"))
+}
+
+fn source_constraint_error(error: rusqlite::Error, name: &str) -> CoreError {
+    match error {
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            source_name_error(name)
+        }
+        e => e.into(),
     }
 }
 
@@ -268,6 +400,37 @@ impl Store {
         Ok(())
     }
 
+    /// Reserve decision order before provider I/O; failed decisions may leave gaps.
+    pub fn reserve_generator_approval_order(&self) -> Result<u64> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let value: Option<String> = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'generator_approval_order'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let previous = match value {
+            None => 0,
+            Some(value) => value
+                .parse::<i64>()
+                .ok()
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| CoreError::internal("invalid generator approval order"))?,
+        };
+        let next = previous
+            .checked_add(1)
+            .ok_or_else(|| CoreError::internal("generator approval order exhausted"))?;
+        tx.execute(
+            "INSERT INTO settings(key, value) VALUES('generator_approval_order', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [next.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(next as u64)
+    }
+
     // ---- vaults ----
 
     pub fn list_vaults(&self) -> Result<Vec<VaultRecord>> {
@@ -298,20 +461,21 @@ impl Store {
 
     pub fn upsert_vault(&self, v: &VaultRecord) -> Result<()> {
         let config = serde_json::to_string(&v.config)?;
-        self.db()
-            .execute(
-                "INSERT INTO vaults(id, name, config, position) VALUES(?1, ?2, ?3, ?4)
-                 ON CONFLICT(id) DO UPDATE SET name = excluded.name, config = excluded.config",
-                params![v.id, v.name, config, v.position],
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::SqliteFailure(f, _)
-                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
-                {
-                    CoreError::exists(format!("a vault named {:?} already exists", v.name))
-                }
-                e => e.into(),
-            })?;
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if tx
+            .prepare("SELECT 1 FROM generators WHERE name = ?1")?
+            .exists([&v.name])?
+        {
+            return Err(source_name_error(&v.name));
+        }
+        tx.execute(
+            "INSERT INTO vaults(id, name, config, position) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, config = excluded.config",
+            params![v.id, v.name, config, v.position],
+        )
+        .map_err(|e| source_constraint_error(e, &v.name))?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -319,6 +483,97 @@ impl Store {
         let db = self.db();
         db.execute("DELETE FROM vaults WHERE id = ?1", [id])?;
         db.execute("DELETE FROM secret_hosts WHERE vault_id = ?1", [id])?;
+        Ok(())
+    }
+
+    // ---- generators ----
+
+    pub fn list_generators(&self) -> Result<Vec<GeneratorRecord>> {
+        let db = self.db();
+        let mut st = db.prepare(
+            "SELECT id, name, config, revision, position FROM generators ORDER BY position, name",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, name, config, revision, position) = row?;
+            Ok(GeneratorRecord {
+                id,
+                name,
+                config: serde_json::from_str(&config)?,
+                revision: positive_u64(revision, "generator revision")?,
+                position,
+            })
+        })
+        .collect()
+    }
+
+    pub fn get_generator(&self, id: &str) -> Result<Option<GeneratorRecord>> {
+        let db = self.db();
+        let row = db
+            .query_row(
+                "SELECT name, config, revision, position FROM generators WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(name, config, revision, position)| {
+            Ok(GeneratorRecord {
+                id: id.into(),
+                name,
+                config: serde_json::from_str(&config)?,
+                revision: positive_u64(revision, "generator revision")?,
+                position,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn upsert_generator(&self, g: &GeneratorRecord) -> Result<()> {
+        if g.revision == 0 {
+            return Err(CoreError::invalid("generator revision must be positive"));
+        }
+        let revision = sqlite_u64(g.revision, "generator revision")?;
+        let config = serde_json::to_string(&g.config)?;
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if tx
+            .prepare("SELECT 1 FROM vaults WHERE name = ?1")?
+            .exists([&g.name])?
+        {
+            return Err(source_name_error(&g.name));
+        }
+        tx.execute(
+            "INSERT INTO generators(id, name, config, revision, position) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, config = excluded.config,
+                                          revision = excluded.revision",
+            params![g.id, g.name, config, revision, g.position],
+        )
+        .map_err(|e| source_constraint_error(e, &g.name))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_generator(&self, id: &str) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        tx.execute("DELETE FROM generators WHERE id = ?1", [id])?;
+        tx.execute("DELETE FROM secret_hosts WHERE vault_id = ?1", [id])?;
+        tx.commit()?;
         Ok(())
     }
 }
@@ -385,6 +640,23 @@ fn migrate(conn: &Connection) -> Result<()> {
              CREATE INDEX activity_request ON activity(request_id) WHERE request_id IS NOT NULL;",
         )?;
         tx.commit()?;
+    }
+    // Keep each column independently discoverable for interrupted/partial upgrades.
+    for (name, definition) in [
+        ("source_kind", "TEXT NOT NULL DEFAULT 'vault'"),
+        ("generation", "TEXT"),
+        ("generator_revision", "INTEGER"),
+        ("credential_expires_at", "INTEGER"),
+        ("approval_order", "INTEGER"),
+        ("credential_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("requested_generation", "TEXT"),
+    ] {
+        let exists = conn
+            .prepare("SELECT 1 FROM pragma_table_info('leases') WHERE name = ?1")?
+            .exists([name])?;
+        if !exists {
+            conn.execute_batch(&format!("ALTER TABLE leases ADD COLUMN {name} {definition};"))?;
+        }
     }
     Ok(())
 }
@@ -831,10 +1103,14 @@ impl Store {
     // ---- leases ----
 
     pub fn insert_lease(&self, l: &LeaseRecord) -> Result<()> {
+        validate_lease_generation(l)?;
         self.db().execute(
             "INSERT INTO leases(id, host_id, vault_id, vault_name, secret_key, name, mode, fields, hosts,
-                                reason, agent, created_at, expires_at, revoked_at)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                reason, agent, created_at, expires_at, revoked_at, source_kind, generation,
+                                generator_revision, credential_expires_at, approval_order, credential_version,
+                                requested_generation)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                    ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 l.id,
                 l.host_id,
@@ -849,7 +1125,14 @@ impl Store {
                 l.agent,
                 l.created_at,
                 l.expires_at,
-                l.revoked_at
+                l.revoked_at,
+                source_kind_str(l.source_kind),
+                l.generation.as_ref().map(serde_json::to_string).transpose()?,
+                l.generator_revision.map(|n| sqlite_u64(n, "generator revision")).transpose()?,
+                l.credential_expires_at,
+                l.approval_order.map(|n| sqlite_u64(n, "generator approval order")).transpose()?,
+                sqlite_u64(l.credential_version, "credential version")?,
+                l.requested_generation.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
         Ok(())
@@ -860,10 +1143,18 @@ impl Store {
         filter: &str,
         args: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<LeaseRecord>> {
-        let db = self.db();
+        Self::query_leases_with(&self.db(), filter, args)
+    }
+
+    fn query_leases_with(
+        db: &Connection,
+        filter: &str,
+        args: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<LeaseRecord>> {
         let sql = format!(
             "SELECT id, host_id, vault_id, vault_name, secret_key, name, mode, fields, hosts, reason, agent,
-                    created_at, expires_at, revoked_at
+                    created_at, expires_at, revoked_at, source_kind, generation, generator_revision,
+                    credential_expires_at, approval_order, credential_version, requested_generation
              FROM leases {filter} ORDER BY created_at, rowid"
         );
         let mut st = db.prepare(&sql)?;
@@ -891,6 +1182,15 @@ impl Store {
                     r.get::<_, Option<i64>>(12)?,
                     r.get::<_, Option<i64>>(13)?,
                 ),
+                (
+                    r.get::<_, String>(14)?,
+                    r.get::<_, Option<String>>(15)?,
+                    r.get::<_, Option<i64>>(16)?,
+                    r.get::<_, Option<i64>>(17)?,
+                    r.get::<_, Option<i64>>(18)?,
+                    r.get::<_, i64>(19)?,
+                    r.get::<_, Option<String>>(20)?,
+                ),
             ))
         })?;
         let mut out = Vec::new();
@@ -900,15 +1200,17 @@ impl Store {
                 (secret_key, name, mode),
                 (fields, hosts, reason, agent),
                 t,
+                (source_kind, generation, generator_revision, credential_expires_at, approval_order,
+                 credential_version, requested_generation),
             ) = row?;
-            out.push(LeaseRecord {
+            let lease = LeaseRecord {
                 id,
                 host_id,
                 vault_id,
                 vault_name,
                 secret_key,
                 name,
-                mode: parse_mode(&mode),
+                mode: parse_mode(&mode)?,
                 fields: serde_json::from_str(&fields)?,
                 hosts: serde_json::from_str(&hosts)?,
                 reason,
@@ -916,7 +1218,20 @@ impl Store {
                 created_at: t.0,
                 expires_at: t.1,
                 revoked_at: t.2,
-            });
+                source_kind: parse_source_kind(&source_kind)?,
+                generation: generation.map(|s| serde_json::from_str(&s)).transpose()?,
+                generator_revision: generator_revision
+                    .map(|n| positive_u64(n, "generator revision")).transpose()?,
+                credential_expires_at,
+                approval_order: approval_order
+                    .map(|n| positive_u64(n, "generator approval order")).transpose()?,
+                credential_version: u64::try_from(credential_version)
+                    .map_err(|_| CoreError::internal("invalid persisted credential version"))?,
+                requested_generation: requested_generation
+                    .map(|s| serde_json::from_str(&s)).transpose()?,
+            };
+            validate_lease_generation(&lease)?;
+            out.push(lease);
         }
         Ok(out)
     }
@@ -942,6 +1257,47 @@ impl Store {
             .query_leases("WHERE id = ?1", &[&id])?
             .into_iter()
             .next())
+    }
+
+    /// Commit the next credential's metadata before publishing it to any live cache.
+    /// The caller holds generated-authorization ownership and checks the deadline.
+    /// A stale expected version cannot overwrite a newer credential or reset its mark.
+    pub fn update_generated_credential(
+        &self,
+        id: &str,
+        expected_version: u64,
+        credential_expires_at: i64,
+    ) -> Result<u64> {
+        if credential_expires_at <= 0 {
+            return Err(CoreError::invalid("credential expiry must be positive"));
+        }
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let lease = Self::query_leases_with(&tx, "WHERE id = ?1", &[&id])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| CoreError::not_found("lease not found"))?;
+        if lease.source_kind != SourceKind::Generator {
+            return Err(CoreError::invalid("lease is not generated"));
+        }
+        if lease.revoked_at.is_some() {
+            return Err(CoreError::invalid("lease is revoked"));
+        }
+        if expected_version != lease.credential_version {
+            return Err(CoreError::invalid("credential version changed"));
+        }
+        let next = expected_version
+            .checked_add(1)
+            .ok_or_else(|| CoreError::internal("credential version exhausted"))?;
+        let next_sql = sqlite_u64(next, "credential version")?;
+        tx.execute(
+            "UPDATE leases SET credential_version = ?2, credential_expires_at = ?3
+             WHERE id = ?1 AND credential_version = ?4 AND source_kind = 'generator'
+               AND revoked_at IS NULL",
+            params![id, next_sql, credential_expires_at, sqlite_u64(expected_version, "credential version")?],
+        )?;
+        tx.commit()?;
+        Ok(next)
     }
 
     /// Revoke if not yet revoked; returns true when it changed.
@@ -1091,6 +1447,500 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asm_proto::generators::{
+        GithubGrant, GithubPermission, GithubRepository, GithubScopeRequest,
+    };
+
+    fn github_grant() -> GithubGrant {
+        GithubGrant {
+            installation_id: 42,
+            repositories: vec![GithubRepository {
+                id: 7,
+                full_name: "acme/web".into(),
+            }],
+            permissions: [
+                ("contents".into(), GithubPermission::Read),
+                ("metadata".into(), GithubPermission::Read),
+            ]
+            .into(),
+        }
+    }
+
+    fn generator(id: &str, name: &str, position: i64) -> GeneratorRecord {
+        GeneratorRecord {
+            id: id.into(),
+            name: name.into(),
+            config: GeneratorConfig::GithubApp(crate::generator::GithubAppConfig {
+                client_id: "Iv1.fixture".into(),
+                installation_id: 42,
+                ceiling: github_grant(),
+            }),
+            revision: 1,
+            position,
+        }
+    }
+
+    fn vault(id: &str, name: &str) -> VaultRecord {
+        VaultRecord {
+            id: id.into(),
+            name: name.into(),
+            config: VaultConfig::Keychain,
+            position: 0,
+        }
+    }
+
+    fn generated_lease(id: &str) -> LeaseRecord {
+        LeaseRecord {
+            id: id.into(),
+            host_id: "host".into(),
+            vault_id: "generator".into(),
+            vault_name: "release-bot".into(),
+            secret_key: "token".into(),
+            name: "GH_TOKEN".into(),
+            mode: LeaseMode::Raw,
+            fields: vec![LeaseField {
+                field: "value".into(),
+                sentinel: None,
+                path: "GH_TOKEN".into(),
+            }],
+            hosts: vec![],
+            reason: "Read acme/web".into(),
+            agent: "builder".into(),
+            created_at: 100,
+            expires_at: Some(43_300),
+            revoked_at: None,
+            source_kind: SourceKind::Generator,
+            generation: Some(GenerationGrant::GithubApp(github_grant())),
+            generator_revision: Some(1),
+            credential_expires_at: Some(3_700),
+            approval_order: Some(1),
+            credential_version: 1,
+            requested_generation: Some(GenerationRequest::GithubApp(GithubScopeRequest {
+                repositories: Some(vec!["acme/web".into()]),
+                permissions: None,
+            })),
+        }
+    }
+
+    #[test]
+    fn generators_round_trip_update_and_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("asm.db")).unwrap();
+        assert!(s.list_generators().unwrap().is_empty());
+        assert!(s.get_generator("missing").unwrap().is_none());
+        let first = generator("a", "release-bot", 1);
+        let second = generator("b", "review-bot", 0);
+        s.upsert_generator(&first).unwrap();
+        s.upsert_generator(&second).unwrap();
+        assert_eq!(s.list_generators().unwrap(), [second, first.clone()]);
+        let mut edited = first;
+        edited.name = "renamed".into();
+        edited.revision = 2;
+        let GeneratorConfig::GithubApp(config) = &mut edited.config;
+        config.client_id = "Iv1.updated".into();
+        s.upsert_generator(&edited).unwrap();
+        assert_eq!(s.get_generator("a").unwrap(), Some(edited.clone()));
+        s.replace_secret_hosts("a", "token", &["api.github.com".into()])
+            .unwrap();
+        s.delete_generator("a").unwrap();
+        assert!(s.get_generator("a").unwrap().is_none());
+        assert!(s.secret_hosts("a", "token").unwrap().is_empty());
+        assert_eq!(s.list_generators().unwrap().len(), 1);
+        edited.revision = 0;
+        assert!(s.upsert_generator(&edited).is_err());
+        edited.revision = u64::MAX;
+        assert!(s.upsert_generator(&edited).is_err());
+        assert!(s.get_generator("a").unwrap().is_none());
+    }
+
+    #[test]
+    fn source_names_are_unique_across_tables_and_failed_edits_are_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("asm.db")).unwrap();
+        let v = vault("vault", "static");
+        let g = generator("generator", "release-bot", 0);
+        s.upsert_vault(&v).unwrap();
+        s.upsert_generator(&g).unwrap();
+        let mut conflicting_vault = v.clone();
+        conflicting_vault.name = g.name.clone();
+        assert_eq!(
+            s.upsert_vault(&conflicting_vault).unwrap_err().code,
+            asm_proto::error::ErrorCode::Exists
+        );
+        let mut conflicting_generator = g.clone();
+        conflicting_generator.name = v.name.clone();
+        assert_eq!(
+            s.upsert_generator(&conflicting_generator).unwrap_err().code,
+            asm_proto::error::ErrorCode::Exists
+        );
+        assert_eq!(s.list_vaults().unwrap(), [v]);
+        assert_eq!(s.list_generators().unwrap(), [g]);
+        assert!(s.upsert_generator(&generator("other", "release-bot", 1)).is_err());
+        assert!(s.upsert_vault(&vault("other", "static")).is_err());
+    }
+
+    #[test]
+    fn concurrent_vault_and_generator_saves_cannot_share_a_source_name() {
+        use std::sync::{Arc, Barrier};
+
+        for separate_connection in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("asm.db");
+            let first = Arc::new(Store::open(&path).unwrap());
+            let second = if separate_connection {
+                Arc::new(Store::open(&path).unwrap())
+            } else {
+                Arc::clone(&first)
+            };
+            let barrier = Arc::new(Barrier::new(2));
+            let vault_store = Arc::clone(&first);
+            let vault_barrier = Arc::clone(&barrier);
+            let save_vault = std::thread::spawn(move || {
+                vault_barrier.wait();
+                vault_store.upsert_vault(&vault("vault", "same-name"))
+            });
+            let save_generator = std::thread::spawn(move || {
+                barrier.wait();
+                second.upsert_generator(&generator("generator", "same-name", 0))
+            });
+            let v = save_vault.join().unwrap();
+            let g = save_generator.join().unwrap();
+            assert_ne!(v.is_ok(), g.is_ok(), "exactly one save wins");
+            let rejected = if let Err(e) = v { e } else { g.unwrap_err() };
+            assert_eq!(rejected.code, asm_proto::error::ErrorCode::Exists);
+            assert_eq!(
+                first.list_vaults().unwrap().len() + first.list_generators().unwrap().len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn migrates_legacy_leases_without_generated_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE leases(
+                    id TEXT PRIMARY KEY, host_id TEXT NOT NULL, vault_id TEXT NOT NULL,
+                    vault_name TEXT NOT NULL, secret_key TEXT NOT NULL, name TEXT NOT NULL,
+                    mode TEXT NOT NULL, fields TEXT NOT NULL, hosts TEXT NOT NULL,
+                    reason TEXT NOT NULL, agent TEXT NOT NULL, created_at INTEGER NOT NULL,
+                    expires_at INTEGER, revoked_at INTEGER
+                 );
+                 INSERT INTO leases VALUES(
+                    'old', 'host', 'vault', 'env', 'TOKEN', 'TOKEN', 'sentinel',
+                    '[{\"field\":\"value\",\"sentinel\":\"asm_fixture\",\"path\":\"TOKEN\"}]',
+                    '[\"api.example.com\"]', 'existing approval', 'agent', 10, 1000, NULL
+                 );",
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let s = Store::open(&path).unwrap();
+            let lease = s.get_lease("old").unwrap().unwrap();
+            assert_eq!(lease.source_kind, SourceKind::Vault);
+            assert_eq!(lease.generation, None);
+            assert_eq!(lease.generator_revision, None);
+            assert_eq!(lease.credential_expires_at, None);
+            assert_eq!(lease.approval_order, None);
+            assert_eq!(lease.credential_version, 0);
+            assert_eq!(lease.requested_generation, None);
+            assert_eq!(lease.mode, LeaseMode::Sentinel);
+            assert_eq!(lease.fields[0].sentinel.as_deref(), Some("asm_fixture"));
+            assert_eq!(lease.hosts, ["api.example.com"]);
+            assert_eq!((lease.created_at, lease.expires_at), (10, Some(1000)));
+            assert!(s.list_generators().unwrap().is_empty());
+            assert_eq!(s.active_leases(20).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn generated_lease_metadata_and_version_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        let mut lease = generated_lease("generated");
+        {
+            let s = Store::open(&path).unwrap();
+            lease.approval_order = Some(s.reserve_generator_approval_order().unwrap());
+            s.insert_lease(&lease).unwrap();
+            let loaded = s.get_lease(&lease.id).unwrap().unwrap();
+            assert_eq!(loaded.source_kind, SourceKind::Generator);
+            assert_eq!(loaded.generation, lease.generation);
+            assert_eq!(loaded.requested_generation, lease.requested_generation);
+            assert_eq!(loaded.generator_revision, Some(1));
+            assert_eq!(loaded.approval_order, Some(1));
+            assert_eq!(loaded.credential_version, 1);
+            assert_eq!(loaded.credential_expires_at, Some(3_700));
+            assert_eq!(s.update_generated_credential(&lease.id, 1, 6_700).unwrap(), 2);
+            assert!(s.update_generated_credential(&lease.id, 1, 9_700).is_err());
+        }
+        let s = Store::open(&path).unwrap();
+        let loaded = s.get_lease(&lease.id).unwrap().unwrap();
+        assert_eq!(loaded.credential_version, 2);
+        assert_eq!(loaded.credential_expires_at, Some(6_700));
+        assert_eq!(loaded.created_at, lease.created_at);
+        assert_eq!(loaded.expires_at, lease.expires_at);
+        assert_eq!(loaded.fields, lease.fields);
+        assert_eq!(loaded.generation, lease.generation);
+        assert_eq!(loaded.approval_order, lease.approval_order);
+        assert_eq!(s.update_generated_credential(&lease.id, 2, 10_000).unwrap(), 3);
+        assert!(s.update_generated_credential(&lease.id, 3, 0).is_err());
+        assert_eq!(s.get_lease(&lease.id).unwrap().unwrap().credential_version, 3);
+        s.revoke_lease(&lease.id, 500).unwrap();
+        assert!(s.update_generated_credential(&lease.id, 3, 11_000).is_err());
+        assert_eq!(s.get_lease(&lease.id).unwrap().unwrap().credential_version, 3);
+        assert!(s.update_generated_credential("missing", 1, 11_000).is_err());
+    }
+
+    #[test]
+    fn credential_version_overflow_never_resets_or_changes_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("asm.db")).unwrap();
+        let mut lease = generated_lease("generated");
+        lease.credential_version = i64::MAX as u64;
+        s.insert_lease(&lease).unwrap();
+        assert!(s
+            .update_generated_credential(&lease.id, i64::MAX as u64, 9_700)
+            .is_err());
+        let loaded = s.get_lease(&lease.id).unwrap().unwrap();
+        assert_eq!(loaded.credential_version, i64::MAX as u64);
+        assert_eq!(loaded.credential_expires_at, lease.credential_expires_at);
+        lease.id = "too-large".into();
+        lease.credential_version = u64::MAX;
+        assert!(s.insert_lease(&lease).is_err());
+        assert!(s.get_lease("too-large").unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_credential_updates_commit_only_one_next_version() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        let first = Arc::new(Store::open(&path).unwrap());
+        let second = Store::open(&path).unwrap();
+        first.insert_lease(&generated_lease("generated")).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let first_store = Arc::clone(&first);
+        let first_barrier = Arc::clone(&barrier);
+        let a = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_store.update_generated_credential("generated", 1, 6_700)
+        });
+        let b = std::thread::spawn(move || {
+            barrier.wait();
+            second.update_generated_credential("generated", 1, 7_700)
+        });
+        let a = a.join().unwrap();
+        let b = b.join().unwrap();
+        assert_ne!(a.is_ok(), b.is_ok());
+        assert_eq!(a.or(b).unwrap(), 2);
+        let loaded = first.get_lease("generated").unwrap().unwrap();
+        assert_eq!(loaded.credential_version, 2);
+        assert!([Some(6_700), Some(7_700)].contains(&loaded.credential_expires_at));
+    }
+
+    #[test]
+    fn corrupt_generated_rows_fail_closed_in_every_lease_query() {
+        let assignments = [
+            "source_kind = 'unknown'",
+            "source_kind = 'vault'",
+            "mode = 'unknown'",
+            "generation = NULL",
+            "generation = '{}'",
+            "generation = 'not json'",
+            "generator_revision = NULL",
+            "generator_revision = 0",
+            "generator_revision = -1",
+            "credential_expires_at = NULL",
+            "credential_expires_at = 0",
+            "approval_order = NULL",
+            "approval_order = 0",
+            "approval_order = -1",
+            "credential_version = 0",
+            "credential_version = -1",
+            "requested_generation = 'not json'",
+            "requested_generation = '{\"provider\":\"github_app\",\"scope\":{\"repositories\":[]}}'",
+            "requested_generation = '{\"provider\":\"github_app\",\"scope\":{\"repositories\":[\"Acme/Web\"]}}'",
+            "expires_at = created_at",
+        ];
+        for assignment in assignments {
+            let dir = tempfile::tempdir().unwrap();
+            let s = Store::open(&dir.path().join("asm.db")).unwrap();
+            s.insert_lease(&generated_lease("generated")).unwrap();
+            s.db()
+                .execute_batch(&format!("UPDATE leases SET {assignment} WHERE id = 'generated';"))
+                .unwrap();
+            assert!(s.get_lease("generated").is_err(), "{assignment}");
+            assert!(s.list_leases().is_err(), "{assignment}");
+            assert!(s.active_leases(50).is_err(), "{assignment}");
+            assert!(s.leases_of_host("host").is_err(), "{assignment}");
+            assert!(s.update_generated_credential("generated", 1, 6_700).is_err(), "{assignment}");
+        }
+    }
+
+    #[test]
+    fn invalid_generated_grants_and_incomplete_inserts_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("asm.db")).unwrap();
+        let mut lease = generated_lease("generated");
+        lease.generation = None;
+        assert!(s.insert_lease(&lease).is_err());
+        assert!(s.list_leases().unwrap().is_empty());
+        for malformed in [
+            GithubGrant { installation_id: 0, ..github_grant() },
+            GithubGrant { repositories: vec![], ..github_grant() },
+            GithubGrant {
+                repositories: vec![GithubRepository { id: 0, full_name: "acme/web".into() }],
+                ..github_grant()
+            },
+            GithubGrant { permissions: Default::default(), ..github_grant() },
+            GithubGrant {
+                permissions: [("metadata".into(), GithubPermission::Write)].into(),
+                ..github_grant()
+            },
+        ] {
+            let mut lease = generated_lease("generated");
+            lease.generation = Some(GenerationGrant::GithubApp(malformed));
+            assert!(s.insert_lease(&lease).is_err());
+            s.insert_lease(&generated_lease("generated")).unwrap();
+            s.db().execute(
+                "UPDATE leases SET generation = ?1 WHERE id = 'generated'",
+                [serde_json::to_string(&lease.generation.unwrap()).unwrap()],
+            ).unwrap();
+            assert!(s.get_lease("generated").is_err());
+            s.db().execute("DELETE FROM leases WHERE id = 'generated'", []).unwrap();
+        }
+    }
+
+    #[test]
+    fn approval_order_is_atomic_durable_and_checked() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        {
+            let stores = [
+                Arc::new(Store::open(&path).unwrap()),
+                Arc::new(Store::open(&path).unwrap()),
+            ];
+            let workers: Vec<_> = (0..8)
+                .map(|index| {
+                    let store = Arc::clone(&stores[index % stores.len()]);
+                    std::thread::spawn(move || {
+                        (0..16)
+                            .map(|_| store.reserve_generator_approval_order().unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            let mut orders: Vec<_> = workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect();
+            orders.sort_unstable();
+            assert_eq!(orders, (1..=128).collect::<Vec<u64>>());
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.reserve_generator_approval_order().unwrap(), 129);
+        for invalid in ["-1", "broken", "9223372036854775808"] {
+            s.set_setting("generator_approval_order", invalid).unwrap();
+            assert!(s.reserve_generator_approval_order().is_err());
+            assert_eq!(s.get_setting("generator_approval_order").unwrap().as_deref(), Some(invalid));
+        }
+        s.set_setting("generator_approval_order", &(i64::MAX - 1).to_string()).unwrap();
+        assert_eq!(s.reserve_generator_approval_order().unwrap(), i64::MAX as u64);
+        assert!(s.reserve_generator_approval_order().is_err());
+        assert_eq!(
+            s.get_setting("generator_approval_order").unwrap().unwrap(),
+            i64::MAX.to_string()
+        );
+    }
+
+    #[test]
+    fn partial_lease_migration_never_reclassifies_an_incomplete_generator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE leases(
+                    id TEXT PRIMARY KEY, host_id TEXT NOT NULL, vault_id TEXT NOT NULL,
+                    vault_name TEXT NOT NULL, secret_key TEXT NOT NULL, name TEXT NOT NULL,
+                    mode TEXT NOT NULL, fields TEXT NOT NULL, hosts TEXT NOT NULL,
+                    reason TEXT NOT NULL, agent TEXT NOT NULL, created_at INTEGER NOT NULL,
+                    expires_at INTEGER, revoked_at INTEGER,
+                    source_kind TEXT NOT NULL DEFAULT 'vault', generation TEXT
+                 );
+                 INSERT INTO leases VALUES(
+                    'incomplete', 'host', 'generator', 'release-bot', 'token', 'GH_TOKEN',
+                    'raw', '[{\"field\":\"value\",\"sentinel\":null,\"path\":\"GH_TOKEN\"}]',
+                    '[]', 'existing approval', 'agent', 100, 43300, NULL, 'generator', NULL
+                 );",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert!(s.get_lease("incomplete").is_err());
+        s.insert_lease(&generated_lease("complete")).unwrap();
+        assert_eq!(
+            s.get_lease("complete").unwrap().unwrap().source_kind,
+            SourceKind::Generator
+        );
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert!(s.get_lease("incomplete").is_err());
+        assert_eq!(
+            s.get_lease("complete").unwrap().unwrap().credential_version,
+            1
+        );
+    }
+
+    #[test]
+    fn approval_order_survives_same_second_reversed_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        {
+            let s = Store::open(&path).unwrap();
+            let mut first = generated_lease("first-decision");
+            first.approval_order = Some(s.reserve_generator_approval_order().unwrap());
+            let mut second = generated_lease("second-decision");
+            second.vault_id = "other-generator".into();
+            second.approval_order = Some(s.reserve_generator_approval_order().unwrap());
+            assert_eq!(first.created_at, second.created_at);
+            s.insert_lease(&second).unwrap();
+            s.insert_lease(&first).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let mut leases = s.leases_of_host("host").unwrap();
+        leases.sort_unstable_by_key(|lease| lease.approval_order);
+        assert_eq!(leases[0].id, "first-decision");
+        assert_eq!(leases[1].id, "second-decision");
+        assert_eq!(leases[1].approval_order, Some(2));
+        assert_eq!(s.reserve_generator_approval_order().unwrap(), 3);
+    }
+
+    #[test]
+    fn credential_update_cannot_turn_a_static_lease_into_generated_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("asm.db")).unwrap();
+        let mut lease = generated_lease("static");
+        lease.source_kind = SourceKind::Vault;
+        lease.generation = None;
+        lease.generator_revision = None;
+        lease.credential_expires_at = None;
+        lease.approval_order = None;
+        lease.credential_version = 0;
+        lease.requested_generation = None;
+        s.insert_lease(&lease).unwrap();
+        assert!(s.update_generated_credential("static", 0, 6_700).is_err());
+        let loaded = s.get_lease("static").unwrap().unwrap();
+        assert_eq!(loaded.source_kind, SourceKind::Vault);
+        assert_eq!(loaded.credential_version, 0);
+        assert_eq!(loaded.credential_expires_at, None);
+    }
 
     fn host(id: &str) -> HostRecord {
         HostRecord {
@@ -1624,6 +2474,13 @@ mod tests {
             created_at: 10,
             expires_at: Some(20),
             revoked_at: None,
+            source_kind: SourceKind::Vault,
+            generation: None,
+            generator_revision: None,
+            credential_expires_at: None,
+            approval_order: None,
+            credential_version: 0,
+            requested_generation: None,
         };
         s.insert_lease(&l).unwrap();
         assert_eq!(s.active_leases(19).unwrap().len(), 1);

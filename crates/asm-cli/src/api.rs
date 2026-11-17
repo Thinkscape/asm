@@ -8,7 +8,7 @@ use asm_proto::wire::DEFAULT_API_PORT;
 use reqwest::blocking::{Client, RequestBuilder};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Generous enough for the manager's 25 s long polls.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -132,6 +132,46 @@ impl Api {
 
     pub fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, CliError> {
         Self::decode(&self.get_bytes(path)?)
+    }
+
+    /// Cap each acquisition request to the operation's remaining wall-clock budget.
+    fn bounded(&self, rb: RequestBuilder, deadline: Option<Instant>) -> Result<RequestBuilder, CliError> {
+        match deadline {
+            Some(until) => {
+                let remaining = until.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(CliError::acquisition_elapsed());
+                }
+                Ok(rb.timeout(remaining.min(REQUEST_TIMEOUT)))
+            }
+            None => Ok(rb),
+        }
+    }
+
+    pub(crate) fn get_until<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        deadline: Option<Instant>,
+    ) -> Result<T, CliError> {
+        let rb = self.bounded(self.client.get(self.url(path)), deadline)?;
+        let body = self.send(rb).map_err(|error| {
+            if error.transient && deadline.is_some_and(|until| Instant::now() >= until) {
+                CliError::acquisition_elapsed()
+            } else {
+                error
+            }
+        })?;
+        Self::decode(&body)
+    }
+
+    pub(crate) fn post_until<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        deadline: Option<Instant>,
+    ) -> Result<T, CliError> {
+        let rb = self.bounded(self.client.post(self.url(path)).json(body), deadline)?;
+        Self::decode(&self.send(rb)?)
     }
 
     pub fn post<B: Serialize, T: DeserializeOwned>(

@@ -90,19 +90,23 @@ struct JsonProxyInfo {
 
 /// Proxy addresses from the manager's hints; the CA files are refreshed on the way.
 /// `recommended` is the first hint that accepts a TCP connection.
-struct Resolved {
-    host: HostState,
+pub(crate) struct Resolved {
     info: ProxyInfo,
     proxies: Vec<JsonProxy>,
     recommended: Option<usize>,
 }
 
-fn resolve() -> Result<Resolved, CliError> {
+fn resolve() -> Result<(HostState, Resolved), CliError> {
     let s = Session::open()?;
     s.warn_secrets();
     s.sync_leases()?;
-    let info: ProxyInfo = s.api.get("/proxy-info")?;
-    refresh_ca(&s.api, &info)?;
+    Ok((s.host, resolve_for(&s.api)?))
+}
+
+/// Resolve proxy/CA metadata without opening a secrets directory or starting a reaper.
+pub(crate) fn resolve_for(api: &Api) -> Result<Resolved, CliError> {
+    let info: ProxyInfo = api.get("/proxy-info")?;
+    refresh_ca(api, &info)?;
     let mut recommended = None;
     let proxies = info
         .hints
@@ -123,11 +127,16 @@ fn resolve() -> Result<Resolved, CliError> {
         })
         .collect();
     Ok(Resolved {
-        host: s.host,
         info,
         proxies,
         recommended,
     })
+}
+
+pub(crate) fn environment(host: &HostState, api: &Api) -> Result<Vec<(&'static str, String)>, CliError> {
+    let r = resolve_for(api)?;
+    let i = r.recommended.ok_or_else(|| unreachable_error(r.info.port))?;
+    exports(host, &r.proxies[i].http)
 }
 
 fn unreachable_error(port: u16) -> CliError {
@@ -139,7 +148,7 @@ fn unreachable_error(port: u16) -> CliError {
 /// `asm proxy-info`: what the proxy is and how to reach it. Informational only; use
 /// `asm proxy-env` for shell variables.
 pub fn proxy_info(json: bool) -> Result<(), CliError> {
-    let r = resolve()?;
+    let (_, r) = resolve()?;
     let ca = state::ca_path()?.to_string_lossy().into_owned();
     let bundle = state::ca_bundle_path()?.to_string_lossy().into_owned();
     if json {
@@ -184,7 +193,7 @@ pub enum Shell {
 }
 
 /// Names `proxy-env` sets, in output order.
-const ENV_NAMES: [&str; 9] = [
+pub(crate) const ENV_NAMES: [&str; 9] = [
     "HTTPS_PROXY",
     "HTTP_PROXY",
     "ALL_PROXY",
@@ -208,11 +217,11 @@ pub fn proxy_env(shell: Shell, unset: bool) -> Result<(), CliError> {
         }
         return Ok(());
     }
-    let r = resolve()?;
+    let (host, r) = resolve()?;
     let Some(i) = r.recommended else {
         return Err(unreachable_error(r.info.port));
     };
-    for (k, v) in exports(&r.host, &r.proxies[i].http)? {
+    for (k, v) in exports(&host, &r.proxies[i].http)? {
         match shell {
             Shell::Posix => println!("export {k}={}", shell_quote(&v)),
             Shell::Fish => println!("set -gx {k} {}", fish_quote(&v)),

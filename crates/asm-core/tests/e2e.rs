@@ -2,17 +2,24 @@
 //! auto-approving observer, the real `asm` CLI, the patched iron-proxy from
 //! `dist/bin/iron-proxy`, and a recording HTTP echo server.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use asm_core::ffi::{RequestDetail, VaultConfig, VaultDraft};
 use asm_core::settings as keys;
 use asm_core::{Decision, Manager, ManagerObserver, StartOptions};
+use asm_core::generator::{GeneratorConfig, GithubAppConfig, GithubAppGenerator};
+use asm_core::store::GeneratorRecord;
+use asm_proto::generators::{
+    GenerationGrant, GenerationSelection, GithubGrant, GithubPermission, GithubRepository,
+};
+use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey};
 use serde_json::json;
 
 const REAL_1: &str = "real-value-123";
@@ -105,6 +112,7 @@ impl AutoApprover {
                             3600
                         }),
                         hosts,
+                        generation: None,
                     }
                 }
                 RequestDetail::Update { vault_id, .. } => Decision::ApproveWrite {
@@ -207,6 +215,10 @@ struct Out {
 
 impl Env {
     fn run(&self, args: &[&str], stdin: Option<&str>) -> Out {
+        self.run_env(args, stdin, &[])
+    }
+
+    fn run_env(&self, args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> Out {
         let mut c = Command::new(&self.cli);
         c.args(args)
             .env("XDG_CONFIG_HOME", &self.config)
@@ -217,6 +229,13 @@ impl Env {
             .env_remove("HTTPS_PROXY")
             .env_remove("HTTP_PROXY")
             .env_remove("ALL_PROXY")
+            .env_remove("https_proxy")
+            .env_remove("http_proxy")
+            .env_remove("all_proxy")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .env_remove("ASM_NO_REAPER")
+            .envs(env.iter().copied())
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -315,13 +334,11 @@ fn set_plain_http(m: &Manager, on: bool) {
 #[test]
 fn headless_end_to_end() {
     let bin_dir = workspace().join("dist/bin");
-    if !bin_dir.join("iron-proxy").exists() {
-        eprintln!(
-            "SKIPPED: {} is missing; run `just proxy` first",
-            bin_dir.join("iron-proxy").display()
-        );
-        return;
-    }
+    assert!(
+        bin_dir.join("iron-proxy").is_file(),
+        "missing prerequisite {}; run `just proxy` before integration tests",
+        bin_dir.join("iron-proxy").display()
+    );
     let cli = build_cli();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1013,4 +1030,875 @@ fn headless_end_to_end() {
     assert!(o.stderr.contains("ambiguous"), "{}", o.stderr);
 
     m.shutdown();
+}
+
+/// The issuer and resource server are real HTTP peers. Only their transport and
+/// root-key lookup are injected; approvals, issuance validation and delivery are real.
+struct LocalHttp {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    errors: Arc<Mutex<Vec<String>>>,
+}
+
+struct LocalRequest {
+    method: String,
+    target: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl LocalHttp {
+    fn start(
+        reply: impl Fn(LocalRequest) -> Result<(u16, serde_json::Value), String>
+        + Send + 'static,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let failures = errors.clone();
+        let worker = std::thread::spawn(move || {
+            while !stopping.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let response = read_local_request(&stream)
+                            .map_err(|_| "local HTTP request could not be read".to_string())
+                            .and_then(&reply);
+                        let (status, value) = response.unwrap_or_else(|error| {
+                            failures.lock().unwrap().push(error);
+                            (422, json!({"error":"isolated fixture rejected request"}))
+                        });
+                        let body = serde_json::to_vec(&value).unwrap();
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        ).and_then(|_| stream.write_all(&body));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self { port, stop, worker: Some(worker), errors }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    fn assert_clean(&self) {
+        let errors = self.errors.lock().unwrap();
+        assert!(errors.is_empty(), "local HTTP fixture rejected requests: {errors:?}");
+    }
+}
+
+impl Drop for LocalHttp {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+fn read_local_request(stream: &TcpStream) -> std::io::Result<LocalRequest> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut first = String::new();
+    reader.read_line(&mut first)?;
+    let mut words = first.split_whitespace();
+    let method = words.next().unwrap_or("").to_owned();
+    let target = words.next().unwrap_or("").to_owned();
+    let mut headers = BTreeMap::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 || line.trim_end().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.trim_end().split_once(':') {
+            headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
+        }
+    }
+    let length = headers.get("content-length")
+        .and_then(|length| length.parse::<usize>().ok()).unwrap_or(0);
+    if length > 64 * 1024 {
+        return Err(std::io::Error::other("oversized fixture request"));
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    Ok(LocalRequest { method, target, headers, body })
+}
+
+struct IssuedToken {
+    token: String,
+    expires_at: i64,
+}
+
+struct GithubFixtureState {
+    issued: Vec<IssuedToken>,
+    revoked: Vec<String>,
+    post_bodies: Vec<serde_json::Value>,
+    next_lifetime: i64,
+    repository_checks: usize,
+}
+
+struct GithubFixture {
+    http: LocalHttp,
+    config: GithubAppConfig,
+    pem: String,
+    state: Arc<Mutex<GithubFixtureState>>,
+}
+
+fn repository(id: u64, full_name: &str) -> GithubRepository {
+    GithubRepository { id, full_name: full_name.into() }
+}
+
+fn approved_grant(installation_id: u64) -> GithubGrant {
+    GithubGrant {
+        installation_id,
+        repositories: vec![repository(202, "acme/web")],
+        permissions: BTreeMap::from([
+            ("contents".into(), GithubPermission::Read),
+            ("metadata".into(), GithubPermission::Read),
+        ]),
+    }
+}
+
+impl GithubFixture {
+    fn new(client_id: &str, installation_id: u64, other_repository: u64) -> Self {
+        let private = rsa::PrivateKey::new(&mut rand::rng(), 2048).unwrap();
+        let pem = private.to_pkcs1_pem(Default::default()).unwrap().to_string();
+        let public = rsa::PublicKey::from(&private)
+            .to_pkcs1_pem(Default::default()).unwrap();
+        let decoding_key = jsonwebtoken::DecodingKey::from_rsa_pem(public.as_bytes()).unwrap();
+        let client_id = client_id.to_owned();
+        let issuer = client_id.clone();
+        let state = Arc::new(Mutex::new(GithubFixtureState {
+            issued: Vec::new(),
+            revoked: Vec::new(),
+            post_bodies: Vec::new(),
+            next_lifetime: 3600,
+            repository_checks: 0,
+        }));
+        let serving = state.clone();
+        let http = LocalHttp::start(move |request| {
+            for (name, expected) in [
+                ("accept", "application/vnd.github+json"),
+                ("x-github-api-version", "2026-03-10"),
+            ] {
+                if request.headers.get(name).map(String::as_str) != Some(expected) {
+                    return Err(format!("GitHub request missing required {name} header"));
+                }
+            }
+            if !request.headers.get("user-agent").is_some_and(|agent| agent.starts_with("asm/")) {
+                return Err("GitHub User-Agent is missing".into());
+            }
+            let bearer = request.headers.get("authorization")
+                .and_then(|header| header.strip_prefix("Bearer "))
+                .ok_or("GitHub bearer authentication missing")?;
+            let mint_path = format!("/app/installations/{installation_id}/access_tokens");
+            if request.method == "POST" && request.target == mint_path {
+                let jwt = jsonwebtoken::decode::<serde_json::Value>(
+                    bearer, &decoding_key,
+                    &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256),
+                ).map_err(|_| "GitHub JWT signature validation failed")?;
+                let now = asm_core::manager::now();
+                let issued_at = jwt.claims["iat"].as_i64().ok_or("JWT iat missing")?;
+                let expiry = jwt.claims["exp"].as_i64().ok_or("JWT exp missing")?;
+                if jwt.claims["iss"].as_str() != Some(issuer.as_str())
+                    || !(now - 65..=now - 55).contains(&issued_at)
+                    || expiry - issued_at != 660
+                {
+                    return Err("JWT issuer or authorization window is incorrect".into());
+                }
+                let body: serde_json::Value = serde_json::from_slice(&request.body)
+                    .map_err(|_| "GitHub mint request is not JSON")?;
+                if body != json!({
+                    "repository_ids":[202],
+                    "permissions":{"contents":"read","metadata":"read"}
+                }) {
+                    return Err("GitHub mint did not use the exact operator-approved scope".into());
+                }
+                let mut state = serving.lock().unwrap();
+                state.post_bodies.push(body);
+                let token = format!("fixture.{issuer}.{}.installation-token", state.issued.len() + 1);
+                let expires_at = now + state.next_lifetime;
+                state.next_lifetime = 3600;
+                state.issued.push(IssuedToken { token: token.clone(), expires_at });
+                // Omit repositories deliberately: real adapter must enumerate this
+                // token's actual scope before the manager can publish it.
+                return Ok((201, json!({
+                    "token":token,
+                    "expires_at":asm_proto::time::fmt_rfc3339(asm_core::manager::to_system_time(expires_at)),
+                    "permissions":{"contents":"read","metadata":"read"}
+                })));
+            }
+            let mut state = serving.lock().unwrap();
+            if !state.issued.iter().any(|issued| issued.token == bearer) {
+                return Err("unknown installation token used at GitHub".into());
+            }
+            if request.method == "DELETE" && request.target == "/installation/token" {
+                state.revoked.push(bearer.to_owned());
+                return Ok((204, serde_json::Value::Null));
+            }
+            if request.method == "GET"
+                && request.target == "/installation/repositories?per_page=100&page=1"
+            {
+                state.repository_checks += 1;
+                return Ok((200, json!({
+                    "total_count":1,"repositories":[{"id":202,"full_name":"acme/web"}]
+                })));
+            }
+            Err("unexpected GitHub method or endpoint".into())
+        });
+        let mut ceiling = approved_grant(installation_id);
+        ceiling.repositories.push(repository(other_repository, "acme/other"));
+        ceiling.permissions.insert("contents".into(), GithubPermission::Write);
+        ceiling.canonicalize().unwrap();
+        Self {
+            http, config: GithubAppConfig { client_id, installation_id, ceiling },
+            pem, state,
+        }
+    }
+
+    fn install(&self, manager: &Manager, id: &str, name: &str) {
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build().unwrap();
+        let generator = GithubAppGenerator::with_client_for_tests(
+            &self.config, &self.pem, client,
+            reqwest::Url::parse(&self.http.url("/")).unwrap(),
+        ).unwrap();
+        manager.core().install_generator_client(
+            GeneratorRecord {
+                id: id.into(), name: name.into(),
+                config: GeneratorConfig::GithubApp(self.config.clone()),
+                revision: 1, position: self.config.installation_id as i64,
+            },
+            Arc::new(generator),
+        ).unwrap();
+    }
+
+    fn count(&self) -> usize {
+        self.state.lock().unwrap().issued.len()
+    }
+
+    fn token(&self, index: usize) -> String {
+        self.state.lock().unwrap().issued[index].token.clone()
+    }
+
+    fn was_revoked(&self, token: &str) -> bool {
+        self.state.lock().unwrap().revoked.iter().any(|value| value == token)
+    }
+}
+
+struct GeneratedApprover {
+    manager: OnceLock<Arc<Manager>>,
+    busy: Mutex<()>,
+    details: Mutex<Vec<RequestDetail>>,
+    errors: Mutex<Vec<String>>,
+}
+
+impl GeneratedApprover {
+    fn run(&self) {
+        let Some(manager) = self.manager.get() else { return };
+        let _busy = self.busy.lock().unwrap();
+        for pending in manager.snapshot().pending {
+            let RequestDetail::Get {
+                generator_choices, raw_requested, sentinel_required,
+                has_substitutable_fields, requested_hosts, reason, ..
+            } = &pending.detail else { continue };
+            let generation = if generator_choices.is_empty() {
+                None
+            } else {
+                let selected = generator_choices.iter()
+                    .find(|candidate| candidate.choice.name == "review-bot")
+                    .or_else(|| (generator_choices.len() == 1).then(|| &generator_choices[0]))
+                    .expect("offered source is selectable");
+                assert!(selected.choice.available);
+                let asm_core::ffi::GenerationGrant::GithubApp { scope } = &selected.choice.ceiling;
+                Some(GenerationSelection {
+                    generator_id: selected.choice.generator_id.clone(),
+                    generator_revision: selected.choice.revision,
+                    grant: GenerationGrant::GithubApp(approved_grant(scope.installation_id)),
+                }.into())
+            };
+            let mode = if *sentinel_required {
+                asm_core::ffi::LeaseMode::Sentinel
+            } else if generation.is_some() || *raw_requested {
+                asm_core::ffi::LeaseMode::Raw
+            } else {
+                asm_core::ffi::LeaseMode::Sentinel
+            };
+            let hosts = if mode == asm_core::ffi::LeaseMode::Sentinel && *has_substitutable_fields {
+                if requested_hosts.is_empty() {
+                    vec!["127.0.0.1".into()]
+                } else {
+                    requested_hosts.clone()
+                }
+            } else {
+                Vec::new()
+            };
+            let result = manager.resolve_request(pending.id, Decision::ApproveGet {
+                mode,
+                duration_secs: Some(if reason.contains("short-generated-lease") { 5 } else { 43_200 }),
+                hosts, generation,
+            });
+            match result {
+                Ok(()) => self.details.lock().unwrap().push(pending.detail),
+                Err(error) => self.errors.lock().unwrap().push(error.to_string()),
+            }
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.details.lock().unwrap().len()
+    }
+}
+
+struct GeneratedObserver(Arc<GeneratedApprover>);
+
+impl ManagerObserver for GeneratedObserver {
+    fn changed(&self, topic: String) {
+        if topic == "requests" {
+            let approver = self.0.clone();
+            std::thread::spawn(move || approver.run());
+        }
+    }
+}
+
+struct ShutdownManager(Arc<Manager>);
+
+impl Drop for ShutdownManager {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
+fn json_get(env: &Env, arguments: &[&str]) -> serde_json::Value {
+    let mut args = vec!["get", "--json", "--no-reaper", "--wait", "30"];
+    args.extend_from_slice(arguments);
+    let output = env.run(&args, None);
+    assert_eq!(output.code, 0, "get failed: {}{}", output.stdout, output.stderr);
+    assert!(!output.stdout.contains("installation-token"), "get JSON disclosed token bytes");
+    serde_json::from_str(&output.stdout).expect("get JSON metadata")
+}
+
+fn delivered_path(result: &serde_json::Value) -> PathBuf {
+    assert_eq!(result["files"].as_array().unwrap().len(), 1);
+    PathBuf::from(result["files"][0]["path"].as_str().unwrap())
+}
+
+fn wait_until(description: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while !ready() {
+        assert!(Instant::now() < deadline, "timed out waiting for {description}");
+        std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
+/// Snapshot all credential material and manifest bytes, rather than merely
+/// checking that exec did not print a filename.
+fn file_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn collect(root: &Path, directory: &Path, found: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        if !directory.exists() { return }
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(root, &path, found);
+            } else {
+                found.insert(path.strip_prefix(root).unwrap().to_owned(), std::fs::read(path).unwrap());
+            }
+        }
+    }
+    let mut found = BTreeMap::new();
+    collect(root, root, &mut found);
+    found
+}
+
+/// A structured static fixture uses the normal VaultProvider read contract; it
+/// cannot issue generated credentials or short-circuit manager authorization.
+struct LoginFixture;
+
+impl asm_core::vault::VaultProvider for LoginFixture {
+    fn status(&self) -> asm_core::vault::VaultStatus {
+        asm_core::vault::VaultStatus::Ready
+    }
+
+    fn list(&self) -> asm_core::error::Result<Vec<asm_core::vault::SecretMeta>> {
+        Ok(vec![asm_core::vault::SecretMeta {
+            key: "google".into(), name: "google".into(),
+            kind: asm_proto::wire::SecretKind::Login,
+            fields: vec!["username".into(), "password".into()],
+            uri_hosts: vec!["http://127.0.0.1".into()],
+        }])
+    }
+
+    fn read(&self, key: &str) -> asm_core::error::Result<Vec<(String, String)>> {
+        if key != "google" {
+            return Err(asm_core::error::CoreError::not_found("unknown fixture item"));
+        }
+        Ok(vec![
+            ("username".into(), "fixture-user@example.test".into()),
+            ("password".into(), "fixture-password\nwith-whitespace ".into()),
+        ])
+    }
+
+    fn update(&self, _: &str, _: &str, _: &str) -> asm_core::error::Result<()> {
+        Err(asm_core::error::CoreError::invalid("fixture is read-only"))
+    }
+
+    fn add(&self, _: &str, _: &str, _: &asm_core::vault::AddTarget) -> asm_core::error::Result<()> {
+        Err(asm_core::error::CoreError::invalid("fixture is read-only"))
+    }
+}
+
+#[test]
+fn generated_github_lease_end_to_end() {
+    let bin_dir = workspace().join("dist/bin");
+    assert!(
+        bin_dir.join("iron-proxy").is_file(),
+        "missing prerequisite {}; run `just proxy` before integration tests",
+        bin_dir.join("iron-proxy").display()
+    );
+    let cli = build_cli();
+    let tmp = tempfile::tempdir().unwrap();
+    let release = GithubFixture::new("release-client", 41, 101);
+    let review = GithubFixture::new("review-client", 84, 303);
+    let upstream_seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let seen = upstream_seen.clone();
+    let issuers = [release.state.clone(), review.state.clone()];
+    let upstream = LocalHttp::start(move |request| {
+        let token = request.headers.get("x-key").ok_or("upstream request has no credential")?;
+        seen.lock().unwrap().push((token.clone(), request.target.clone()));
+        let active = issuers.iter().any(|issuer| {
+            let issuer = issuer.lock().unwrap();
+            issuer.issued.iter().any(|issued| issued.token == *token
+                && issued.expires_at > asm_core::manager::now())
+                && !issuer.revoked.contains(token)
+        });
+        let permitted = active && request.target == "/repos/acme/web";
+        Ok((if permitted { 200 } else { 403 }, json!({"ok":permitted})))
+    });
+    let approved_url = upstream.url("/repos/acme/web");
+    let outside_url = upstream.url("/repos/acme/private");
+    let ports = free_ports(5);
+    let approver = Arc::new(GeneratedApprover {
+        manager: OnceLock::new(), busy: Mutex::new(()),
+        details: Mutex::new(Vec::new()), errors: Mutex::new(Vec::new()),
+    });
+    let manager = Manager::start_with(
+        tmp.path().join("data"), bin_dir,
+        Arc::new(GeneratedObserver(approver.clone())),
+        StartOptions {
+            values_root: Some(tmp.path().join("values")),
+            settings: vec![
+                (keys::API_BIND.into(), json!("127.0.0.1")),
+                (keys::API_PORT.into(), json!(0)),
+                (keys::PROXY_BIND.into(), json!("127.0.0.1")),
+                (keys::PROXY_PORT.into(), json!(ports[0])),
+                (keys::PROXY_HTTP_PORT.into(), json!(ports[1])),
+                (keys::PROXY_HTTPS_PORT.into(), json!(ports[2])),
+                (keys::PROXY_MGMT_PORT.into(), json!(ports[3])),
+                (keys::PROXY_METRICS_PORT.into(), json!(ports[4])),
+                (keys::PROXY_UPSTREAM_DENY_CIDRS.into(), json!(["192.0.2.0/24"])),
+                (keys::PROXY_ALLOW_PLAIN_HTTP.into(), json!(true)),
+                (keys::PROXY_HINTS.into(), json!(["127.0.0.1"])),
+            ],
+        },
+    ).expect("start isolated manager");
+    let _shutdown = ShutdownManager(manager.clone());
+    approver.manager.set(manager.clone()).ok().unwrap();
+    release.install(&manager, "00000000-0000-4000-8000-000000000041", "release-bot");
+    review.install(&manager, "00000000-0000-4000-8000-000000000084", "review-bot");
+    wait_healthy(&manager);
+    let env = Env {
+        cli: cli.clone(), config: tmp.path().join("config"),
+        secrets: tmp.path().join("secrets"),
+    };
+    let code = manager.create_pairing_code(
+        "generated e2e".into(), Some(3600), Some(1), vec!["127.0.0.1/8".into()],
+    ).unwrap();
+    let output = env.run(&["pair", &manager.general_settings().listening_on, &code.code], None);
+    assert_eq!(output.code, 0, "pair failed: {}", output.stderr);
+    let output = env.run(&["list", "--json"], None);
+    assert_eq!(output.code, 0, "list failed: {}", output.stderr);
+    let catalog: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
+    let rows = catalog["secrets"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "duplicate apps form one logical output");
+    assert_eq!(rows[0]["name"], "GH_TOKEN");
+    assert_eq!(rows[0]["aliases"], json!(["GITHUB_TOKEN"]));
+    assert_eq!(rows[0]["generators"].as_array().unwrap().len(), 2);
+    assert!(rows[0]["generators"].as_array().unwrap().iter()
+        .all(|candidate| candidate.get("ceiling").is_none()));
+    assert_eq!(release.count() + review.count(), 0, "listing never mints");
+
+    // One chooser offers both apps; the approval deliberately narrows review's
+    // write/two-repository ceiling to one repository with read permission.
+    let first = json_get(&env, &[
+        "--sentinel", "--hosts", "127.0.0.1",
+        "--repositories", "ACME/web", "--permission", "contents=read",
+        "GH_TOKEN", "Read acme/web through the proxy",
+    ]);
+    assert_eq!(first["mode"], "sentinel");
+    assert_eq!(first["generator_name"], "review-bot");
+    assert_eq!(first["credential_version"], 1);
+    assert_eq!(first["generation"]["grant"]["scope"]["repositories"], json!([
+        {"id":202,"full_name":"acme/web"}
+    ]));
+    assert_eq!(first["generation"]["grant"]["scope"]["permissions"],
+        json!({"contents":"read","metadata":"read"}));
+    let lease_id = first["lease_id"].as_str().unwrap().to_owned();
+    let deadline = first["expires_at"].clone();
+    let first_lease = manager.list_leases().into_iter()
+        .find(|lease| lease.lease_id == lease_id).unwrap();
+    assert_eq!(first_lease.expires_at.unwrap().duration_since(first_lease.created_at).unwrap(),
+        Duration::from_secs(43_200));
+    assert_eq!(first_lease.fields, ["value"]);
+    assert_eq!(release.count(), 0, "unselected app never signs or mints");
+    assert_eq!(review.count(), 1);
+    assert_eq!(approver.count(), 1);
+    {
+        let details = approver.details.lock().unwrap();
+        let RequestDetail::Get { generator_choices, requested_generation, .. } = &details[0]
+            else { panic!("generated approval detail expected") };
+        assert_eq!(generator_choices.len(), 2, "the approval must offer both identities");
+        let Some(asm_core::ffi::GenerationRequest::GithubApp { scope }) = requested_generation
+            else { panic!("requested GitHub scope expected") };
+        assert_eq!(scope.repositories.as_deref(), Some(["acme/web".to_owned()].as_slice()));
+    }
+    let sentinel_path = delivered_path(&first);
+    let sentinel = std::fs::read_to_string(&sentinel_path).unwrap();
+    assert!(is_sentinel(&sentinel));
+    let (status, _) = via_proxy(ports[0], &approved_url, &sentinel);
+    assert_eq!(status, 200);
+    assert!(upstream_seen.lock().unwrap().last()
+        .is_some_and(|(token, _)| *token == review.token(0)));
+    let (status, _) = via_proxy(ports[0], &outside_url, &sentinel);
+    assert_eq!(status, 403, "an unapproved repository is not accessible");
+
+    // Alias reuse is one grant/version, not a second issuance or approval.
+    let alias = json_get(&env, &[
+        "--sentinel", "GITHUB_TOKEN", "Continue reading acme/web",
+    ]);
+    let alias_path = delivered_path(&alias);
+    assert_eq!(alias["lease_id"], first["lease_id"]);
+    assert_eq!(alias["credential_version"], 1);
+    assert_eq!(std::fs::read_to_string(&alias_path).unwrap(), sentinel);
+    assert_ne!(alias_path, sentinel_path);
+    assert_eq!(review.count(), 1);
+
+    // A real refresh changes the upstream credential while preserving sentinel,
+    // immutable grant, lease id and authorization deadline. Only this replacement
+    // has a short provider deadline so the production expiry wake can be observed.
+    review.state.lock().unwrap().next_lifetime = 8;
+    let refreshed = json_get(&env, &[
+        "--lease", &lease_id, "--refresh", "--sentinel",
+        "GITHUB_TOKEN", "Rotate the approved installation token",
+    ]);
+    assert_eq!(refreshed["lease_id"], first["lease_id"]);
+    assert_eq!(refreshed["expires_at"], deadline);
+    assert_eq!(refreshed["generation"], first["generation"]);
+    assert_eq!(refreshed["credential_version"], 2);
+    assert_eq!(std::fs::read_to_string(&sentinel_path).unwrap(), sentinel);
+    assert_eq!(std::fs::read_to_string(&alias_path).unwrap(), sentinel);
+    assert!(review.was_revoked(&review.token(0)), "explicit refresh revokes its predecessor");
+    let (status, _) = via_proxy(ports[0], &approved_url, &sentinel);
+    assert_eq!(status, 200);
+    assert!(upstream_seen.lock().unwrap().last()
+        .is_some_and(|(token, _)| *token == review.token(1)));
+    wait_until("provider-expired sentinel suspension", || {
+        manager.list_leases().iter().any(|lease| lease.lease_id == lease_id && lease.suspended)
+    });
+    wait_until("expired credential removal at the proxy", || {
+        let before = upstream_seen.lock().unwrap().len();
+        via_proxy(ports[0], &approved_url, &sentinel).0 == 403
+            && upstream_seen.lock().unwrap().len() == before
+    });
+    let before = upstream_seen.lock().unwrap().len();
+    let (status, _) = via_proxy(ports[0], &approved_url, &sentinel);
+    assert_eq!(status, 403);
+    assert_eq!(upstream_seen.lock().unwrap().len(), before, "expired token never forwarded");
+    assert_eq!(review.count(), 2, "sweeping/listing does not renew credentials");
+    assert!(sentinel_path.exists(), "provider expiry does not end a sentinel lease file");
+    let resumed = json_get(&env, &[
+        "--lease", &lease_id, "GH_TOKEN", "Resume the same approved grant",
+    ]);
+    assert_eq!(resumed["credential_version"], 3);
+    assert_eq!(resumed["expires_at"], deadline);
+    assert_eq!(std::fs::read_to_string(&sentinel_path).unwrap(), sentinel);
+    assert_eq!(approver.count(), 1, "renewal needs no new operator decision");
+    let (status, _) = via_proxy(ports[0], &approved_url, &sentinel);
+    assert_eq!(status, 200);
+    assert!(upstream_seen.lock().unwrap().last()
+        .is_some_and(|(token, _)| *token == review.token(2)));
+    manager.revoke_lease(lease_id.clone()).unwrap();
+    let before = upstream_seen.lock().unwrap().len();
+    assert_eq!(via_proxy(ports[0], &approved_url, &sentinel).0, 403);
+    assert_eq!(upstream_seen.lock().unwrap().len(), before);
+    assert!(review.was_revoked(&review.token(2)));
+    let ended = env.run(&[
+        "get", "--no-reaper", "--lease", &lease_id, "GITHUB_TOKEN", "Do not rebind",
+    ], None);
+    assert_eq!(ended.code, 3, "ended --lease must be terminal: {}", ended.stderr);
+    assert_eq!(review.count(), 3, "revoked lease cannot mint");
+
+    // Fresh generated approvals default raw. Both local aliases stay attached to
+    // one durable version and every known get view is rewritten on refresh.
+    let raw = json_get(&env, &["--new-lease", "GH_TOKEN", "Read acme/web directly"]);
+    assert_eq!(raw["mode"], "raw");
+    let raw_id = raw["lease_id"].as_str().unwrap().to_owned();
+    let raw_path = delivered_path(&raw);
+    let raw_alias = json_get(&env, &["GITHUB_TOKEN", "Use the same direct credential"]);
+    let raw_alias_path = delivered_path(&raw_alias);
+    assert_eq!(raw_alias["lease_id"], raw["lease_id"]);
+    assert_eq!(raw_alias["credential_version"], raw["credential_version"]);
+    assert_eq!(std::fs::read_to_string(&raw_path).unwrap(), review.token(3));
+    assert_eq!(std::fs::read_to_string(&raw_alias_path).unwrap(), review.token(3));
+    let raw_rotated = json_get(&env, &[
+        "--lease", &raw_id, "--refresh", "GITHUB_TOKEN", "Rotate both local alias views",
+    ]);
+    assert_eq!(raw_rotated["credential_version"], 2);
+    assert_eq!(raw_rotated["expires_at"], raw["expires_at"]);
+    assert_eq!(std::fs::read_to_string(&raw_path).unwrap(), review.token(4));
+    assert_eq!(std::fs::read_to_string(&raw_alias_path).unwrap(), review.token(4));
+    assert!(review.was_revoked(&review.token(3)));
+    let direct = reqwest::blocking::Client::builder().no_proxy()
+        .timeout(Duration::from_secs(5)).build().unwrap();
+    assert_eq!(direct.get(&approved_url).header("X-Key", review.token(3))
+        .send().unwrap().status().as_u16(), 403, "revoked raw predecessor cannot access the resource");
+
+    let exec_env = Env {
+        cli, config: env.config.clone(), secrets: tmp.path().join("exec-must-not-write"),
+    };
+    let saved_files = file_snapshot(&env.secrets);
+    let approvals = approver.count();
+    let minted = review.count();
+    let raw_child = r#"set -eu
+test "$GH_TOKEN" = "$GITHUB_TOKEN"
+test "$GH_TOKEN" != stale-gh
+test "$GITHUB_TOKEN" != stale-github
+test "$HTTP_PROXY" = caller-network
+test "$3" = 'literal;$(not-a-command)'
+curl --noproxy '*' -fsS -o /dev/null -H "X-Key: $GH_TOKEN" "$1"
+test "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H "X-Key: $GITHUB_TOKEN" "$2")" = 403
+printf 'raw-child-ok\n'"#;
+    let output = exec_env.run_env(&[
+        "exec", "--wait", "30", "GH_TOKEN,GITHUB_TOKEN", "--",
+        "/bin/sh", "-c", raw_child, "asm-fixture",
+        &approved_url, &outside_url, "literal;$(not-a-command)",
+    ], None, &[
+        ("GH_TOKEN", "stale-gh"), ("GITHUB_TOKEN", "stale-github"),
+        ("HTTP_PROXY", "caller-network"),
+    ]);
+    assert_eq!(output.code, 0, "raw exec failed: {}", output.stderr);
+    assert_eq!(output.stdout, "raw-child-ok\n");
+    assert_eq!(review.count(), minted, "both aliases acquire one cached credential");
+    assert_eq!(approver.count(), approvals);
+    assert_eq!(file_snapshot(&env.secrets), saved_files);
+    assert!(!exec_env.secrets.exists(), "exec must not open the credential directory");
+
+    // Identity conflicts are rejected before either app is contacted; custom
+    // destinations intentionally permit two distinct app identities.
+    let conflict = exec_env.run(&[
+        "exec", "GH_TOKEN=release-bot/GH_TOKEN,GITHUB_TOKEN=review-bot/GH_TOKEN",
+        "--", "/bin/sh", "-c", "printf should-not-launch",
+    ], None);
+    assert_eq!(conflict.code, asm_proto::error::EXIT_INVALID);
+    assert!(conflict.stdout.is_empty());
+    assert_eq!(release.count(), 0);
+    assert_eq!(review.count(), minted);
+    let custom_child = r#"set -eu
+test "$BOT_A_TOKEN" != "$BOT_B_TOKEN"
+test "$GH_TOKEN" = inherited-gh
+test "$GITHUB_TOKEN" = inherited-github
+curl --noproxy '*' -fsS -o /dev/null -H "X-Key: $BOT_A_TOKEN" "$1"
+curl --noproxy '*' -fsS -o /dev/null -H "X-Key: $BOT_B_TOKEN" "$1"
+printf 'two-apps-ok\n'"#;
+    let output = exec_env.run_env(&[
+        "exec", "--wait", "30",
+        "BOT_A_TOKEN=release-bot/GH_TOKEN,BOT_B_TOKEN=review-bot/GH_TOKEN",
+        "--", "/bin/sh", "-c", custom_child, "asm-fixture", &approved_url,
+    ], None, &[("GH_TOKEN", "inherited-gh"), ("GITHUB_TOKEN", "inherited-github")]);
+    assert_eq!(output.code, 0, "two-app exec failed: {}", output.stderr);
+    assert_eq!(output.stdout, "two-apps-ok\n");
+    assert_eq!(release.count(), 1);
+    assert_eq!(review.count(), minted + 1);
+    assert!(!exec_env.secrets.exists());
+
+    // The actual exec sentinel path obtains its proxy/CA environment itself,
+    // replaces lowercase overrides, and forwards only the selected app's token.
+    let sentinel_child = r#"set -eu
+test "$GH_TOKEN" = "$GITHUB_TOKEN"
+case "$GH_TOKEN" in asm_*) ;; *) exit 81 ;; esac
+test -n "$HTTP_PROXY"
+test -n "$HTTPS_PROXY"
+test -r "$SSL_CERT_FILE"
+test -z "${http_proxy+x}"
+test -z "${https_proxy+x}"
+test -z "${all_proxy+x}"
+curl --noproxy '' -fsS -o /dev/null -H "X-Key: $GH_TOKEN" "$1"
+printf 'sentinel-child-ok\n'"#;
+    let output = exec_env.run_env(&[
+        "exec", "--sentinel", "--hosts", "127.0.0.1", "--wait", "30",
+        "GITHUB_TOKEN", "--", "/bin/sh", "-c", sentinel_child,
+        "asm-fixture", &approved_url,
+    ], None, &[
+        ("http_proxy", "http://127.0.0.1:1"),
+        ("https_proxy", "http://127.0.0.1:1"),
+        ("all_proxy", "http://127.0.0.1:1"),
+    ]);
+    assert_eq!(output.code, 0, "sentinel exec failed: {}", output.stderr);
+    assert_eq!(output.stdout, "sentinel-child-ok\n");
+    assert_eq!(file_snapshot(&env.secrets), saved_files, "exec never synchronizes get files");
+    assert!(!exec_env.secrets.exists());
+
+    // Ending authorization, unlike provider expiry, permanently ends exact-lease
+    // renewal and revokes its still-valid GitHub token.
+    let short = json_get(&env, &[
+        "--new-lease", "--sentinel", "--hosts", "127.0.0.1",
+        "release-bot/GH_TOKEN", "short-generated-lease",
+    ]);
+    let short_id = short["lease_id"].as_str().unwrap();
+    let short_sentinel = std::fs::read_to_string(delivered_path(&short)).unwrap();
+    assert_eq!(via_proxy(ports[0], &approved_url, &short_sentinel).0, 200);
+    wait_until("generated authorization expiry", || manager.list_leases().iter()
+        .any(|lease| lease.lease_id == short_id && lease.status == asm_core::ffi::LeaseStatus::Expired));
+    wait_until("expired authorization removal at the proxy", || {
+        let before = upstream_seen.lock().unwrap().len();
+        via_proxy(ports[0], &approved_url, &short_sentinel).0 == 403
+            && upstream_seen.lock().unwrap().len() == before
+    });
+    let before = upstream_seen.lock().unwrap().len();
+    assert_eq!(via_proxy(ports[0], &approved_url, &short_sentinel).0, 403);
+    assert_eq!(upstream_seen.lock().unwrap().len(), before);
+    wait_until("expired lease provider revocation", || release.was_revoked(&release.token(1)));
+    let minted = release.count();
+    let output = env.run(&[
+        "get", "--no-reaper", "--lease", short_id,
+        "release-bot/GITHUB_TOKEN", "An expired grant cannot renew",
+    ], None);
+    assert_eq!(output.code, 3, "expired --lease must be terminal: {}", output.stderr);
+    assert_eq!(release.count(), minted);
+
+    // The documented multi-secret shorthand acquires everything before invoking
+    // the real child. Default static sentinel delivery also prepares the proxy.
+    let examples_file = tmp.path().join("examples.env");
+    std::fs::write(&examples_file, "OTHER_SECRET=fixture-other-value\n").unwrap();
+    manager.save_vault(VaultDraft {
+        id: None, name: "examples".into(),
+        config: VaultConfig::EnvFile { path: examples_file.to_string_lossy().into_owned() },
+        client_secret: String::new(), master_password: String::new(),
+    }).unwrap();
+    let output = exec_env.run(&[
+        "exec", "--wait", "30", "GH_TOKEN,OTHER_SECRET", "--", "/bin/sh", "-c",
+        r#"set -eu; test "$GH_TOKEN" = "$GITHUB_TOKEN"; test -n "$HTTPS_PROXY"; case "$OTHER_SECRET" in asm_*) ;; *) exit 82 ;; esac; printf 'all-acquired-ok\n'"#,
+    ], None);
+    assert_eq!(output.code, 0, "multi-secret exec failed: {}", output.stderr);
+    assert_eq!(output.stdout, "all-acquired-ok\n");
+    assert!(!exec_env.secrets.exists());
+
+    // Shipped structured-field examples run through the real manager/CLI.
+    let login_file = tmp.path().join("empty.env");
+    std::fs::write(&login_file, "").unwrap();
+    let vault = manager.save_vault(VaultDraft {
+        id: None, name: "Vaultwarden".into(),
+        config: VaultConfig::EnvFile { path: login_file.to_string_lossy().into_owned() },
+        client_secret: String::new(), master_password: String::new(),
+    }).unwrap();
+    let mut entry = manager.core().registry.get(&vault.id).unwrap();
+    entry.provider = Arc::new(LoginFixture);
+    manager.core().registry.insert(entry);
+    let username = json_get(&env, &[
+        "GOOGLE_USER=Vaultwarden/google::username", "Sign in",
+    ]);
+    assert_eq!(username["files"][0]["field"], "username");
+    let username_path = delivered_path(&username);
+    assert_eq!(username_path.file_name().unwrap(), "GOOGLE_USER");
+    assert_eq!(std::fs::read_to_string(&username_path).unwrap(), "fixture-user@example.test");
+    let username_lease = manager.list_leases().into_iter()
+        .find(|lease| lease.lease_id == username["lease_id"].as_str().unwrap()).unwrap();
+    assert_eq!(username_lease.fields, ["username"]);
+    assert!(username_lease.hosts.is_empty(), "plain username requires no host approval");
+    let proxy_entries = manager.core().proxy_state.lock().unwrap();
+    assert!(proxy_entries.entries.get(&username_lease.lease_id).is_none_or(Vec::is_empty),
+        "plain-only selection never publishes a proxy entry");
+    drop(proxy_entries);
+    let approvals = approver.count();
+    let whole = json_get(&env, &[
+        "--hosts", "127.0.0.1", "Vaultwarden/google", "Sign in with the full item",
+    ]);
+    assert_eq!(whole["files"].as_array().unwrap().len(), 2);
+    assert_eq!(approver.count(), approvals + 1, "a username-only lease cannot authorize password");
+    let mut whole_fields: Vec<&str> = whole["files"].as_array().unwrap().iter()
+        .map(|file| file["field"].as_str().unwrap()).collect();
+    whole_fields.sort();
+    assert_eq!(whole_fields, ["password", "username"]);
+
+    let approvals = approver.count();
+    let static_child = r#"set -eu
+test "$GOOGLE_USER" = fixture-user@example.test
+test "$GOOGLE_PASS" = 'fixture-password
+with-whitespace '
+printf 'structured-child-ok\n'"#;
+    let static_args = [
+        "exec", "--raw", "--wait", "30",
+        "GOOGLE_USER=Vaultwarden/google::username,GOOGLE_PASS=Vaultwarden/google::password",
+        "--", "/bin/sh", "-c", static_child,
+    ];
+    for _ in 0..2 {
+        let output = exec_env.run(&static_args, None);
+        assert_eq!(output.code, 0, "structured exec failed: {}", output.stderr);
+        assert_eq!(output.stdout, "structured-child-ok\n");
+    }
+    assert_eq!(approver.count(), approvals + 2, "static raw requires approval each time");
+    let details = approver.details.lock().unwrap();
+    for detail in &details[details.len() - 2..] {
+        let RequestDetail::Get { fields, .. } = detail else { panic!("get approval expected") };
+        assert_eq!(fields, &["password", "username"], "one approval authorizes the field union");
+    }
+    drop(details);
+    assert!(!exec_env.secrets.exists());
+    assert!(approver.errors.lock().unwrap().is_empty(), "an approval failed");
+    let review_count = review.count();
+    let release_count = release.count();
+    assert_eq!(review.state.lock().unwrap().repository_checks, review_count);
+    assert_eq!(release.state.lock().unwrap().repository_checks, release_count);
+    review.http.assert_clean();
+    release.http.assert_clean();
+    upstream.assert_clean();
+
+    // Configuration, SQLite and audit surfaces contain metadata only. Private
+    // proxy material is intentionally excluded: it is the sentinel data plane.
+    for path in [
+        tmp.path().join("data/asm.db"),
+        tmp.path().join("data/asm.db-wal"),
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains("installation-token") && !text.contains("BEGIN RSA PRIVATE KEY"));
+        }
+    }
+    let activities = manager.list_activity(asm_core::ffi::ActivityQuery {
+        categories: vec![], host_id: None, search: String::new(),
+        before_id: None, limit: 1000,
+    });
+    for activity in activities {
+        let display = format!("{} {:?}", activity.summary, activity.detail);
+        assert!(!display.contains("installation-token") && !display.contains("BEGIN RSA PRIVATE KEY"));
+    }
+    drop(_shutdown);
+    assert!(release.was_revoked(&release.token(0)), "shutdown revokes live raw credentials");
+    assert!(review.was_revoked(&review.token(review.count() - 1)),
+        "shutdown revokes the final sentinel credential");
 }

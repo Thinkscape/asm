@@ -51,7 +51,14 @@ struct LeasesPane: View {
                     TableColumn("Created", value: \.createdAt) { lease in
                         Text(lease.createdAt, format: .dateTime.month().day().hour().minute())
                     }
-                    TableColumn("Expires", value: \.expiresSortKey) { lease in ExpiryCell(date: lease.expiresAt) }
+                    TableColumn("Lease expires", value: \.expiresSortKey) { lease in ExpiryCell(date: lease.expiresAt) }
+                    TableColumn("Credential expires") { lease in
+                        if let expiry = lease.credentialExpiresAt {
+                            Text(expiry, format: .dateTime.month().day().hour().minute())
+                        } else {
+                            Text("—").accessibilityLabel("Not a generated credential")
+                        }
+                    }
                     TableColumn("Status", value: \.statusLine) { lease in
                         Text(verbatim: lease.statusLine).foregroundStyle(lease.status == .active && !lease.suspended ? .primary : .secondary)
                     }
@@ -79,6 +86,15 @@ struct LeasesPane: View {
                 .disabled(activeIDs(in: selection).isEmpty)
             }
         }
+        .inspector(isPresented: Binding(
+            get: { selectedLease != nil },
+            set: { if !$0 { selection = [] } }
+        )) {
+            if let selectedLease {
+                LeaseDetail(lease: selectedLease)
+                    .inspectorColumnWidth(min: 260, ideal: 320, max: 480)
+            }
+        }
         .confirmationDialog(
             "Revoke \(confirming?.count ?? 0) leases?",
             isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
@@ -86,7 +102,7 @@ struct LeasesPane: View {
         ) { ids in
             Button("Revoke", role: .destructive) { perform(ids) }
         } message: { _ in
-            Text("Their sentinels stop working at once. Raw values already delivered cannot be recalled.")
+            Text("Their sentinels stop working at once. ASM attempts to revoke generated tokens, but raw copies may remain usable until provider expiry if revocation fails. Static raw values cannot be recalled.")
         }
         .errorAlert($error)
         .onAppear(perform: recompute)
@@ -104,6 +120,11 @@ struct LeasesPane: View {
             }
             model.leaseFocus = nil
         }
+    }
+
+    private var selectedLease: LeaseItem? {
+        guard selection.count == 1, let id = selection.first else { return nil }
+        return model.leases.first { $0.id == id }
     }
 
     private var emptyText: LocalizedStringKey {
@@ -145,5 +166,81 @@ struct LeasesPane: View {
 
     private func perform(_ ids: Set<String>) {
         Task { error = await model.revokeLeases(ids) }
+    }
+}
+
+private struct LeaseDetail: View {
+    let lease: LeaseItem
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text(verbatim: lease.name).font(.headline).textSelection(.enabled)
+                LabeledContent("Source", value: lease.source)
+                LabeledContent("Host", value: lease.hostLabel)
+                LabeledContent("Delivery", value: lease.modeLine)
+                LabeledContent("Status", value: lease.status.rawValue)
+                if let reason = lease.suspensionReason, lease.suspended {
+                    Label(reason, systemImage: "pause.circle").fixedSize(horizontal: false, vertical: true)
+                }
+                LabeledContent("Authorized fields", value: lease.fields.formatted())
+                LabeledContent("Allowed hosts", value: lease.hostsLine)
+                LabeledContent("Approved") { Text(lease.createdAt, format: .dateTime.year().month().day().hour().minute()) }
+                LabeledContent("Lease expires") { ExpiryCell(date: lease.expiresAt) }
+                if let generation = lease.generation {
+                    Divider()
+                    Text("GitHub App").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+                    Text(lease.generatorName ?? lease.source).font(.headline)
+                    LabeledContent("Revision", value: String(generation.generatorRevision))
+                    LabeledContent("Generator ID", value: generation.generatorID).textSelection(.enabled)
+                    GithubGrantSummary(grant: generation.grant.github)
+                    if let expiry = lease.credentialExpiresAt {
+                        LabeledContent("Credential expires") {
+                            Text(expiry, format: .dateTime.year().month().day().hour().minute().second())
+                        }
+                    } else {
+                        Text("No live credential has been issued.")
+                    }
+                    if let version = lease.credentialVersion { LabeledContent("Credential version", value: String(version)) }
+                    Text("Credential expiry and lease expiry are independent. Run asm get again to renew a token within this authorization; renewal never extends the lease.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    if lease.mode == .raw {
+                        Label("Delivered tokens may remain usable until GitHub expiry after failed revocation or a manager crash.", systemImage: "exclamationmark.triangle")
+                            .font(.callout).fixedSize(horizontal: false, vertical: true)
+                    }
+                } else if lease.mode == .raw {
+                    Text("Static raw values already delivered cannot be recalled.").font(.callout)
+                }
+                Divider()
+                LabeledContent("Lease ID", value: lease.id).font(.caption.monospaced()).textSelection(.enabled)
+            }
+            .font(.callout)
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private struct GithubGrantSummary: View {
+    let grant: GithubGrantItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            LabeledContent("Installation", value: String(grant.installationID))
+            Text("Approved repositories").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+            ForEach(grant.repositories) { repository in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: repository.fullName)
+                    Text("Repository ID \(repository.id)").font(.caption).foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+            }
+            Text("Approved permissions").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+            ForEach(grant.permissions) { permission in
+                LabeledContent(permission.scopeLabel, value: permission.level.rawValue)
+            }
+            Text("Repository selection does not restrict organization, account, or enterprise permissions.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
     }
 }

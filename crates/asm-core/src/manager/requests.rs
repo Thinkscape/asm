@@ -5,6 +5,9 @@
 use std::collections::HashMap;
 
 use asm_proto::crypto::{new_uuid_v4, sha256};
+use asm_proto::generators::{
+    GenerationChoice, GenerationRequest, GenerationSelection, SourceKind,
+};
 use asm_proto::rules::{
     is_broad, new_sentinel, normalize_host_pattern, normalize_host_patterns, relative_paths,
     validate_agent_text, validate_reason, validate_secret_value,
@@ -17,13 +20,13 @@ use asm_proto::wire::{
 
 use super::pairing::{PairAttempt, PairState, Repair};
 use super::{
-    Core, TOPIC_LEASES, TOPIC_REQUESTS, TOPIC_VAULTS, activity, lock, now, to_system_time,
+    Core, TOPIC_LEASES, TOPIC_REQUESTS, TOPIC_VAULTS, activity, lock, to_system_time,
 };
 use crate::error::{CoreError, Result};
 use crate::ffi;
 use crate::proxy::ProxyEntry;
 use crate::store::{HistoryRecord, HostRecord, LeaseField, LeaseRecord};
-use crate::vault::names::{NamedSecret, base_name_exists, compute_names, lookup};
+use crate::vault::names::NamedSecret;
 use crate::vault::{AddTarget, CollectionInfo, VaultConfig, VaultStatus};
 
 /// Resolved host requests stay pollable this long.
@@ -39,9 +42,17 @@ pub struct Book {
 }
 
 pub(crate) struct Done {
-    host_id: String,
-    state: RequestState,
-    at: i64,
+    pub(crate) host_id: String,
+    pub(crate) state: RequestState,
+    pub(crate) at: i64,
+    pub(crate) generated: Option<GeneratedDelivery>,
+}
+
+#[derive(Clone)]
+pub(crate) struct GeneratedDelivery {
+    pub lease_id: String,
+    pub credential_version: u64,
+    pub consumed: bool,
 }
 
 /// A secret as resolved when the request was made.
@@ -81,14 +92,51 @@ impl SecretRef {
     }
 }
 
+pub(crate) use asm_proto::wire::RequestedMode;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratorTarget {
+    pub requested_name: String,
+    pub output_name: String,
+    pub pinned_generator_id: Option<String>,
+    pub candidates: Vec<GenerationChoice>,
+    pub requested_generation: Option<GenerationRequest>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum GetTarget {
+    Vault(SecretRef),
+    Generated(GeneratorTarget),
+}
+
+impl GetTarget {
+    pub(crate) fn display(&self) -> &str {
+        match self {
+            Self::Vault(s) => &s.display,
+            Self::Generated(g) => &g.requested_name,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct GetDetail {
-    pub secret: SecretRef,
-    pub raw: bool,
+    pub target: GetTarget,
+    pub mode: RequestedMode,
+    pub wanted_fields: Vec<String>,
     pub requested_hosts: Vec<String>,
     pub reason: String,
     pub initial: Vec<String>,
     pub suggestions: Vec<String>,
+}
+
+impl GetDetail {
+    pub(crate) fn has_substitutable_fields(&self) -> bool {
+        self.wanted_fields.iter().any(|f| substitutes(f))
+    }
+}
+
+pub(crate) fn substitutes(field: &str) -> bool {
+    field != "username"
 }
 
 #[derive(Debug, Clone)]
@@ -172,8 +220,8 @@ impl Pending {
             Detail::Pair { info, .. } => format!("pair {}", info.hostname),
             Detail::Get(g) => format!(
                 "get {}{}",
-                g.secret.display,
-                if g.raw { " (raw)" } else { "" }
+                g.target.display(),
+                if g.mode == RequestedMode::Raw { " (raw)" } else { "" }
             ),
             Detail::Update(u) => format!("update {} ({})", u.secret.display, u.field),
             Detail::Add(a) => format!("add {}", a.name),
@@ -198,7 +246,7 @@ impl Pending {
     }
 
     /// The terminal state this request ended in (no expiry any more).
-    fn ended_state(&self, status: RequestStatus) -> RequestState {
+    pub(crate) fn ended_state(&self, status: RequestStatus) -> RequestState {
         RequestState {
             status,
             expires_at: None,
@@ -206,7 +254,7 @@ impl Pending {
         }
     }
 
-    fn history(&self, status: RequestStatus, deny_reason: Option<String>, t: i64) -> HistoryRecord {
+    pub(crate) fn history(&self, status: RequestStatus, deny_reason: Option<String>, t: i64) -> HistoryRecord {
         HistoryRecord {
             id: self.id.clone(),
             kind: self.kind_str().to_string(),
@@ -243,6 +291,10 @@ impl From<CoreError> for Fail {
     fn from(e: CoreError) -> Self {
         Fail::Keep(e)
     }
+}
+
+impl From<asm_proto::ApiError> for Fail {
+    fn from(e: asm_proto::ApiError) -> Self { Self::Keep(e.into()) }
 }
 
 /// Host part of a URI-ish string (`https://a.b:443/x`, `a.b`, `a.b:8080`) as a pattern.
@@ -314,10 +366,12 @@ impl Core {
         let mut rows = Vec::new();
         let mut changed = false;
         {
+            let _authority = lock(&self.authorization);
             let mut b = lock(&self.book);
             let (expired, keep): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut b.pending)
                 .into_iter()
-                .partition(|p| !p.resolving && p.expires <= t);
+                .partition(|p| p.expires <= t && (!p.resolving || matches!(&p.detail,
+                    Detail::Get(GetDetail { target: GetTarget::Generated(_), .. }))));
             b.pending = keep;
             for p in expired {
                 changed = true;
@@ -338,6 +392,7 @@ impl Core {
                                 host_id: host_id.clone(),
                                 state,
                                 at: t,
+                                generated: None,
                             },
                         );
                     }
@@ -370,12 +425,22 @@ impl Core {
     /// that lease's secret: names becoming vault-prefixed (or getting a `~hash`) must not
     /// break the names an agent already holds leases under.
     pub(crate) fn find_secret(&self, host_id: &str, query: &str) -> Result<NamedSecret> {
-        let (listings, _) = self.registry.listings();
-        let names = compute_names(&listings);
-        let e = match lookup(&names, query) {
-            Ok(n) => return Ok(n.clone()),
+        let catalog = self.secret_catalog()?;
+        let names = &catalog.static_entries;
+        let e = match catalog.resolve(query) {
+            Ok(super::catalog::CatalogMatch::Vault(named)) => return Ok(named),
+            Ok(super::catalog::CatalogMatch::Generated(_)) => return Err(CoreError::invalid("generated secrets cannot be updated")),
             Err(e) => e,
         };
+        if catalog.generated.iter().any(|g| g.static_collisions.iter().any(|n| n == query)) {
+            return Err(e);
+        }
+        if let Some((source, leaf)) = query.rsplit_once('/')
+            && matches!(leaf, "GH_TOKEN" | "GITHUB_TOKEN")
+            && self.store.leases_of_host(host_id)?.iter().any(|lease|
+                lease.source_kind == SourceKind::Generator && lease.vault_name == source) {
+            return Err(e);
+        }
         if !matches!(
             e.code,
             asm_proto::ErrorCode::NotFound | asm_proto::ErrorCode::Ambiguous
@@ -417,12 +482,12 @@ impl Core {
         query: &str,
         names: &[NamedSecret],
     ) -> Result<Option<NamedSecret>> {
-        let t = now();
+        let t = self.generation_now();
         let mut leases: Vec<LeaseRecord> = self
             .store
             .leases_of_host(host_id)?
             .into_iter()
-            .filter(|l| l.name == query && l.is_active(t))
+            .filter(|l| l.source_kind == SourceKind::Vault && l.name == query && l.is_active(t))
             .collect();
         leases.sort_by_key(|l| std::cmp::Reverse(l.created_at));
         Ok(leases.iter().find_map(|l| {
@@ -439,27 +504,22 @@ impl Core {
         &self,
         host: &HostRecord,
         address: &str,
-        body: RequestBody,
+        mut body: RequestBody,
     ) -> Result<RequestState> {
+        body.canonicalize()?;
         let agent = body.agent().trim().to_string();
         validate_agent_text("agent", &agent)?;
         if agent.chars().count() > 128 {
             return Err(CoreError::invalid("agent label is too long"));
         }
-        let t = now();
+        let t = self.generation_now();
         if !agent.is_empty() {
             self.store.upsert_agent(&host.id, &agent, t)?;
             self.notify(super::TOPIC_HOSTS);
         }
         self.expire_requests(t);
         match body {
-            RequestBody::Get {
-                name,
-                raw,
-                hosts,
-                reason,
-                ..
-            } => self.create_get(host, &agent, address, &name, raw, &hosts, &reason),
+            body @ RequestBody::Get { .. } => self.create_get(host, &agent, address, body),
             RequestBody::Update {
                 name, field, value, ..
             } => self.create_update(host, &agent, address, &name, field, value),
@@ -469,14 +529,14 @@ impl Core {
         }
     }
 
-    fn new_pending(
+    pub(crate) fn new_pending(
         &self,
         host: &HostRecord,
         agent: &str,
         address: &str,
         detail: Detail,
     ) -> Pending {
-        let t = now();
+        let t = self.generation_now();
         let lifetime = self.settings().request_lifetime_secs.max(1) as i64;
         Pending {
             id: new_uuid_v4(),
@@ -494,7 +554,7 @@ impl Core {
     }
 
     /// Push a pending request unless an equal one of the same host exists (re-attach).
-    fn push_pending(&self, p: Pending, same: impl Fn(&Pending) -> bool) -> RequestState {
+    pub(crate) fn push_pending(&self, p: Pending, same: impl Fn(&Pending) -> bool) -> RequestState {
         let state = {
             let mut b = lock(&self.book);
             if let Some(existing) = b.pending.iter().find(|q| q.host_id == p.host_id && same(q)) {
@@ -515,47 +575,75 @@ impl Core {
         host: &HostRecord,
         agent: &str,
         address: &str,
-        name: &str,
-        raw: bool,
-        hosts: &[String],
-        reason: &str,
+        body: RequestBody,
     ) -> Result<RequestState> {
+        let RequestBody::Get {
+            name, raw, sentinel, hosts, reason, fields, generation, refresh, new_lease,
+            lease_id, refresh_from_version, ..
+        } = &body else { unreachable!() };
+        let mode = if *raw { RequestedMode::Raw } else if *sentinel {
+            RequestedMode::Sentinel
+        } else { RequestedMode::Default };
         let reason = validate_reason(reason)?;
         let requested = normalize_host_patterns(hosts)?;
-        let named = self.find_secret(&host.id, name)?;
-        let secret = SecretRef::from_named(&named);
-
-        if !raw && let Some(state) = self.get_shortcut(host, agent, &secret, &requested, &reason)? {
-            return Ok(state);
+        if let Some(id) = lease_id {
+            body.validate_get_capabilities(SourceKind::Generator)?;
+            return self.generated_pinned_get(host, agent, name, id, mode, &requested,
+                fields.as_deref(), generation.as_ref(), *refresh, *refresh_from_version, &reason);
         }
-
-        let remembered = self.store.secret_hosts(&secret.vault_id, &secret.key)?;
-        let mut uri: Vec<String> = Vec::new();
-        for h in named.meta.uri_hosts.iter().filter_map(|u| uri_host(u)) {
-            if !uri.contains(&h) {
-                uri.push(h);
+        let catalog = self.secret_catalog()?;
+        let resolved = match catalog.resolve(name) {
+            Ok(target) => target,
+            Err(e) if matches!(e.code, asm_proto::ErrorCode::NotFound | asm_proto::ErrorCode::Ambiguous) => {
+                if catalog.generated.iter().any(|g| g.static_collisions.iter().any(|n| n == name)) {
+                    return Err(e);
+                }
+                super::catalog::CatalogMatch::Vault(self.find_secret(&host.id, name)?)
             }
-        }
-        let (initial, suggestions) = host_candidates(&requested, &remembered, &uri);
-        let detail = GetDetail {
-            secret,
-            raw,
-            requested_hosts: requested,
-            reason,
-            initial,
-            suggestions,
+            Err(e) => return Err(e),
         };
-        let p = self.new_pending(host, agent, address, Detail::Get(detail.clone()));
-        Ok(self.push_pending(p, |q| match &q.detail {
-            Detail::Get(g) => {
-                g.secret.vault_id == detail.secret.vault_id
-                    && g.secret.key == detail.secret.key
-                    && g.raw == detail.raw
-                    && g.requested_hosts == detail.requested_hosts
-                    && g.reason == detail.reason
+        match resolved {
+            super::catalog::CatalogMatch::Generated(super::catalog::CatalogGeneratedTarget {
+                requested_name, output_name, pinned_generator_id, candidates,
+            }) => {
+                body.validate_get_capabilities(SourceKind::Generator)?;
+                let target = GeneratorTarget {
+                    requested_name, output_name, pinned_generator_id, candidates,
+                    requested_generation: generation.clone(),
+                };
+                let wanted_fields = select_fields(&["value".to_string()], fields.as_deref())?;
+                self.create_generated_get(host, agent, address, target, mode, wanted_fields,
+                    requested, reason, *new_lease, *refresh, *refresh_from_version)
             }
-            _ => false,
-        }))
+            super::catalog::CatalogMatch::Vault(named) => {
+                body.validate_get_capabilities(SourceKind::Vault)?;
+                if generation.is_some() || *refresh || *new_lease || refresh_from_version.is_some() {
+                    return Err(CoreError::invalid("generator options require a generated secret"));
+                }
+                let secret = SecretRef::from_named(&named);
+                let wanted_fields = select_fields(&secret.fields, fields.as_deref())?;
+                if mode != RequestedMode::Raw
+                    && let Some(state) = self.get_shortcut(host, agent, &secret,
+                        &wanted_fields, &requested, &reason)? {
+                    return Ok(state);
+                }
+                let remembered = self.store.secret_hosts(&secret.vault_id, &secret.key)?;
+                let uri: Vec<String> = named.meta.uri_hosts.iter().filter_map(|u| uri_host(u)).collect();
+                let (initial, suggestions) = host_candidates(&requested, &remembered, &uri);
+                let detail = GetDetail {
+                    target: GetTarget::Vault(secret), mode, wanted_fields,
+                    requested_hosts: requested, reason, initial, suggestions,
+                };
+                let p = self.new_pending(host, agent, address, Detail::Get(detail.clone()));
+                Ok(self.push_pending(p, |q| match (&q.detail, &detail.target) {
+                    (Detail::Get(g), GetTarget::Vault(s)) => matches!(&g.target,
+                        GetTarget::Vault(other) if other.vault_id == s.vault_id && other.key == s.key)
+                        && g.mode == detail.mode && g.wanted_fields == detail.wanted_fields
+                        && g.requested_hosts == detail.requested_hosts && g.reason == detail.reason,
+                    _ => false,
+                }))
+            }
+        }
     }
 
     /// Existing active sentinel lease covering the request → approved without a popup.
@@ -564,20 +652,25 @@ impl Core {
         host: &HostRecord,
         agent: &str,
         secret: &SecretRef,
+        wanted_fields: &[String],
         requested: &[String],
         reason: &str,
     ) -> Result<Option<RequestState>> {
-        let t = now();
+        let t = self.generation_now();
         let mut candidates: Vec<LeaseRecord> = self
             .store
             .leases_of_host(&host.id)?
             .into_iter()
             .filter(|l| {
+                l.source_kind == SourceKind::Vault
+                    && wanted_fields.iter().all(|f| l.fields.iter().any(|lf| &lf.field == f))
+                    &&
                 l.is_active(t)
                     && l.mode == LeaseMode::Sentinel
                     && l.vault_id == secret.vault_id
                     && l.secret_key == secret.key
                     && (requested.is_empty()
+                        || wanted_fields.iter().all(|f| !substitutes(f))
                         || l.hosts == ["*"]
                         || requested.iter().all(|r| l.hosts.contains(r)))
             })
@@ -588,7 +681,7 @@ impl Core {
             return Ok(None);
         };
 
-        let needs_values = lease.fields.iter().any(|f| f.sentinel.is_none());
+        let needs_values = lease.fields.iter().any(|f| wanted_fields.contains(&f.field) && f.sentinel.is_none());
         let values = if needs_values {
             let entry = self
                 .registry
@@ -602,7 +695,7 @@ impl Core {
             Vec::new()
         };
         let mut files = Vec::new();
-        for f in &lease.fields {
+        for f in lease.fields.iter().filter(|f| wanted_fields.contains(&f.field)) {
             let content = match &f.sentinel {
                 Some(s) => s.clone(),
                 None => values
@@ -620,10 +713,15 @@ impl Core {
                 field: f.field.clone(),
                 relative_path: f.path.clone(),
                 content,
+                substituted: f.sentinel.is_some(),
             });
         }
-        if self.suspended().contains_key(&lease.id) {
-            self.sync_proxy(true);
+        if lease.fields.iter().any(|f| wanted_fields.contains(&f.field) && f.sentinel.is_some())
+            && (self.suspended().contains_key(&lease.id) || lock(&self.proxy_state).dirty) {
+            self.reconcile_proxy_with(true, |_| {})?;
+            if self.suspended().contains_key(&lease.id) {
+                return Err(CoreError::vault_unavailable("lease is suspended because its vault is unavailable"));
+            }
         }
         let id = new_uuid_v4();
         let state = RequestState {
@@ -637,6 +735,10 @@ impl Core {
                 hosts: lease.hosts.clone(),
                 expires_at: lease.expires_at.map(fmt_unix),
                 files,
+                generation: None,
+                credential_expires_at: None,
+                credential_version: None,
+                generator_name: None,
             })),
             expires_at: None,
             pending_lifetime_secs: self.settings().request_lifetime_secs.max(1),
@@ -647,6 +749,7 @@ impl Core {
                 host_id: host.id.clone(),
                 state: state.clone(),
                 at: t,
+                generated: None,
             },
         );
         self.log(
@@ -695,6 +798,9 @@ impl Core {
         value: String,
     ) -> Result<RequestState> {
         validate_secret_value(&value)?;
+        if matches!(self.secret_catalog()?.resolve(name), Ok(super::catalog::CatalogMatch::Generated(_))) {
+            return Err(CoreError::invalid("generated secrets cannot be updated"));
+        }
         let named = self.find_secret(&host.id, name)?;
         let secret = SecretRef::from_named(&named);
         let field = match field
@@ -844,8 +950,7 @@ impl Core {
             return Err(CoreError::invalid("name must not contain '/'"));
         }
         validate_agent_text("name", &name)?;
-        let (listings, _) = self.registry.listings();
-        if base_name_exists(&listings, &name) {
+        if self.secret_catalog()?.has_base_name(&name) {
             return Err(CoreError::exists(format!(
                 "a secret named {name:?} already exists; use asm update"
             )));
@@ -870,39 +975,62 @@ impl Core {
 
     /// `GET /requests/{id}`: the request's state. A raw result is returned once, then dropped.
     pub fn request_state(&self, host_id: &str, id: &str) -> Result<RequestState> {
-        self.expire_requests(now());
-        let mut b = lock(&self.book);
-        if let Some(p) = b
-            .pending
-            .iter()
-            .find(|p| p.id == id && p.host_id.as_deref() == Some(host_id))
-        {
-            return Ok(p.state());
-        }
-        if let Some(d) = b.done.get_mut(id).filter(|d| d.host_id == host_id) {
-            let state = d.state.clone();
-            if let Some(RequestResult::Get(g)) = &d.state.result
-                && g.mode == LeaseMode::Raw
-            {
-                d.state.result = None;
+        self.expire_requests(self.generation_now());
+        let marker = {
+            let mut book = lock(&self.book);
+            if let Some(pending) = book.pending.iter().find(|p| p.id == id && p.host_id.as_deref() == Some(host_id)) {
+                return Ok(pending.state());
             }
-            return Ok(state);
-        }
-        Err(CoreError::not_found("no such request"))
+            let done = book.done.get_mut(id).filter(|d| d.host_id == host_id)
+                .ok_or_else(|| CoreError::not_found("no such request"))?;
+            if let Some(marker) = &done.generated { marker.clone() } else {
+                let state = done.state.clone();
+                if matches!(&done.state.result, Some(RequestResult::Get(g)) if g.mode == LeaseMode::Raw) {
+                    done.state.result = None;
+                }
+                return Ok(state);
+            }
+        };
+        let outcome = (|| -> Result<RequestState> {
+            let authority = lock(&self.authorization);
+            let mode = self.check_generated_delivery(&marker.lease_id, marker.credential_version)?;
+            if mode == LeaseMode::Sentinel && lock(&self.proxy_state).dirty {
+                self.publish_proxy_locked(&authority).map_err(|_|
+                    CoreError::vault_unavailable("generated credential publication failed; run asm get to retry"))?;
+            }
+            let result = self.validate_generated_delivery(&marker.lease_id, marker.credential_version)?;
+            let mut book = lock(&self.book);
+            let done = book.done.get_mut(id).filter(|d| d.host_id == host_id)
+                .ok_or_else(|| CoreError::not_found("no such request"))?;
+            let delivery = done.generated.as_mut().filter(|d| d.lease_id == marker.lease_id
+                && d.credential_version == marker.credential_version)
+                .ok_or_else(|| CoreError::vault_unavailable("generated credential is no longer available; run asm get again"))?;
+            if result.mode == LeaseMode::Raw && delivery.consumed {
+                return Err(CoreError::vault_unavailable("generated credential is no longer available; run asm get again"));
+            }
+            if result.mode == LeaseMode::Raw { delivery.consumed = true; }
+            let mut state = done.state.clone();
+            state.result = Some(RequestResult::Get(result));
+            Ok(state)
+        })();
+        self.notify_proxy_changed();
+        outcome
     }
 
     /// `DELETE /requests/{id}`.
     pub fn cancel_request(&self, host_id: &str, id: &str) -> Result<RequestState> {
-        let t = now();
+        let t = self.generation_now();
         self.expire_requests(t);
         let (state, row) = {
+            let _authority = lock(&self.authorization);
             let mut b = lock(&self.book);
             let pos = b
                 .pending
                 .iter()
                 .position(|p| p.id == id && p.host_id.as_deref() == Some(host_id));
             match pos {
-                Some(i) if !b.pending[i].resolving => {
+                Some(i) if !b.pending[i].resolving || matches!(&b.pending[i].detail,
+                    Detail::Get(GetDetail { target: GetTarget::Generated(_), .. })) => {
                     let p = b.pending.remove(i);
                     let state = p.ended_state(RequestStatus::Cancelled);
                     b.done.insert(
@@ -911,20 +1039,20 @@ impl Core {
                             host_id: host_id.to_string(),
                             state: state.clone(),
                             at: t,
+                            generated: None,
                         },
                     );
                     self.log(activity::ended(&p, "cancelled", None));
                     (state, Some(p.history(RequestStatus::Cancelled, None, t)))
                 }
                 Some(i) => (b.pending[i].state(), None),
-                None => match b.done.get(id).filter(|d| d.host_id == host_id) {
+                None => match b.done.get_mut(id).filter(|d| d.host_id == host_id) {
                     Some(d) => {
-                        let mut s = d.state.clone();
-                        if matches!(&s.result, Some(RequestResult::Get(g)) if g.mode == LeaseMode::Raw)
-                        {
-                            s.result = None;
+                        if let Some(delivery) = d.generated.as_mut() { delivery.consumed = true; }
+                        if matches!(&d.state.result, Some(RequestResult::Get(g)) if g.mode == LeaseMode::Raw) {
+                            d.state.result = None;
                         }
-                        (s, None)
+                        (d.state.clone(), None)
                     }
                     None => return Err(CoreError::not_found("no such request")),
                 },
@@ -940,12 +1068,13 @@ impl Core {
 
     /// Cancel every pending request of a host (host revoked).
     pub(crate) fn cancel_host_requests(&self, host_id: &str) {
-        let t = now();
+        let t = self.generation_now();
         let rows: Vec<HistoryRecord> = {
+            let _authority = lock(&self.authorization);
             let mut b = lock(&self.book);
             let (gone, keep): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut b.pending)
                 .into_iter()
-                .partition(|p| p.host_id.as_deref() == Some(host_id) && !p.resolving);
+                .partition(|p| p.host_id.as_deref() == Some(host_id));
             b.pending = keep;
             gone.iter()
                 .map(|p| {
@@ -956,6 +1085,7 @@ impl Core {
                             host_id: host_id.to_string(),
                             state,
                             at: t,
+                            generated: None,
                         },
                     );
                     self.log(activity::ended(p, "cancelled", Some("host revoked")));
@@ -974,7 +1104,7 @@ impl Core {
 
     /// Carry out the operator's decision on a pending request.
     pub fn resolve_request(&self, id: &str, decision: ffi::Decision) -> Result<()> {
-        let t = now();
+        let t = self.generation_now();
         self.expire_requests(t);
         // Phase 1: claim the request.
         let p = {
@@ -1021,10 +1151,13 @@ impl Core {
                     mode,
                     duration_secs,
                     hosts,
+                    generation,
                 },
-            ) => self
-                .approve_get(&p, g, mode.into(), duration_secs, hosts)
-                .map(|r| Some(RequestResult::Get(r))),
+            ) => match generation.map(GenerationSelection::try_from).transpose() {
+                Ok(selection) => self.approve_get(&p, g, mode.into(), duration_secs, hosts, selection)
+                    .map(|r| Some(RequestResult::Get(r))),
+                Err(error) => Err(Fail::Keep(error)),
+            },
             (Detail::Update(u), ffi::Decision::ApproveWrite { vault_id, .. }) => self
                 .approve_update(u, &vault_id)
                 .map(|r| Some(RequestResult::Write(r))),
@@ -1043,7 +1176,7 @@ impl Core {
         };
 
         // Phase 3: record the outcome.
-        let t = now();
+        let t = self.generation_now();
         match outcome {
             Ok(result) => {
                 let p = self.take_pending(id);
@@ -1080,7 +1213,7 @@ impl Core {
 
     /// Move a removed pending request to its terminal state. `Ok(result)` = approved,
     /// `Err(reason)` = denied (`failed`: by a vault failure while approving).
-    fn finish(
+    pub(crate) fn finish(
         &self,
         p: Pending,
         outcome: std::result::Result<Option<RequestResult>, Option<String>>,
@@ -1121,6 +1254,7 @@ impl Core {
                             host_id: host_id.clone(),
                             state,
                             at: t,
+                            generated: None,
                         },
                     );
                 }
@@ -1139,12 +1273,22 @@ impl Core {
         mode: LeaseMode,
         duration_secs: Option<u64>,
         hosts: Vec<String>,
+        generation: Option<GenerationSelection>,
     ) -> std::result::Result<GetResult, Fail> {
+        if g.mode == RequestedMode::Sentinel && mode == LeaseMode::Raw {
+            return Err(Fail::Keep(CoreError::invalid("this request requires sentinel delivery")));
+        }
+        if let GetTarget::Generated(target) = &g.target {
+            return self.approve_generated_get(p, g, target, mode, duration_secs, hosts, generation);
+        }
+        if generation.is_some() {
+            return Err(Fail::Keep(CoreError::invalid("static secrets cannot select a generator")));
+        }
         let hosts = match mode {
             LeaseMode::Raw => Vec::new(),
             LeaseMode::Sentinel => {
                 let h = normalize_host_patterns(&hosts).map_err(CoreError::from)?;
-                if h.is_empty() {
+                if h.is_empty() && g.has_substitutable_fields() {
                     return Err(Fail::Keep(CoreError::invalid(
                         "choose at least one host, or Any host",
                     )));
@@ -1156,15 +1300,21 @@ impl Core {
                 }
             }
         };
-        let s = &g.secret;
+        let GetTarget::Vault(s) = &g.target else { unreachable!() };
         let entry = self
             .registry
             .get(&s.vault_id)
             .ok_or_else(|| Fail::Deny("vault unavailable: vault was removed".into()))?;
-        let values = entry
+        let mut values = entry
             .provider
             .read(&s.key)
             .map_err(|e| Fail::Deny(format!("vault unavailable: {}", e.message)))?;
+        for field in &g.wanted_fields {
+            if !values.iter().any(|(f, _)| f == field) {
+                return Err(Fail::Keep(CoreError::vault_unavailable("an approved field is no longer available")));
+            }
+        }
+        values.retain(|(f, _)| g.wanted_fields.contains(f));
         if values.is_empty() {
             return Err(Fail::Deny(
                 "vault unavailable: the secret has no fields".into(),
@@ -1178,12 +1328,12 @@ impl Core {
             &field_names,
         );
         let lease_id = new_uuid_v4();
-        let t = now();
+        let t = self.generation_now();
         let mut files = Vec::new();
         let mut fields = Vec::new();
         let mut entries = Vec::new();
         for (index, ((field, value), path)) in values.iter().zip(paths).enumerate() {
-            let sentinel = (mode == LeaseMode::Sentinel && field != "username").then(new_sentinel);
+            let sentinel = (mode == LeaseMode::Sentinel && substitutes(field)).then(new_sentinel);
             if let Some(sv) = &sentinel {
                 entries.push(ProxyEntry {
                     lease_id: lease_id.clone(),
@@ -1197,6 +1347,7 @@ impl Core {
                 field: field.clone(),
                 relative_path: path.clone(),
                 content: sentinel.clone().unwrap_or_else(|| value.clone()),
+                substituted: sentinel.is_some(),
             });
             fields.push(LeaseField {
                 field: field.clone(),
@@ -1220,13 +1371,21 @@ impl Core {
             created_at: t,
             expires_at,
             revoked_at: None,
+            source_kind: SourceKind::Vault,
+            generation: None,
+            generator_revision: None,
+            credential_expires_at: None,
+            approval_order: None,
+            credential_version: 0,
+            requested_generation: None,
         };
         self.store.insert_lease(&lease)?;
         self.log_lease_created(&lease);
-        if mode == LeaseMode::Sentinel {
+        if mode == LeaseMode::Sentinel && g.has_substitutable_fields() {
             self.store
                 .replace_secret_hosts(&s.vault_id, &s.key, &hosts)?;
             self.sync_proxy_with(false, |st| {
+                st.dirty = true;
                 st.entries.insert(lease_id.clone(), entries);
             });
         }
@@ -1238,6 +1397,10 @@ impl Core {
             hosts,
             expires_at: expires_at.map(fmt_unix),
             files,
+            generation: None,
+            credential_expires_at: None,
+            credential_version: None,
+            generator_name: None,
         })
     }
 
@@ -1260,13 +1423,13 @@ impl Core {
             .provider
             .update(&s.key, &u.field, &u.new_value)
             .map_err(|e| Fail::Deny(format!("vault unavailable: {}", e.message)))?;
-        let t = now();
+        let t = self.generation_now();
         let leases: Vec<LeaseRecord> = self
             .store
             .active_leases(t)
             .map_err(Fail::Keep)?
             .into_iter()
-            .filter(|l| l.vault_id == s.vault_id && l.secret_key == s.key)
+            .filter(|l| l.source_kind == SourceKind::Vault && l.vault_id == s.vault_id && l.secret_key == s.key)
             .collect();
         for l in leases.iter().filter(|l| l.mode == LeaseMode::Raw) {
             match self.store.revoke_lease(&l.id, t) {
@@ -1280,6 +1443,7 @@ impl Core {
             .filter(|l| l.mode == LeaseMode::Sentinel)
             .collect();
         self.sync_proxy_with(false, |st| {
+            st.dirty = true;
             for l in &sentinel {
                 if let Some(es) = st.entries.get_mut(&l.id) {
                     for e in es.iter_mut() {
@@ -1323,8 +1487,7 @@ impl Core {
             },
             _ => None,
         };
-        let (listings, _) = self.registry.listings();
-        if base_name_exists(&listings, &a.name) {
+        if self.secret_catalog()?.has_base_name(&a.name) {
             return Err(Fail::Deny(format!(
                 "a secret named {:?} already exists",
                 a.name
@@ -1348,7 +1511,7 @@ impl Core {
     // ---- snapshot ----
 
     pub fn snapshot(&self) -> ffi::Snapshot {
-        self.expire_requests(now());
+        self.expire_requests(self.generation_now());
         let default_duration = self.settings().lease_default_secs;
         let pending: Vec<Pending> = lock(&self.book).pending.clone();
         // Labels follow renames: look up the host's current name.
@@ -1359,7 +1522,7 @@ impl Core {
                 if let Some((label, _)) = p.host_id.as_deref().and_then(|id| names.get(id)) {
                     p.host_label = label.clone();
                 }
-                pending_to_ffi(p, default_duration)
+                pending_to_ffi(self, p, default_duration)
             })
             .collect();
         let recent = self
@@ -1395,6 +1558,16 @@ impl Core {
     }
 }
 
+fn select_fields(available: &[String], wanted: Option<&[String]>) -> Result<Vec<String>> {
+    let mut fields = wanted.unwrap_or(available).to_vec();
+    if fields.is_empty() || fields.iter().any(|f| !available.contains(f)) {
+        return Err(CoreError::invalid(format!("choose fields from: {}", available.join(", "))));
+    }
+    fields.sort();
+    fields.dedup();
+    Ok(fields)
+}
+
 fn kind_from_str(s: &str) -> ffi::RequestKind {
     match s {
         "pair" => ffi::RequestKind::Pair,
@@ -1411,7 +1584,7 @@ fn pattern_check(p: &str) -> ffi::HostPatternCheck {
     }
 }
 
-fn pending_to_ffi(p: Pending, default_duration: Option<u64>) -> ffi::PendingRequest {
+fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi::PendingRequest {
     let summary = p.summary();
     let kind = kind_from_str(p.kind_str());
     let detail = match p.detail {
@@ -1432,18 +1605,35 @@ fn pending_to_ffi(p: Pending, default_duration: Option<u64>) -> ffi::PendingRequ
                 paired_at: to_system_time(r.paired_at),
             }),
         },
-        Detail::Get(g) => ffi::RequestDetail::Get {
-            name: g.secret.display,
-            vault_id: g.secret.vault_id,
-            vault_name: g.secret.vault_name,
-            kind: g.secret.kind.into(),
-            fields: g.secret.fields,
-            reason: g.reason,
-            raw_requested: g.raw,
-            requested_hosts: g.requested_hosts,
-            initial_hosts: g.initial.iter().map(|h| pattern_check(h)).collect(),
-            suggested_hosts: g.suggestions.iter().map(|h| pattern_check(h)).collect(),
-            default_duration_secs: default_duration,
+        Detail::Get(g) => {
+            let has_substitutable_fields = g.has_substitutable_fields();
+            let (name, vault_id, vault_name, kind, generator_choices, requested_generation) = match &g.target {
+                GetTarget::Vault(s) => (s.display.clone(), Some(s.vault_id.clone()), s.vault_name.clone(),
+                    s.kind, Vec::new(), None),
+                GetTarget::Generated(target) => (
+                    target.requested_name.clone(), target.pinned_generator_id.clone(), "GitHub App".into(),
+                    SecretKind::Single, target.candidates.iter().map(|choice| ffi::GeneratorApprovalChoice {
+                        choice: choice.clone().into(),
+                        suggested_hosts: {
+                            let remembered = core.store.secret_hosts(&choice.generator_id, "token").unwrap_or_default();
+                            let (initial, suggestions) = host_candidates(&g.requested_hosts, &remembered, &["api.github.com".into()]);
+                            initial.iter().chain(&suggestions).map(|h| pattern_check(h)).collect()
+                        },
+                        scope_issues: target.requested_generation.as_ref().map(|request|
+                            choice.ceiling.scope_issues(request).unwrap_or_else(|e| vec![e.message])).unwrap_or_default(),
+                    }).collect(), target.requested_generation.clone().map(Into::into)),
+            };
+            ffi::RequestDetail::Get {
+                name, vault_id, vault_name, kind: kind.into(), fields: g.wanted_fields,
+                reason: g.reason, raw_requested: g.mode == RequestedMode::Raw
+                    || (g.mode == RequestedMode::Default && matches!(g.target, GetTarget::Generated(_))),
+                sentinel_required: g.mode == RequestedMode::Sentinel, has_substitutable_fields,
+                generator_choices, requested_generation,
+                requested_hosts: g.requested_hosts,
+                initial_hosts: g.initial.iter().map(|h| pattern_check(h)).collect(),
+                suggested_hosts: g.suggestions.iter().map(|h| pattern_check(h)).collect(),
+                default_duration_secs: default_duration,
+            }
         },
         Detail::Update(u) => ffi::RequestDetail::Update {
             name: u.secret.display,

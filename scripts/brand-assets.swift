@@ -1,10 +1,10 @@
-// Renders the app icon and the README images from the square icon artwork.
+// Renders the app icon and the README images from the Signal SVG artwork.
 //
-//   swift scripts/brand-assets.swift docs/assets/src/appicon.png
+//   swift scripts/brand-assets.swift docs/assets/src/appicon.svg
 //
 // The argument is the full-bleed square icon artwork (the squircle touching the edges,
-// e.g. 1254²); the tracked source is docs/assets/src/appicon.png. Run from the
-// repository root. Writes:
+// 1024²); the editable source is docs/assets/src/appicon.svg, loaded natively by AppKit.
+// Run from the repository root. Writes:
 //   app/Bundle/AppIcon.icns          macOS icon grid: 824/1024 artwork, continuous-corner
 //                                    mask (radius 185/824), soft drop shadow
 //   docs/assets/icon.png             512² of the same icon
@@ -17,7 +17,7 @@ let arguments = CommandLine.arguments
 guard arguments.count == 2,
       let source = NSImage(contentsOfFile: arguments[1])?.cgImage(forProposedRect: nil, context: nil, hints: nil)
 else {
-    FileHandle.standardError.write("usage: swift scripts/brand-assets.swift <artwork.png>\n".data(using: .utf8)!)
+    FileHandle.standardError.write("usage: swift scripts/brand-assets.swift <artwork.svg>\n".data(using: .utf8)!)
     exit(2)
 }
 
@@ -113,8 +113,8 @@ struct Logotype: View {
 
 let logoArtwork = maskedArtwork(512)
 let variants: [(file: String, word: Color, tagline: Color)] = [
-    ("logotype.png", Color(red: 0x1B / 255, green: 0x25 / 255, blue: 0x59 / 255), Color(red: 0x4F / 255, green: 0x5A / 255, blue: 0x75 / 255)),
-    ("logotype-dark.png", Color(red: 0xE9 / 255, green: 0xEC / 255, blue: 0xFF / 255), Color(red: 0xA3 / 255, green: 0xAC / 255, blue: 0xC4 / 255)),
+    ("logotype.png", Color(red: 0x25 / 255, green: 0x2D / 255, blue: 0x29 / 255), Color(red: 0x69 / 255, green: 0x74 / 255, blue: 0x6C / 255)),
+    ("logotype-dark.png", Color(red: 0xF4 / 255, green: 0xF2 / 255, blue: 0xE9 / 255), Color(red: 0xB4 / 255, green: 0xBD / 255, blue: 0xB5 / 255)),
 ]
 MainActor.assumeIsolated {
     for variant in variants {

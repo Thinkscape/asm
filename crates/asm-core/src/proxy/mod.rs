@@ -146,6 +146,9 @@ struct Failure {
 struct State {
     cfg: ProxyConfig,
     entries: Vec<ProxyEntry>,
+    /// Desired entries have not yet been successfully published. No restart may use
+    /// the on-disk config until these entries and their values have been rewritten.
+    apply_pending: bool,
     sentinels: files::SentinelStore,
     child: Option<Running>,
     health: health::Health,
@@ -211,6 +214,7 @@ impl ProxySupervisor {
             state: Mutex::new(State {
                 cfg,
                 entries: Vec::new(),
+                apply_pending: false,
                 sentinels: files::SentinelStore::load(&dirs.proxy),
                 child: None,
                 health: health::Health::default(),
@@ -249,15 +253,26 @@ impl ProxySupervisor {
     }
 
     /// Replace the full entry set: write/delete value files, rewrite the config, reload;
-    /// on reload failure restart the child. Also replaces the log-redaction value set.
+    /// on any failure stop the child and retry the desired set with backoff.
     pub fn apply(&self, entries: Vec<ProxyEntry>) -> Result<()> {
-        validate_entries(&entries)?;
-        let r = {
-            let _ops = lock(&self.ops);
-            self.apply_locked(entries)
-        };
+        let result = self.apply_deferred(entries);
+        self.notify_changed();
+        result
+    }
+
+    /// Like [`Self::apply`], without invoking the `on_change` observer. Call
+    /// [`Self::notify_changed`] after releasing the caller's authorization/state locks,
+    /// whether publication succeeds or fails. Lifecycle events retain their existing
+    /// nonblocking [`EventSink`] contract.
+    pub fn apply_deferred(&self, entries: Vec<ProxyEntry>) -> Result<()> {
+        let _ops = lock(&self.ops);
+        self.apply_locked(entries)
+    }
+
+    /// Deliver the observer notification deferred by [`Self::apply_deferred`].
+    /// The caller must release its locks before calling this method.
+    pub fn notify_changed(&self) {
         self.notify();
-        r
     }
 
     fn apply_locked(&self, entries: Vec<ProxyEntry>) -> Result<()> {
@@ -268,21 +283,42 @@ impl ProxySupervisor {
             }
             (st.cfg.clone(), st.child.is_some(), values_of(&st.entries))
         };
-        // Until the old config is gone, lines may still mention ended values.
+        // Until the old child is gone, lines may still mention ended values.
         let new_values = values_of(&entries);
         let union: Vec<String> = old_values.iter().chain(&new_values).cloned().collect();
         self.logs.set_redactor(redact::Redactor::new(&union));
 
-        self.write_files(&entries)?;
-        self.write_config(&cfg, &entries)?;
-        lock(&self.state).entries = entries;
-        let result = if running {
-            self.reload_or_restart()
-        } else {
-            Ok(())
-        };
-        self.prune_values();
-        self.logs.set_redactor(redact::Redactor::new(&new_values));
+        let written = (|| {
+            validate_entries(&entries)?;
+            self.write_files(&entries)?;
+            self.write_config(&cfg, &entries)
+        })();
+        {
+            let mut st = lock(&self.state);
+            // Retain the desired set even when a rewrite failed: recovery must never
+            // restore a removed grant or a superseded credential from the old config.
+            st.entries = entries;
+            st.apply_pending = true;
+        }
+        let result = written.and_then(|()| {
+            self.prune_values();
+            if running {
+                self.reload_or_restart()
+            } else {
+                self.spawn_prepared_locked()
+            }
+        });
+        match &result {
+            Ok(()) => {
+                lock(&self.state).apply_pending = false;
+                self.logs.set_redactor(redact::Redactor::new(&new_values));
+            }
+            Err(e) => {
+                self.kill_locked();
+                self.schedule_retry(e.message.clone());
+                self.prune_values();
+            }
+        }
         result
     }
 
@@ -313,8 +349,7 @@ impl ProxySupervisor {
                     format!("proxy reload failed ({e}); restarting"),
                 );
                 self.kill_locked();
-                self.spawn_locked()
-                    .inspect_err(|e| self.schedule_retry(e.message.clone()))
+                self.spawn_prepared_locked()
             }
         }
     }
@@ -544,7 +579,34 @@ impl ProxySupervisor {
         Ok(())
     }
 
+    /// Retry an unpublished desired set before starting. Every restart path goes
+    /// through this guard; only an apply that just wrote the files may bypass it.
     fn spawn_locked(&self) -> Result<()> {
+        let pending = {
+            let st = lock(&self.state);
+            if st.shutdown {
+                return Err(CoreError::internal("proxy supervisor is shut down"));
+            }
+            st.apply_pending
+                .then(|| (st.cfg.clone(), st.entries.clone()))
+        };
+        if let Some((cfg, entries)) = &pending {
+            validate_entries(entries)?;
+            self.write_files(entries)?;
+            self.write_config(cfg, entries)?;
+            self.prune_values();
+        }
+        self.spawn_prepared_locked()?;
+        if let Some((_, entries)) = pending {
+            lock(&self.state).apply_pending = false;
+            self.logs
+                .set_redactor(redact::Redactor::new(&values_of(&entries)));
+        }
+        Ok(())
+    }
+
+    /// Start only after the current desired config and values have been written.
+    fn spawn_prepared_locked(&self) -> Result<()> {
         let (shutdown, mgmt_port, metrics_port) = {
             let st = lock(&self.state);
             (st.shutdown, st.cfg.mgmt_port, st.cfg.metrics_port)

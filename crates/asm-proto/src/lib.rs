@@ -1,8 +1,10 @@
 //! Wire types and shared rules for Agents Secrets Manager, used by both the
 //! manager (`asm-core`) and the agent CLI (`asm-cli`). Pure Rust, portable.
 
+pub mod bindings;
 pub mod crypto;
 pub mod error;
+pub mod generators;
 pub mod names;
 pub mod pairing;
 pub mod rules;
