@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -21,6 +22,14 @@ struct VaultsPane: View {
     @State private var sheet: VaultSheet?
     @State private var removing: VaultItem?
     @State private var error: String?
+    @State private var nameColumnWidth: CGFloat?
+
+    private static let secretsColumnWidth: CGFloat = {
+        let header = NSTableHeaderCell(textCell: "Secrets")
+        let font = header.font ?? NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        let width = (header.stringValue as NSString).size(withAttributes: [.font: font]).width
+        return ceil(width) + 4
+    }()
 
     private var hasKeychain: Bool { model.vaults.contains { $0.kind == .keychain } }
 
@@ -31,25 +40,36 @@ struct VaultsPane: View {
             } else {
                 Table(model.vaults, selection: $selection) {
                     TableColumn("Name") { vault in Text(verbatim: vault.name) }
-                    TableColumn("Kind") { vault in Text(vault.kind.title) }
+                        .width(nameColumnWidth ?? 150)
+                    TableColumn("Kind") { vault in
+                        Text(vault.kind.title)
+                            .lineLimit(1)
+                            .help(Text(verbatim: vault.kind.title))
+                    }
+                    .width(80)
                     TableColumn("Status") { vault in
                         HStack {
-                            VaultStatusCell(state: vault.state)
-                                .fixedSize(horizontal: true, vertical: false)
+                            VaultStatusCell(state: vault.state, note: vault.note)
+                                .fixedSize(horizontal: vault.state == .locked, vertical: false)
                             if vault.canUnlock {
                                 Button("Unlock…") { model.unlockingVaultID = vault.id }
                                     .controlSize(.small)
+                                    .fixedSize(horizontal: true, vertical: false)
                             }
                         }
                     }
+                    .width(140)
                     TableColumn("Secrets") { vault in
                         Text(verbatim: vault.secretCount.map(String.init) ?? "–").monospacedDigit()
                     }
-                    .width(60)
-                    TableColumn("Note") { vault in
-                        Text(verbatim: vault.note ?? "")
+                    .width(Self.secretsColumnWidth)
+                    TableColumn("Details") { vault in
+                        let details = vault.tableDetails
+                        Text(verbatim: details)
                             .foregroundStyle(.secondary)
-                            .help(Text(verbatim: vault.note ?? ""))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .help(Text(verbatim: details))
                     }
                 }
                 .contextMenu(forSelectionType: String.self) { ids in
@@ -67,6 +87,11 @@ struct VaultsPane: View {
                     if let id = ids.first, let vault = model.vaults.first(where: { $0.id == id }) { edit(vault) }
                 }
             }
+        }
+        .onChange(of: model.vaults, initial: true) { previousVaults, vaults in
+            guard nameColumnWidth == nil ||
+                !previousVaults.elementsEqual(vaults, by: { $0.name == $1.name }) else { return }
+            updateNameColumnWidth(vaults)
         }
         .toolbar {
             ToolbarItemGroup {
@@ -112,6 +137,18 @@ struct VaultsPane: View {
         .errorAlert($error)
     }
 
+    private func updateNameColumnWidth(_ vaults: [VaultItem]) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.preferredFont(forTextStyle: .body),
+        ]
+        var width: CGFloat = 150
+        for vault in vaults {
+            let textWidth = (vault.name as NSString).size(withAttributes: attributes).width
+            width = max(width, ceil(textWidth) + 16)
+        }
+        nameColumnWidth = width
+    }
+
     private var selectedVault: VaultItem? {
         model.vaults.first { $0.id == selection }
     }
@@ -132,6 +169,14 @@ struct VaultsPane: View {
 extension VaultItem {
     /// A Bitwarden vault waiting for its master password, which is never stored.
     var canUnlock: Bool { kind == .bitwarden && state == .locked }
+
+    fileprivate var tableDetails: String {
+        switch config {
+        case let .bitwarden(config): config.serverURL
+        case let .envFile(path): path
+        case .keychain: note ?? ""
+        }
+    }
 }
 
 /// Asks for a Bitwarden master password and unlocks the vault in the running manager.
@@ -196,13 +241,19 @@ struct UnlockVaultSheet: View {
 
 private struct VaultStatusCell: View {
     let state: VaultState
+    let note: String?
 
     var body: some View {
         HStack(spacing: 4) {
             Image(systemName: icon).foregroundStyle(color)
             Text(verbatim: state.title).lineLimit(1).truncationMode(.tail)
         }
-        .help(Text(verbatim: state.title))
+        .help(Text(verbatim: tooltip))
+    }
+
+    private var tooltip: String {
+        guard let note, !note.isEmpty else { return state.title }
+        return "\(state.title)\n\(note)"
     }
 
     private var icon: String {
