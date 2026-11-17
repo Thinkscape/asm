@@ -506,15 +506,37 @@ pub struct ProxySettings {
     pub allow_plain_http: bool,
 }
 
+/// Proxy health as the UI shows it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ProxyState {
+    Running,
+    /// Just spawned and not healthy yet, or restarting after a failure for under 5 s.
+    Starting,
+    /// Not running for at least 5 s (crash loop, start failure, stopped); `reason` is the
+    /// most relevant cause, e.g. `port 7416 is in use by python3 (pid 123)`.
+    Down {
+        reason: String,
+        since: SystemTime,
+    },
+    /// Running, but `/healthz` has failed for more than 10 s.
+    Unhealthy {
+        since: SystemTime,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ProxyStatus {
     pub running: bool,
     pub pid: Option<u32>,
     pub healthy: bool,
+    pub state: ProxyState,
+    /// Failed exits/starts since the proxy was last healthy.
+    pub consecutive_failures: u32,
     pub last_reload: Option<SystemTime>,
     pub ca_path: String,
     pub ca_expiry: Option<SystemTime>,
     pub ca_pem: Option<String>,
+    /// Cause of the last failure; cleared once the proxy is healthy.
     pub error: Option<String>,
     /// Sentinel fields currently substituted.
     pub active_entries: u32,
@@ -568,8 +590,9 @@ pub struct ActivityEntry {
     pub category: String,
     /// Per category, e.g. requests: `requested`, `approved`, `reused`, `denied`, `failed`,
     /// `expired`, `cancelled`; leases: `created`, `revoked`, `expired`, `suspended`,
-    /// `resumed`; proxy: `substitution`, `rejected`, `started`, `restarted`, `crashed`,
-    /// `start_failed`, `reload_failed`; pairing: `requested`, `approved`, `denied`,
+    /// `resumed`; proxy: `substitution`, `rejected`, `started`, `restarted`, `crashed`
+    /// (once per distinct cause per outage), `start_failed`, `reload_failed`, `down`,
+    /// `unhealthy`, `recovered` (with the downtime), `orphan_killed`; pairing: `requested`, `approved`, `denied`,
     /// `expired`, `paired_with_code`, `repaired`, `repaired_with_code`, `replaced`,
     /// `renamed`, `revoked`; vaults: `added`, `edited`,
     /// `removed`, `unlocked`, `unlock_failed`, `unavailable`, `available`.

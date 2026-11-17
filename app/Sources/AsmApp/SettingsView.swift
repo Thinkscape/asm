@@ -36,7 +36,18 @@ struct SettingsView: View {
     var body: some View {
         NavigationSplitView {
             List(SettingsPane.allCases, selection: $selection) { pane in
-                Label(pane.title, systemImage: pane.symbol).tag(pane)
+                HStack {
+                    Label(pane.title, systemImage: pane.symbol)
+                    if pane == .proxy && model.proxyStatus.needsAttention {
+                        Spacer(minLength: 4)
+                        Image(systemName: "exclamationmark.circle.fill")
+                            .symbolRenderingMode(.palette)
+                            .foregroundStyle(.white, .red)
+                            .help("Proxy not running")
+                            .accessibilityLabel("Proxy not running")
+                    }
+                }
+                .tag(pane)
             }
             .safeAreaInset(edge: .bottom, spacing: 0) { SidebarLogotype() }
             .navigationSplitViewColumnWidth(min: 200, ideal: 200, max: 200)
@@ -64,6 +75,11 @@ struct SettingsView: View {
         }
         .onChange(of: model.leaseFocus, initial: true) { _, focus in
             if focus != nil { selection = .leases }
+        }
+        .onChange(of: model.settingsPaneRequest, initial: true) { _, pane in
+            guard let pane else { return }
+            selection = pane
+            model.settingsPaneRequest = nil
         }
         .sheet(item: Binding(
             get: { model.unlockingVault },

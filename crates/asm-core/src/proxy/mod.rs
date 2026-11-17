@@ -8,8 +8,10 @@ pub mod audit;
 mod ca;
 mod config;
 mod files;
+pub mod health;
 mod http;
 mod logs;
+mod procs;
 mod redact;
 #[cfg(test)]
 mod tests;
@@ -17,10 +19,11 @@ mod tests;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::{Duration, Instant};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime};
 
 use asm_proto::crypto::{new_token, sha256_hex};
 use asm_proto::rules::is_sentinel;
@@ -31,6 +34,7 @@ use crate::paths::DataDirs;
 
 pub use audit::ProxyEvent;
 pub use config::DEFAULT_DENY_CIDRS;
+pub use health::Phase;
 pub use redact::REDACTED;
 
 /// Receives activity events from the proxy's threads; must not block.
@@ -95,10 +99,14 @@ pub struct ProxyStatus {
     pub running: bool,
     pub pid: Option<u32>,
     pub healthy: bool,
+    pub phase: Phase,
+    /// Failed exits/starts since the proxy was last healthy.
+    pub consecutive_failures: u32,
     /// RFC 3339 time the current config was last applied (reload or start).
     pub last_reload: Option<String>,
     pub ca_path: String,
     pub ca_expiry: Option<String>,
+    /// Cause of the last failure; cleared once the proxy is healthy.
     pub error: Option<String>,
 }
 
@@ -110,6 +118,8 @@ const SETTLE_WINDOW: Duration = Duration::from_secs(3);
 const TERM_GRACE: Duration = Duration::from_secs(3);
 const RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long an exited child's log thread may take to drain stderr.
+const LOG_DRAIN: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(250);
 const HEALTH_EVERY_TICKS: u32 = 8;
 const PID_FILE: &str = "iron-proxy.pid";
@@ -121,6 +131,16 @@ struct Running {
     api_key: String,
     mgmt_port: u16,
     metrics_port: u16,
+    log_thread: Option<JoinHandle<()>>,
+    /// Cause from the child's last ERROR log line ([`health::error_cause`]).
+    last_error: Arc<Mutex<Option<String>>>,
+}
+
+/// Why a child exited, for status and activity.
+struct Failure {
+    message: String,
+    /// The port it needed is held by an iron-proxy of this data directory.
+    own_holder: Option<libc::pid_t>,
 }
 
 struct State {
@@ -128,7 +148,11 @@ struct State {
     entries: Vec<ProxyEntry>,
     sentinels: files::SentinelStore,
     child: Option<Running>,
-    healthy: bool,
+    health: health::Health,
+    /// Phase at the last monitor step (a change notifies the observer).
+    last_phase: Phase,
+    /// An own iron-proxy holding a port was killed during this outage (done at most once).
+    killed_port_holder: bool,
     last_reload: Option<String>,
     error: Option<String>,
     backoff: Duration,
@@ -175,7 +199,6 @@ impl ProxySupervisor {
             .and_then(|der| ca::not_after(&der));
         // Dummy value file of the ended-sentinel entries of earlier versions.
         let _ = std::fs::remove_file(dirs.proxy.join("blocked.value"));
-        kill_stale_child(&dirs.proxy, &binary);
 
         let sup = Arc::new(Self {
             logs: Arc::new(logs::LogSink::new(dirs.logs.join("proxy.log"))),
@@ -190,7 +213,9 @@ impl ProxySupervisor {
                 entries: Vec::new(),
                 sentinels: files::SentinelStore::load(&dirs.proxy),
                 child: None,
-                healthy: false,
+                health: health::Health::default(),
+                last_phase: Phase::Starting,
+                killed_port_holder: false,
                 last_reload: None,
                 error: None,
                 backoff: BACKOFF_MIN,
@@ -202,6 +227,7 @@ impl ProxySupervisor {
         });
         {
             let _ops = lock(&sup.ops);
+            sup.kill_orphans();
             sup.logs
                 .set_redactor(redact::Redactor::new(&values_of(&entries)));
             sup.write_files(&entries)?;
@@ -356,10 +382,10 @@ impl ProxySupervisor {
                 let mut st = lock(&self.state);
                 let r = st.child.as_mut()?;
                 if let Ok(Some(status)) = r.child.try_wait() {
-                    st.child = None;
-                    st.healthy = false;
+                    let r = st.child.take().expect("child checked above");
+                    st.health.stopped();
                     drop(st);
-                    return Some(self.exit_message(status));
+                    return Some(self.diagnose(r, status).message);
                 }
             }
             if Instant::now() >= deadline {
@@ -375,10 +401,20 @@ impl ProxySupervisor {
 
     pub fn status(&self) -> ProxyStatus {
         let st = lock(&self.state);
+        let running = st.child.is_some();
         ProxyStatus {
-            running: st.child.is_some(),
+            running,
             pid: st.child.as_ref().map(|r| r.pid),
-            healthy: st.child.is_some() && st.healthy,
+            healthy: st.health.healthy(running),
+            phase: if st.shutdown {
+                Phase::Down {
+                    reason: "the proxy is stopped".into(),
+                    since: SystemTime::now(),
+                }
+            } else {
+                st.health.phase(running, Instant::now())
+            },
+            consecutive_failures: st.health.failures(),
             last_reload: st.last_reload.clone(),
             ca_path: self.ca.cert.to_string_lossy().into_owned(),
             ca_expiry: self.ca_expiry.clone(),
@@ -522,6 +558,8 @@ impl ProxySupervisor {
             .arg(config::config_path(&self.dirs))
             .env_clear()
             .env("IRON_MANAGEMENT_API_KEY", &api_key)
+            // The patched iron-proxy exits when this process does (no orphans holding ports).
+            .env("IRON_PARENT_PID", std::process::id().to_string())
             .env("PATH", "/usr/bin:/bin")
             .current_dir(&self.dirs.proxy)
             .process_group(0)
@@ -535,30 +573,47 @@ impl ProxySupervisor {
             Ok(c) => c,
             Err(e) => {
                 let msg = format!("cannot start {}: {e}", self.binary.display());
-                if lock(&self.state).error.as_deref() != Some(msg.as_str()) {
+                if lock(&self.state).health.should_log_failure(&msg) {
                     self.event("start_failed", format!("proxy failed to start: {msg}"));
                 }
                 return Err(CoreError::internal(msg));
             }
         };
         let pid = child.id();
-        if let Some(stderr) = child.stderr.take() {
+        let last_error = Arc::new(Mutex::new(None));
+        let log_thread = child.stderr.take().and_then(|stderr| {
             let sink = Arc::clone(&self.logs);
             let on_event = Arc::clone(&self.on_event);
-            let _ = std::thread::Builder::new()
+            let last_error = Arc::clone(&last_error);
+            std::thread::Builder::new()
                 .name("asm-proxy-log".into())
                 .spawn(move || {
                     let mut r = BufReader::new(stderr);
                     let mut buf = Vec::with_capacity(1024);
                     while matches!(r.read_until(b'\n', &mut buf), Ok(n) if n > 0) {
-                        let audit = sink.push_inspect(&String::from_utf8_lossy(&buf), audit::parse);
+                        let (audit, error, stop) =
+                            sink.push_inspect(&String::from_utf8_lossy(&buf), |l| {
+                                (
+                                    audit::parse(l),
+                                    health::error_cause(l),
+                                    health::stop_cause(l),
+                                )
+                            });
                         if let Some(a) = audit {
                             on_event(ProxyEvent::Request(a));
                         }
+                        let mut last = lock(&last_error);
+                        if error.is_some() {
+                            *last = error;
+                        } else if stop.is_some() && last.is_none() {
+                            *last = stop;
+                        }
+                        drop(last);
                         buf.clear();
                     }
-                });
-        }
+                })
+                .ok()
+        });
         let _ = std::fs::write(self.dirs.proxy.join(PID_FILE), pid.to_string());
         self.logs
             .push(&format!("asm: started iron-proxy pid {pid}"));
@@ -570,9 +625,10 @@ impl ProxySupervisor {
             api_key,
             mgmt_port,
             metrics_port,
+            log_thread,
+            last_error,
         });
-        st.healthy = false;
-        st.error = None;
+        st.health.spawned(Instant::now(), SystemTime::now());
         st.restart_at = None;
         st.last_reload = Some(now_rfc3339());
         st.spawns += 1;
@@ -581,8 +637,12 @@ impl ProxySupervisor {
         } else {
             "restarted"
         };
+        // Restarts within a reported outage are summed up by the `recovered` row.
+        let quiet = st.health.reported_down();
         drop(st);
-        self.event(kind, format!("proxy {kind} (pid {pid})"));
+        if !quiet {
+            self.event(kind, format!("proxy {kind} (pid {pid})"));
+        }
         Ok(())
     }
 
@@ -590,7 +650,7 @@ impl ProxySupervisor {
     fn kill_locked(&self) {
         let running = {
             let mut st = lock(&self.state);
-            st.healthy = false;
+            st.health.stopped();
             st.child.take()
         };
         let Some(mut r) = running else { return };
@@ -619,14 +679,83 @@ impl ProxySupervisor {
         let delay = st.backoff;
         st.backoff = (delay * 2).min(BACKOFF_MAX);
         st.restart_at = Some(Instant::now() + delay);
+        st.health
+            .failed(error.clone(), Instant::now(), SystemTime::now());
         st.error = Some(error);
     }
 
-    fn exit_message(&self, status: std::process::ExitStatus) -> String {
-        match self.logs.last() {
-            Some(line) => format!("iron-proxy exited ({status}); last log line: {line}"),
-            None => format!("iron-proxy exited ({status})"),
+    /// The cause of an exited child's failure: its last ERROR log line (a port conflict
+    /// names the process holding the port), else the exit status and last log line.
+    fn diagnose(&self, r: Running, status: ExitStatus) -> Failure {
+        // Stderr reaches EOF once the child is gone; let the log thread finish its lines.
+        if let Some(t) = &r.log_thread {
+            let deadline = Instant::now() + LOG_DRAIN;
+            while !t.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
+        let cause = lock(&r.last_error).take();
+        let Some(cause) = cause else {
+            let message = match self.logs.last() {
+                Some(line) => format!("iron-proxy exited ({status}); last log line: {line}"),
+                None => format!("iron-proxy exited ({status})"),
+            };
+            return Failure {
+                message,
+                own_holder: None,
+            };
+        };
+        let Some(port) = health::port_in_use(&cause) else {
+            return Failure {
+                message: cause,
+                own_holder: None,
+            };
+        };
+        let holder = procs::port_holder(port);
+        let config = config::config_path(&self.dirs);
+        let own_holder = holder
+            .as_ref()
+            .filter(|h| procs::is_own_proxy(h.pid, &self.binary, &config))
+            .map(|h| h.pid);
+        Failure {
+            message: health::port_conflict_message(
+                port,
+                holder.as_ref().map(|h| (h.name.as_str(), h.pid)),
+            ),
+            own_holder,
+        }
+    }
+
+    /// Kill iron-proxy processes of this data directory left by an earlier manager that
+    /// died without shutting down: every `iron-proxy` started with our `--config`, and the
+    /// pid in the pid file when it still runs our binary.
+    fn kill_orphans(&self) {
+        let config = config::config_path(&self.dirs);
+        let pid_path = self.dirs.proxy.join(PID_FILE);
+        let mut pids = procs::find_proxies_for_config(&config, None);
+        if let Some(pid) = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<libc::pid_t>().ok())
+            && pid > 1
+            && !pids.contains(&pid)
+            && procs::is_own_proxy(pid, &self.binary, &config)
+        {
+            pids.push(pid);
+        }
+        let _ = std::fs::remove_file(&pid_path);
+        for pid in pids {
+            self.kill_orphan(pid, "left running by an earlier manager");
+        }
+    }
+
+    fn kill_orphan(&self, pid: libc::pid_t, why: &str) {
+        let msg = if procs::terminate(pid, TERM_GRACE) {
+            format!("killed orphaned iron-proxy pid {pid} ({why})")
+        } else {
+            format!("could not kill orphaned iron-proxy pid {pid} ({why})")
+        };
+        self.logs.push(&format!("asm: {msg}"));
+        self.event("orphan_killed", msg);
     }
 
     /// One monitor step. Returns false once shut down.
@@ -638,23 +767,38 @@ impl ProxySupervisor {
                 if st.shutdown {
                     return false;
                 }
-                match st.child.as_mut().map(|r| (r.child.try_wait(), r.started)) {
-                    Some((Ok(Some(status)), started)) => {
-                        st.child = None;
-                        st.healthy = false;
-                        if started.elapsed() >= STABLE_UPTIME {
+                match st.child.as_mut().map(|r| r.child.try_wait()) {
+                    Some(Ok(Some(status))) => {
+                        let r = st.child.take().expect("child checked above");
+                        if r.started.elapsed() >= STABLE_UPTIME {
                             st.backoff = BACKOFF_MIN;
                         }
-                        Some(status)
+                        Some((r, status))
                     }
                     _ => None,
                 }
             };
-            if let Some(status) = exited {
+            if let Some((r, status)) = exited {
                 let _ = std::fs::remove_file(self.dirs.proxy.join(PID_FILE));
-                let msg = self.exit_message(status);
-                self.event("crashed", format!("proxy exited unexpectedly: {msg}"));
-                self.schedule_retry(msg);
+                let failure = self.diagnose(r, status);
+                if lock(&self.state)
+                    .health
+                    .should_log_failure(&failure.message)
+                {
+                    self.event(
+                        "crashed",
+                        format!("proxy exited unexpectedly: {}", failure.message),
+                    );
+                }
+                self.schedule_retry(failure.message);
+                if let Some(pid) = failure.own_holder {
+                    let first = !std::mem::replace(&mut lock(&self.state).killed_port_holder, true);
+                    if first {
+                        // Our own leftover blocks the port: remove it and retry at once.
+                        self.kill_orphan(pid, "it held a port the proxy needs");
+                        lock(&self.state).restart_at = Some(Instant::now());
+                    }
+                }
                 changed = true;
             }
             let due = {
@@ -672,21 +816,70 @@ impl ProxySupervisor {
             let st = lock(&self.state);
             st.child
                 .as_ref()
-                .filter(|_| check_health || !st.healthy)
+                .filter(|_| check_health || !st.health.healthy(true))
                 .map(|r| r.metrics_port)
         };
-        {
-            if let Some(port) = port {
-                let ok = http::request(port, "GET", "/healthz", None, HEALTH_TIMEOUT)
-                    .is_ok_and(|r| r.status == 200);
+        if let Some(port) = port {
+            let ok = http::request(port, "GET", "/healthz", None, HEALTH_TIMEOUT)
+                .is_ok_and(|r| r.status == 200);
+            let recovered = {
                 let mut st = lock(&self.state);
-                if st.child.is_some() && st.healthy != ok {
-                    st.healthy = ok;
-                    changed = true;
+                if st.child.is_some() {
+                    let was = st.health.healthy(true);
+                    let t = st.health.checked(ok, Instant::now(), SystemTime::now());
+                    if ok {
+                        st.error = None;
+                        st.killed_port_holder = false;
+                    }
+                    changed |= was != st.health.healthy(true);
+                    t
+                } else {
+                    None
                 }
+            };
+            if let Some(health::Transition::Recovered { downtime, failures }) = recovered {
+                // The incident is over: the next failure starts a fresh backoff.
+                lock(&self.state).backoff = BACKOFF_MIN;
+                let starts = match failures {
+                    0 => String::new(),
+                    1 => " (1 failed start)".into(),
+                    n => format!(" ({n} failed starts)"),
+                };
+                self.logs.push("asm: proxy recovered");
+                self.event(
+                    "recovered",
+                    format!(
+                        "proxy recovered after {} down{starts}",
+                        health::fmt_downtime(downtime)
+                    ),
+                );
             }
         }
-        if changed {
+        let (phase_changed, transition) = {
+            let mut st = lock(&self.state);
+            let running = st.child.is_some();
+            let now = Instant::now();
+            let transition = st.health.transitions(running, now);
+            let phase = st.health.phase(running, now);
+            let phase_changed = phase != st.last_phase;
+            st.last_phase = phase;
+            (phase_changed, transition)
+        };
+        match transition {
+            Some(health::Transition::Down { reason }) => {
+                self.logs.push(&format!("asm: proxy is down: {reason}"));
+                self.event("down", format!("proxy is down: {reason}"));
+            }
+            Some(health::Transition::Unhealthy) => self.event(
+                "unhealthy",
+                format!(
+                    "proxy is running but has failed health checks for over {} s",
+                    health::UNHEALTHY_AFTER.as_secs()
+                ),
+            ),
+            _ => {}
+        }
+        if changed || phase_changed {
             self.notify();
         }
         true
@@ -745,44 +938,4 @@ fn validate_entries(entries: &[ProxyEntry]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// A previous manager that died without shutdown leaves its iron-proxy running (own
-/// process group) with a config that may hold ended leases: kill it when the recorded
-/// pid still runs our binary.
-fn kill_stale_child(proxy_dir: &Path, binary: &Path) {
-    let pid_path = proxy_dir.join(PID_FILE);
-    let Some(pid) = std::fs::read_to_string(&pid_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<libc::pid_t>().ok())
-    else {
-        return;
-    };
-    let _ = std::fs::remove_file(&pid_path);
-    let binary = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
-    if pid <= 1 || process_path(pid).as_deref() != Some(binary.as_path()) {
-        return;
-    }
-    // SAFETY: plain syscalls on a pid verified to run our binary.
-    unsafe { libc::killpg(pid, libc::SIGTERM) };
-    let deadline = Instant::now() + TERM_GRACE;
-    while process_path(pid).is_some() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    if process_path(pid).is_some() {
-        // SAFETY: as above.
-        unsafe { libc::killpg(pid, libc::SIGKILL) };
-    }
-}
-
-fn process_path(pid: libc::pid_t) -> Option<PathBuf> {
-    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    // SAFETY: buffer is valid for `len` bytes.
-    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
-    if n <= 0 {
-        return None;
-    }
-    buf.truncate(n as usize);
-    let p = PathBuf::from(String::from_utf8(buf).ok()?);
-    Some(std::fs::canonicalize(&p).unwrap_or(p))
 }

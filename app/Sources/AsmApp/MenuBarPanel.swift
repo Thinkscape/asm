@@ -2,51 +2,88 @@ import AppKit
 import SwiftUI
 
 struct MenuBarLabel: View {
-    let pendingCount: Int
+    let model: AppModel
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        if pendingCount > 0 {
-            Text("\(Image(nsImage: MenuBarGlyph.image)) \(pendingCount)")
-        } else {
-            Image(nsImage: MenuBarGlyph.image)
+        let alert = model.proxyStatus.needsAttention
+        let glyph = alert ? MenuBarGlyph.alertImage : MenuBarGlyph.image
+        let pendingCount = model.pending.count
+        Group {
+            if pendingCount > 0 {
+                Text("\(Image(nsImage: glyph)) \(pendingCount)")
+            } else {
+                Image(nsImage: glyph)
+            }
         }
+        .accessibilityLabel(alert ? Text("Proxy not running") : Text("Agents Secrets Manager"))
+        // The label lives as long as the app: lend its `openWindow` to the model (used by
+        // notification clicks, which have no view).
+        .onAppear { model.openWindow = { openWindow(id: $0) } }
     }
 }
 
-/// The app icon's padlock robot as a vector template image for the menu bar: rounded
-/// shackle, rounded body with a pill-shaped visor cut out, two oval eyes in the visor.
+/// The app icon's padlock robot as a vector image for the menu bar: rounded shackle,
+/// rounded body with a pill-shaped visor cut out, two oval eyes in the visor.
 enum MenuBarGlyph {
+    /// Template image (macOS tints it for the menu bar).
     @MainActor static let image: NSImage = {
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
             guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-            ctx.setFillColor(.black)
-            ctx.setStrokeColor(.black)
-
-            let shackle = CGMutablePath()
-            shackle.move(to: CGPoint(x: 5, y: 8.5))
-            shackle.addLine(to: CGPoint(x: 5, y: 6))
-            shackle.addArc(center: CGPoint(x: 9, y: 6), radius: 4, startAngle: .pi, endAngle: 2 * .pi, clockwise: false)
-            shackle.addLine(to: CGPoint(x: 13, y: 8.5))
-            ctx.addPath(shackle)
-            ctx.setLineWidth(2)
-            ctx.strokePath()
-
-            // Even-odd fill: body, minus the visor, plus the eyes inside it.
-            let body = CGMutablePath()
-            body.addPath(RoundedRectangle(cornerRadius: 3.2, style: .continuous)
-                .path(in: CGRect(x: 2, y: 7.2, width: 14, height: 9.8)).cgPath)
-            body.addPath(Capsule().path(in: CGRect(x: 4.2, y: 9.4, width: 9.6, height: 4.4)).cgPath)
-            for x in [7.0, 11.0] {
-                body.addPath(Capsule().path(in: CGRect(x: x - 0.75, y: 10.3, width: 1.5, height: 2.6)).cgPath)
-            }
-            ctx.addPath(body)
-            ctx.fillPath(using: .evenOdd)
+            drawRobot(ctx, color: .black)
             return true
         }
         image.isTemplate = true
         image.accessibilityDescription = "Agents Secrets Manager"
         return image
     }()
+
+    /// The glyph with a red dot badge (top right) while the proxy is down. A template
+    /// image cannot carry colour, so this one draws the robot itself in the menu bar's
+    /// text colour for the appearance it is drawn in.
+    @MainActor static let alertImage: NSImage = {
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            let dark = NSAppearance.currentDrawing().bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            drawRobot(ctx, color: dark ? CGColor(gray: 1, alpha: 1) : CGColor(gray: 0, alpha: 0.85))
+            let badge = CGRect(x: 11.5, y: 0, width: 6.5, height: 6.5)
+            // Clear a ring around the dot so it reads against the shackle.
+            ctx.setBlendMode(.clear)
+            ctx.fillEllipse(in: badge.insetBy(dx: -1.2, dy: -1.2))
+            ctx.setBlendMode(.normal)
+            ctx.setFillColor(NSColor.systemRed.cgColor)
+            ctx.fillEllipse(in: badge)
+            return true
+        }
+        image.isTemplate = false
+        image.accessibilityDescription = "Proxy not running"
+        return image
+    }()
+
+    private static func drawRobot(_ ctx: CGContext, color: CGColor) {
+        ctx.setFillColor(color)
+        ctx.setStrokeColor(color)
+
+        let shackle = CGMutablePath()
+        shackle.move(to: CGPoint(x: 5, y: 8.5))
+        shackle.addLine(to: CGPoint(x: 5, y: 6))
+        shackle.addArc(center: CGPoint(x: 9, y: 6), radius: 4, startAngle: .pi, endAngle: 2 * .pi, clockwise: false)
+        shackle.addLine(to: CGPoint(x: 13, y: 8.5))
+        ctx.addPath(shackle)
+        ctx.setLineWidth(2)
+        ctx.strokePath()
+
+        // Even-odd fill: body, minus the visor, plus the eyes inside it.
+        let body = CGMutablePath()
+        body.addPath(RoundedRectangle(cornerRadius: 3.2, style: .continuous)
+            .path(in: CGRect(x: 2, y: 7.2, width: 14, height: 9.8)).cgPath)
+        body.addPath(Capsule().path(in: CGRect(x: 4.2, y: 9.4, width: 9.6, height: 4.4)).cgPath)
+        for x in [7.0, 11.0] {
+            body.addPath(Capsule().path(in: CGRect(x: x - 0.75, y: 10.3, width: 1.5, height: 2.6)).cgPath)
+        }
+        ctx.addPath(body)
+        ctx.fillPath(using: .evenOdd)
+    }
 }
 
 /// The 360 pt window shown from the menu bar item. Every button that opens another
@@ -67,6 +104,15 @@ struct MenuBarPanel: View {
                 }
                 .font(.callout)
             }
+            if let title = model.proxyStatus.problemTitle {
+                ProxyProblemBanner(
+                    title: title,
+                    reason: model.proxyStatus.problemReason ?? "",
+                    restart: { await model.restartProxy() },
+                    dismissPanel: { dismiss() },
+                    showDetails: { model.settingsPaneRequest = .proxy }
+                )
+            }
             let locked = model.lockedVaults
             if !locked.isEmpty {
                 LockedVaultsSection(locked: locked, unlock: { model.unlockingVaultID = $0 }, dismissPanel: { dismiss() })
@@ -83,6 +129,74 @@ struct MenuBarPanel: View {
         }
         .padding(12)
         .frame(width: 360)
+    }
+}
+
+/// Red banner while the proxy is down or not responding: headline, the cause on one
+/// line (full text in the tooltip), Restart and Details… (Settings → Proxy).
+private struct ProxyProblemBanner: View {
+    let title: String
+    let reason: String
+    let restart: () async -> String?
+    let dismissPanel: () -> Void
+    let showDetails: () -> Void
+    @Environment(\.openWindow) private var openWindow
+    @State private var restarting = false
+    @State private var restartError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label {
+                Text(title).font(.callout.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+            }
+            Text(verbatim: restartError ?? reason)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .help(restartError ?? reason)
+                .opacity(0.9)
+            HStack(spacing: 8) {
+                Spacer()
+                if restarting { ProgressView().controlSize(.small).tint(.white) }
+                BannerButton(title: "Restart") {
+                    restarting = true
+                    Task {
+                        restartError = await restart()
+                        restarting = false
+                    }
+                }
+                .disabled(restarting)
+                BannerButton(title: "Details…") {
+                    dismissPanel()
+                    showDetails()
+                    ActivationPolicyController.shared.openRegularWindow { openWindow(id: "settings") }
+                }
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.red.gradient, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .accessibilityElement(children: .contain)
+    }
+}
+
+private struct BannerButton: View {
+    let title: LocalizedStringKey
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.callout.weight(.medium))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background(.white.opacity(0.22), in: Capsule())
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
     }
 }
 

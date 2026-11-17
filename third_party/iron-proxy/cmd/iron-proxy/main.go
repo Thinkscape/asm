@@ -81,6 +81,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// asm patch: shut down when the supervising process exits.
+	parentPID, err := parentFromEnv(os.Getenv)
+	if err != nil {
+		logger.Error("parent watch", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
 	// CLI flag takes precedence over environment variable.
 	proxyToken := *tokenFlag
 	if proxyToken == "" {
@@ -330,21 +337,34 @@ func main() {
 		logger.Info("transform pipeline", slog.String("transforms", pipeline.Names()))
 	}
 
-	// Wait for shutdown signal or fatal error from any background goroutine.
+	// Wait for shutdown signal, the parent's exit (asm patch) or fatal error
+	// from any background goroutine.
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 
+	var parentGone <-chan struct{}
+	if parentPID != 0 {
+		parentGone = watchParent(parentPID)
+	}
+
+	exitCode := 0
+	shutdownTimeout := 10 * time.Second
 	select {
 	case sig := <-sigc:
 		logger.Info("received signal, shutting down", slog.String("signal", sig.String()))
+	case <-parentGone:
+		// Nobody supervises this process any more: free the ports promptly.
+		logger.Info("parent process exited, shutting down", slog.Int("parent_pid", parentPID))
+		shutdownTimeout = time.Second
 	case err := <-errc:
 		logger.Error("fatal error", slog.String("error", err.Error()))
+		exitCode = 1
 	}
 
 	// Cancel context to stop the poller, then shut down services.
 	cancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutdownCancel()
 
 	if otelShutdown != nil {
@@ -381,6 +401,10 @@ func main() {
 	}
 
 	logger.Info("iron-proxy stopped")
+	if exitCode != 0 {
+		// Report the fatal error to a supervisor through the exit status (asm patch).
+		os.Exit(exitCode)
+	}
 }
 
 // initManaged registers with the control plane, performs an initial sync, builds

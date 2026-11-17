@@ -213,12 +213,12 @@ final class CoreBridge: @unchecked Sendable {
         manager.shutdown()
     }
 
-    /// Rethrows core errors as `AppError` carrying the core's message.
+    /// Rethrows core errors as `AppError` carrying the core's message and code.
     private static func mapped<T>(_ work: () throws -> T) throws -> T {
         do {
             return try work()
-        } catch let ManagerError.Failed(_, message) {
-            throw AppError(message: message)
+        } catch let ManagerError.Failed(code, message) {
+            throw AppError(message: message, code: code)
         }
     }
 }
@@ -467,8 +467,15 @@ private extension ProxySettings {
 
 private extension ProxyStatusItem {
     init(_ s: ProxyStatus) {
+        let health: ProxyHealth = switch s.state {
+        case .running: .running
+        case .starting: .starting
+        case let .down(reason, since): .down(reason: reason, since: since)
+        case let .unhealthy(since): .unhealthy(since: since)
+        }
         self.init(
             running: s.running, pid: s.pid.map(Int.init), lastReload: s.lastReload, healthy: s.healthy,
+            health: health, consecutiveFailures: Int(s.consecutiveFailures),
             caExpiry: s.caExpiry, caPath: s.caPath, caPEM: s.caPem ?? "", error: s.error,
             activeEntries: Int(s.activeEntries), suspendedLeases: Int(s.suspendedLeases)
         )

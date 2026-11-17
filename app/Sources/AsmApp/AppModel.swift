@@ -4,6 +4,8 @@ import Observation
 
 struct AppError: LocalizedError {
     var message: String
+    /// Core error code (`invalid`, `exists`, …) when the error came from the core.
+    var code: String?
     var errorDescription: String? { message }
 }
 
@@ -31,6 +33,11 @@ final class AppModel {
     private(set) var activityRevision = 0
     /// Set by the Activity Log's "Show lease"; the Settings window shows the lease.
     var leaseFocus: LeaseFocus?
+    /// Set to show a pane in the Settings window (consumed by `SettingsView`).
+    var settingsPaneRequest: SettingsPane?
+    /// Opens a window scene by id; registered by the always-present menu bar label (SwiftUI
+    /// hands `openWindow` to views only).
+    @ObservationIgnored var openWindow: ((String) -> Void)?
 
     /// Request shown in the approval panel; `nil` when nothing is pending.
     private(set) var shownRequestID: String?
@@ -53,6 +60,7 @@ final class AppModel {
     @ObservationIgnored private var bridge: CoreBridge?
     @ObservationIgnored private lazy var panel = ApprovalPanelController(model: self)
     @ObservationIgnored private var wakeObserver: NSObjectProtocol?
+    @ObservationIgnored private let proxyAlerts = ProxyAlerts()
 
     // MARK: Lifecycle
 
@@ -72,10 +80,19 @@ final class AppModel {
             self.bridge = bridge
             started = true
             startError = nil
+        } catch let error as AppError where error.code == "exists" {
+            // Another copy owns the data directory (and the proxy ports).
+            Self.quitAsSecondInstance(error.message)
+            return
         } catch {
             startError = error.localizedDescription
             return
         }
+        proxyAlerts.onRestart = { [weak self] in
+            Task { _ = await self?.restartProxy() }
+        }
+        proxyAlerts.onShowDetails = { [weak self] in self?.showProxyDetails() }
+        proxyAlerts.install()
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
@@ -148,6 +165,7 @@ final class AppModel {
     func refreshProxy() async {
         guard let status = try? await call({ try $0.proxyStatus() }) else { return }
         proxyStatus = status
+        proxyAlerts.update(status)
         if let log = try? await call({ try $0.proxyLogTail(200) }) {
             proxyLog = log
         }
@@ -310,6 +328,34 @@ final class AppModel {
         let error = await perform { try $0.restartProxy() }
         await refreshProxy()
         return error
+    }
+
+    /// Opens Settings → Proxy (notification click, banner "Details…").
+    func showProxyDetails() {
+        settingsPaneRequest = .proxy
+        guard let openWindow else {
+            ProxyAlerts.openMenuBarPanel()
+            return
+        }
+        ActivationPolicyController.shared.openRegularWindow { openWindow("settings") }
+    }
+
+    /// This copy found another one running with the same data directory: say so, bring
+    /// the other one forward and quit (the running copy keeps the manager and proxy).
+    private static func quitAsSecondInstance(_ message: String) {
+        let me = ProcessInfo.processInfo.processIdentifier
+        let other = NSRunningApplication
+            .runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "net.thinkscape.asm")
+            .first { $0.processIdentifier != me }
+        NSApp.activate()
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Agents Secrets Manager is already running"
+        alert.informativeText = "\(message.prefix(1).uppercased())\(message.dropFirst()). This copy will quit; the running one stays in the menu bar."
+        alert.addButton(withTitle: "Quit")
+        alert.runModal()
+        other?.activate()
+        NSApp.terminate(nil)
     }
 
     func saveGeneralSettings(_ settings: GeneralSettingsItem) async -> String? {

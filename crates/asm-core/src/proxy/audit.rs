@@ -9,7 +9,8 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyEvent {
     Request(AuditLine),
-    /// `kind`: `started`, `restarted`, `crashed`, `start_failed`, `reload_failed`.
+    /// `kind`: `started`, `restarted`, `crashed`, `start_failed`, `reload_failed`, `down`,
+    /// `unhealthy`, `recovered`, `orphan_killed`.
     Lifecycle {
         kind: &'static str,
         summary: String,

@@ -3,7 +3,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -353,4 +353,161 @@ fn end_to_end_with_patched_iron_proxy() {
     assert!(!pid_alive(pid), "iron-proxy pid {pid} still running");
     assert_eq!(file_count(&dirs.values), 0);
     assert!(sup.apply(vec![]).is_err());
+}
+
+fn skip_without_binary(test: &str) -> Option<PathBuf> {
+    let bin = bin_dir();
+    if bin.join("iron-proxy").exists() {
+        Some(bin)
+    } else {
+        eprintln!(
+            "SKIPPED {test}: {} not found",
+            bin.join("iron-proxy").display()
+        );
+        None
+    }
+}
+
+fn loopback_config() -> ProxyConfig {
+    ProxyConfig {
+        bind: "127.0.0.1".into(),
+        port: free_port(),
+        http_port: free_port(),
+        https_port: free_port(),
+        mgmt_port: free_port(),
+        metrics_port: free_port(),
+        ..ProxyConfig::default()
+    }
+}
+
+fn lifecycle(events: &Mutex<Vec<ProxyEvent>>, kind: &str) -> Vec<String> {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            ProxyEvent::Lifecycle { kind: k, summary } if *k == kind => Some(summary.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn port_conflict_is_reported_as_down_and_recovers() {
+    let Some(bin) = skip_without_binary("port_conflict_is_reported_as_down_and_recovers") else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = DataDirs::create(&tmp.path().join("data"), Some(tmp.path())).unwrap();
+    let blocker = TcpListener::bind("127.0.0.1:0").unwrap();
+    let cfg = ProxyConfig {
+        metrics_port: blocker.local_addr().unwrap().port(),
+        ..loopback_config()
+    };
+    let (_, cb) = counter();
+    let (events, ev) = events();
+    let sup = ProxySupervisor::start(bin, dirs, cfg.clone(), vec![], cb, ev).unwrap();
+    wait_for("Down", Duration::from_secs(15), || {
+        matches!(sup.status().phase, Phase::Down { .. })
+    });
+    let st = sup.status();
+    let want = format!(
+        "port {} is in use by {} (pid {})",
+        cfg.metrics_port,
+        procs::process_args(std::process::id() as libc::pid_t)
+            .and_then(|a| a.into_iter().next())
+            .map(|a0| Path::new(&a0)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned())
+            .unwrap(),
+        std::process::id()
+    );
+    assert!(
+        matches!(&st.phase, Phase::Down { reason, .. } if *reason == want),
+        "{st:?}"
+    );
+    assert_eq!(st.error.as_deref(), Some(want.as_str()));
+    assert!(st.consecutive_failures >= 1);
+    // The monitor records the transition on its next step.
+    wait_for("down event", Duration::from_secs(2), || {
+        !lifecycle(&events, "down").is_empty()
+    });
+    assert_eq!(
+        lifecycle(&events, "crashed").len(),
+        1,
+        "repeated crashes are collapsed"
+    );
+    assert_eq!(
+        lifecycle(&events, "down"),
+        vec![format!("proxy is down: {want}")]
+    );
+
+    drop(blocker);
+    wait_for("recovery", Duration::from_secs(40), || {
+        matches!(sup.status().phase, Phase::Running)
+    });
+    let st = sup.status();
+    assert!(
+        st.healthy && st.error.is_none() && st.consecutive_failures == 0,
+        "{st:?}"
+    );
+    let recovered = lifecycle(&events, "recovered");
+    assert_eq!(recovered.len(), 1, "{recovered:?}");
+    assert!(
+        recovered[0].starts_with("proxy recovered after "),
+        "{recovered:?}"
+    );
+    sup.shutdown();
+}
+
+#[test]
+fn orphan_with_our_config_is_killed_at_start() {
+    let Some(bin) = skip_without_binary("orphan_with_our_config_is_killed_at_start") else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = DataDirs::create(&tmp.path().join("data"), Some(tmp.path())).unwrap();
+    let cfg = loopback_config();
+    // First supervisor: writes the CA and config, then goes away.
+    let (_, cb) = counter();
+    let (_, ev) = events();
+    let first =
+        ProxySupervisor::start(bin.clone(), dirs.clone(), cfg.clone(), vec![], cb, ev).unwrap();
+    first.shutdown();
+    drop(first);
+
+    // The orphan: a copy of the binary elsewhere (not the pid file's), our config, no
+    // parent watch.
+    let other = tmp.path().join("old-app");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::copy(bin.join("iron-proxy"), other.join("iron-proxy")).unwrap();
+    let mut orphan = Command::new(other.join("iron-proxy"))
+        .arg("--config")
+        .arg(config::config_path(&dirs))
+        .env_clear()
+        .env("IRON_MANAGEMENT_API_KEY", "k")
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let opid = orphan.id();
+    wait_for("orphan listening", Duration::from_secs(10), || {
+        TcpStream::connect(("127.0.0.1", cfg.metrics_port)).is_ok()
+    });
+    let (_, cb) = counter();
+    let (events, ev) = events();
+    let sup = ProxySupervisor::start(bin, dirs, cfg, vec![], cb, ev).unwrap();
+    assert!(orphan.try_wait().unwrap().is_some() || orphan.wait().is_ok());
+    let killed = lifecycle(&events, "orphan_killed");
+    assert_eq!(
+        killed,
+        vec![format!(
+            "killed orphaned iron-proxy pid {opid} (left running by an earlier manager)"
+        )]
+    );
+    wait_for("healthy proxy", Duration::from_secs(15), || {
+        sup.status().healthy
+    });
+    sup.shutdown();
 }

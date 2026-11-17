@@ -44,6 +44,11 @@ const EXPIRY_MARGIN: Duration = Duration::from_millis(20);
 const BW_SYNC_EVERY: Duration = Duration::from_secs(300);
 /// Resolved requests are kept in the database this long.
 const HISTORY_SECS: i64 = 30 * 86_400;
+/// Held (exclusive `flock`) by the running manager of a data directory.
+const LOCK_FILE: &str = "manager.lock";
+/// Error message when another manager holds [`LOCK_FILE`] (code `exists`).
+pub const ALREADY_RUNNING: &str =
+    "another Agents Secrets Manager is already running with this data directory";
 
 /// Options for `Manager::start_with` (not exported over FFI).
 #[derive(Debug, Clone, Default)]
@@ -119,6 +124,47 @@ pub struct Core {
     /// Collection id → name from Bitwarden "Connect" calls (a new vault has no id yet when
     /// it connects; its save picks the names up from here).
     pub(crate) connect_names: Mutex<HashMap<String, String>>,
+    /// Exclusive lock on `<data>/manager.lock`; released by `shutdown`.
+    instance_lock: Mutex<Option<std::fs::File>>,
+}
+
+/// One manager per data directory: take an exclusive lock on its lock file, or fail with
+/// [`ALREADY_RUNNING`] (code `exists`) while another process holds it.
+fn lock_data_dir(data: &std::path::Path) -> Result<std::fs::File> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(data.join(LOCK_FILE))?;
+    match f.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(CoreError::exists(ALREADY_RUNNING)),
+        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+    }
+    // The holder's pid, for people looking at the file.
+    f.set_len(0)?;
+    writeln!(f, "{}", std::process::id())?;
+    Ok(f)
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn second_lock_on_a_data_dir_is_refused_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_data_dir(dir.path()).unwrap();
+        let e = lock_data_dir(dir.path()).unwrap_err();
+        assert_eq!(e.code, asm_proto::error::ErrorCode::Exists);
+        assert_eq!(e.message, ALREADY_RUNNING);
+        drop(first);
+        lock_data_dir(dir.path()).unwrap();
+    }
 }
 
 /// `(field, value)` pairs read from a vault.
@@ -185,6 +231,7 @@ impl Core {
     ) -> Result<Arc<Self>> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dirs = DataDirs::create(&data_dir, options.values_root.as_deref())?;
+        let instance_lock = lock_data_dir(&dirs.data)?;
         let store = Arc::new(Store::open(&dirs.db())?);
         let activity = activity::ActivityLog::start(store.clone(), observer.clone());
         Settings::seed(&store, &options.settings)?;
@@ -285,6 +332,7 @@ impl Core {
             activity,
             vault_ready: Mutex::new(HashMap::new()),
             connect_names: Mutex::new(HashMap::new()),
+            instance_lock: Mutex::new(Some(instance_lock)),
             lease_wake: Arc::new(Notify::new()),
         });
         {
@@ -615,6 +663,8 @@ impl Core {
             rt.shutdown_background();
         }
         self.activity.stop();
+        // Another manager may use the data directory from now on.
+        lock(&self.instance_lock).take();
     }
 }
 

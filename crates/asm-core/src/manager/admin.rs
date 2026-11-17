@@ -18,7 +18,7 @@ use super::{
 };
 use crate::error::{CoreError, Result};
 use crate::ffi;
-use crate::proxy::ProxyConfig;
+use crate::proxy::{Phase, ProxyConfig};
 use crate::store::{PairingCodeRecord, Store, VaultRecord};
 use crate::vault::registry::{Registry, VaultEntry};
 use crate::vault::{BitwardenSecrets, CollectionInfo, VaultConfig, VaultStatus, bitwarden, creds};
@@ -917,6 +917,13 @@ impl Core {
             running: st.running,
             pid: st.pid,
             healthy: st.healthy,
+            state: match st.phase {
+                Phase::Running => ffi::ProxyState::Running,
+                Phase::Starting => ffi::ProxyState::Starting,
+                Phase::Down { reason, since } => ffi::ProxyState::Down { reason, since },
+                Phase::Unhealthy { since } => ffi::ProxyState::Unhealthy { since },
+            },
+            consecutive_failures: st.consecutive_failures,
             last_reload: parse_time(&st.last_reload),
             ca_path: st.ca_path,
             ca_expiry: parse_time(&st.ca_expiry),

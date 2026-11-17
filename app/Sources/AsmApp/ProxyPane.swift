@@ -135,20 +135,35 @@ private struct ProxyStatusSection: View {
         Section("Status") {
             LabeledContent("Proxy") {
                 HStack(spacing: 6) {
-                    Circle().fill(status.running ? Color.green : Color.red).frame(width: 8, height: 8)
-                    Text(status.running ? "Running" : "Stopped")
+                    Circle().fill(stateColor).frame(width: 8, height: 8)
+                    Text(stateTitle)
                     if let pid = status.pid {
                         Text("pid \(pid)").foregroundStyle(.secondary).monospacedDigit()
                     }
                 }
             }
+            switch status.health {
+            case let .down(reason, since):
+                LabeledContent("Reason") {
+                    Text(verbatim: reason).foregroundStyle(.red).textSelection(.enabled)
+                }
+                LabeledContent("Down since") { SinceText(date: since) }
+            case let .unhealthy(since):
+                LabeledContent("Not responding since") { SinceText(date: since) }
+            case .running, .starting:
+                if let error = status.error {
+                    LabeledContent("Last error") {
+                        Text(verbatim: error).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }
+            }
+            if status.consecutiveFailures > 0 {
+                LabeledContent("Failed starts") { Text("\(status.consecutiveFailures)").monospacedDigit() }
+            }
             LabeledContent("Substituted fields") {
                 Text(verbatim: status.suspendedLeases > 0
                     ? "\(status.activeEntries) (\(status.suspendedLeases) leases suspended: vault unavailable)"
                     : "\(status.activeEntries)")
-            }
-            LabeledContent("Health") {
-                Text(status.healthy ? "Healthy" : "Not responding")
             }
             LabeledContent("Last reload") {
                 if let reload = status.lastReload {
@@ -164,11 +179,38 @@ private struct ProxyStatusSection: View {
                     Text("unknown").foregroundStyle(.secondary)
                 }
             }
-            if let error = status.error {
-                Text(verbatim: error).foregroundStyle(.red).textSelection(.enabled)
-            }
             Button("Restart proxy", action: restart)
         }
+    }
+
+    private var stateTitle: LocalizedStringKey {
+        switch status.health {
+        case .running: "Running"
+        case .starting: "Starting…"
+        case .down: "Not running"
+        case .unhealthy: "Not responding"
+        }
+    }
+
+    private var stateColor: Color {
+        switch status.health {
+        case .running: .green
+        case .starting: .orange
+        case .down, .unhealthy: .red
+        }
+    }
+}
+
+/// `Nov 17, 14:02:31 (3 min ago)`.
+private struct SinceText: View {
+    let date: Date
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(date, format: .dateTime.month().day().hour().minute().second())
+            Text("(\(Text(date, style: .relative)) ago)").foregroundStyle(.secondary)
+        }
+        .monospacedDigit()
     }
 }
 

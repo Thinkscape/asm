@@ -139,7 +139,7 @@ struct AsmApp: App {
         MenuBarExtra {
             MenuBarPanel(model: appDelegate.model)
         } label: {
-            MenuBarLabel(pendingCount: appDelegate.model.pending.count)
+            MenuBarLabel(model: appDelegate.model)
         }
         .menuBarExtraStyle(.window)
 

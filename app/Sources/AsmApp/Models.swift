@@ -273,17 +273,65 @@ struct ProxySettingsItem: Equatable, Sendable {
     var allowPlainHTTP: Bool = false
 }
 
+/// Proxy health as the core reports it (`ProxyState`).
+enum ProxyHealth: Equatable, Sendable {
+    case running
+    /// Just started, or restarting after a failure for under 5 s.
+    case starting
+    /// Not running for at least 5 s; `reason` is the most relevant cause.
+    case down(reason: String, since: Date)
+    /// Running, but its health check has failed for more than 10 s.
+    case unhealthy(since: Date)
+}
+
 struct ProxyStatusItem: Equatable, Sendable {
     var running: Bool = false
     var pid: Int?
     var lastReload: Date?
     var healthy: Bool = false
+    var health: ProxyHealth = .starting
+    /// Failed starts since the proxy was last healthy.
+    var consecutiveFailures: Int = 0
     var caExpiry: Date?
     var caPath: String = ""
     var caPEM: String = ""
     var error: String?
     var activeEntries: Int = 0
     var suspendedLeases: Int = 0
+
+    /// Down, or unhealthy for over 10 s: agents cannot use their leases.
+    var needsAttention: Bool {
+        switch health {
+        case .down, .unhealthy: true
+        case .running, .starting: false
+        }
+    }
+
+    /// When the current problem started (Down or Unhealthy).
+    var problemSince: Date? {
+        switch health {
+        case let .down(_, since), let .unhealthy(since): since
+        case .running, .starting: nil
+        }
+    }
+
+    /// One-line headline of the problem; `nil` while fine.
+    var problemTitle: String? {
+        switch health {
+        case .down: "Proxy is not running: agents can't use their leases"
+        case .unhealthy: "Proxy is not responding: agents can't use their leases"
+        case .running, .starting: nil
+        }
+    }
+
+    /// The cause shown under the headline.
+    var problemReason: String? {
+        switch health {
+        case let .down(reason, _): reason
+        case .unhealthy: error ?? "Its health check has failed for more than 10 seconds."
+        case .running, .starting: nil
+        }
+    }
 }
 
 struct GeneralSettingsItem: Equatable, Sendable {
