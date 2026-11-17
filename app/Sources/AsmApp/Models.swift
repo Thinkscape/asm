@@ -447,3 +447,10 @@ struct LeaseFocus: Equatable, Sendable {
     var search: String
     var token = UUID()
 }
+
+/// Set by a click on a Recent entry of the menu bar panel; the Activity Log selects the
+/// row (`rowID` nil: the entry is no longer in the log).
+struct ActivityFocus: Equatable, Sendable {
+    var rowID: Int64?
+    var token = UUID()
+}

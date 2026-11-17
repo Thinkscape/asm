@@ -357,17 +357,32 @@ fn migrate(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(
             "CREATE TABLE activity(
-                 id       INTEGER PRIMARY KEY,
-                 at       TEXT NOT NULL,
-                 category TEXT NOT NULL,
-                 kind     TEXT NOT NULL,
-                 host_id  TEXT,
-                 secret   TEXT,
-                 summary  TEXT NOT NULL,
-                 detail   TEXT
+                 id         INTEGER PRIMARY KEY,
+                 at         TEXT NOT NULL,
+                 category   TEXT NOT NULL,
+                 kind       TEXT NOT NULL,
+                 host_id    TEXT,
+                 secret     TEXT,
+                 summary    TEXT NOT NULL,
+                 detail     TEXT,
+                 request_id TEXT
              );
              CREATE INDEX activity_at ON activity(at);
-             CREATE INDEX activity_host ON activity(host_id, id);",
+             CREATE INDEX activity_host ON activity(host_id, id);
+             CREATE INDEX activity_request ON activity(request_id) WHERE request_id IS NOT NULL;",
+        )?;
+        tx.commit()?;
+    }
+    let has_request_id = conn
+        .prepare("SELECT 1 FROM pragma_table_info('activity') WHERE name = 'request_id'")?
+        .exists([])?;
+    if !has_request_id {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE activity ADD COLUMN request_id TEXT;
+             UPDATE activity SET request_id = json_extract(detail, '$.request_id')
+              WHERE detail IS NOT NULL AND json_valid(detail);
+             CREATE INDEX activity_request ON activity(request_id) WHERE request_id IS NOT NULL;",
         )?;
         tx.commit()?;
     }
@@ -391,6 +406,9 @@ pub struct NewActivity {
     pub summary: String,
     /// JSON text.
     pub detail: Option<String>,
+    /// The request this row belongs to (pairing and secret requests), for
+    /// [`Store::activity_row_for_request`].
+    pub request_id: Option<String>,
 }
 
 /// An activity row as listed; `host_label` is the host's current friendly name ("" when
@@ -976,12 +994,19 @@ impl Store {
         let tx = db.transaction()?;
         {
             let mut st = tx.prepare_cached(
-                "INSERT INTO activity(at, category, kind, host_id, secret, summary, detail)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO activity(at, category, kind, host_id, secret, summary, detail, request_id)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for r in rows {
                 st.execute(params![
-                    r.at, r.category, r.kind, r.host_id, r.secret, r.summary, r.detail
+                    r.at,
+                    r.category,
+                    r.kind,
+                    r.host_id,
+                    r.secret,
+                    r.summary,
+                    r.detail,
+                    r.request_id
                 ])?;
             }
         }
@@ -1030,6 +1055,23 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Id of the row that records how a request ended (`approved`, `reused`, `denied`,
+    /// `failed`, `expired`, `cancelled`); the newest such row when there are several.
+    pub fn activity_row_for_request(&self, request_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT id FROM activity
+                 WHERE request_id = ?1
+                   AND category IN ('requests', 'pairing')
+                   AND kind IN ('approved', 'reused', 'denied', 'failed', 'expired', 'cancelled')
+                 ORDER BY id DESC LIMIT 1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Delete rows older than `cutoff` (RFC 3339 UTC, compared as text) and all but the
@@ -1125,7 +1167,57 @@ mod tests {
             secret: Some("DEMO_TOKEN".into()),
             summary: summary.into(),
             detail: Some("{\"k\":1}".into()),
+            request_id: None,
         }
+    }
+
+    #[test]
+    fn migrates_activity_without_request_id_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        {
+            // The `activity` table as created by builds before the request link.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE activity(
+                     id       INTEGER PRIMARY KEY,
+                     at       TEXT NOT NULL,
+                     category TEXT NOT NULL,
+                     kind     TEXT NOT NULL,
+                     host_id  TEXT,
+                     secret   TEXT,
+                     summary  TEXT NOT NULL,
+                     detail   TEXT
+                 );
+                 INSERT INTO activity VALUES
+                   (1, '2026-11-16T00:00:00Z', 'requests', 'requested', NULL, 'X', 'get X requested', '{\"request_id\":\"r1\"}'),
+                   (2, '2026-11-16T00:00:01Z', 'requests', 'denied', NULL, 'X', 'get X denied', '{\"request_id\":\"r1\"}'),
+                   (3, '2026-11-16T00:00:02Z', 'pairing', 'approved', NULL, NULL, 'pairing of box approved', '{\"request_id\":\"p1\"}'),
+                   (4, '2026-11-16T00:00:03Z', 'proxy', 'started', NULL, NULL, 'proxy started', NULL),
+                   (5, '2026-11-16T00:00:04Z', 'vaults', 'added', NULL, NULL, 'bad detail', 'not json');",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.activity_row_for_request("r1").unwrap(),
+            Some(2),
+            "outcome row, not the request"
+        );
+        assert_eq!(s.activity_row_for_request("p1").unwrap(), Some(3));
+        assert_eq!(s.activity_row_for_request("nope").unwrap(), None);
+        // New rows carry the column.
+        s.insert_activity(&[NewActivity {
+            kind: "approved",
+            request_id: Some("r2".into()),
+            ..activity("2026-11-16T00:00:05Z", "requests", None, "get Y approved")
+        }])
+        .unwrap();
+        assert_eq!(s.activity_row_for_request("r2").unwrap(), Some(6));
+        drop(s);
+        // Opening again is a no-op.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.activity_row_for_request("r1").unwrap(), Some(2));
     }
 
     #[test]

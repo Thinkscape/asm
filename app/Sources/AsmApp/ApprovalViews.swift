@@ -649,18 +649,11 @@ private struct DenySplitButton: View {
             }
             .buttonStyle(SegmentButtonStyle())
             SegmentDivider(style: AnyShapeStyle(.separator))
-            Menu {
-                ForEach(cannedReasons, id: \.self) { reason in
-                    Button("Deny (\(reason))") { deny(reason) }
-                }
-                Button("Deny with custom reason…", action: customReason)
-            } label: {
-                SplitChevron(label: "Deny with a reason")
+            SplitChevron(label: "Deny with a reason") {
+                cannedReasons.map { reason in
+                    SplitMenuItem(title: "Deny (\(reason))") { deny(reason) }
+                } + [SplitMenuItem(title: "Deny with custom reason…", action: customReason)]
             }
-            .menuStyle(.button)
-            .buttonStyle(.plain)
-            .menuIndicator(.hidden)
-            .fixedSize()
         }
         .font(PanelButtonMetrics.font)
         .frame(height: PanelButtonMetrics.height)
@@ -696,20 +689,16 @@ private struct AllowSplitButton: View {
             .keyboardShortcut(isDefault ? .defaultAction : nil)
             .disabled(!enabled)
             SegmentDivider(style: realValue ? AnyShapeStyle(.black.opacity(0.25)) : AnyShapeStyle(.white.opacity(0.45)))
-            Menu {
-                Toggle(isOn: selects(.proxied)) {
-                    Text("Allow through proxy (hidden)")
-                }
-                Toggle(isOn: selects(.realValue)) {
-                    Text("Allow real value…").foregroundStyle(.orange)
-                }
-            } label: {
-                SplitChevron(label: "Approval mode")
+            SplitChevron(label: "Approval mode") {
+                [
+                    SplitMenuItem(title: "Allow through proxy (hidden)", checked: mode == .proxied) {
+                        mode = .proxied
+                    },
+                    SplitMenuItem(title: "Allow real value…", checked: mode == .realValue, tint: .systemOrange) {
+                        mode = .realValue
+                    },
+                ]
             }
-            .menuStyle(.button)
-            .buttonStyle(.plain)
-            .menuIndicator(.hidden)
-            .fixedSize()
             .help("Choose how the agent gets the secret")
         }
         .font(PanelButtonMetrics.font)
@@ -722,11 +711,6 @@ private struct AllowSplitButton: View {
         )
         .clipShape(Capsule())
         .fixedSize()
-    }
-
-    /// Checked when `value` is the current mode; picking it only switches the mode.
-    private func selects(_ value: ValueMode) -> Binding<Bool> {
-        Binding(get: { mode == value }, set: { if $0 { mode = value } })
     }
 }
 
@@ -756,18 +740,100 @@ private struct SegmentDivider: View {
     }
 }
 
-/// The menu segment of a split button: a chevron, labelled for accessibility.
+/// One item of a split button's menu.
+private struct SplitMenuItem {
+    let title: String
+    var checked = false
+    var tint: NSColor? = nil
+    let action: () -> Void
+}
+
+/// The menu segment of a split button: a chevron drawn by SwiftUI under an AppKit hit
+/// area that fills the whole 44 × 40 pt segment. A SwiftUI `Menu` was used before, but on
+/// macOS its clickable control stays the height of the glyph (about 9 pt) whatever frame
+/// it is given.
 private struct SplitChevron: View {
-    let label: LocalizedStringKey
+    let label: String
+    let items: () -> [SplitMenuItem]
 
     var body: some View {
-        Label(label, systemImage: "chevron.down")
-            .labelStyle(.iconOnly)
+        Image(systemName: "chevron.down")
             .font(.system(size: 13, weight: .semibold))
-            .padding(.leading, 12)
-            .padding(.trailing, 16)
-            .frame(maxHeight: .infinity)
-            .contentShape(Rectangle())
+            .frame(width: 44, height: PanelButtonMetrics.height)
+            .accessibilityHidden(true)
+            .overlay(SplitMenuHitArea(label: label, items: items))
+    }
+}
+
+private struct SplitMenuHitArea: NSViewRepresentable {
+    let label: String
+    let items: () -> [SplitMenuItem]
+
+    func makeNSView(context: Context) -> SplitMenuButton {
+        let button = SplitMenuButton()
+        button.isBordered = false
+        button.title = ""
+        button.setButtonType(.momentaryChange)
+        update(button)
+        return button
+    }
+
+    func updateNSView(_ button: SplitMenuButton, context: Context) {
+        update(button)
+    }
+
+    private func update(_ button: SplitMenuButton) {
+        button.items = items
+        button.setAccessibilityLabel(label)
+        button.setAccessibilityRole(.menuButton)
+    }
+}
+
+/// Transparent button that opens its menu below itself on click, Space or AX press.
+private final class SplitMenuButton: NSButton {
+    var items: () -> [SplitMenuItem] = { [] }
+    private var actions: [() -> Void] = []
+
+    // The approval panel is non-activating: the first click must work without making it key.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { showMenu() }
+    override func performClick(_ sender: Any?) { showMenuSoon() }
+    // `NSMenu.popUp` runs a modal loop; answer the AX press first, or VoiceOver and other
+    // assistive tools wait on it and time out.
+    override func accessibilityPerformPress() -> Bool {
+        showMenuSoon()
+        return true
+    }
+    private func showMenuSoon() {
+        DispatchQueue.main.async { [weak self] in self?.showMenu() }
+    }
+    override func draw(_ dirtyRect: NSRect) {}
+
+    private func showMenu() {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        actions = []
+        for (index, spec) in items().enumerated() {
+            let item = NSMenuItem(title: spec.title, action: #selector(pick(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = index
+            item.state = spec.checked ? .on : .off
+            if let tint = spec.tint {
+                item.attributedTitle = NSAttributedString(
+                    string: spec.title,
+                    attributes: [.foregroundColor: tint, .font: NSFont.menuFont(ofSize: 0)]
+                )
+            }
+            menu.addItem(item)
+            actions.append(spec.action)
+        }
+        let below = NSPoint(x: 0, y: isFlipped ? bounds.height + 4 : -4)
+        menu.popUp(positioning: nil, at: below, in: self)
+    }
+
+    @objc private func pick(_ sender: NSMenuItem) {
+        guard actions.indices.contains(sender.tag) else { return }
+        actions[sender.tag]()
     }
 }
 

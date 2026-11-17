@@ -95,6 +95,12 @@ impl Event {
     }
 
     fn into_row(self) -> NewActivity {
+        let request_id = self
+            .detail
+            .as_ref()
+            .and_then(|d| d.get("request_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         NewActivity {
             at: fmt_unix(self.at),
             category: self.category.as_str(),
@@ -103,6 +109,7 @@ impl Event {
             secret: self.secret,
             summary: self.summary,
             detail: self.detail.map(|d| d.to_string()),
+            request_id,
         }
     }
 }
@@ -732,6 +739,18 @@ impl Core {
                 Vec::new()
             }
         }
+    }
+
+    /// `activity_row_for_request` over FFI: the row recording how a resolved request ended;
+    /// written events are flushed first.
+    pub fn activity_row_for_request(&self, request_id: &str) -> Option<i64> {
+        self.activity.flush();
+        self.store
+            .activity_row_for_request(request_id)
+            .unwrap_or_else(|e| {
+                log::error!("activity row for request: {}", e.message);
+                None
+            })
     }
 
     /// Retention (called by the sweep).

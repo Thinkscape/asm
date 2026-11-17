@@ -803,6 +803,12 @@ impl Manager {
         self.core.list_activity(query)
     }
 
+    /// Id of the activity row recording how a resolved request (pairing or secret
+    /// request, e.g. a `Snapshot.recent` entry) ended; `None` once pruned or unknown.
+    pub fn activity_row_for_request(&self, request_id: String) -> Option<i64> {
+        self.core.activity_row_for_request(&request_id)
+    }
+
     pub fn general_settings(&self) -> GeneralSettings {
         self.core.general_settings()
     }

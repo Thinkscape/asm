@@ -93,6 +93,7 @@ enum MenuBarGlyph {
 struct MenuBarPanel: View {
     let model: AppModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -123,7 +124,11 @@ struct MenuBarPanel: View {
                 model.openApproval(for: id)
             }
             Divider()
-            RecentSection(recent: model.recent)
+            RecentSection(recent: model.recent) { id in
+                dismiss()
+                model.focusActivity(forRequest: id)
+                ActivationPolicyController.shared.openRegularWindow { openWindow(id: "activity") }
+            }
             Divider()
             MenuBarFooter(dismissPanel: { dismiss() })
         }
@@ -278,8 +283,10 @@ private struct PendingRow: View {
     }
 }
 
+/// Resolved requests; a click shows the entry's row in the Activity Log.
 private struct RecentSection: View {
     let recent: [RecentItem]
+    let open: (String) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -288,9 +295,52 @@ private struct RecentSection: View {
                 Text("Nothing resolved yet.").foregroundStyle(.secondary).font(.callout)
             } else {
                 ForEach(recent.prefix(10)) { item in
-                    RecentRow(kind: item.kind, host: item.hostLabel, summary: item.summary, outcome: item.outcome, approved: item.approved, resolvedAt: item.resolvedAt)
+                    Button {
+                        open(item.id)
+                    } label: {
+                        RecentRow(kind: item.kind, host: item.hostLabel, summary: item.summary, outcome: item.outcome, approved: item.approved, resolvedAt: item.resolvedAt)
+                    }
+                    .buttonStyle(HoverRowButtonStyle())
+                    .help("Show in Activity Log")
+                    .accessibilityLabel(Text(verbatim: item.summary))
+                    .accessibilityValue(Text(verbatim: item.outcome))
+                    .accessibilityHint(Text("Shows this entry in the Activity Log"))
                 }
             }
+        }
+    }
+}
+
+/// Plain row button with a hover highlight and the pointing-hand cursor.
+private struct HoverRowButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HoverRow(configuration: configuration)
+    }
+
+    private struct HoverRow: View {
+        let configuration: ButtonStyleConfiguration
+        @State private var hovering = false
+
+        var body: some View {
+            configuration.label
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.primary.opacity(configuration.isPressed ? 0.14 : hovering ? 0.08 : 0))
+                )
+                .contentShape(Rectangle())
+                .onHover { inside in
+                    guard inside != hovering else { return }
+                    hovering = inside
+                    if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                }
+                // The panel closes on click, before the pointer leaves the row.
+                .onDisappear {
+                    if hovering {
+                        hovering = false
+                        NSCursor.pop()
+                    }
+                }
         }
     }
 }

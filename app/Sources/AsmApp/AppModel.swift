@@ -33,6 +33,8 @@ final class AppModel {
     private(set) var activityRevision = 0
     /// Set by the Activity Log's "Show lease"; the Settings window shows the lease.
     var leaseFocus: LeaseFocus?
+    /// Set by a click on a Recent entry; the Activity Log window selects that row.
+    var activityFocus: ActivityFocus?
     /// Set to show a pane in the Settings window (consumed by `SettingsView`).
     var settingsPaneRequest: SettingsPane?
     /// Opens a window scene by id; registered by the always-present menu bar label (SwiftUI
@@ -313,6 +315,15 @@ final class AppModel {
     /// Switches the Settings window to Leases, searching for `secret` with `leaseID` selected.
     func showLease(_ leaseID: String, secret: String) {
         leaseFocus = LeaseFocus(leaseID: leaseID, search: secret)
+    }
+
+    /// Asks the Activity Log to select the row of a resolved request (a Recent entry); the
+    /// caller opens the window.
+    func focusActivity(forRequest requestID: String) {
+        Task {
+            let rowID = try? await call { try $0.activityRowForRequest(requestID) }
+            activityFocus = ActivityFocus(rowID: rowID)
+        }
     }
 
     // MARK: Proxy and settings

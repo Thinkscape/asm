@@ -25,6 +25,8 @@ struct ActivityView: View {
     @Environment(\.openWindow) private var openWindow
 
     private static let pageSize: UInt32 = 200
+    /// A Recent entry's row is searched for in at most this many rows.
+    private static let revealCap = 5_000
 
     @State private var tab: ActivityTab = .all
     /// "" = all hosts.
@@ -36,6 +38,12 @@ struct ActivityView: View {
     @State private var loaded = false
     @State private var loadingOlder = false
     @State private var error: String?
+
+    /// Row of a Recent entry to select once loaded (`reveal`).
+    @State private var revealRowID: Int64?
+    /// Row to scroll to after it was selected.
+    @State private var scrollTarget: Int64?
+    @State private var notice: String?
 
     private var query: ActivityQueryItem {
         ActivityQueryItem(
@@ -56,9 +64,31 @@ struct ActivityView: View {
             if rows.isEmpty {
                 EmptyStateLine(text: emptyText)
             } else {
-                table
+                ScrollViewReader { proxy in
+                    table
+                        .onChange(of: scrollTarget, initial: true) { _, id in
+                            guard let id else { return }
+                            scrollTarget = nil
+                            // After the table has taken the rows just loaded.
+                            Task { @MainActor in
+                                proxy.scrollTo(id, anchor: .center)
+                            }
+                        }
+                }
                 Divider()
                 footer
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if let notice {
+                Text(verbatim: notice)
+                    .font(.callout)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(.regularMaterial, in: Capsule())
+                    .shadow(radius: 3, y: 1)
+                    .padding(.bottom, 44)
+                    .transition(.opacity)
             }
         }
         .frame(minWidth: 760, minHeight: 420)
@@ -98,6 +128,11 @@ struct ActivityView: View {
         .task(id: query) { await reload() }
         .onChange(of: model.activityRevision) {
             Task { await fetchNewer() }
+        }
+        .onChange(of: model.activityFocus, initial: true) { _, focus in
+            guard let focus else { return }
+            model.activityFocus = nil
+            reveal(focus.rowID)
         }
     }
 
@@ -201,6 +236,7 @@ struct ActivityView: View {
             self.error = error.localizedDescription
         }
         loaded = true
+        if revealRowID != nil { await continueReveal() }
     }
 
     /// New rows go on top; the selection and the loaded older pages stay.
@@ -250,6 +286,63 @@ struct ActivityView: View {
     private func showLease(_ leaseID: String, secret: String) {
         model.showLease(leaseID, secret: secret)
         ActivationPolicyController.shared.openRegularWindow { openWindow(id: "settings") }
+    }
+
+    /// Selects a Recent entry's row: at once when it is loaded, else with the filters
+    /// reset to All and the search cleared, loading older pages until it appears.
+    private func reveal(_ rowID: Int64?) {
+        guard let rowID else {
+            showNotice()
+            return
+        }
+        if rows.contains(where: { $0.id == rowID }) {
+            select(rowID)
+            return
+        }
+        revealRowID = rowID
+        let before = query
+        tab = .all
+        hostID = ""
+        search = ""
+        // A changed query reloads and continues from there.
+        if query == before, loaded {
+            Task { await continueReveal() }
+        }
+    }
+
+    private func continueReveal() async {
+        guard let target = revealRowID else { return }
+        if let top = rows.first?.id, target > top {
+            await fetchNewer()
+        }
+        // Ids only grow: once the oldest loaded row is older than the target, it is gone.
+        while !rows.contains(where: { $0.id == target }), hasMore, rows.count < Self.revealCap,
+              let last = rows.last?.id, last > target {
+            await loadOlder()
+            if rows.last?.id == last { break }
+        }
+        guard revealRowID == target else { return }
+        revealRowID = nil
+        if rows.contains(where: { $0.id == target }) {
+            select(target)
+        } else {
+            showNotice()
+        }
+    }
+
+    private func select(_ rowID: Int64) {
+        selection = rowID
+        scrollTarget = rowID
+    }
+
+    private func showNotice() {
+        let text = String(localized: "Entry no longer in the log")
+        withAnimation { notice = text }
+        AccessibilityNotification.Announcement(text).post()
+        Task {
+            try? await Task.sleep(for: .seconds(4))
+            if notice == text { withAnimation { notice = nil } }
+        }
     }
 }
 

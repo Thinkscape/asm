@@ -1,13 +1,14 @@
 //! Pairing the same machine again: re-pairing with a proof of the old pairing keeps the
 //! host record, a machine-hint match may replace it (revoking its leases), pairing codes
-//! never replace by hint, and `asm pair` refuses to pair again while still paired.
+//! never replace by hint, and `asm pair` refuses to pair again while still paired. Also:
+//! resolved requests (Recent in the menu bar) lead to their activity log rows.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use asm_core::ffi::{LeaseMode, RequestDetail, VaultConfig, VaultDraft};
+use asm_core::ffi::{ActivityQuery, LeaseMode, RequestDetail, VaultConfig, VaultDraft};
 use asm_core::manager::now;
 use asm_core::settings as keys;
 use asm_core::{Decision, Manager, ManagerObserver, StartOptions};
@@ -416,6 +417,93 @@ fn revoked_hosts_token_is_no_proof() {
     let (third, _) = pair_code(m, "box", None, Some((&new_id, "wrong-token")));
     assert!(third != new_id);
     assert_eq!(m.list_hosts().len(), 3);
+}
+
+#[test]
+fn resolved_requests_link_to_their_activity_rows() {
+    let Some(s) = setup() else { return };
+    let m = &s.m;
+    // Pairing approved, as a replacement (its extra `replaced` row is not the outcome).
+    let (old_id, _) = pair_code(m, "box", Some(HINT), None);
+    let (paired, poll) = pair_popup(m, "box", Some(HINT), None);
+    let (host_id, _) = approve(m, &paired, &poll, "Box", true);
+    assert_ne!(host_id, old_id);
+    // Pairing denied.
+    let (pair_denied, _) = pair_popup(m, "other", None, None);
+    m.resolve_request(
+        pair_denied.clone(),
+        Decision::Deny {
+            reason: String::new(),
+        },
+    )
+    .unwrap();
+    // Secret requests: approved, served from the lease, denied.
+    let host = m.core().store.get_host(&host_id).unwrap().unwrap();
+    let get = |raw: bool| {
+        m.core()
+            .create_request(
+                &host,
+                "10.0.0.5",
+                RequestBody::Get {
+                    name: "DEMO_TOKEN".into(),
+                    raw,
+                    hosts: vec!["api.example.com".into()],
+                    reason: "recent link test".into(),
+                    agent: "test".into(),
+                },
+            )
+            .unwrap()
+            .request_id
+    };
+    let approved = get(false);
+    m.resolve_request(
+        approved.clone(),
+        Decision::ApproveGet {
+            mode: LeaseMode::Sentinel,
+            duration_secs: Some(3600),
+            hosts: vec!["api.example.com".into()],
+        },
+    )
+    .unwrap();
+    let reused = get(false);
+    let denied = get(true);
+    m.resolve_request(
+        denied.clone(),
+        Decision::Deny {
+            reason: "provide a better reason".into(),
+        },
+    )
+    .unwrap();
+
+    let recent: Vec<String> = m.snapshot().recent.into_iter().map(|r| r.id).collect();
+    let rows = m.list_activity(ActivityQuery {
+        categories: vec![],
+        host_id: None,
+        search: String::new(),
+        before_id: None,
+        limit: 0,
+    });
+    for (id, category, kind) in [
+        (&paired, "pairing", "approved"),
+        (&pair_denied, "pairing", "denied"),
+        (&approved, "requests", "approved"),
+        (&reused, "requests", "reused"),
+        (&denied, "requests", "denied"),
+    ] {
+        assert!(recent.contains(id), "{kind} {id} is a Recent entry");
+        let row_id = m
+            .activity_row_for_request(id.clone())
+            .unwrap_or_else(|| panic!("row for {category} {kind}"));
+        let row = rows
+            .iter()
+            .find(|r| r.id == row_id)
+            .expect("list_activity returns it");
+        assert_eq!((row.category.as_str(), row.kind.as_str()), (category, kind));
+        let detail: serde_json::Value =
+            serde_json::from_str(row.detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["request_id"], json!(id));
+    }
+    assert_eq!(m.activity_row_for_request("unknown".into()), None);
 }
 
 /// Run the real CLI with its own config dir.

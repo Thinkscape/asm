@@ -190,6 +190,11 @@ final class CoreBridge: @unchecked Sendable {
         )).map(ActivityItem.init)
     }
 
+    /// Activity row recording how a resolved request ended; nil when pruned.
+    func activityRowForRequest(_ id: String) throws -> Int64? {
+        manager.activityRowForRequest(requestId: id)
+    }
+
     func generalSettings() throws -> GeneralSettingsItem {
         GeneralSettingsItem(manager.generalSettings())
     }
