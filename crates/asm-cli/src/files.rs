@@ -1,5 +1,5 @@
 //! Private directories, safe atomic file writes, the secrets directory and its
-//! lease manifest (`.leases.json`).
+//! lease manifest (`.leases.json`, changed under an flock on `.leases.lock`).
 
 use crate::error::CliError;
 use asm_proto::crypto::{hex_encode, random_bytes};
@@ -7,12 +7,47 @@ use asm_proto::rules::check_relative_path;
 use asm_proto::wire::{GetResult, LeaseMode};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const MANIFEST: &str = ".leases.json";
+/// Serialises read-modify-write of the manifest between `asm` processes (the
+/// background reaper included).
+const MANIFEST_LOCK: &str = ".leases.lock";
+
+/// Open (creating, 0600, never through a symlink) `dir/name` and take an exclusive
+/// `flock` on it, released when the file is dropped. With `wait == false`,
+/// `Ok(None)` when another open file holds the lock.
+pub fn lock_file(dir: &Path, name: &str, wait: bool) -> std::io::Result<Option<File>> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir.join(name))?;
+    let op = if wait {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
+    loop {
+        // SAFETY: flock on a descriptor owned by `f`.
+        if unsafe { libc::flock(f.as_raw_fd(), op) } == 0 {
+            return Ok(Some(f));
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            ErrorKind::Interrupted => continue,
+            ErrorKind::WouldBlock if !wait => return Ok(None),
+            _ => return Err(e),
+        }
+    }
+}
 
 fn io_err(what: &str, path: &Path, e: std::io::Error) -> CliError {
     CliError::failure(format!("{what} {}: {e}", path.display()))
@@ -134,6 +169,14 @@ impl SecretsDir {
         &self.root
     }
 
+    /// Wait for the manifest lock; hold the returned file while changing the manifest.
+    fn lock_manifest(&self) -> Result<File, CliError> {
+        let path = self.root.join(MANIFEST_LOCK);
+        lock_file(&self.root, MANIFEST_LOCK, true)
+            .map_err(|e| io_err("locking", &path, e))
+            .map(|f| f.expect("a blocking lock is always taken"))
+    }
+
     pub fn load_manifest(&self) -> Result<Manifest, CliError> {
         let path = self.root.join(MANIFEST);
         match fs::read(&path) {
@@ -148,7 +191,7 @@ impl SecretsDir {
         }
     }
 
-    fn save_manifest(&self, m: &Manifest) -> Result<(), CliError> {
+    pub(crate) fn save_manifest(&self, m: &Manifest) -> Result<(), CliError> {
         let json = serde_json::to_vec_pretty(m).expect("manifest serializes");
         write_file_atomic(&self.root, MANIFEST, &json).map(|_| ())
     }
@@ -170,6 +213,7 @@ impl SecretsDir {
     }
 
     fn retain(&self, keep: impl Fn(&str, &ManifestEntry) -> bool) -> Result<(), CliError> {
+        let _lock = self.lock_manifest()?;
         let mut m = self.load_manifest()?;
         let gone: Vec<String> = m
             .iter()
@@ -227,6 +271,7 @@ impl SecretsDir {
                 CliError::failure(format!("manager sent an unsafe path: {}", e.message))
             })?;
         }
+        let _lock = self.lock_manifest()?;
         let mut m = self.load_manifest()?;
         let taken: HashSet<&str> = m
             .iter()

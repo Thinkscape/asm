@@ -44,19 +44,25 @@ impl Session {
         }
     }
 
-    /// `GET /leases`; delete the files of leases no longer reported active.
+    /// `GET /leases`; delete the files of leases no longer reported active, then make
+    /// sure a background reaper removes the remaining ones when they end.
     pub fn sync_leases(&self) -> Result<LeasesResponse, CliError> {
-        let leases: LeasesResponse = self.api.get("/leases")?;
+        let result = self.api.get("/leases").and_then(|leases: LeasesResponse| {
+            if let Ok(dir) = &self.secrets {
+                let active: HashSet<String> = leases
+                    .leases
+                    .iter()
+                    .filter(|l| l.status == LeaseStatus::Active)
+                    .map(|l| l.lease_id.clone())
+                    .collect();
+                dir.reconcile(&active)?;
+            }
+            Ok(leases)
+        });
         if let Ok(dir) = &self.secrets {
-            let active: HashSet<String> = leases
-                .leases
-                .iter()
-                .filter(|l| l.status == LeaseStatus::Active)
-                .map(|l| l.lease_id.clone())
-                .collect();
-            dir.reconcile(&active)?;
+            crate::reaper::ensure_running(dir);
         }
-        Ok(leases)
+        result
     }
 }
 
@@ -301,6 +307,7 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
         }
     };
     let stored = dir.store(&result)?;
+    crate::reaper::ensure_running(dir);
     let mut out = std::io::stdout().lock();
     if a.json {
         let j = JsonGet {

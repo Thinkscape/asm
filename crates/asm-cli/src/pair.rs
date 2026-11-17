@@ -1,20 +1,67 @@
-//! `asm pair <hostname>[:port] [pairing-code]` (plan steps 5 and 8).
+//! `asm pair [--force] <hostname>[:port] [pairing-code]` (plan steps 5 and 8).
 
 use crate::api::{Api, manager_url};
 use crate::error::CliError;
 use crate::state::{self, HostState};
 use crate::tls::Pin;
 use asm_proto::crypto::{hex_decode_array, hex_encode};
+use asm_proto::error::ErrorCode;
 use asm_proto::pairing::{
     NONCE_LEN, UnattendedCode, client_commit, format_pairing_code, fp_prefix, new_nonce,
     pairing_code,
 };
 use asm_proto::wire::{
-    HealthResponse, MANAGER_NAME, MAX_POLL_WAIT_SECS, PairRequest, PairResponse, RevealRequest,
+    HealthResponse, MANAGER_NAME, MAX_POLL_WAIT_SECS, PairProof, PairRequest, PairResponse,
+    RevealRequest,
 };
 use std::io::Write;
 
-pub fn run(target: &str, code: Option<String>) -> Result<(), CliError> {
+/// What an existing `host.json` means for a new pairing.
+#[derive(Debug, PartialEq, Eq)]
+enum Existing {
+    /// Still paired with this manager: print this and stop.
+    AlreadyPaired(String),
+    /// Pair, sending this proof of the earlier pairing (`None`: no pairing with this
+    /// manager's certificate).
+    Pair(Option<PairProof>),
+}
+
+/// `old` is the stored pairing, `cert` the certificate the target presents. A pairing
+/// with another certificate is never disclosed. With the same certificate: when
+/// `token_accepted` and not `force` → already paired; otherwise its host id and token go
+/// along as proof (the manager ignores a stale one).
+fn existing_pairing(
+    old: Option<&HostState>,
+    cert: &[u8; 32],
+    force: bool,
+    token_accepted: impl FnOnce(&HostState) -> Result<bool, CliError>,
+) -> Result<Existing, CliError> {
+    let Some(old) = old.filter(|o| o.pin().ok().as_ref() == Some(cert)) else {
+        return Ok(Existing::Pair(None));
+    };
+    if !force && token_accepted(old)? {
+        return Ok(Existing::AlreadyPaired(format!(
+            "already paired with {} as {}; use --force to pair again",
+            old.manager_url, old.host_id
+        )));
+    }
+    Ok(Existing::Pair(Some(PairProof {
+        host_id: old.host_id.clone(),
+        token: old.token.clone(),
+    })))
+}
+
+/// Whether the manager at `base` (presenting `cert`) still accepts the stored token.
+fn token_accepted(base: &str, cert: &[u8; 32], old: &HostState) -> Result<bool, CliError> {
+    let api = Api::new(base.to_owned(), Pin::Fixed(*cert), Some(old.token.clone()))?;
+    match api.get::<serde_json::Value>("/leases") {
+        Ok(_) => Ok(true),
+        Err(e) if e.code == Some(ErrorCode::Unauthorized) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn run(target: &str, code: Option<String>, force: bool) -> Result<(), CliError> {
     let code = code
         .or_else(|| std::env::var("ASM_PAIRING_CODE").ok())
         .map(|c| c.trim().to_owned())
@@ -36,11 +83,25 @@ pub fn run(target: &str, code: Option<String>) -> Result<(), CliError> {
         .fingerprint()
         .expect("a TLS handshake recorded the certificate");
 
+    // An unreadable host.json is replaced by this pairing.
+    let stored = state::load().unwrap_or(None);
+    let previous = match existing_pairing(stored.as_ref(), &cert, force, |old| {
+        token_accepted(&base, &cert, old)
+    })? {
+        Existing::AlreadyPaired(message) => {
+            println!("{message}");
+            return Ok(());
+        }
+        Existing::Pair(previous) => previous,
+    };
+
     let client_nonce = new_nonce();
     let request = PairRequest {
         client_commit: hex_encode(&client_commit(&client_nonce)),
         host_info: crate::hostinfo::collect(),
         pairing_code: None,
+        previous,
+        machine_hint: crate::hostinfo::machine_hint(),
     };
 
     let approved = match code {
@@ -194,4 +255,64 @@ pub fn query_escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored(cert: &[u8; 32]) -> HostState {
+        HostState {
+            manager_url: "https://mac.local:7411".into(),
+            cert_sha256: hex_encode(cert),
+            host_id: "h-1".into(),
+            token: "tok".into(),
+            paired_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn pairing_while_paired() {
+        let cert = [7u8; 32];
+        let old = stored(&cert);
+        let proof = Existing::Pair(Some(PairProof {
+            host_id: "h-1".into(),
+            token: "tok".into(),
+        }));
+
+        // Still accepted by the same manager: nothing to do.
+        assert_eq!(
+            existing_pairing(Some(&old), &cert, false, |_| Ok(true)).unwrap(),
+            Existing::AlreadyPaired(
+                "already paired with https://mac.local:7411 as h-1; use --force to pair again"
+                    .into()
+            )
+        );
+        // --force or a rejected token: pair, proving the old pairing.
+        let unchecked = |_: &HostState| -> Result<bool, CliError> { panic!("not checked") };
+        assert_eq!(
+            existing_pairing(Some(&old), &cert, true, unchecked).unwrap(),
+            proof
+        );
+        assert_eq!(
+            existing_pairing(Some(&old), &cert, false, |_| Ok(false)).unwrap(),
+            proof
+        );
+        // Another manager certificate never sees the token, and is not asked about it.
+        assert_eq!(
+            existing_pairing(Some(&old), &[8u8; 32], false, unchecked).unwrap(),
+            Existing::Pair(None)
+        );
+        assert_eq!(
+            existing_pairing(None, &cert, false, unchecked).unwrap(),
+            Existing::Pair(None)
+        );
+        // An unreachable manager is an error, not a reason to pair again.
+        assert!(
+            existing_pairing(Some(&old), &cert, false, |_| Err(CliError::unreachable(
+                "down"
+            )))
+            .is_err()
+        );
+    }
 }

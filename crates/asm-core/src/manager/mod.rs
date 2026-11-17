@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asm_proto::wire::LeaseMode;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::error::{CoreError, Result};
 use crate::ffi::ManagerObserver;
@@ -39,6 +39,8 @@ pub const TOPIC_SETTINGS: &str = "settings";
 pub const TOPIC_ACTIVITY: &str = "activity";
 
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
+/// Sleep past an expiry instant by this much, so `now()` (whole seconds) has reached it.
+const EXPIRY_MARGIN: Duration = Duration::from_millis(20);
 const BW_SYNC_EVERY: Duration = Duration::from_secs(300);
 /// Resolved requests are kept in the database this long.
 const HISTORY_SECS: i64 = 30 * 86_400;
@@ -106,6 +108,8 @@ pub struct Core {
     api: Mutex<Option<ApiServer>>,
     /// Lease ids active at the last sweep (to notice expiries).
     last_active: Mutex<HashSet<String>>,
+    /// Wakes the sweep loop to recompute its deadline when leases change.
+    lease_wake: Arc<Notify>,
     /// Vaults whose provider could not be built (id → message).
     pub(crate) vault_errors: Mutex<HashMap<String, String>>,
     /// Audit trail writer.
@@ -281,6 +285,7 @@ impl Core {
             activity,
             vault_ready: Mutex::new(HashMap::new()),
             connect_names: Mutex::new(HashMap::new()),
+            lease_wake: Arc::new(Notify::new()),
         });
         {
             let suspended = lock(&core.proxy_state).suspended.clone();
@@ -301,14 +306,42 @@ impl Core {
     }
 
     fn spawn_background(self: &Arc<Self>) {
+        // Sweep at the earliest active lease expiry, and at least every SWEEP_EVERY, so an
+        // ended lease leaves the proxy within about a second of `expires_at`. The deadline
+        // is wall-clock (tokio's monotonic sleep is only a bounded wait; `on_wake` covers
+        // system sleep) and is recomputed whenever leases change.
         let weak = Arc::downgrade(self);
+        let wake = self.lease_wake.clone();
         self.rt_handle.spawn(async move {
-            let mut iv = tokio::time::interval(SWEEP_EVERY);
-            iv.tick().await;
+            let mut next_periodic = tokio::time::Instant::now() + SWEEP_EVERY;
             loop {
-                iv.tick().await;
+                let Some(core) = weak.upgrade() else { return };
+                let notified = wake.notified();
+                tokio::pin!(notified);
+                // Register before reading the leases, so a change in between is not lost.
+                notified.as_mut().enable();
+                let next = {
+                    let core = core.clone();
+                    tokio::task::spawn_blocking(move || core.until_next_expiry())
+                        .await
+                        .ok()
+                        .flatten()
+                };
+                drop(core);
+                let periodic = next_periodic.saturating_duration_since(tokio::time::Instant::now());
+                let delay = next.map_or(periodic, |d| d.min(periodic));
+                let woken = tokio::select! {
+                    _ = tokio::time::sleep(delay) => false,
+                    _ = &mut notified => true,
+                };
+                if woken {
+                    continue;
+                }
                 let Some(core) = weak.upgrade() else { return };
                 let _ = tokio::task::spawn_blocking(move || core.sweep()).await;
+                if tokio::time::Instant::now() >= next_periodic {
+                    next_periodic = tokio::time::Instant::now() + SWEEP_EVERY;
+                }
             }
         });
         let weak = Arc::downgrade(self);
@@ -324,7 +357,29 @@ impl Core {
     }
 
     pub fn notify(&self, topic: &str) {
+        if topic == TOPIC_LEASES {
+            self.lease_wake.notify_one();
+        }
         self.observer.changed(topic.to_string())
+    }
+
+    /// Wall-clock time until the earliest expiry of an active lease (plus a small margin),
+    /// `None` when no active lease expires.
+    fn until_next_expiry(&self) -> Option<Duration> {
+        let t = now();
+        let next = self
+            .store
+            .active_leases(t)
+            .ok()?
+            .iter()
+            .filter_map(|l| l.expires_at)
+            .min()?;
+        Some(
+            to_system_time(next)
+                .duration_since(SystemTime::now())
+                .unwrap_or_default()
+                + EXPIRY_MARGIN,
+        )
     }
 
     /// Wake long polls after a request/pairing change.

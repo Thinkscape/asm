@@ -77,7 +77,9 @@ asm get --hosts api.github.com GITHUB_TOKEN "Open a PR on acme/web for the login
 - `… may still be pending on the manager` (exit 1): the manager stopped answering while
   you waited; run the same command again to pick the request up.
 - HTTP 403 `asm: sentinel not valid for this host or scheme`: the host is not approved for
-  this lease, or the URL is not HTTPS, or the lease has ended.
+  this lease, or the URL is not HTTPS.
+- HTTP 403 `asm: sentinel expired or revoked; run asm get again`, or a secret file that is
+  no longer there: the lease has ended; request it again with `asm get`.
 - `request lost; run the command again`: the manager restarted; repeat the command.
 - Never ask for a secret value in chat.
 
@@ -106,4 +108,9 @@ sentinel leases keep working with the new value.
 - Use hostnames, not IP addresses, for HTTPS.
 - `*.username` files hold the plain username, not a sentinel.
 - Echoed secrets in responses are redacted on a best-effort basis; do not rely on it.
-- Secret files disappear when their leases end.
+- Secret files are deleted when their leases end: a background `asm reap` process removes
+  them at the expiry time, and within about a minute of a revocation. A missing file means
+  the lease ended; run `asm get` again. Leases with `expires: never` end only when the
+  operator revokes them.
+- Where background processes are not allowed, use `asm get --no-reaper` (or set
+  `ASM_NO_REAPER=1`); files of ended leases are then removed by the next `asm` command.

@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS hosts(
     address    TEXT NOT NULL,
     paired_at  INTEGER NOT NULL,
     last_seen  INTEGER,
-    revoked_at INTEGER
+    revoked_at INTEGER,
+    machine_hint TEXT
 );
 CREATE TABLE IF NOT EXISTS host_agents(
     host_id   TEXT NOT NULL,
@@ -108,6 +109,8 @@ pub struct HostRecord {
     pub paired_at: i64,
     pub last_seen: Option<i64>,
     pub revoked_at: Option<i64>,
+    /// Hex hint of the host's machine id as the CLI claimed it (forgeable; display only).
+    pub machine_hint: Option<String>,
 }
 
 impl HostRecord {
@@ -137,8 +140,10 @@ pub struct PairingCodeRecord {
 /// Outcome of presenting a pairing code ([`Store::consume_pairing_code`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodeUse {
-    /// One use counted and the host inserted; the code's label.
+    /// One use counted and the host inserted (or its token rotated); the code's label.
     Paired { label: String },
+    /// The host to rotate no longer holds the proven token (or was revoked); nothing changed.
+    StaleProof,
     /// A valid code presented from outside its networks; nothing changed.
     WrongNetwork {
         label: String,
@@ -339,6 +344,12 @@ fn migrate(conn: &Connection) -> Result<()> {
             "ALTER TABLE pairing_codes ADD COLUMN networks TEXT NOT NULL DEFAULT '[]';",
         )?;
     }
+    let has_hint = conn
+        .prepare("SELECT 1 FROM pragma_table_info('hosts') WHERE name = 'machine_hint'")?
+        .exists([])?;
+    if !has_hint {
+        conn.execute_batch("ALTER TABLE hosts ADD COLUMN machine_hint TEXT;")?;
+    }
     let has_activity = conn
         .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'activity'")?
         .exists([])?;
@@ -410,8 +421,8 @@ pub struct ActivityFilter {
 
 fn insert_host_row(db: &Connection, h: &HostRecord, token_hash: &[u8; 32]) -> Result<()> {
     db.execute(
-        "INSERT INTO hosts(id, token_hash, info, name, address, paired_at, last_seen, revoked_at)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+        "INSERT INTO hosts(id, token_hash, info, name, address, paired_at, last_seen, revoked_at, machine_hint)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
         params![
             h.id,
             &token_hash[..],
@@ -419,13 +430,54 @@ fn insert_host_row(db: &Connection, h: &HostRecord, token_hash: &[u8; 32]) -> Re
             h.name,
             h.address,
             h.paired_at,
-            h.last_seen
+            h.last_seen,
+            h.machine_hint
         ],
     )?;
     Ok(())
 }
 
-/// Raw `hosts` row: id, info JSON, name, address, paired_at, last_seen, revoked_at.
+/// Give the active host `h.id` whose token hashes to `old_hash` the token `new_hash`, and
+/// refresh its info, address, machine hint and last-seen time from `h` (name, pairing time
+/// and leases stay). False when no such host holds that token any more.
+fn rotate_host_row(
+    db: &Connection,
+    h: &HostRecord,
+    old_hash: &[u8; 32],
+    new_hash: &[u8; 32],
+) -> Result<bool> {
+    let stored: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT token_hash FROM hosts WHERE id = ?1 AND revoked_at IS NULL",
+            [&h.id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if !stored.is_some_and(|s| asm_proto::crypto::ct_eq(&s, old_hash)) {
+        return Ok(false);
+    }
+    let n = db.execute(
+        "UPDATE hosts SET token_hash = ?3, info = ?4, address = ?5, last_seen = ?6, machine_hint = ?7
+         WHERE id = ?1 AND token_hash = ?2 AND revoked_at IS NULL",
+        params![
+            h.id,
+            &old_hash[..],
+            &new_hash[..],
+            serde_json::to_string(&h.info)?,
+            h.address,
+            h.last_seen,
+            h.machine_hint
+        ],
+    )?;
+    Ok(n > 0)
+}
+
+/// Columns of a [`HostRow`], in order.
+const HOST_COLUMNS: &str =
+    "id, info, name, address, paired_at, last_seen, revoked_at, machine_hint";
+
+/// Raw `hosts` row: id, info JSON, name, address, paired_at, last_seen, revoked_at,
+/// machine_hint.
 type HostRow = (
     String,
     String,
@@ -434,6 +486,7 @@ type HostRow = (
     i64,
     Option<i64>,
     Option<i64>,
+    Option<String>,
 );
 
 impl Store {
@@ -448,11 +501,12 @@ impl Store {
             r.get(4)?,
             r.get(5)?,
             r.get(6)?,
+            r.get(7)?,
         ))
     }
 
     fn host_build(t: HostRow) -> Result<HostRecord> {
-        let (id, info, name, address, paired_at, last_seen, revoked_at) = t;
+        let (id, info, name, address, paired_at, last_seen, revoked_at, machine_hint) = t;
         Ok(HostRecord {
             id,
             info: serde_json::from_str(&info)?,
@@ -461,6 +515,7 @@ impl Store {
             paired_at,
             last_seen,
             revoked_at,
+            machine_hint,
         })
     }
 
@@ -468,15 +523,63 @@ impl Store {
         insert_host_row(&self.db(), h, token_hash)
     }
 
+    /// The active host `id` if its token hashes to `token_hash` (compared in constant time):
+    /// a proof of an earlier pairing.
+    pub fn host_by_proof(&self, id: &str, token_hash: &[u8; 32]) -> Result<Option<HostRecord>> {
+        let db = self.db();
+        let row = db
+            .query_row(
+                &format!(
+                    "SELECT {HOST_COLUMNS}, token_hash FROM hosts WHERE id = ?1 AND revoked_at IS NULL"
+                ),
+                [id],
+                |r| Ok((Self::host_from_row(r)?, r.get::<_, Vec<u8>>(8)?)),
+            )
+            .optional()?;
+        match row {
+            Some((t, stored)) if asm_proto::crypto::ct_eq(&stored, token_hash) => {
+                Ok(Some(Self::host_build(t)?))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// See [`rotate_host_row`].
+    pub fn rotate_host_token(
+        &self,
+        h: &HostRecord,
+        old_hash: &[u8; 32],
+        new_hash: &[u8; 32],
+    ) -> Result<bool> {
+        rotate_host_row(&self.db(), h, old_hash, new_hash)
+    }
+
+    /// Active hosts claiming `machine_hint`, most recently seen first.
+    pub fn hosts_with_hint(&self, machine_hint: &str) -> Result<Vec<HostRecord>> {
+        let db = self.db();
+        let mut st = db.prepare(&format!(
+            "SELECT {HOST_COLUMNS} FROM hosts WHERE machine_hint = ?1 AND revoked_at IS NULL
+             ORDER BY coalesce(last_seen, paired_at) DESC, paired_at DESC"
+        ))?;
+        let rows = st.query_map([machine_hint], Self::host_from_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(Self::host_build(r?)?);
+        }
+        Ok(out)
+    }
+
     /// The non-revoked host whose token hashes to `token_hash` (compared in constant time).
     pub fn host_by_token(&self, token_hash: &[u8; 32]) -> Result<Option<HostRecord>> {
         let db = self.db();
         let row = db
             .query_row(
-                "SELECT id, info, name, address, paired_at, last_seen, revoked_at, token_hash FROM hosts
-                 WHERE token_hash = ?1 AND revoked_at IS NULL",
+                &format!(
+                    "SELECT {HOST_COLUMNS}, token_hash FROM hosts
+                     WHERE token_hash = ?1 AND revoked_at IS NULL"
+                ),
                 [&token_hash[..]],
-                |r| Ok((Self::host_from_row(r)?, r.get::<_, Vec<u8>>(7)?)),
+                |r| Ok((Self::host_from_row(r)?, r.get::<_, Vec<u8>>(8)?)),
             )
             .optional()?;
         match row {
@@ -491,7 +594,7 @@ impl Store {
         let db = self.db();
         let t = db
             .query_row(
-                "SELECT id, info, name, address, paired_at, last_seen, revoked_at FROM hosts WHERE id = ?1",
+                &format!("SELECT {HOST_COLUMNS} FROM hosts WHERE id = ?1"),
                 [id],
                 Self::host_from_row,
             )
@@ -501,10 +604,9 @@ impl Store {
 
     pub fn list_hosts(&self) -> Result<Vec<HostRecord>> {
         let db = self.db();
-        let mut st = db.prepare(
-            "SELECT id, info, name, address, paired_at, last_seen, revoked_at FROM hosts
-             WHERE revoked_at IS NULL ORDER BY paired_at",
-        )?;
+        let mut st = db.prepare(&format!(
+            "SELECT {HOST_COLUMNS} FROM hosts WHERE revoked_at IS NULL ORDER BY paired_at"
+        ))?;
         let rows = st.query_map([], Self::host_from_row)?;
         let mut out = Vec::new();
         for r in rows {
@@ -607,7 +709,9 @@ impl Store {
     }
 
     /// Atomically check a pairing code (hash, expiry, remaining uses, not revoked, then
-    /// `network_ok` on its allowed networks), count one use, and insert the new host.
+    /// `network_ok` on its allowed networks), count one use, and insert the new host; with
+    /// `rotate_from` (the proven token hash of the existing host `host.id`) rotate that
+    /// host's token instead ([`rotate_host_row`]).
     /// Nothing changes unless the answer is [`CodeUse::Paired`]; in particular a network
     /// mismatch does not use up the code.
     pub fn consume_pairing_code(
@@ -616,6 +720,7 @@ impl Store {
         now: i64,
         host: &HostRecord,
         token_hash: &[u8; 32],
+        rotate_from: Option<&[u8; 32]>,
         network_ok: impl FnOnce(&[String]) -> bool,
     ) -> Result<CodeUse> {
         let mut db = self.db();
@@ -644,7 +749,14 @@ impl Store {
             "UPDATE pairing_codes SET uses = uses + 1 WHERE id = ?1",
             [&id],
         )?;
-        insert_host_row(&tx, host, token_hash)?;
+        match rotate_from {
+            Some(old) => {
+                if !rotate_host_row(&tx, host, old, token_hash)? {
+                    return Ok(CodeUse::StaleProof);
+                }
+            }
+            None => insert_host_row(&tx, host, token_hash)?,
+        }
         tx.commit()?;
         Ok(CodeUse::Paired { label })
     }
@@ -950,6 +1062,7 @@ mod tests {
             paired_at: 100,
             last_seen: None,
             revoked_at: None,
+            machine_hint: None,
         }
     }
 
@@ -1211,18 +1324,18 @@ mod tests {
         };
         s.insert_pairing_code(&code, &hash).unwrap();
         assert_eq!(
-            s.consume_pairing_code(&[8u8; 32], 200, &host("h0"), &[0u8; 32], any)
+            s.consume_pairing_code(&[8u8; 32], 200, &host("h0"), &[0u8; 32], None, any)
                 .unwrap(),
             CodeUse::Rejected
         );
         assert_eq!(
-            s.consume_pairing_code(&hash, 200, &host("h1"), &[1u8; 32], any)
+            s.consume_pairing_code(&hash, 200, &host("h1"), &[1u8; 32], None, any)
                 .unwrap(),
             CodeUse::Paired { label: "ci".into() },
             "answers the code's label"
         );
         assert_eq!(
-            s.consume_pairing_code(&hash, 201, &host("h2"), &[2u8; 32], any)
+            s.consume_pairing_code(&hash, 201, &host("h2"), &[2u8; 32], None, any)
                 .unwrap(),
             CodeUse::Rejected,
             "used up"
@@ -1237,19 +1350,19 @@ mod tests {
         };
         s.insert_pairing_code(&code2, &[9u8; 32]).unwrap();
         assert_eq!(
-            s.consume_pairing_code(&[9u8; 32], 1000, &host("h3"), &[3u8; 32], any)
+            s.consume_pairing_code(&[9u8; 32], 1000, &host("h3"), &[3u8; 32], None, any)
                 .unwrap(),
             CodeUse::Rejected,
             "expired"
         );
         assert!(matches!(
-            s.consume_pairing_code(&[9u8; 32], 999, &host("h4"), &[4u8; 32], any)
+            s.consume_pairing_code(&[9u8; 32], 999, &host("h4"), &[4u8; 32], None, any)
                 .unwrap(),
             CodeUse::Paired { .. }
         ));
         assert!(s.revoke_pairing_code("c2", 999).unwrap());
         assert_eq!(
-            s.consume_pairing_code(&[9u8; 32], 999, &host("h5"), &[5u8; 32], any)
+            s.consume_pairing_code(&[9u8; 32], 999, &host("h5"), &[5u8; 32], None, any)
                 .unwrap(),
             CodeUse::Rejected,
             "revoked"
@@ -1266,7 +1379,7 @@ mod tests {
         let c3 = listed.iter().find(|c| c.id == "c3").unwrap();
         assert_eq!(c3.networks, ["10.0.0.0/8"]);
         assert_eq!(
-            s.consume_pairing_code(&[6u8; 32], 200, &host("h6"), &[6u8; 32], |n| {
+            s.consume_pairing_code(&[6u8; 32], 200, &host("h6"), &[6u8; 32], None, |n| {
                 assert_eq!(n, ["10.0.0.0/8"]);
                 false
             })
@@ -1285,10 +1398,79 @@ mod tests {
             .unwrap();
         assert_eq!(c3.uses, 0);
         assert!(matches!(
-            s.consume_pairing_code(&[6u8; 32], 200, &host("h7"), &[7u8; 32], any)
+            s.consume_pairing_code(&[6u8; 32], 200, &host("h7"), &[7u8; 32], None, any)
                 .unwrap(),
             CodeUse::Paired { .. }
         ));
+
+        // Rotation: the existing host keeps its id and gets the new token.
+        let code4 = PairingCodeRecord {
+            id: "c4".into(),
+            max_uses: None,
+            ..code3
+        };
+        s.insert_pairing_code(&code4, &[4u8; 32]).unwrap();
+        let mut again = host("h7");
+        again.address = "10.0.0.77".into();
+        again.machine_hint = Some("ab".repeat(32));
+        assert!(matches!(
+            s.consume_pairing_code(&[4u8; 32], 300, &again, &[17u8; 32], Some(&[7u8; 32]), any)
+                .unwrap(),
+            CodeUse::Paired { .. }
+        ));
+        assert!(s.host_by_token(&[7u8; 32]).unwrap().is_none());
+        let h7 = s.host_by_token(&[17u8; 32]).unwrap().unwrap();
+        assert_eq!((h7.id.as_str(), h7.address.as_str()), ("h7", "10.0.0.77"));
+        assert_eq!(h7.machine_hint, Some("ab".repeat(32)));
+        // A proof that no longer holds changes nothing (no use counted).
+        assert_eq!(
+            s.consume_pairing_code(&[4u8; 32], 301, &again, &[18u8; 32], Some(&[7u8; 32]), any)
+                .unwrap(),
+            CodeUse::StaleProof
+        );
+        let uses = |id: &str| {
+            s.list_pairing_codes()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap()
+                .uses
+        };
+        assert_eq!(uses("c4"), 1);
+        assert!(s.host_by_token(&[18u8; 32]).unwrap().is_none());
+    }
+
+    #[test]
+    fn proofs_rotation_and_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("asm.db")).unwrap();
+        let hint = "cd".repeat(32);
+        let mut a = host("a");
+        a.machine_hint = Some(hint.clone());
+        a.last_seen = Some(10);
+        let mut b = host("b");
+        b.machine_hint = Some(hint.clone());
+        b.last_seen = Some(20);
+        s.insert_host(&a, &[1u8; 32]).unwrap();
+        s.insert_host(&b, &[2u8; 32]).unwrap();
+        s.insert_host(&host("c"), &[3u8; 32]).unwrap();
+
+        assert_eq!(s.host_by_proof("a", &[1u8; 32]).unwrap().unwrap().id, "a");
+        assert!(s.host_by_proof("a", &[2u8; 32]).unwrap().is_none());
+        assert!(s.host_by_proof("zz", &[1u8; 32]).unwrap().is_none());
+        let ids = |v: Vec<HostRecord>| v.into_iter().map(|h| h.id).collect::<Vec<_>>();
+        assert_eq!(ids(s.hosts_with_hint(&hint).unwrap()), ["b", "a"]);
+
+        a.address = "10.9.9.9".into();
+        assert!(s.rotate_host_token(&a, &[1u8; 32], &[11u8; 32]).unwrap());
+        assert!(!s.rotate_host_token(&a, &[1u8; 32], &[12u8; 32]).unwrap());
+        let a2 = s.host_by_proof("a", &[11u8; 32]).unwrap().unwrap();
+        assert_eq!((a2.address.as_str(), a2.name.as_str()), ("10.9.9.9", "box"));
+
+        assert!(s.revoke_host("b", 30).unwrap());
+        assert!(s.host_by_proof("b", &[2u8; 32]).unwrap().is_none());
+        assert!(!s.rotate_host_token(&b, &[2u8; 32], &[13u8; 32]).unwrap());
+        assert_eq!(ids(s.hosts_with_hint(&hint).unwrap()), ["a"]);
     }
 
     #[test]

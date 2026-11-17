@@ -17,6 +17,7 @@ use serde_json::json;
 
 const REAL_1: &str = "real-value-123";
 const REAL_2: &str = "real-value-456";
+const ENDED_BODY: &str = "asm: sentinel expired or revoked; run asm get again";
 
 fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -42,7 +43,8 @@ fn build_cli() -> PathBuf {
     target.join("debug/asm")
 }
 
-/// Approves everything except `get` requests whose reason contains "deny-me".
+/// Approves everything except `get` requests whose reason contains "deny-me"; a `get`
+/// whose reason contains "short-lease" gets a 3-second lease.
 struct AutoApprover {
     manager: OnceLock<Arc<Manager>>,
     approvals: AtomicUsize,
@@ -61,6 +63,7 @@ impl AutoApprover {
                         p.id.clone(),
                         Decision::ApprovePair {
                             name: "bad\u{202E}name".into(),
+                            replace: false,
                         },
                     ) {
                         Err(asm_core::ManagerError::Failed { code, .. }) => {
@@ -72,6 +75,7 @@ impl AutoApprover {
                     assert!(still.is_some_and(|q| q.error.is_some()));
                     Decision::ApprovePair {
                         name: "  e2e friendly  ".into(),
+                        replace: false,
                     }
                 }
                 RequestDetail::Get { reason, .. } if reason.contains("deny-me") => Decision::Deny {
@@ -81,6 +85,7 @@ impl AutoApprover {
                     raw_requested,
                     requested_hosts,
                     initial_hosts,
+                    reason,
                     ..
                 } => {
                     let hosts = if requested_hosts.is_empty() {
@@ -94,7 +99,11 @@ impl AutoApprover {
                         } else {
                             asm_core::ffi::LeaseMode::Sentinel
                         },
-                        duration_secs: Some(3600),
+                        duration_secs: Some(if reason.contains("short-lease") {
+                            3
+                        } else {
+                            3600
+                        }),
                         hosts,
                     }
                 }
@@ -527,9 +536,61 @@ fn headless_end_to_end() {
         .unwrap();
     m.revoke_lease(lease.lease_id.clone()).unwrap();
     let before = seen.lock().unwrap().len();
-    let (status, _) = via_proxy(proxy_port, &echo_url, &sentinel);
+    let (status, body) = via_proxy(proxy_port, &echo_url, &sentinel);
     assert_eq!(status, 403);
+    assert!(body.contains(ENDED_BODY), "{body}");
     assert_eq!(seen.lock().unwrap().len(), before);
+    // An ended sentinel gets the same answer wherever it is sent.
+    let (status, body) = via_proxy(proxy_port, "http://unapproved.invalid/", &sentinel);
+    assert_eq!(status, 403);
+    assert!(body.contains(ENDED_BODY), "{body}");
+
+    // A short lease ends at the proxy within about a second of its expiry.
+    let o = env.run(
+        &[
+            "get",
+            "--wait",
+            "30",
+            "--hosts",
+            "127.0.0.1",
+            "DEMO_TOKEN",
+            "e2e: short-lease expiry",
+        ],
+        None,
+    );
+    assert_eq!(o.code, 0, "short get: {}{}", o.stdout, o.stderr);
+    let (_, _, paths) = parse_get(&o.stdout);
+    let short = std::fs::read_to_string(&paths[0]).unwrap();
+    assert!(is_sentinel(&short) && short != sentinel);
+    let short_lease = m
+        .list_leases()
+        .into_iter()
+        .find(|l| l.status == asm_core::ffi::LeaseStatus::Active)
+        .unwrap();
+    let expires = short_lease.expires_at.expect("short lease expires");
+    let (status, body) = via_proxy(proxy_port, &echo_url, &short);
+    assert_eq!(status, 200, "short lease before expiry: {body}");
+    let check_at = expires + Duration::from_millis(1200);
+    if let Ok(d) = check_at.duration_since(std::time::SystemTime::now()) {
+        std::thread::sleep(d);
+    }
+    let before = seen.lock().unwrap().len();
+    let (status, body) = via_proxy(proxy_port, &echo_url, &short);
+    let answered = std::time::SystemTime::now();
+    assert_eq!(status, 403, "short lease after expiry: {body}");
+    assert!(body.contains(ENDED_BODY), "{body}");
+    assert!(
+        answered <= expires + Duration::from_secs(2),
+        "answered {:?} after expiry",
+        answered.duration_since(expires)
+    );
+    assert_eq!(seen.lock().unwrap().len(), before, "upstream not called");
+    let ended = m
+        .list_leases()
+        .into_iter()
+        .find(|l| l.lease_id == short_lease.lease_id)
+        .unwrap();
+    assert_eq!(ended.status, asm_core::ffi::LeaseStatus::Expired);
 
     // A new sentinel lease, then a raw lease.
     let o = env.run(
@@ -733,9 +794,16 @@ fn headless_end_to_end() {
         ("proxy", "started"),
         ("proxy", "substitution"),
         ("proxy", "rejected"),
+        ("leases", "expired"),
     ] {
         assert!(has(category, kind), "missing activity {category}/{kind}");
     }
+    assert!(
+        rows.iter().any(|r| r.category == "proxy"
+            && r.kind == "rejected"
+            && r.summary.contains("rejected: lease expired or revoked")),
+        "ended sentinel rejection logged"
+    );
     let sub = rows
         .iter()
         .find(|r| r.category == "proxy" && r.kind == "substitution")

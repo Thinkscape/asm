@@ -585,11 +585,26 @@ impl Core {
         for l in self.store.active_leases(t).unwrap_or_default() {
             *active.entry(l.host_id).or_default() += 1;
         }
-        self.store
-            .list_hosts()
-            .unwrap_or_default()
+        let hosts = self.store.list_hosts().unwrap_or_default();
+        let mut hints: HashMap<&str, u32> = HashMap::new();
+        for h in &hosts {
+            if let Some(hint) = h.machine_hint.as_deref() {
+                *hints.entry(hint).or_default() += 1;
+            }
+        }
+        let hint_matches: Vec<u32> = hosts
+            .iter()
+            .map(|h| {
+                h.machine_hint
+                    .as_deref()
+                    .map_or(0, |hint| hints[hint].saturating_sub(1))
+            })
+            .collect();
+        hosts
             .into_iter()
-            .map(|h| ffi::HostRecord {
+            .zip(hint_matches)
+            .map(|(h, machine_hint_matches)| ffi::HostRecord {
+                machine_hint_matches,
                 agents: self
                     .store
                     .agents_of(&h.id)

@@ -480,6 +480,12 @@ Replace-mode safeguards (asm fork):
   but goes to a host outside the entry's rules (or over plain HTTP without
   `allow_plain_http`), is rejected with 403
   `asm: sentinel not valid for this host or scheme`.
+- An entry with `replace: {proxy_value: …, ended: true}` (no `source` or
+  `rules`) marks the token of an expired or revoked lease. It never
+  substitutes and is not redacted; a request carrying it in a header, the URL
+  path or the query is rejected with 403
+  `asm: sentinel expired or revoked; run asm get again` (audit annotation
+  `reject_reason: sentinel_ended`), whatever the destination.
 - A WebSocket upgrade that would receive a substituted value is rejected with
   403; WebSocket frames are relayed raw and cannot be redacted.
 - A request body larger than `max_request_body_bytes` that a transform had to

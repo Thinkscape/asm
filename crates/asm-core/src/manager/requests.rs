@@ -15,7 +15,7 @@ use asm_proto::wire::{
     RequestStatus, ResultFile, SecretKind, WriteResult,
 };
 
-use super::pairing::{PairAttempt, PairState};
+use super::pairing::{PairAttempt, PairState, Repair};
 use super::{
     Core, TOPIC_LEASES, TOPIC_REQUESTS, TOPIC_VAULTS, activity, lock, now, to_system_time,
 };
@@ -121,6 +121,10 @@ pub(crate) enum Detail {
         info: HostInfo,
         address: String,
         code: String,
+        /// The machine hint the CLI claimed (forgeable).
+        machine_hint: Option<String>,
+        /// The existing host this request relates to, if any.
+        repair: Option<Repair>,
     },
     Get(GetDetail),
     Update(UpdateDetail),
@@ -1008,8 +1012,8 @@ impl Core {
         // Phase 2: do the work without holding the book.
         let outcome: std::result::Result<Option<RequestResult>, Fail> = match (&p.detail, decision)
         {
-            (Detail::Pair { .. }, ffi::Decision::ApprovePair { name }) => {
-                self.approve_pair(&p, &name).map(|_| None)
+            (Detail::Pair { .. }, ffi::Decision::ApprovePair { name, replace }) => {
+                self.approve_pair(&p, &name, replace).map(|_| None)
             }
             (
                 Detail::Get(g),
@@ -1415,10 +1419,18 @@ fn pending_to_ffi(p: Pending, default_duration: Option<u64>) -> ffi::PendingRequ
             info,
             address,
             code,
+            repair,
+            ..
         } => ffi::RequestDetail::Pair {
             host_info: info.into(),
             observed_address: address,
             code,
+            repair: repair.map(|r| ffi::RepairInfo {
+                kind: r.kind().to_string(),
+                host_id: r.host_id,
+                host_name: r.host_name,
+                paired_at: to_system_time(r.paired_at),
+            }),
         },
         Detail::Get(g) => ffi::RequestDetail::Get {
             name: g.secret.display,

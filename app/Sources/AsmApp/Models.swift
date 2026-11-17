@@ -59,10 +59,25 @@ struct AddTargetItem: Identifiable, Equatable, Sendable {
 }
 
 enum RequestDetail: Equatable, Sendable {
-    case pair(info: HostInfoItem, observedAddress: String, code: String)
+    case pair(info: HostInfoItem, observedAddress: String, code: String, repair: RepairItem?)
     case get(GetDetail)
     case update(name: String, vaultID: String, vaultName: String, field: String, oldValue: String, newValue: String)
     case add(name: String, value: String, targets: [AddTargetItem])
+}
+
+/// The pairing machine looks like an already paired host.
+struct RepairItem: Equatable, Sendable {
+    enum Kind: Equatable, Sendable {
+        /// The CLI proved it holds the old host's token: the same record is re-paired.
+        case sameInstall
+        /// Machine-id hint only: the operator may replace the old pairing.
+        case sameMachine
+    }
+
+    var hostID: String
+    var hostName: String
+    var pairedAt: Date
+    var kind: Kind
 }
 
 struct GetDetail: Equatable, Sendable {
@@ -179,6 +194,8 @@ struct HostItem: Identifiable, Equatable, Sendable {
     var pairedAt: Date
     var lastSeen: Date?
     var activeLeases: Int
+    /// Other active hosts that look like the same machine (machine-id hint).
+    var machineHintMatches: Int
 
     var osLine: String { "\(info.os) \(info.osVersion) (\(info.arch))" }
     var addressLine: String {
@@ -285,7 +302,9 @@ struct GeneralSettingsItem: Equatable, Sendable {
 /// The approval popup's choice for one request.
 enum DecisionItem: Sendable {
     case deny(reason: String)
-    case approvePair(name: String)
+    /// `replace`: revoke the matching old pairing (`same_machine`); `same_install` re-pairs
+    /// the same record whatever it says.
+    case approvePair(name: String, replace: Bool)
     case approveGet(raw: Bool, durationSecs: UInt64?, hosts: [String])
     case approveWrite(vaultID: String, collectionID: String?)
 }

@@ -29,7 +29,7 @@ struct HostsPane: View {
                 EmptyStateLine(text: "No paired hosts. Run asm pair on an agent machine.")
             } else {
                 Table(model.hosts, selection: $hostSelection) {
-                    TableColumn("Name") { host in Text(verbatim: host.name) }
+                    TableColumn("Name") { host in HostNameCell(host: host) }
                     TableColumn("Hostname") { host in Text(verbatim: host.info.hostname) }
                     TableColumn("OS") { host in Text(verbatim: host.osLine) }
                     TableColumn("Addresses") { host in Text(verbatim: host.addressLine).help(Text(verbatim: host.addressLine)) }
@@ -118,6 +118,37 @@ struct HostsPane: View {
             Text("Hosts already paired with it stay paired.")
         }
         .errorAlert($error)
+    }
+}
+
+/// The host's name, with a "Duplicate?" badge when another active host looks like the
+/// same machine.
+private struct HostNameCell: View {
+    let host: HostItem
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(verbatim: host.name)
+            if host.machineHintMatches > 0 {
+                Text("Duplicate?")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.orange.opacity(0.15), in: Capsule())
+                    .help(tooltip)
+                    .accessibilityLabel(Text("Possible duplicate"))
+                    .accessibilityHint(tooltip)
+            }
+        }
+    }
+
+    private var tooltip: Text {
+        let count = host.machineHintMatches
+        let others = count == 1
+            ? Text("Another paired host looks like the same machine.")
+            : Text("\(count) other paired hosts look like the same machine.")
+        return Text("\(others) If this machine was paired again, revoke the old pairing.")
     }
 }
 

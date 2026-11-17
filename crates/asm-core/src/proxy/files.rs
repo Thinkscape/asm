@@ -50,13 +50,14 @@ pub fn prune_dir(dir: &Path, keep: &HashSet<String>) {
     }
 }
 
-/// Most recently ended sentinels kept as blocked entries.
+/// Most recently ended sentinels kept as `ended` entries.
 pub const MAX_ENDED: usize = 1000;
 
 /// Sentinels that were applied and have since ended. They stay in the proxy config as
-/// never-matching entries so a request carrying one gets the patched proxy's 403 instead
-/// of reaching the destination. Persisted so the block survives manager restarts (also
-/// covering leases left out at start because their vault is unavailable).
+/// `ended: true` entries so a request carrying one gets the patched proxy's 403
+/// (`asm: sentinel expired or revoked; run asm get again`) instead of reaching the
+/// destination. Persisted so the block survives manager restarts (also covering leases
+/// left out at start because their vault is unavailable).
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SentinelStore {
     active: Vec<String>,

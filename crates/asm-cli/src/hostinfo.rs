@@ -200,6 +200,68 @@ fn in_container() -> bool {
     })
 }
 
+/// [`asm_proto::wire::machine_hint`] of this machine's id; `None` without one (e.g. a
+/// container without `/etc/machine-id`).
+pub fn machine_hint() -> Option<String> {
+    machine_id().map(|id| asm_proto::wire::machine_hint(&id))
+}
+
+/// `/etc/machine-id`, else `/var/lib/dbus/machine-id`.
+#[cfg(target_os = "linux")]
+fn machine_id() -> Option<String> {
+    ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+        .iter()
+        .find_map(|p| {
+            let id = std::fs::read_to_string(p).ok()?;
+            let id = id.trim();
+            (!id.is_empty() && id != "uninitialized").then(|| id.to_owned())
+        })
+}
+
+/// The hardware UUID (`IOPlatformUUID`, uppercase with dashes) from `gethostuuid`, else
+/// from `ioreg`.
+#[cfg(target_os = "macos")]
+fn machine_id() -> Option<String> {
+    let mut id = [0u8; 16];
+    let wait = libc::timespec {
+        tv_sec: 1,
+        tv_nsec: 0,
+    };
+    // SAFETY: id is the 16-byte uuid_t gethostuuid writes; wait is a valid timespec.
+    if unsafe { libc::gethostuuid(id.as_mut_ptr(), &wait) } == 0 && id != [0; 16] {
+        let h = asm_proto::crypto::hex_encode(&id).to_ascii_uppercase();
+        return Some(format!(
+            "{}-{}-{}-{}-{}",
+            &h[0..8],
+            &h[8..12],
+            &h[12..16],
+            &h[16..20],
+            &h[20..32]
+        ));
+    }
+    ioreg_platform_uuid()
+}
+
+/// `IOPlatformUUID` as printed by `ioreg -rd1 -c IOPlatformExpertDevice`.
+#[cfg(target_os = "macos")]
+fn ioreg_platform_uuid() -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+        let v = l.split_once("\"IOPlatformUUID\" = \"")?.1;
+        let v = v.split('"').next()?.trim();
+        (!v.is_empty()).then(|| v.to_owned())
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn machine_id() -> Option<String> {
+    None
+}
+
 /// The agent label: `$ASM_AGENT`, else the parent process name, else empty.
 pub fn agent_label() -> String {
     if let Ok(a) = std::env::var("ASM_AGENT") {
@@ -269,5 +331,20 @@ mod tests {
     fn cleaning_drops_controls() {
         assert_eq!(clean(" claude\n"), "claude");
         assert_eq!(clean("a\u{202E}b"), "ab");
+    }
+
+    #[test]
+    fn machine_hint_is_stable_hex() {
+        let Some(h) = machine_hint() else { return };
+        assert_eq!(h.len(), 64);
+        assert_eq!(machine_hint(), Some(h));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gethostuuid_matches_ioreg() {
+        if let Some(ioreg) = ioreg_platform_uuid() {
+            assert_eq!(machine_id(), Some(ioreg));
+        }
     }
 }

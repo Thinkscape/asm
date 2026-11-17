@@ -64,7 +64,11 @@ pub enum Decision {
     Deny { reason: String },
     /// `name`: the host's friendly name; trimmed, `""` = the reported hostname, at most 64
     /// characters, no control or bidi characters (else `invalid`, request stays pending).
-    ApprovePair { name: String },
+    /// Ignored when the request re-pairs a host (`repair.kind == "same_install"`, the name
+    /// is kept) or replaces one (`same_machine` with `replace`, the old name carries over).
+    /// `replace`: for `repair.kind == "same_machine"` only: revoke the host it looks like
+    /// (and its leases) and give the new host its name; `false` = a separate host.
+    ApprovePair { name: String, replace: bool },
     /// `duration_secs: None` = unlimited; `hosts` for sentinel leases (`["*"]` = any host).
     ApproveGet {
         mode: LeaseMode,
@@ -186,6 +190,8 @@ pub enum RequestDetail {
         observed_address: String,
         /// Verification code as shown by the CLI, e.g. `123 456`.
         code: String,
+        /// The request looks like an existing host pairing again; `None` = a new machine.
+        repair: Option<RepairInfo>,
     },
     Get {
         name: String,
@@ -395,6 +401,22 @@ pub struct HostRecord {
     pub paired_at: SystemTime,
     pub last_seen: Option<SystemTime>,
     pub active_leases: u32,
+    /// Other active hosts claiming the same machine (a forgeable hint): likely duplicates.
+    pub machine_hint_matches: u32,
+}
+
+/// The existing host a pairing request relates to.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RepairInfo {
+    pub host_id: String,
+    /// The host's friendly name.
+    pub host_name: String,
+    pub paired_at: SystemTime,
+    /// `"same_install"`: the CLI proved it holds the host's current token; approving gives
+    /// the same host record a new token (name, leases and history kept).
+    /// `"same_machine"`: only the machine-id hint matches (anyone can claim it); show
+    /// "Looks like <host_name>" and a "Replace <host_name>" toggle (default on).
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -548,7 +570,8 @@ pub struct ActivityEntry {
     /// `expired`, `cancelled`; leases: `created`, `revoked`, `expired`, `suspended`,
     /// `resumed`; proxy: `substitution`, `rejected`, `started`, `restarted`, `crashed`,
     /// `start_failed`, `reload_failed`; pairing: `requested`, `approved`, `denied`,
-    /// `expired`, `paired_with_code`, `renamed`, `revoked`; vaults: `added`, `edited`,
+    /// `expired`, `paired_with_code`, `repaired`, `repaired_with_code`, `replaced`,
+    /// `renamed`, `revoked`; vaults: `added`, `edited`,
     /// `removed`, `unlocked`, `unlock_failed`, `unavailable`, `available`.
     pub kind: String,
     pub host_id: Option<String>,

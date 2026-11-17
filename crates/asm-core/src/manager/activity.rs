@@ -358,12 +358,23 @@ fn request_detail(p: &Pending) -> Map<String, Value> {
         d.insert("agent".into(), json!(p.agent));
     }
     match &p.detail {
-        Detail::Pair { info, address, .. } => {
+        Detail::Pair {
+            info,
+            address,
+            repair,
+            ..
+        } => {
             d.insert("address".into(), json!(address));
             d.insert(
                 "host_info".into(),
                 serde_json::to_value(info).unwrap_or(Value::Null),
             );
+            if let Some(r) = repair {
+                d.insert(
+                    "repair".into(),
+                    json!({ "kind": r.kind(), "host_id": r.host_id, "host_name": r.host_name }),
+                );
+            }
         }
         Detail::Get(g) => {
             d.insert("vault".into(), json!(g.secret.vault_name));
@@ -416,8 +427,21 @@ fn subject(p: &Pending) -> String {
 /// A new pending request (popup shown).
 pub(crate) fn requested(p: &Pending) -> Event {
     let summary = match &p.detail {
-        Detail::Pair { info, address, .. } => {
-            format!("pairing requested by {} from {address}", info.hostname)
+        Detail::Pair {
+            info,
+            address,
+            repair,
+            ..
+        } => {
+            let about = match repair {
+                Some(r) if r.proof.is_some() => format!(" (re-pairing {})", r.host_name),
+                Some(r) => format!(" (looks like {})", r.host_name),
+                None => String::new(),
+            };
+            format!(
+                "pairing requested by {} from {address}{about}",
+                info.hostname
+            )
         }
         Detail::Get(g) if g.requested_hosts.is_empty() => {
             format!("{} requested: {}", p.summary(), g.reason)

@@ -79,6 +79,50 @@ pub struct PairRequest {
     pub host_info: HostInfo,
     /// Unattended pairing code `asm-<secret>-<fp>`, or `None` for interactive pairing.
     pub pairing_code: Option<String>,
+    /// Proof of an existing pairing with this manager (the stored `host.json`); sent only to
+    /// the certificate pinned there. A valid proof re-pairs the same host record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<PairProof>,
+    /// [`machine_hint`] of this machine; a hint only, anyone can claim any value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_hint: Option<String>,
+}
+
+/// The host id and token of an earlier pairing.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairProof {
+    pub host_id: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for PairProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairProof")
+            .field("host_id", &self.host_id)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Lowercase hex SHA-256 of `asm-machine-v1:` + the platform machine id.
+pub fn machine_hint(machine_id: &str) -> String {
+    crate::crypto::sha256_hex(format!("asm-machine-v1:{machine_id}"))
+}
+
+impl PairRequest {
+    /// Host info strings, and `machine_hint` must be 64 lowercase hex digits (`invalid`).
+    pub fn validate(&self) -> Result<(), ApiError> {
+        self.host_info.validate()?;
+        if let Some(h) = &self.machine_hint
+            && !(h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        {
+            return Err(ApiError::new(
+                crate::error::ErrorCode::Invalid,
+                "machine_hint must be 64 lowercase hex digits",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `POST /pair/{pair_id}/reveal` body.
@@ -504,5 +548,33 @@ mod tests {
         assert!(h.validate().is_ok());
         h.username = "evil\u{202E}".into();
         assert!(h.validate().is_err());
+    }
+
+    #[test]
+    fn pair_request_optional_fields() {
+        // Requests of older CLIs (no `previous`, no `machine_hint`) still parse.
+        let r: PairRequest = from_str(
+            r#"{"client_commit":"00","host_info":{"hostname":"h","os":"","os_version":"","kernel":"","arch":"","username":"","addresses":[],"asm_version":"","container":false},"pairing_code":null}"#,
+        )
+        .unwrap();
+        assert_eq!((r.previous.as_ref(), r.machine_hint.as_ref()), (None, None));
+        let v = to_value(&r).unwrap();
+        assert!(v.get("previous").is_none() && v.get("machine_hint").is_none());
+        assert!(r.validate().is_ok());
+
+        let hint = machine_hint("4c4c4544-0042");
+        assert_eq!(hint.len(), 64);
+        let mut r = PairRequest {
+            previous: Some(PairProof {
+                host_id: "h1".into(),
+                token: "secret-token".into(),
+            }),
+            machine_hint: Some(hint),
+            ..r
+        };
+        assert!(r.validate().is_ok());
+        assert!(!format!("{r:?}").contains("secret-token"));
+        r.machine_hint = Some("ABC".into());
+        assert!(r.validate().is_err());
     }
 }

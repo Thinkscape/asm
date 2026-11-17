@@ -174,7 +174,20 @@ asm pair my-mac.tailnet.ts.net:7411 asm-<secret>-<fingerprint>   # or set ASM_PA
 
 A pairing code has a label, an expiry, a maximum number of uses and optionally the networks it may be used from. The fingerprint part makes the CLI refuse a manager whose certificate does not match before it sends the secret.
 
+#### Pairing the same machine again
+
+- **While still paired.** `asm pair` checks whether the manager still accepts the stored pairing (`~/.config/asm/host.json`). If it does, the command prints `already paired with <manager> as <host id>; use --force to pair again` and exits 0.
+- **Re-pairing.** When `host.json` belongs to the same manager certificate, the CLI sends its host id and token as proof. It never sends them to any other certificate. A proof the manager accepts keeps the **same host record**: the popup reads "Re-pair <name>", and a pairing code re-pairs without a popup. The host gets a new token and the old one stops working. Its info and addresses are refreshed, and its name, leases and history stay. The proof is used when `--force` was given or the token was rejected. A proof of a revoked host, or a wrong token, is ignored and the pairing is a new one.
+- **Machine hint.** The CLI also sends a hash of the machine id: `/etc/machine-id` on Linux, the hardware UUID on macOS, nothing in a container that has none. Anyone can claim any value, so it is only a hint. If an interactive pairing without a valid proof matches an active host, the popup reads "Looks like <name> (paired <date>)" and offers **Replace <name>** (on by default). Replacing revokes the old host together with its leases, so no capability moves on the strength of the hint. The new host takes the old one's name. With the toggle off, the new host is a separate record. A pairing code never replaces a host by hint; the match is noted in the Activity Log.
+- **Duplicates.** In **Hosts and Agents**, hosts that share a machine hint are flagged as possible duplicates. Revoke the stale one.
+
 To teach an agent the workflow, give it the skill at [`skill/asm/SKILL.md`](skill/asm/SKILL.md) (also installed by every package; see above).
+
+### When a lease ends
+
+A lease ends when it expires or the operator revokes it (also when its host is revoked, and raw leases when the secret is updated). Within about a second of that, the proxy answers any request that still carries the lease's sentinel, to any host, with `403` and the body `asm: sentinel expired or revoked; run asm get again`. Run `asm get` again for a new lease.
+
+The lease files on the agent machine are deleted by the CLI: at expiry by a background `asm` process, and on revocation within about a minute.
 
 ## CLI reference
 
@@ -194,9 +207,9 @@ Commands:
 
 |Command|Options|Notes|
 |---|---|---|
-|`asm pair <MANAGER> [PAIRING_CODE]`||`MANAGER` is `<hostname>[:port]`. `PAIRING_CODE` (`asm-…`) is the unattended code; it is also read from `$ASM_PAIRING_CODE`. Without a code the CLI prints `verification code: 123 456` and waits for approval. Prints `paired: <host id>`.|
+|`asm pair <MANAGER> [PAIRING_CODE]`|`--force`: pair again although the current pairing still works|`MANAGER` is `<hostname>[:port]`. `PAIRING_CODE` (`asm-…`) is the unattended code; it is also read from `$ASM_PAIRING_CODE`. Without a code the CLI prints `verification code: 123 456` and waits for approval. Prints `paired: <host id>`, or `already paired with …` (exit 0) when the manager still accepts this machine's pairing. See [Pairing the same machine again](#pairing-the-same-machine-again).|
 |`asm list`|`--json`: print the manager's JSON answer|One name per line. Names are vault-prefixed (`work/GITHUB_TOKEN`) when two vaults share a name.|
-|`asm get <NAME> <REASON>`|`--raw`: ask for the real value instead of a sentinel<br>`--hosts <HOSTS>`: hosts the sentinel will be used with (comma-separated patterns)<br>`--wait <WAIT>`: stop waiting after this many seconds (exit 4 while still pending); default: until the request expires on the manager (typically 10 min)<br>`--json`: print the result as JSON|`REASON` is shown to the operator (at most 250 characters). Prints `mode:`, `hosts:` (as approved, which may differ from the request), `expires:` and one absolute file path per field. A repeated sentinel `get` covered by an active lease returns without a popup.|
+|`asm get <NAME> <REASON>`|`--raw`: ask for the real value instead of a sentinel<br>`--hosts <HOSTS>`: hosts the sentinel will be used with (comma-separated patterns)<br>`--wait <WAIT>`: stop waiting after this many seconds (exit 4 while still pending); default: until the request expires on the manager (typically 10 min)<br>`--json`: print the result as JSON<br>`--no-reaper`: do not start the background cleanup process|`REASON` is shown to the operator (at most 250 characters). Prints `mode:`, `hosts:` (as approved, which may differ from the request), `expires:` and one absolute file path per field. A repeated sentinel `get` covered by an active lease returns without a popup.|
 |`asm update <NAME>`|`--field <FIELD>`: field to change (default: `password` for logins, the only field otherwise)<br>`--wait <WAIT>`|Reads the new value from stdin. Prints `updated <name> in <vault>`. Raw leases on that secret are revoked.|
 |`asm add <NAME>`|`--wait <WAIT>`|Reads the value from stdin. The operator picks the vault. Prints `added <name> to <vault>; run asm get to use it`.|
 |`asm proxy-info`|`--json`|Proxy URLs (`http://` and `socks5h://` per hostname hint, the first reachable one marked `(recommended)`), CA certificate and CA bundle paths. Refreshes the CA files.|
@@ -223,9 +236,11 @@ Files on the agent machine:
 |---|---|
 |`${XDG_CONFIG_HOME:-~/.config}/asm/host.json`|manager URL, pinned certificate, host token (mode 0600)|
 |`${XDG_CONFIG_HOME:-~/.config}/asm/ca.crt`, `ca-bundle.crt`|proxy CA, and system roots plus the proxy CA|
-|`$ASM_SECRETS_DIR`, else `$XDG_RUNTIME_DIR/asm/secrets`, else `~/.asm/secrets`|lease files (0600); deleted when leases expire or are revoked|
+|`$ASM_SECRETS_DIR`, else `$XDG_RUNTIME_DIR/asm/secrets`, else `~/.asm/secrets`|lease files (0600); deleted when leases expire or are revoked (see below), plus the manifest `.leases.json` and the lock files `.leases.lock` and `.reaper.lock`|
 
-Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets directory), and `ASM_AGENT` (agent label shown to the operator; defaults to the CLI's parent process name).
+Lease files are deleted on time by a background process, the hidden command `asm reap`: `get` (and every command that talks to the manager while leases remain) starts one per secrets directory, detached from the terminal, kept single by a lock on `.reaper.lock`. It deletes a lease's files at its expiry, asks the manager every minute which leases were revoked, and exits once no lease is left. Leases without an expiry stay until revoked. With `--no-reaper` or `ASM_NO_REAPER=1` nothing runs in the background, and ended leases' files are removed by the next `asm` command.
+
+Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets directory), `ASM_AGENT` (agent label shown to the operator; defaults to the CLI's parent process name), `ASM_NO_REAPER=1` (no background cleanup) and `ASM_REAPER_LOG` (a file the background cleanup logs to, for debugging).
 
 ## The manager app
 
@@ -284,6 +299,7 @@ Pushing a tag `vX.Y.Z` (matching the version in `Cargo.toml` and `app/Bundle/Inf
 `third_party/iron-proxy` is upstream [iron-proxy](https://github.com/paradigmxyz/iron-proxy) v0.56.0 (Apache-2.0, see its [LICENSE](third_party/iron-proxy/LICENSE)) with these changes to the `secrets` transform and the proxy pipeline:
 
 - **Swap gate**: replace-mode values are substituted only when the host matches the entry's rules and the request arrived over TLS (or `allow_plain_http: true`). A sentinel in a header, the path or the query to any other host or scheme gets `403 asm: sentinel not valid for this host or scheme`, and so does a WebSocket upgrade that would carry a substituted value.
+- **Ended sentinels**: a `replace` entry with `ended: true` (no source or rules) never substitutes; a request carrying its sentinel in a header, the path or the query gets `403 asm: sentinel expired or revoked; run asm get again`.
 - **Response redaction**: echoes of substituted values (raw, query/path-escaped, JSON-escaped, base64, hex) in response headers, trailers and streamed bodies are replaced with the client's sentinel, and other entries' values with `asm_redacted`. A content-encoded response to a request that received a substitution is refused with 502. `Accept-Encoding` is removed from requests so the proxy decodes gzip itself, and `Range`/`If-Range` are removed when a value was substituted.
 - **Fixes**: the second body secret of a request was never swapped (the body was not rewound), and bodies larger than `max_request_body_bytes` were forwarded truncated (now 413).
 

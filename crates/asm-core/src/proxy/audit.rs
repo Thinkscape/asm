@@ -26,9 +26,11 @@ pub struct Swap {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reject {
-    /// e.g. `sentinel_not_valid`, `websocket_upgrade`, `content_encoded_response`.
+    /// e.g. `sentinel_not_valid`, `sentinel_ended`, `websocket_upgrade`,
+    /// `content_encoded_response`.
     pub reason: Option<String>,
-    /// Value file of the entry whose sentinel was refused, when known.
+    /// Value file of the entry whose sentinel was refused, when known (never for
+    /// `sentinel_ended`: ended entries have no value file).
     pub value_path: Option<String>,
 }
 
@@ -134,8 +136,7 @@ pub fn parse(line: &str) -> Option<AuditLine> {
     })
 }
 
-/// `<values>/<lease_id>.<n>` → `(lease_id, n)`. `None` for other files (e.g. the
-/// placeholder value of ended sentinels).
+/// `<values>/<lease_id>.<n>` → `(lease_id, n)`. `None` for other files.
 pub fn lease_of_value_path(path: &str) -> Option<(String, usize)> {
     let name = std::path::Path::new(path).file_name()?.to_str()?;
     let (id, n) = name.rsplit_once('.')?;
@@ -147,6 +148,7 @@ pub fn lease_of_value_path(path: &str) -> Option<(String, usize)> {
 pub fn reject_text(reason: &str) -> &str {
     match reason {
         "sentinel_not_valid" => "sentinel not valid for this host or scheme",
+        "sentinel_ended" => "lease expired or revoked",
         "secret_unavailable" => "secret unavailable",
         "websocket_upgrade" => "sentinels are not substituted on WebSocket upgrades",
         "content_encoded_response" => "upstream response is content-encoded",
@@ -159,7 +161,8 @@ mod tests {
     use super::*;
 
     const SWAP: &str = r#"{"time":"2026-11-16T16:50:34.281492+11:00","level":"INFO","msg":"request","audit":{"host":"httpbingo.org","method":"GET","path":"/headers?x=1","remote_addr":"127.0.0.1:57217","sni":"httpbingo.org","mode":"mitm","action":"allow","status_code":200,"duration_ms":412.266},"tunnel":{"target":"httpbingo.org:443","request_transforms":[{"name":"secrets","action":"allow","duration_ms":0.003}]},"request_transforms":[{"name":"secrets","action":"allow","duration_ms":0.506,"annotations":{"swapped":[{"secret":"/tmp/net.thinkscape.asm/values/7637e5fd-7d0d-491b-93e6-45096c02e94c.0","locations":["header:X-Key"]}]}}],"response_transforms":[{"name":"secrets","action":"allow","duration_ms":0.118}]}"#;
-    const REJECT: &str = r#"{"time":"2026-11-16T16:50:50.845653+11:00","level":"WARN","msg":"request","audit":{"host":"httpbingo.org","method":"GET","path":"/headers","remote_addr":"127.0.0.1:57291","sni":"httpbingo.org","mode":"mitm","action":"reject","status_code":403,"duration_ms":0.023},"tunnel":{"target":"httpbingo.org:443","request_transforms":[{"name":"secrets","action":"allow","duration_ms":0.003}]},"rejected_by":"secrets","request_transforms":[{"name":"secrets","action":"reject","duration_ms":0.017,"annotations":{"reject_reason":"sentinel_not_valid","rejected":"/data/proxy/blocked.value"}}]}"#;
+    const REJECT: &str = r#"{"time":"2026-11-16T16:50:50.845653+11:00","level":"WARN","msg":"request","audit":{"host":"httpbingo.org","method":"GET","path":"/headers","remote_addr":"127.0.0.1:57291","sni":"httpbingo.org","mode":"mitm","action":"reject","status_code":403,"duration_ms":0.023},"tunnel":{"target":"httpbingo.org:443","request_transforms":[{"name":"secrets","action":"allow","duration_ms":0.003}]},"rejected_by":"secrets","request_transforms":[{"name":"secrets","action":"reject","duration_ms":0.017,"annotations":{"reject_reason":"sentinel_not_valid","rejected":"/tmp/net.thinkscape.asm/values/7637e5fd-7d0d-491b-93e6-45096c02e94c.0"}}]}"#;
+    const ENDED: &str = r#"{"time":"2026-11-17T09:12:03.5+11:00","level":"WARN","msg":"request","audit":{"host":"httpbingo.org","method":"GET","path":"/headers","remote_addr":"127.0.0.1:57301","sni":"httpbingo.org","mode":"mitm","action":"reject","status_code":403,"duration_ms":0.019},"rejected_by":"secrets","request_transforms":[{"name":"secrets","action":"reject","duration_ms":0.011,"annotations":{"reject_reason":"sentinel_ended"}}]}"#;
     const PLAIN: &str = r#"{"time":"2026-11-16T16:50:34Z","level":"INFO","msg":"request","audit":{"host":"example.com","method":"GET","path":"/","status_code":200},"request_transforms":[{"name":"secrets","action":"allow"}]}"#;
 
     #[test]
@@ -184,7 +187,20 @@ mod tests {
         assert_eq!(a.status, Some(403));
         let r = a.rejected.unwrap();
         assert_eq!(r.reason.as_deref(), Some("sentinel_not_valid"));
-        assert_eq!(lease_of_value_path(r.value_path.as_deref().unwrap()), None);
+        assert_eq!(
+            lease_of_value_path(r.value_path.as_deref().unwrap()),
+            Some(("7637e5fd-7d0d-491b-93e6-45096c02e94c".to_string(), 0))
+        );
+    }
+
+    #[test]
+    fn parses_an_ended_sentinel_line() {
+        let a = parse(ENDED).expect("ended line");
+        assert_eq!(a.status, Some(403));
+        let r = a.rejected.unwrap();
+        assert_eq!(r.reason.as_deref(), Some("sentinel_ended"));
+        assert_eq!(r.value_path, None);
+        assert_eq!(reject_text("sentinel_ended"), "lease expired or revoked");
     }
 
     #[test]

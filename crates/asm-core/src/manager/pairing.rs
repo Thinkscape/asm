@@ -9,7 +9,7 @@ use asm_proto::pairing::{
 };
 use asm_proto::rules::validate_agent_text;
 use asm_proto::time::fmt_unix;
-use asm_proto::wire::{HostInfo, PairRequest, PairResponse, RevealRequest};
+use asm_proto::wire::{HostInfo, PairProof, PairRequest, PairResponse, RevealRequest};
 use serde_json::json;
 
 use super::activity::{self, Category, Event};
@@ -51,6 +51,37 @@ pub(crate) enum PairState {
     Approved { host_id: String, token: String },
 }
 
+/// The existing host a pairing request relates to.
+#[derive(Debug, Clone)]
+pub(crate) struct Repair {
+    pub host_id: String,
+    /// The host's friendly name.
+    pub host_name: String,
+    pub paired_at: i64,
+    /// `Some(token hash)`: the CLI proved it holds this host's current token
+    /// (`same_install`); `None`: only the forgeable machine hint matches (`same_machine`).
+    pub proof: Option<[u8; 32]>,
+}
+
+impl Repair {
+    pub(crate) fn kind(&self) -> &'static str {
+        if self.proof.is_some() {
+            "same_install"
+        } else {
+            "same_machine"
+        }
+    }
+
+    fn new(h: &HostRecord, proof: Option<[u8; 32]>) -> Self {
+        Repair {
+            host_id: h.id.clone(),
+            host_name: h.label().to_string(),
+            paired_at: h.paired_at,
+            proof,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PairAttempt {
     pub id: String,
@@ -63,6 +94,10 @@ pub(crate) struct PairAttempt {
     pub state: PairState,
     /// When the attempt reached a terminal state (for pruning).
     pub ended: Option<i64>,
+    /// The machine hint the CLI claimed.
+    pub machine_hint: Option<String>,
+    /// The existing host this attempt relates to (shown in the popup).
+    pub repair: Option<Repair>,
 }
 
 impl PairAttempt {
@@ -115,6 +150,8 @@ pub(crate) fn start_attempt(
             expires: t + REVEAL_SECS,
             state: PairState::AwaitingReveal,
             ended: None,
+            machine_hint: None,
+            repair: None,
         },
     );
     Ok(PairResponse::AwaitingReveal {
@@ -179,6 +216,8 @@ pub(crate) fn reveal_attempt(
             info: a.info.clone(),
             address: a.ip.clone(),
             code,
+            machine_hint: a.machine_hint.clone(),
+            repair: a.repair.clone(),
         },
     };
     book.pending.push(pending);
@@ -226,6 +265,8 @@ pub(crate) enum CodePairing {
         host_id: String,
         token: String,
         label: String,
+        /// The proven existing host got the new token (no new host record).
+        rotated: bool,
     },
     /// The code is limited to `networks` and the peer address is outside all of them;
     /// nothing changed (the code keeps its uses).
@@ -237,13 +278,18 @@ pub(crate) enum CodePairing {
 
 /// Unattended pairing: check the code against the certificate and the store (atomically
 /// checking the peer address `ip`, as observed on the TCP connection, against the code's
-/// networks and counting one use) and create the host. A bad, expired, used-up or revoked
-/// code is `unauthorized`.
+/// networks and counting one use) and create the host, or with `proven` (an existing host
+/// id and the hash of its current token, as proven by the caller) rotate that host's token.
+/// A proof that no longer holds when the code is consumed falls back to a new host. A bad,
+/// expired, used-up or revoked code is `unauthorized`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pair_with_code(
     store: &Store,
     cert_sha256: &[u8; 32],
     code: &str,
     info: HostInfo,
+    machine_hint: Option<String>,
+    proven: Option<(&str, &[u8; 32])>,
     ip: &str,
     t: i64,
 ) -> Result<CodePairing> {
@@ -254,6 +300,7 @@ pub(crate) fn pair_with_code(
     }
     let peer = ip.parse::<IpAddr>().ok().map(|a| a.to_canonical());
     let token = new_token();
+    let token_hash = sha256(token.as_bytes());
     let host = HostRecord {
         id: new_uuid_v4(),
         name: info.hostname.clone(),
@@ -262,40 +309,121 @@ pub(crate) fn pair_with_code(
         paired_at: t,
         last_seen: Some(t),
         revoked_at: None,
+        machine_hint,
     };
-    match store.consume_pairing_code(
-        &code.secret_sha256(),
-        t,
-        &host,
-        &sha256(token.as_bytes()),
-        |networks| network_allows(networks, peer),
-    )? {
+    let consume = |h: &HostRecord, rotate_from: Option<&[u8; 32]>| {
+        store.consume_pairing_code(
+            &code.secret_sha256(),
+            t,
+            h,
+            &token_hash,
+            rotate_from,
+            |networks| network_allows(networks, peer),
+        )
+    };
+    let (host_id, used, rotated) = match proven {
+        Some((id, old_hash)) => {
+            let existing = HostRecord {
+                id: id.to_string(),
+                ..host.clone()
+            };
+            match consume(&existing, Some(old_hash))? {
+                // The proof no longer holds: a normal new host.
+                CodeUse::StaleProof => (host.id.clone(), consume(&host, None)?, false),
+                used => (existing.id, used, true),
+            }
+        }
+        None => (host.id.clone(), consume(&host, None)?, false),
+    };
+    match used {
         CodeUse::Paired { label } => Ok(CodePairing::Paired {
-            host_id: host.id,
+            host_id,
             token,
             label,
+            rotated,
         }),
         CodeUse::WrongNetwork { label, networks } => {
             Ok(CodePairing::WrongNetwork { label, networks })
         }
-        CodeUse::Rejected => Err(rejected()),
+        CodeUse::Rejected | CodeUse::StaleProof => Err(rejected()),
     }
 }
 
 impl Core {
+    /// The active host proven by `previous` (its id and current token) and its token hash.
+    fn proven_host(&self, previous: Option<&PairProof>) -> Result<Option<(HostRecord, [u8; 32])>> {
+        let Some(p) = previous else { return Ok(None) };
+        let hash = sha256(p.token.as_bytes());
+        Ok(self
+            .store
+            .host_by_proof(&p.host_id, &hash)?
+            .map(|h| (h, hash)))
+    }
+
     /// `POST /pair`.
     pub fn pair_start(&self, req: PairRequest, ip: &str) -> Result<PairResponse> {
-        req.host_info.validate()?;
+        req.validate()?;
         let t = now();
+        // An invalid or revoked proof is ignored: the request is a normal new pairing.
+        let proven = self.proven_host(req.previous.as_ref())?;
+        let hint_matches = match (&proven, req.machine_hint.as_deref()) {
+            (None, Some(hint)) => self.store.hosts_with_hint(hint)?,
+            _ => Vec::new(),
+        };
         if let Some(code) = req.pairing_code.as_deref().filter(|c| !c.trim().is_empty()) {
             let hostname = req.host_info.hostname.clone();
             let info = serde_json::to_value(&req.host_info).unwrap_or_default();
-            match pair_with_code(&self.store, &self.cert.sha256, code, req.host_info, ip, t)? {
+            let paired = pair_with_code(
+                &self.store,
+                &self.cert.sha256,
+                code,
+                req.host_info,
+                req.machine_hint.clone(),
+                proven.as_ref().map(|(h, hash)| (h.id.as_str(), hash)),
+                ip,
+                t,
+            )?;
+            match paired {
                 CodePairing::Paired {
                     host_id,
                     token,
                     label,
+                    rotated: true,
                 } => {
+                    let name = proven
+                        .map(|(h, _)| h.label().to_string())
+                        .unwrap_or_default();
+                    self.log(
+                        Event::new(
+                            Category::Pairing,
+                            "repaired_with_code",
+                            format!(
+                                "{name} paired again with pairing code \"{label}\"; its old token no longer works"
+                            ),
+                        )
+                        .host(Some(&host_id))
+                        .detail(json!({ "code_label": label, "address": ip, "host_info": info })),
+                    );
+                    self.notify(TOPIC_HOSTS);
+                    return Ok(PairResponse::Approved { host_id, token });
+                }
+                CodePairing::Paired {
+                    host_id,
+                    token,
+                    label,
+                    rotated: false,
+                } => {
+                    let mut detail =
+                        json!({ "code_label": label, "address": ip, "host_info": info });
+                    if !hint_matches.is_empty() {
+                        let names: Vec<&str> = hint_matches.iter().map(|h| h.label()).collect();
+                        detail["warning"] = json!(format!(
+                            "same machine hint as {}; not replaced (pairing codes never replace hosts)",
+                            names.join(", ")
+                        ));
+                        detail["machine_hint_matches"] =
+                            json!(hint_matches.iter().map(|h| &h.id).collect::<Vec<_>>());
+                    }
                     self.log(
                         Event::new(
                             Category::Pairing,
@@ -303,7 +431,7 @@ impl Core {
                             format!("{hostname} paired with pairing code \"{label}\""),
                         )
                         .host(Some(&host_id))
-                        .detail(json!({ "code_label": label, "address": ip, "host_info": info })),
+                        .detail(detail),
                     );
                     self.notify(TOPIC_HOSTS);
                     return Ok(PairResponse::Approved { host_id, token });
@@ -330,14 +458,22 @@ impl Core {
                 }
             }
         }
+        let repair = match &proven {
+            Some((h, hash)) => Some(Repair::new(h, Some(*hash))),
+            None => hint_matches.first().map(|h| Repair::new(h, None)),
+        };
         self.expire_requests(t);
-        let r = start_attempt(
-            &mut lock(&self.book),
-            &req.client_commit,
-            req.host_info,
-            ip,
-            t,
-        )?;
+        let r = {
+            let mut b = lock(&self.book);
+            let r = start_attempt(&mut b, &req.client_commit, req.host_info, ip, t)?;
+            if let PairResponse::AwaitingReveal { pair_id, .. } = &r
+                && let Some(a) = b.pairs.get_mut(pair_id)
+            {
+                a.machine_hint = req.machine_hint;
+                a.repair = repair;
+            }
+            r
+        };
         self.bump();
         Ok(r)
     }
@@ -373,27 +509,114 @@ impl Core {
         poll_attempt(&mut lock(&self.book), pair_id, poll_token)
     }
 
-    /// Operator approved a pairing popup: create the host (named `name`, see [`host_name`])
-    /// and hand its token to the poller.
-    pub(crate) fn approve_pair(&self, p: &Pending, name: &str) -> std::result::Result<(), Fail> {
-        let Detail::Pair { info, address, .. } = &p.detail else {
+    /// Operator approved a pairing popup and hand the token to the poller:
+    /// - re-pairing (`same_install`): the proven host gets a new token, its info and
+    ///   address are refreshed, its name, leases and history stay;
+    /// - `same_machine` with `replace`: the old host is revoked (with its leases) and a new
+    ///   host takes over its friendly name;
+    /// - otherwise a new host named `name` (see [`host_name`]).
+    pub(crate) fn approve_pair(
+        &self,
+        p: &Pending,
+        name: &str,
+        replace: bool,
+    ) -> std::result::Result<(), Fail> {
+        let Detail::Pair {
+            info,
+            address,
+            machine_hint,
+            repair,
+            ..
+        } = &p.detail
+        else {
             return Err(Fail::Keep(CoreError::invalid("not a pairing request")));
         };
-        let name = host_name(name, &info.hostname).map_err(Fail::Keep)?;
         let t = now();
         let token = new_token();
-        let host = HostRecord {
+        let token_hash = sha256(token.as_bytes());
+        let mut host = HostRecord {
             id: new_uuid_v4(),
             info: info.clone(),
-            name,
+            name: String::new(),
             address: address.clone(),
             paired_at: t,
             last_seen: Some(t),
             revoked_at: None,
+            machine_hint: machine_hint.clone(),
         };
-        self.store.insert_host(&host, &sha256(token.as_bytes()))?;
+        // The old host's current name (it may have been renamed since the request).
+        let old_name = |r: &Repair| -> Result<String> {
+            Ok(self
+                .store
+                .get_host(&r.host_id)?
+                .map_or_else(|| r.host_name.clone(), |h| h.label().to_string()))
+        };
+        match repair {
+            Some(
+                r @ Repair {
+                    proof: Some(old_hash),
+                    ..
+                },
+            ) => {
+                host.id = r.host_id.clone();
+                if !self.store.rotate_host_token(&host, old_hash, &token_hash)? {
+                    return Err(Fail::Keep(CoreError::invalid(format!(
+                        "{} was revoked or paired again since this request; deny it and run asm pair again",
+                        r.host_name
+                    ))));
+                }
+                host.name = old_name(r)?;
+                self.log(
+                    Event::new(
+                        Category::Pairing,
+                        "repaired",
+                        format!(
+                            "{} paired again from {address}; its old token no longer works",
+                            host.name
+                        ),
+                    )
+                    .host(Some(&host.id))
+                    .detail(json!({
+                        "request_id": p.id,
+                        "address": address,
+                        "host_info": serde_json::to_value(info).unwrap_or_default(),
+                    })),
+                );
+            }
+            Some(r) if replace => {
+                host.name = old_name(r)?;
+                // Revoke first: a forgeable hint never carries leases or tokens over.
+                match self.revoke_host(&r.host_id) {
+                    Ok(()) => {}
+                    Err(e) if e.code == asm_proto::ErrorCode::NotFound => {}
+                    Err(e) => return Err(Fail::Keep(e)),
+                }
+                self.store.insert_host(&host, &token_hash)?;
+                self.log(
+                    Event::new(
+                        Category::Pairing,
+                        "replaced",
+                        format!(
+                            "{} paired from {address}, replacing the earlier host of that name (same machine hint); the earlier host and its leases were revoked",
+                            host.name
+                        ),
+                    )
+                    .host(Some(&host.id))
+                    .detail(json!({
+                        "request_id": p.id,
+                        "replaced_host_id": r.host_id,
+                        "address": address,
+                        "host_info": serde_json::to_value(info).unwrap_or_default(),
+                    })),
+                );
+            }
+            _ => {
+                host.name = host_name(name, &info.hostname).map_err(Fail::Keep)?;
+                self.store.insert_host(&host, &token_hash)?;
+            }
+        }
         let mut b = lock(&self.book);
-        // History of this request names the new host.
+        // History of this request names the host.
         if let Some(q) = b.pending.iter_mut().find(|q| q.id == p.id) {
             q.host_id = Some(host.id.clone());
             q.host_label = host.name.clone();
@@ -424,6 +647,18 @@ mod tests {
             hostname: name.into(),
             ..Default::default()
         }
+    }
+
+    /// A code pairing without proof or machine hint.
+    fn pair_with_code(
+        store: &Store,
+        cert: &[u8; 32],
+        code: &str,
+        info: HostInfo,
+        ip: &str,
+        t: i64,
+    ) -> Result<CodePairing> {
+        super::pair_with_code(store, cert, code, info, None, None, ip, t)
     }
 
     #[test]
@@ -611,6 +846,7 @@ mod tests {
             host_id,
             token,
             label,
+            ..
         } = pair_with_code(&store, &CERT, &s, info("a"), "ip", 10).unwrap()
         else {
             panic!("not paired")

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 	"testing/iotest"
 
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/transform"
@@ -411,4 +413,128 @@ func TestRedactor_PrefersLongestAndCompletesStraddlingMatch(t *testing.T) {
 	out, err := io.ReadAll(rr)
 	require.NoError(t, err)
 	require.Equal(t, "..<long>..<other>..<short>Z", string(out))
+}
+
+const endedSentinel = "asm_endedendedendedendedendedendedended0000"
+
+// endedEntry is the config of an expired or revoked lease's sentinel.
+func endedEntry() secretEntry {
+	return secretEntry{Replace: &replaceConfig{ProxyValue: endedSentinel, Ended: true}}
+}
+
+func TestSecrets_EndedSentinelRejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		url     string
+		prepare func(req *http.Request)
+	}{
+		{"header to formerly approved host", "https://api.openai.com/v1/chat", func(req *http.Request) {
+			req.Header.Set("Authorization", "Bearer "+endedSentinel)
+		}},
+		{"header to other host", "https://evil.com/steal", func(req *http.Request) {
+			req.Header.Set("X-Key", endedSentinel)
+		}},
+		{"basic auth", "https://api.openai.com/v1/chat", func(req *http.Request) {
+			req.SetBasicAuth("user", endedSentinel)
+		}},
+		{"path", "https://api.openai.com/v1/" + endedSentinel, func(*http.Request) {}},
+		{"query", "https://api.openai.com/v1/chat?k=" + endedSentinel, func(*http.Request) {}},
+		{"plain http", "http://api.openai.com/v1/chat", func(req *http.Request) {
+			req.Header.Set("X-Key", endedSentinel)
+		}},
+		{"next to an active sentinel", "https://api.openai.com/v1/chat", func(req *http.Request) {
+			req.Header.Set("Authorization", "Bearer "+openaiSentinel)
+			req.Header.Set("X-Old", endedSentinel)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := makeSecrets(t, []secretEntry{allHeadersEntry(), endedEntry()})
+			req := httptest.NewRequest("GET", tc.url, nil)
+			tc.prepare(req)
+
+			tctx := &transform.TransformContext{}
+			res, err := s.TransformRequest(context.Background(), tctx, req)
+			require.NoError(t, err)
+			require.Equal(t, transform.ActionReject, res.Action)
+			require.Equal(t, http.StatusForbidden, res.Response.StatusCode)
+			body, err := io.ReadAll(res.Response.Body)
+			require.NoError(t, err)
+			require.Equal(t, "asm: sentinel expired or revoked; run asm get again\n", string(body))
+			require.Equal(t, "sentinel_ended", tctx.DrainAnnotations()["reject_reason"])
+			require.NotContains(t, req.Header.Get("Authorization"), openaiReal)
+		})
+	}
+}
+
+func TestSecrets_EndedSentinelOutsideScannedPlacesPasses(t *testing.T) {
+	cases := []struct {
+		name    string
+		prepare func(req *http.Request)
+	}{
+		{"no sentinel", func(*http.Request) {}},
+		{"only in body", func(req *http.Request) {
+			body := `{"key":"` + endedSentinel + `"}`
+			req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
+		}},
+		{"active sentinel only", func(req *http.Request) {
+			req.Header.Set("X-Key", openaiSentinel)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := makeSecrets(t, []secretEntry{allHeadersEntry(), endedEntry()})
+			req := openaiReq("POST", "/v1/chat")
+			tc.prepare(req)
+			doTransform(t, s, req)
+			require.NotEqual(t, openaiSentinel, req.Header.Get("X-Key"))
+		})
+	}
+}
+
+func TestSecrets_EndedEntryConfig(t *testing.T) {
+	cases := []struct {
+		name   string
+		yaml   string
+		errMsg string
+	}{
+		{"no source or rules", `secrets: [{replace: {proxy_value: "asm_x", ended: true}}]`, ""},
+		{"with source", `secrets: [{source: {type: env, var: X}, replace: {proxy_value: "asm_x", ended: true}}]`, "an ended entry takes no source or rules"},
+		{"with rules", `secrets: [{rules: [{host: "a.example.com"}], replace: {proxy_value: "asm_x", ended: true}}]`, "an ended entry takes no source or rules"},
+		{"without proxy_value", `secrets: [{replace: {ended: true}}]`, "replace.proxy_value is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var doc yaml.Node
+			require.NoError(t, yaml.Unmarshal([]byte(tc.yaml), &doc))
+			tr, err := factory(*doc.Content[0], slog.Default())
+			if tc.errMsg != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.errMsg)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, []string{"asm_x"}, tr.(*Secrets).ended)
+			require.Empty(t, tr.(*Secrets).secrets)
+		})
+	}
+}
+
+func TestSecrets_EndedEntriesAreNotRedactionNeedles(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{endedEntry()})
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("Accept-Encoding", "gzip")
+	tctx := &transform.TransformContext{}
+	res, err := s.TransformRequest(context.Background(), tctx, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionContinue, res.Action)
+	require.Equal(t, "gzip", req.Header.Get("Accept-Encoding"), "an ended entry never substitutes")
+
+	payload := "echo " + endedSentinel
+	resp := upstreamResponse(strings.NewReader(payload), http.Header{"Content-Length": {"48"}})
+	resp.ContentLength = int64(len(payload))
+	res, body := respond(t, s, tctx, req, resp)
+	require.Equal(t, transform.ActionContinue, res.Action)
+	require.Equal(t, payload, body)
+	require.Equal(t, int64(len(payload)), resp.ContentLength)
 }

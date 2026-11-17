@@ -81,7 +81,7 @@ final class CoreBridge: @unchecked Sendable {
     func resolve(id: String, decision: DecisionItem) throws {
         let core: Decision = switch decision {
         case let .deny(reason): .deny(reason: reason)
-        case let .approvePair(name): .approvePair(name: name)
+        case let .approvePair(name, replace): .approvePair(name: name, replace: replace)
         case let .approveGet(raw, durationSecs, hosts): .approveGet(mode: raw ? .raw : .sentinel, durationSecs: durationSecs, hosts: hosts)
         case let .approveWrite(vaultID, collectionID): .approveWrite(vaultId: vaultID, collectionId: collectionID)
         }
@@ -280,11 +280,24 @@ private extension RequestKind {
     }
 }
 
+private extension RepairItem {
+    /// `nil` for a kind this build does not know.
+    init?(_ r: RepairInfo) {
+        let kind: Kind
+        switch r.kind {
+        case "same_install": kind = .sameInstall
+        case "same_machine": kind = .sameMachine
+        default: return nil
+        }
+        self.init(hostID: r.hostId, hostName: r.hostName, pairedAt: r.pairedAt, kind: kind)
+    }
+}
+
 private extension PendingItem {
     init(_ r: PendingRequest) {
         let detail: RequestDetail = switch r.detail {
-        case let .pair(hostInfo, observedAddress, code):
-            .pair(info: HostInfoItem(hostInfo), observedAddress: observedAddress, code: code)
+        case let .pair(hostInfo, observedAddress, code, repair):
+            .pair(info: HostInfoItem(hostInfo), observedAddress: observedAddress, code: code, repair: repair.flatMap(RepairItem.init))
         case let .get(name, _, vaultName, _, fields, reason, rawRequested, requestedHosts, initialHosts, suggestedHosts, defaultDurationSecs):
             .get(GetDetail(
                 name: name, vaultName: vaultName, fields: fields, reason: reason, rawRequested: rawRequested,
@@ -376,7 +389,8 @@ private extension HostItem {
         self.init(
             id: h.hostId, name: h.name, info: HostInfoItem(h.info), observedAddress: h.observedAddress,
             agents: h.agents.map { AgentSeenItem(agent: $0.agent, lastSeen: $0.lastSeen) },
-            pairedAt: h.pairedAt, lastSeen: h.lastSeen, activeLeases: Int(h.activeLeases)
+            pairedAt: h.pairedAt, lastSeen: h.lastSeen, activeLeases: Int(h.activeLeases),
+            machineHintMatches: Int(h.machineHintMatches)
         )
     }
 }

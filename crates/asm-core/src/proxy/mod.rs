@@ -113,7 +113,6 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(250);
 const HEALTH_EVERY_TICKS: u32 = 8;
 const PID_FILE: &str = "iron-proxy.pid";
-const BLOCKED_VALUE_FILE: &str = "blocked.value";
 
 struct Running {
     child: Child,
@@ -174,7 +173,8 @@ impl ProxySupervisor {
             .ok()
             .and_then(|pem| ca::pem_to_der(&pem).ok())
             .and_then(|der| ca::not_after(&der));
-        files::write_private_atomic(&dirs.proxy, BLOCKED_VALUE_FILE, b"-")?;
+        // Dummy value file of the ended-sentinel entries of earlier versions.
+        let _ = std::fs::remove_file(dirs.proxy.join("blocked.value"));
         kill_stale_child(&dirs.proxy, &binary);
 
         let sup = Arc::new(Self {
@@ -473,7 +473,7 @@ impl ProxySupervisor {
 
     /// Record the active sentinel set, then render and atomically write the config.
     fn write_config(&self, cfg: &ProxyConfig, entries: &[ProxyEntry]) -> Result<()> {
-        let blocked = {
+        let ended = {
             let mut st = lock(&self.state);
             let active: Vec<&str> = entries.iter().map(|e| e.sentinel.as_str()).collect();
             st.sentinels.update(&active);
@@ -496,8 +496,7 @@ impl ProxySupervisor {
             ca_cert: &self.ca.cert,
             ca_key: &self.ca.key,
             entries: &render,
-            blocked: &blocked,
-            blocked_value_path: &self.dirs.proxy.join(BLOCKED_VALUE_FILE),
+            ended: &ended,
         });
         let path = config::config_path(&self.dirs);
         let name = path

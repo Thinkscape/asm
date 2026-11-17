@@ -15,7 +15,7 @@ struct ApprovalRoot: View {
     var body: some View {
         ApprovalContent(model: model, armed: armed)
             .padding(18)
-            .frame(width: 410)
+            .frame(width: 400)
             .fixedSize(horizontal: false, vertical: true)
             .modifier(PanelBackground())
             // Top-aligned, so while the panel animates a height change the content is
@@ -144,8 +144,8 @@ private struct ApprovalBody: View {
             resolve: resolve
         )
         switch request.detail {
-        case let .pair(info, address, code):
-            PairApproval(context: context, info: info, observedAddress: address, code: code)
+        case let .pair(info, address, code, repair):
+            PairApproval(context: context, info: info, observedAddress: address, code: code, repair: repair)
         case let .get(detail):
             GetApproval(context: context, detail: detail, durations: CoreBridge.leaseDurations, check: model.checkHostPattern)
         case let .update(name, vaultID, vault, field, oldValue, newValue):
@@ -234,7 +234,7 @@ private struct ApprovalHeader<Icon: View>: View {
                     .lineLimit(2)
                 subtitle
                     .font(.system(size: 13))
-                    .lineLimit(3)
+                    .lineLimit(4)
             }
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -337,21 +337,87 @@ private struct ReasonBlock: View {
     }
 }
 
-/// Orange caution shown when the real value would leave the Mac.
-private struct RawCaution: View {
+/// How an approved `get` delivers the secret.
+private enum ValueMode: Hashable {
+    /// A sentinel that works only through the proxy, over HTTPS, for the approved hosts.
+    case proxied
+    /// The real value; the agent keeps it.
+    case realValue
+}
+
+/// Compact "Proxied" / "Real value" switch for the action row. Drawn by SwiftUI: a
+/// segmented `Picker` looks inactive while the non-activating panel is not key. AX sees
+/// a segmented picker labelled "Value mode".
+private struct ValueModeSwitch: View {
+    @Binding var mode: ValueMode
+
     var body: some View {
-        Label {
-            Text("The agent will keep the real value. It cannot be taken back.")
-                .fixedSize(horizontal: false, vertical: true)
-        } icon: {
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        HStack(spacing: 2) {
+            segment(.proxied, title: "Proxied", help: "The agent gets a token that works only through the proxy")
+            segment(.realValue, title: "Real value", help: "The agent receives the real value and keeps it")
         }
-        .font(.callout)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.orange.opacity(0.4), lineWidth: 0.5))
+        .padding(2)
+        .background(.fill.tertiary, in: Capsule())
+        .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+        .fixedSize()
+        .accessibilityRepresentation {
+            Picker("Value mode", selection: $mode) {
+                Text("Proxied").tag(ValueMode.proxied)
+                Text("Real value").tag(ValueMode.realValue)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+        }
+    }
+
+    /// Selected Proxied: a raised neutral segment; selected Real value: orange.
+    private func segment(_ value: ValueMode, title: LocalizedStringKey, help: LocalizedStringKey) -> some View {
+        let selected = mode == value
+        let caution = value == .realValue
+        return Button {
+            mode = value
+        } label: {
+            Text(title)
+                .font(.system(size: 12, weight: selected ? .semibold : .medium))
+                .lineLimit(1)
+                .foregroundStyle(selected && caution ? AnyShapeStyle(.black.opacity(0.85)) : AnyShapeStyle(.primary))
+                .padding(.horizontal, 10)
+                .frame(minHeight: 26)
+                .background {
+                    if selected {
+                        Capsule()
+                            .fill(caution ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.background))
+                            .shadow(color: .black.opacity(0.15), radius: 1, y: 0.5)
+                    }
+                }
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
+/// Footnote under the action row: what the chosen mode gives the agent.
+private struct ValueModeCaption: View {
+    let mode: ValueMode
+
+    var body: some View {
+        Group {
+            switch mode {
+            case .proxied:
+                Text("The agent gets a token that works only through the proxy, over HTTPS, for the hosts above.")
+                    .foregroundStyle(.secondary)
+            case .realValue:
+                Label {
+                    Text("The agent receives the real value and keeps it. It cannot be taken back.")
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
+                .foregroundStyle(.orange)
+            }
+        }
+        .font(.system(size: 11))
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -663,8 +729,6 @@ private struct PanelButtonStyle: ButtonStyle {
         case primary
         /// Filled orange: gives away the real value.
         case caution
-        /// Neutral fill with a hairline border.
-        case secondary
     }
 
     var role: Role
@@ -679,7 +743,6 @@ private struct PanelButtonStyle: ButtonStyle {
             .frame(minWidth: 76, minHeight: 30, maxHeight: 30)
             .foregroundStyle(foreground)
             .background(background, in: Capsule())
-            .overlay(Capsule().strokeBorder(role == .secondary ? AnyShapeStyle(.separator) : AnyShapeStyle(.clear), lineWidth: 0.5))
             .contentShape(Capsule())
             .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.45)
     }
@@ -688,7 +751,6 @@ private struct PanelButtonStyle: ButtonStyle {
         switch role {
         case .primary: AnyShapeStyle(.white)
         case .caution: AnyShapeStyle(.black.opacity(0.85))
-        case .secondary: AnyShapeStyle(.primary)
         }
     }
 
@@ -696,7 +758,6 @@ private struct PanelButtonStyle: ButtonStyle {
         switch role {
         case .primary: AnyShapeStyle(Color.accentColor)
         case .caution: AnyShapeStyle(Color.orange)
-        case .secondary: AnyShapeStyle(.fill.tertiary)
         }
     }
 }
@@ -714,16 +775,30 @@ private struct PairApproval: View {
     let info: HostInfoItem
     let observedAddress: String
     let code: String
+    /// The machine looks like an already paired host.
+    let repair: RepairItem?
     @State private var name: String
+    /// `same_machine`: revoke the old pairing and take its name.
+    @State private var replace = true
     @State private var editingReason = false
     @FocusState private var nameFocused: Bool
 
-    init(context: RequestContext, info: HostInfoItem, observedAddress: String, code: String) {
+    init(context: RequestContext, info: HostInfoItem, observedAddress: String, code: String, repair: RepairItem?) {
         self.context = context
         self.info = info
         self.observedAddress = observedAddress
         self.code = code
-        _name = State(initialValue: info.hostname)
+        self.repair = repair
+        // Re-pairing or replacing keeps the old host's name.
+        _name = State(initialValue: repair?.hostName ?? info.hostname)
+    }
+
+    private var sameInstall: Bool { repair?.kind == .sameInstall }
+
+    /// The core ignores the typed name when re-pairing or replacing: the old name stays.
+    private var nameKept: Bool {
+        guard let repair else { return false }
+        return repair.kind == .sameInstall || replace
     }
 
     /// Same rules as the core (`invalid` there keeps the request pending): at most 64
@@ -752,22 +827,35 @@ private struct PairApproval: View {
         return [info.hostname, os, info.arch, observedAddress].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
+    private var title: Text {
+        if let repair, sameInstall {
+            return Text("\(Text(verbatim: repair.hostName)) wants to pair again")
+        }
+        return Text("New device wants to pair")
+    }
+
+    private var subtitle: Text {
+        let summary = Text(verbatim: summaryLine).foregroundStyle(.secondary)
+        guard sameInstall else { return summary }
+        return Text("Same installation as before: keeps its name, leases and history.").foregroundStyle(.secondary)
+            + Text(verbatim: "\n") + summary
+    }
+
     var body: some View {
         ApprovalScaffold(
             error: context.error,
             footnote: Text("Pairing lets this device ask for secrets. You still approve every request.")
         ) {
-            ApprovalHeader(
-                title: Text("New device wants to pair"),
-                subtitle: Text(verbatim: summaryLine).foregroundStyle(.secondary),
-                queue: context.queue
-            ) {
+            ApprovalHeader(title: title, subtitle: subtitle, queue: context.queue) {
                 Image(systemName: deviceSymbol)
                     .font(.system(size: 28))
                     .foregroundStyle(.secondary)
                     .accessibilityHidden(true)
             }
         } content: {
+            if let repair, repair.kind == .sameMachine {
+                SameMachineCallout(repair: repair, replace: $replace)
+            }
             VStack(alignment: .leading, spacing: 6) {
                 SectionLabel("Name")
                 TextField(text: $name, prompt: Text(verbatim: info.hostname)) {
@@ -778,7 +866,12 @@ private struct PairApproval: View {
                 .controlSize(.large)
                 .focused($nameFocused)
                 .onExitCommand { nameFocused = false }
-                if let nameProblem {
+                .disabled(nameKept)
+                if nameKept {
+                    Text(sameInstall ? "Keeps its current name." : "Takes the old pairing's name.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if let nameProblem {
                     Text(verbatim: nameProblem).font(.caption).foregroundStyle(.red)
                 }
             }
@@ -802,6 +895,9 @@ private struct PairApproval: View {
             InfoRow(label: "asm version", value: info.asmVersion)
             InfoRow(label: "Container", value: info.container ? String(localized: "yes") : String(localized: "no"))
             InfoRow(label: "Request ID", value: context.request.id)
+            if let repair {
+                InfoRow(label: "Previous host ID", value: repair.hostID)
+            }
         } actions: {
             ApprovalActions(
                 cannedReasons: [],
@@ -813,11 +909,20 @@ private struct PairApproval: View {
                 // Not the default button: comparing the codes is the approval, so Return never pairs.
                 Button("Pair", action: approve)
                     .buttonStyle(.panel(.primary))
-                    .disabled(!context.armed || nameProblem != nil)
+                    .disabled(!context.armed || (!nameKept && nameProblem != nil))
             }
         }
         .onAppear {
             if NSApp.keyWindow is ApprovalPanel { focusName() }
+        }
+        .onChange(of: replace) { _, replacing in
+            // Keeps a name the operator typed; swaps only the pre-filled one.
+            guard let repair else { return }
+            if replacing, name == info.hostname {
+                name = repair.hostName
+            } else if !replacing, name == repair.hostName {
+                name = info.hostname
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
             if note.object is ApprovalPanel, !editingReason { focusName() }
@@ -825,16 +930,85 @@ private struct PairApproval: View {
     }
 
     private func approve() {
-        guard context.armed, nameProblem == nil else { return }
-        context.resolve(.approvePair(name: name))
+        guard context.armed, nameKept || nameProblem == nil else { return }
+        // `same_install` re-pairs the same record whatever `replace` says.
+        context.resolve(.approvePair(name: name, replace: repair != nil && (sameInstall || replace)))
     }
 
     /// Focus the name field and select its text, so typing replaces the hostname.
     private func focusName() {
+        guard !nameKept else { return }
         nameFocused = true
         DispatchQueue.main.async {
             guard NSApp.keyWindow is ApprovalPanel else { return }
             NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
+        }
+    }
+}
+
+/// `same_machine` re-pair: which host this looks like and whether to replace it.
+private struct SameMachineCallout: View {
+    let repair: RepairItem
+    @Binding var replace: Bool
+
+    var body: some View {
+        let name = Text(verbatim: repair.hostName).fontWeight(.semibold)
+        let date = Text(repair.pairedAt, format: .dateTime.year().month().day())
+        VStack(alignment: .leading, spacing: 8) {
+            Label {
+                Text("Looks like \(name) (paired \(date))")
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(Color.accentColor)
+            }
+            Toggle(isOn: $replace) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Replace \(Text(verbatim: repair.hostName))")
+                    Text("Revokes the old pairing and its leases; the new one takes its name.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(PanelSwitchStyle())
+            .accessibilityLabel(Text("Replace \(Text(verbatim: repair.hostName))"))
+            .accessibilityHint(Text("Revokes the old pairing and its leases; the new one takes its name."))
+        }
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.accentColor.opacity(0.3), lineWidth: 0.5))
+    }
+}
+
+/// On/off switch drawn by SwiftUI: AppKit's switch turns grey while the non-activating
+/// panel is not key, which hides whether it is on.
+private struct PanelSwitchStyle: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            configuration.isOn.toggle()
+        } label: {
+            HStack(alignment: .center, spacing: 10) {
+                configuration.label
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Capsule()
+                    .fill(configuration.isOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.fill.secondary))
+                    .frame(width: 32, height: 18)
+                    .overlay(alignment: configuration.isOn ? .trailing : .leading) {
+                        Circle()
+                            .fill(.white)
+                            .shadow(color: .black.opacity(0.2), radius: 0.5, y: 0.5)
+                            .padding(2)
+                    }
+                    .animation(.easeOut(duration: 0.12), value: configuration.isOn)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityRepresentation {
+            Toggle(isOn: configuration.$isOn) { configuration.label }
         }
     }
 }
@@ -860,8 +1034,9 @@ private struct GetApproval: View {
     @State private var newHost = ""
     @State private var hostError: String?
     @State private var editingReason = false
-    /// "Show Value…" was clicked on a hidden-value request: confirm inline.
-    @State private var confirmingRaw = false
+    @State private var mode: ValueMode
+    /// Restarts with every mode flip, so a quick flip plus click cannot approve.
+    @State private var modeArmed = false
     @FocusState private var hostFieldFocused: Bool
 
     init(
@@ -876,13 +1051,20 @@ private struct GetApproval: View {
         self.check = check
         _hosts = State(initialValue: detail.initialHosts.map { HostEntry(pattern: $0.normalized, broad: $0.broad) })
         _duration = State(initialValue: detail.defaultDurationSecs ?? 0)
+        _mode = State(initialValue: detail.rawRequested ? .realValue : .proxied)
     }
 
     private var raw: Bool { detail.rawRequested }
     private var durationSecs: UInt64? { duration == 0 ? nil : duration }
-    private var canAllowHidden: Bool { context.armed && (anyHost || !hosts.isEmpty) }
-    /// Return approves hidden only on hidden-value requests, and never while typing.
-    private var allowIsDefault: Bool { !raw && !confirmingRaw && !hostFieldFocused && !editingReason }
+    private var armed: Bool { context.armed && modeArmed }
+    private var canAllow: Bool {
+        switch mode {
+        case .proxied: armed && (anyHost || !hosts.isEmpty)
+        case .realValue: armed
+        }
+    }
+    /// Return allows only in Proxied mode, and never while typing.
+    private var allowIsDefault: Bool { mode == .proxied && !hostFieldFocused && !editingReason }
 
     /// Requested hosts and the secret's remembered/URI hosts that are not chosen yet.
     private var suggestions: [HostEntry] {
@@ -898,38 +1080,24 @@ private struct GetApproval: View {
     private var subtitle: Text {
         let name = Text(verbatim: detail.name).fontWeight(.bold)
         if raw {
-            let rawValue = Text("raw value").foregroundStyle(.orange).fontWeight(.semibold)
-            return Text("wants the \(rawValue) of \(name)")
+            let realValue = Text("real value").foregroundStyle(.orange).fontWeight(.semibold)
+            return Text("wants the \(realValue) of \(name)")
         }
         return Text("wants to use \(name)")
     }
 
-    private var footnote: Text {
-        if confirmingRaw {
-            return Text("The agent asked for a hidden value. Show Value gives it the real value instead.")
-        }
-        if raw {
-            return Text("Allow Hidden Instead gives the agent a token that works only through the proxy, over HTTPS, for these hosts.")
-        }
-        return anyHost
-            ? Text("The agent gets a token that works only through the proxy, over HTTPS, for any host.")
-            : Text("The agent gets a token that works only through the proxy, over HTTPS, for these hosts.")
-    }
-
     private var approvedHostsLine: String {
-        anyHost ? String(localized: "any host") : hosts.map(\.pattern).joined(separator: ", ")
+        if mode == .realValue { return String(localized: "none (real value)") }
+        return anyHost ? String(localized: "any host") : hosts.map(\.pattern).joined(separator: ", ")
     }
 
     var body: some View {
-        ApprovalScaffold(error: context.error, footnote: footnote) {
+        ApprovalScaffold(error: context.error, footnote: nil) {
             ApprovalHeader(title: context.requesterTitle, subtitle: subtitle, queue: context.queue) {
                 AppIconImage()
             }
         } content: {
             ReasonBlock(reason: detail.reason)
-            if raw || confirmingRaw {
-                RawCaution()
-            }
             HostsSection(
                 hosts: $hosts,
                 anyHost: $anyHost,
@@ -938,7 +1106,7 @@ private struct GetApproval: View {
                 error: $hostError,
                 fieldFocused: $hostFieldFocused,
                 suggestions: suggestions,
-                dimmed: raw || confirmingRaw,
+                dimmed: mode == .realValue,
                 add: add
             )
             VStack(alignment: .leading, spacing: 6) {
@@ -956,51 +1124,47 @@ private struct GetApproval: View {
             InfoRow(label: "Fields", value: detail.fields.joined(separator: ", "))
             InfoRow(label: "Requested hosts", value: detail.requestedHosts.joined(separator: ", "))
             InfoRow(label: "Approved hosts", value: approvedHostsLine)
-            InfoRow(label: "Requested mode", value: raw ? String(localized: "raw value") : String(localized: "hidden (sentinel)"))
+            InfoRow(label: "Requested mode", value: raw ? String(localized: "real value") : String(localized: "proxied (sentinel)"))
             RequestMetaRows(context: context)
         } actions: {
             ApprovalActions(
                 cannedReasons: ["host selection too open", "provide a better reason"],
                 armed: context.armed,
-                escapeDenies: !hostFieldFocused && !confirmingRaw,
+                escapeDenies: !hostFieldFocused,
                 editingReason: $editingReason,
                 deny: context.deny
             ) {
-                if confirmingRaw {
-                    Button("Cancel") { confirmingRaw = false }
-                        .buttonStyle(.panel(.secondary))
-                        .keyboardShortcut(.cancelAction)
-                    Button("Show Value", action: approveRaw)
-                        .buttonStyle(.panel(.caution))
-                        .disabled(!context.armed)
-                } else if raw {
-                    Button("Allow Hidden Instead", action: approveHidden)
-                        .buttonStyle(.panel(.secondary))
-                        .disabled(!canAllowHidden)
-                    Button("Show Value", action: approveRaw)
-                        .buttonStyle(.panel(.caution))
-                        .disabled(!context.armed)
-                } else {
-                    Button("Show Value…") { confirmingRaw = true }
-                        .buttonStyle(.panel(.secondary))
-                        .disabled(!context.armed)
-                    Button("Allow", action: approveHidden)
-                        .buttonStyle(.panel(.primary))
-                        .keyboardShortcut(allowIsDefault ? .defaultAction : nil)
-                        .disabled(!canAllowHidden)
-                }
+                ValueModeSwitch(mode: $mode)
+                // Real value: orange and never bound to Return.
+                Button("Allow", action: allow)
+                    .buttonStyle(.panel(mode == .proxied ? .primary : .caution))
+                    .keyboardShortcut(allowIsDefault ? .defaultAction : nil)
+                    .disabled(!canAllow)
+            }
+            ValueModeCaption(mode: mode)
+        }
+        .task(id: mode) {
+            modeArmed = false
+            try? await Task.sleep(for: .seconds(1))
+            modeArmed = !Task.isCancelled
+        }
+        .onChange(of: mode) { _, newMode in
+            if newMode == .realValue {
+                editingHost = false
+                newHost = ""
+                hostError = nil
             }
         }
     }
 
-    private func approveHidden() {
-        guard canAllowHidden else { return }
-        context.resolve(.approveGet(raw: false, durationSecs: durationSecs, hosts: anyHost ? ["*"] : hosts.map(\.pattern)))
-    }
-
-    private func approveRaw() {
-        guard context.armed else { return }
-        context.resolve(.approveGet(raw: true, durationSecs: durationSecs, hosts: []))
+    private func allow() {
+        guard canAllow else { return }
+        switch mode {
+        case .proxied:
+            context.resolve(.approveGet(raw: false, durationSecs: durationSecs, hosts: anyHost ? ["*"] : hosts.map(\.pattern)))
+        case .realValue:
+            context.resolve(.approveGet(raw: true, durationSecs: durationSecs, hosts: []))
+        }
     }
 
     /// Validates with the core's rule; `*` turns on "Any host".
@@ -1032,7 +1196,8 @@ private struct HostsSection: View {
     @Binding var error: String?
     var fieldFocused: FocusState<Bool>.Binding
     let suggestions: [HostEntry]
-    /// Raw requests: the hosts apply only if the operator allows it hidden.
+    /// Real value mode: the hosts do not apply; shown dimmed and inert so the panel
+    /// keeps its height.
     let dimmed: Bool
     let add: (String) -> Bool
 
@@ -1046,7 +1211,7 @@ private struct HostsSection: View {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 SectionLabel("Can be used with")
                 if dimmed {
-                    Text("Used if you allow it hidden")
+                    Text("Not used for real values")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 }
@@ -1104,7 +1269,9 @@ private struct HostsSection: View {
                         .foregroundStyle(.orange)
                 }
             }
-            .opacity(dimmed ? 0.55 : 1)
+            .opacity(dimmed ? 0.45 : 1)
+            .disabled(dimmed)
+            .accessibilityHidden(dimmed)
         }
     }
 

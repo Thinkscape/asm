@@ -56,6 +56,11 @@ type replaceConfig struct {
 	// over TLS. Off by default: a real value sent over plain HTTP is visible
 	// on the network path to the upstream.
 	AllowPlainHTTP bool `yaml:"allow_plain_http,omitempty"`
+	// Ended marks the sentinel of a lease that has expired or been revoked.
+	// The entry never substitutes and takes no source or rules; a request
+	// carrying its proxy_value in a header, the path or the query is
+	// rejected with 403.
+	Ended bool `yaml:"ended,omitempty"`
 }
 
 type injectConfig struct {
@@ -133,12 +138,16 @@ var formatterFuncs = template.FuncMap{
 // Secrets is the transform that swaps proxy tokens for real secrets.
 type Secrets struct {
 	secrets []resolvedSecret
+	// ended holds the proxy values of ended entries; they never substitute
+	// and are not redaction needles.
+	ended []string
 	// hasReplace is true when at least one entry is in replace mode.
 	hasReplace bool
 }
 
 const (
 	msgSentinelNotValid = "asm: sentinel not valid for this host or scheme"
+	msgSentinelEnded    = "asm: sentinel expired or revoked; run asm get again"
 	msgWebSocketSwap    = "asm: sentinels are not substituted on WebSocket upgrades"
 )
 
@@ -212,6 +221,7 @@ func resolveSource(registry sourceBuilderRegistry, node yaml.Node) (secretSource
 // newFromConfig creates a Secrets transform from a parsed config.
 func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets, error) {
 	resolved := make([]resolvedSecret, 0, len(cfg.Secrets))
+	var ended []string
 	hasReplace := false
 
 	for i, entry := range cfg.Secrets {
@@ -219,6 +229,14 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 		replace, inject, err := normalizeEntry(i, &entry)
 		if err != nil {
 			return nil, err
+		}
+
+		if replace != nil && replace.Ended {
+			if !entry.Source.IsZero() || len(entry.Rules) > 0 {
+				return nil, fmt.Errorf("secrets[%d]: an ended entry takes no source or rules", i)
+			}
+			ended = append(ended, replace.ProxyValue)
+			continue
 		}
 
 		source, err := resolveSource(registry, entry.Source)
@@ -269,7 +287,7 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 		}
 	}
 
-	return &Secrets{secrets: resolved, hasReplace: hasReplace}, nil
+	return &Secrets{secrets: resolved, ended: ended, hasReplace: hasReplace}, nil
 }
 
 // normalizeEntry validates the entry and returns either a replaceConfig or injectConfig.
@@ -358,6 +376,15 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		// TransformResponse sees an identity-encoded body it can redact.
 		// Upstream headers are copied from req after request transforms.
 		req.Header.Del("Accept-Encoding")
+	}
+
+	// An ended sentinel reaches no destination, whatever else the request
+	// carries; the client learns to request a new lease.
+	for _, pv := range s.ended {
+		if sentinelInRequest(req, pv) {
+			tctx.Annotate("reject_reason", "sentinel_ended")
+			return rejectResult(req, http.StatusForbidden, msgSentinelEnded), nil
+		}
 	}
 
 	for _, sec := range s.secrets {

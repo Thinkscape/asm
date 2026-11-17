@@ -6,6 +6,7 @@ mod files;
 mod hostinfo;
 mod pair;
 mod proxy;
+mod reaper;
 mod requests;
 mod state;
 mod tls;
@@ -25,8 +26,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Pair this machine with a manager (default port 7411).
+    /// Pair this machine with a manager (default port 7411). While the manager still
+    /// accepts this machine's pairing, prints "already paired" and does nothing.
     Pair {
+        /// Pair again even though the current pairing still works (the manager keeps the
+        /// same host record and issues a new token).
+        #[arg(long)]
+        force: bool,
         /// Manager address: <hostname>[:port].
         manager: String,
         /// Unattended pairing code (asm-…); also read from $ASM_PAIRING_CODE.
@@ -53,6 +59,10 @@ enum Command {
         /// Print the result as JSON.
         #[arg(long)]
         json: bool,
+        /// Do not start the background process that deletes the files when the lease
+        /// ends (also `ASM_NO_REAPER=1`); later asm commands still delete them.
+        #[arg(long)]
+        no_reaper: bool,
         /// Secret name as shown by `asm list`.
         name: String,
         /// Why you need it (shown to the operator; at most 250 characters).
@@ -98,6 +108,13 @@ enum Command {
         #[arg(long, default_value = "https://example.com/")]
         probe_url: String,
     },
+    /// Delete the files of ended leases in the background (started by other commands).
+    #[command(hide = true)]
+    Reap {
+        /// Secrets directory (default: as for the other commands).
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() {
@@ -105,30 +122,38 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Pair {
+            force,
             manager,
             pairing_code,
-        } => pair::run(&manager, pairing_code),
+        } => pair::run(&manager, pairing_code, force),
         Command::List { json } => requests::list(json),
         Command::Get {
             raw,
             hosts,
             wait,
             json,
+            no_reaper,
             name,
             reason,
-        } => requests::get(requests::GetArgs {
-            raw,
-            hosts,
-            wait,
-            json,
-            name,
-            reason,
-        }),
+        } => {
+            if no_reaper {
+                reaper::disable();
+            }
+            requests::get(requests::GetArgs {
+                raw,
+                hosts,
+                wait,
+                json,
+                name,
+                reason,
+            })
+        }
         Command::Update { field, wait, name } => requests::update(field, wait, name),
         Command::Add { wait, name } => requests::add(wait, name),
         Command::ProxyInfo { json } => proxy::proxy_info(json),
         Command::ProxyEnv { shell, unset } => proxy::proxy_env(shell, unset),
         Command::Doctor { probe_url } => proxy::doctor(&probe_url),
+        Command::Reap { dir } => reaper::run(dir),
     };
     if let Err(e) = result {
         if !e.message.is_empty() {

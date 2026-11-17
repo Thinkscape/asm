@@ -50,6 +50,9 @@ final class ApprovalPanel: NSPanel {
 final class ApprovalPanelController {
     private unowned let model: AppModel
     private var panel: ApprovalPanel?
+    #if DEBUG
+    private var snapshotSignal: DispatchSourceSignal?
+    #endif
 
     init(model: AppModel) {
         self.model = model
@@ -77,7 +80,7 @@ final class ApprovalPanelController {
 
     private func makePanel() -> ApprovalPanel {
         let panel = ApprovalPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 410, height: 400),
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 400),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -94,6 +97,7 @@ final class ApprovalPanelController {
         // Lets screenshots capture the panel when reviewing its look in a debug build.
         if ProcessInfo.processInfo.environment["ASM_DEBUG_SHAREABLE_PANEL"] == "1" {
             panel.sharingType = .readOnly
+            installSnapshotSignal()
         }
         #endif
         panel.isReleasedWhenClosed = false
@@ -106,6 +110,33 @@ final class ApprovalPanelController {
         panel.contentViewController = hosting
         return panel
     }
+
+    #if DEBUG
+    /// `kill -USR1 <pid>` writes the panel's own rendering to
+    /// `$TMPDIR/asm-panel-<time>.png`, for reviewing its look where screen capture is
+    /// not permitted. Open menus and the glass backdrop are not part of the image.
+    private func installSnapshotSignal() {
+        guard snapshotSignal == nil else { return }
+        signal(SIGUSR1, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+        source.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.writeSnapshot() }
+        }
+        source.resume()
+        snapshotSignal = source
+    }
+
+    private func writeSnapshot() {
+        guard let view = panel?.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+        view.effectiveAppearance.performAsCurrentDrawingAppearance {
+            view.cacheDisplay(in: view.bounds, to: rep)
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("asm-panel-\(Int(Date().timeIntervalSince1970 * 1000)).png")
+        try? rep.representation(using: .png, properties: [:])?.write(to: url)
+        NSLog("asm debug snapshot: %@", url.path)
+    }
+    #endif
 
     private func position(_ panel: NSPanel) {
         let mouse = NSEvent.mouseLocation

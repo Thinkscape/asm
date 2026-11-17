@@ -285,7 +285,7 @@ fn end_to_end_with_patched_iron_proxy() {
     let (status, body) = via_proxy(cfg.port, echo_port, &sentinel);
     assert_eq!(status, 403, "{body}");
     assert!(
-        body.contains("asm: sentinel not valid for this host or scheme"),
+        body.contains("asm: sentinel expired or revoked; run asm get again"),
         "{body}"
     );
     assert_eq!(
@@ -344,7 +344,7 @@ fn end_to_end_with_patched_iron_proxy() {
             == Some(("lease-1".to_string(), 0))))));
     assert!(events.iter().any(|e| matches!(e, ProxyEvent::Request(a)
         if a.status == Some(403) && a.rejected.as_ref().is_some_and(|r|
-            r.reason.as_deref() == Some("sentinel_not_valid")))));
+            r.reason.as_deref() == Some("sentinel_ended")))));
     assert!(!format!("{events:?}").contains(REAL));
 
     let pid = sup.status().pid.unwrap();
