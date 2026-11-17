@@ -6,6 +6,10 @@ description: Get API keys, tokens and passwords through Agents Secrets Manager (
 # Agents Secrets Manager (`asm`)
 
 ## 1. What it is
+This skill ships inside the `asm` binary. `asm skill install` writes it to
+`~/.agents/skills/asm/SKILL.md` (`--dir DIR` for other skill folders); run it again after
+upgrading `asm` to keep this file in step with the CLI.
+
 
 Secrets live on the operator's Mac. A human approves every request you make. You normally
 receive a **sentinel** (`asm_…`), not the value. The sentinel works only when the request

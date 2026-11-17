@@ -8,6 +8,7 @@ mod pair;
 mod proxy;
 mod reaper;
 mod requests;
+mod skill;
 mod state;
 mod tls;
 
@@ -108,6 +109,9 @@ enum Command {
         #[arg(long, default_value = "https://example.com/")]
         probe_url: String,
     },
+    /// Install the agent skill shipped with this CLI into agents' skill folders.
+    #[command(subcommand)]
+    Skill(skill::SkillCommand),
     /// Delete the files of ended leases in the background (started by other commands).
     #[command(hide = true)]
     Reap {
@@ -154,6 +158,7 @@ fn main() {
         Command::ProxyEnv { shell, unset } => proxy::proxy_env(shell, unset),
         Command::Doctor { probe_url } => proxy::doctor(&probe_url),
         Command::Reap { dir } => reaper::run(dir),
+        Command::Skill(cmd) => skill::run(cmd),
     };
     if let Err(e) = result {
         if !e.message.is_empty() {

@@ -5,9 +5,11 @@
 #
 # Environment:
 #   ASM_VERSION  release tag to install, e.g. v0.1.0 (default: the latest release)
-#   PREFIX       install prefix (default: ~/.local); the binary goes to $PREFIX/bin/asm and
-#                the agent skill to $PREFIX/share/asm/skill/asm/SKILL.md
+#   PREFIX       install prefix (default: ~/.local); the binary goes to $PREFIX/bin/asm
 #   ASM_REPO     GitHub repository (default: Thinkscape/asm)
+#
+# Afterwards it runs `asm skill install`, which writes the agent skill embedded in the binary to
+# ~/.agents/skills/asm/SKILL.md (skipped under sudo, so root's home is not used).
 set -eu
 
 repo=${ASM_REPO:-Thinkscape/asm}
@@ -68,15 +70,18 @@ tar -xzf "$tmp/$archive" -C "$tmp"
 src="$tmp/asm-$target"
 [ -f "$src/asm" ] || die "archive does not contain asm-$target/asm"
 
-mkdir -p "$prefix/bin" "$prefix/share/asm/skill/asm"
+mkdir -p "$prefix/bin"
 # Install via a temp file and rename, so a running asm is never overwritten in place.
 cp "$src/asm" "$prefix/bin/.asm.new"
 chmod 0755 "$prefix/bin/.asm.new"
 mv -f "$prefix/bin/.asm.new" "$prefix/bin/asm"
-cp "$src/skill/asm/SKILL.md" "$prefix/share/asm/skill/asm/SKILL.md"
 
 say "installed $("$prefix/bin/asm" --version) to $prefix/bin/asm"
-say "agent skill: $prefix/share/asm/skill/asm/SKILL.md"
+if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    say "agent skill: run 'asm skill install' as $SUDO_USER (adds it to ~/.agents/skills)"
+elif ! "$prefix/bin/asm" skill install >&2; then
+    say "note: the agent skill was not installed; see the message above ('asm skill status' shows the state)"
+fi
 case ":$PATH:" in
     *":$prefix/bin:"*) ;;
     *) say "note: $prefix/bin is not on PATH; add it, e.g. export PATH=\"$prefix/bin:\$PATH\"" ;;
@@ -86,3 +91,4 @@ say "next steps:"
 say "  asm pair <manager-host>      # approve the code shown on the Mac, or pass a pairing code"
 say "  asm doctor                   # every line should say ok"
 say "  eval \"\$(asm proxy-env)\"      # point HTTP clients at the proxy"
+say "  asm skill install --dir ~/.claude/skills   # also for agents reading another skill folder"

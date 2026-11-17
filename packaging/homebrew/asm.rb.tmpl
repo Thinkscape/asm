@@ -23,8 +23,9 @@ class Asm < Formula
     <<~EOS
       Pair this machine with the manager on the operator's Mac:
         asm pair <manager-host>
-      The agent skill is at:
-        #{opt_pkgshare}/skill/asm/SKILL.md
+      Add the agent skill to ~/.agents/skills (rerun after upgrades to keep it current):
+        asm skill install
+      For agents that read another folder, add e.g. --dir ~/.claude/skills.
     EOS
   end
 

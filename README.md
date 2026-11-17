@@ -80,9 +80,10 @@ Release assets are on [GitHub Releases](https://github.com/Thinkscape/asm/releas
 
 ```sh
 brew install thinkscape/asm/asm
+asm skill install
 ```
 
-This taps [`Thinkscape/homebrew-asm`](https://github.com/Thinkscape/homebrew-asm) and installs the prebuilt binary (universal on macOS, x86_64 or arm64 on Linux). The agent skill is installed to `$(brew --prefix)/opt/asm/share/asm/skill/asm/SKILL.md`. Newer Homebrew versions require third-party taps to be trusted: the fully qualified name above trusts the formula. If you prefer `brew tap thinkscape/asm && brew install asm`, run `brew trust thinkscape/asm` first.
+This taps [`Thinkscape/homebrew-asm`](https://github.com/Thinkscape/homebrew-asm) and installs the prebuilt binary (universal on macOS, x86_64 or arm64 on Linux). Homebrew never writes to your home directory, so add the agent skill with `asm skill install` (see [The agent skill](#the-agent-skill)) and run it again after `brew upgrade`. A copy of the skill also stays at `$(brew --prefix)/opt/asm/share/asm/skill/asm/SKILL.md`. Newer Homebrew versions require third-party taps to be trusted: the fully qualified name above trusts the formula. If you prefer `brew tap thinkscape/asm && brew install asm`, run `brew trust thinkscape/asm` first.
 
 ### CLI with an install script (macOS, Linux)
 
@@ -90,11 +91,11 @@ This taps [`Thinkscape/homebrew-asm`](https://github.com/Thinkscape/homebrew-asm
 curl -fsSL https://raw.githubusercontent.com/Thinkscape/asm/main/scripts/install.sh | sh
 ```
 
-The script detects the OS and architecture, downloads the matching tarball from the latest release, checks it against `SHA256SUMS` and installs `asm` to `~/.local/bin`. The skill goes to `~/.local/share/asm/skill/asm/SKILL.md`. Set `PREFIX=/usr/local` (with `sudo sh`) to install system-wide, or `ASM_VERSION=v0.1.0` to pin a release.
+The script detects the OS and architecture, downloads the matching tarball from the latest release, checks it against `SHA256SUMS`, installs `asm` to `~/.local/bin` and then runs `asm skill install`, which adds the agent skill to `~/.agents/skills`. Set `PREFIX=/usr/local` (with `sudo sh`) to install system-wide, or `ASM_VERSION=v0.1.0` to pin a release. Under `sudo` the script skips the skill so that it does not land in root's home; run `asm skill install` as your own user afterwards. Running the script again upgrades both.
 
 ### CLI as a Linux package
 
-The Linux binaries are static (musl), so the same package works on any distribution version. Packages install `/usr/bin/asm` and the skill at `/usr/share/asm/skill/asm/SKILL.md`. Use `x86_64` or `aarch64` in the file name to match `uname -m`:
+The Linux binaries are static (musl), so the same package works on any distribution version. Packages install `/usr/bin/asm` and a copy of the skill at `/usr/share/asm/skill/asm/SKILL.md`; they do not touch home directories. Use `x86_64` or `aarch64` in the file name to match `uname -m`, then run `asm skill install` as each user whose agents need the skill:
 
 ```sh
 base=https://github.com/Thinkscape/asm/releases/latest/download
@@ -110,6 +111,9 @@ wget $base/asm-linux-x86_64.apk && sudo apk add --allow-untrusted ./asm-linux-x8
 
 # Arch Linux
 sudo pacman -U $base/asm-linux-x86_64.pkg.tar.zst
+
+# then, as your user
+asm skill install
 ```
 
 **Why there is no apt/yum repository yet:** a package repository is only useful if it is signed. An unsigned apt repository needs `[trusted=yes]` and an unsigned yum repository needs `gpgcheck=0`. Both settings make the package manager accept anything served from that URL on every future update. The packages are not GPG-signed either, which is why Alpine needs `--allow-untrusted`. Until a signing key is set up for the project, install the packages from the release and check them against `SHA256SUMS`:
@@ -124,9 +128,31 @@ curl -fsSLO $base/SHA256SUMS && sha256sum --ignore-missing -c SHA256SUMS
 curl -fsSLO https://github.com/Thinkscape/asm/releases/latest/download/asm-linux-x86_64.tar.gz
 tar -xzf asm-linux-x86_64.tar.gz
 install -m 0755 asm-linux-x86_64/asm ~/.local/bin/asm
+asm skill install
 ```
 
 Tarballs are `asm-linux-x86_64`, `asm-linux-aarch64` and `asm-macos-universal`. Each contains `asm`, `README.md`, `LICENSE` and `skill/asm/SKILL.md`.
+
+### The agent skill
+
+The skill that teaches agents the asm workflow ([`skill/asm/SKILL.md`](skill/asm/SKILL.md)) is built into the `asm` binary, so the installed skill always matches the CLI version, however the CLI was installed:
+
+```sh
+asm skill install                                          # ~/.agents/skills/asm/SKILL.md
+asm skill install --dir ~/.claude/skills --dir ~/.agents/skills   # several skill folders
+asm skill status                                           # installed (current|outdated), foreign, symlink or missing
+asm skill uninstall
+```
+
+`asm skill install` prints `installed: <path>`, `updated: <path>` (the skill text changed), `updated (asm-version only): <path>` (same text, installed by another `asm` version) or `up to date: <path>`; it writes nothing when the file already matches. Run it again after upgrading `asm`. The installed file records its origin at the end of the frontmatter, in the Agent Skills `metadata` map:
+
+```yaml
+metadata:
+  installed-by: asm
+  asm-version: "0.2.3"
+```
+
+asm only updates or removes files whose frontmatter has `installed-by: asm`. A `SKILL.md` you wrote yourself, or an `asm` folder that is a symlink (for example to the Homebrew copy), is refused with exit 1; `--force` replaces it with asm's copy (a symlink becomes a real folder; its target is not touched).
 
 ### The manager app (macOS 14 or later)
 
@@ -181,7 +207,7 @@ A pairing code has a label, an expiry, a maximum number of uses and optionally t
 - **Machine hint.** The CLI also sends a hash of the machine id: `/etc/machine-id` on Linux, the hardware UUID on macOS, nothing in a container that has none. Anyone can claim any value, so it is only a hint. If an interactive pairing without a valid proof matches an active host, the popup reads "Looks like <name> (paired <date>)" and offers **Replace <name>** (on by default). Replacing revokes the old host together with its leases, so no capability moves on the strength of the hint. The new host takes the old one's name. With the toggle off, the new host is a separate record. A pairing code never replaces a host by hint; the match is noted in the Activity Log.
 - **Duplicates.** In **Hosts and Agents**, hosts that share a machine hint are flagged as possible duplicates. Revoke the stale one.
 
-To teach an agent the workflow, give it the skill at [`skill/asm/SKILL.md`](skill/asm/SKILL.md) (also installed by every package; see above).
+To teach an agent the workflow, install the skill with `asm skill install` (see [The agent skill](#the-agent-skill)).
 
 ### When a lease ends
 
@@ -203,6 +229,7 @@ Commands:
   proxy-info  Show the proxy addresses, which one is reachable, and the CA files (information only)
   proxy-env   Print shell code that points HTTP clients at the proxy: eval "$(asm proxy-env)". Prints nothing on stdout (and exits 1) when no proxy address is reachable
   doctor      Check pairing, connectivity, files and the proxy
+  skill       Install the agent skill shipped with this CLI into agents' skill folders
 ```
 
 |Command|Options|Notes|
@@ -215,6 +242,9 @@ Commands:
 |`asm proxy-info`|`--json`|Proxy URLs (`http://` and `socks5h://` per hostname hint, the first reachable one marked `(recommended)`), CA certificate and CA bundle paths. Refreshes the CA files.|
 |`asm proxy-env`|`--shell <posix\|fish>`: output syntax (default `posix`)<br>`--unset`: print code that removes the variables instead|Sets `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` (the manager host), `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO` (system roots + proxy CA) and `NODE_EXTRA_CA_CERTS` (proxy CA).|
 |`asm doctor`|`--probe-url <PROBE_URL>`: HTTPS URL fetched through the proxy (default `https://example.com/`)|One `ok` / `warn` / `FAIL` line per check: pairing, manager reachable and pin matches, token accepted, secrets directory, CA files, proxy addresses, the manager's macOS Firewall (managers that report it), an HTTPS request through the proxy.|
+|`asm skill install`|`--dir <DIR>` (repeatable; default `~/.agents/skills`)<br>`--force`: replace a skill not installed by asm, or an `asm` symlink<br>`--print`: print the embedded `SKILL.md` instead|Writes `<DIR>/asm/SKILL.md` (folders 0755, file 0644). Prints `installed: …`, `updated: …`, `updated (asm-version only): …` or `up to date: …` per folder; refusals go to stderr and make the exit code 1. See [The agent skill](#the-agent-skill).|
+|`asm skill uninstall`|`--dir <DIR>` (repeatable)|Removes `<DIR>/asm/SKILL.md` only when asm installed it, then the `asm` folder when empty. Prints `removed: …`, `not installed: …` or `left alone (…): …`; exit 0.|
+|`asm skill status`|`--dir <DIR>` (repeatable)<br>`--json`|One line per folder: `installed (current)` or `installed (outdated)` with the installed `asm-version`, `foreign`, `symlink` or `missing`. `--json` adds `installed_version` and this CLI's `version`. Exit 0.|
 
 Host patterns follow iron-proxy's rules: case-insensitive, `*` matches any host, `*.example.com` matches `example.com` and every subdomain, and any other `*` is a glob. Patterns have no scheme and no port.
 
