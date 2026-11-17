@@ -345,58 +345,6 @@ private enum ValueMode: Hashable {
     case realValue
 }
 
-/// Compact "Proxied" / "Real value" switch for the action row. Drawn by SwiftUI: a
-/// segmented `Picker` looks inactive while the non-activating panel is not key. AX sees
-/// a segmented picker labelled "Value mode".
-private struct ValueModeSwitch: View {
-    @Binding var mode: ValueMode
-
-    var body: some View {
-        HStack(spacing: 2) {
-            segment(.proxied, title: "Proxied", help: "The agent gets a token that works only through the proxy")
-            segment(.realValue, title: "Real value", help: "The agent receives the real value and keeps it")
-        }
-        .padding(2)
-        .background(.fill.tertiary, in: Capsule())
-        .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
-        .fixedSize()
-        .accessibilityRepresentation {
-            Picker("Value mode", selection: $mode) {
-                Text("Proxied").tag(ValueMode.proxied)
-                Text("Real value").tag(ValueMode.realValue)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-        }
-    }
-
-    /// Selected Proxied: a raised neutral segment; selected Real value: orange.
-    private func segment(_ value: ValueMode, title: LocalizedStringKey, help: LocalizedStringKey) -> some View {
-        let selected = mode == value
-        let caution = value == .realValue
-        return Button {
-            mode = value
-        } label: {
-            Text(title)
-                .font(.system(size: 12, weight: selected ? .semibold : .medium))
-                .lineLimit(1)
-                .foregroundStyle(selected && caution ? AnyShapeStyle(.black.opacity(0.85)) : AnyShapeStyle(.primary))
-                .padding(.horizontal, 10)
-                .frame(minHeight: 26)
-                .background {
-                    if selected {
-                        Capsule()
-                            .fill(caution ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.background))
-                            .shadow(color: .black.opacity(0.15), radius: 1, y: 0.5)
-                    }
-                }
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .help(help)
-    }
-}
-
 /// Footnote under the action row: what the chosen mode gives the agent.
 private struct ValueModeCaption: View {
     let mode: ValueMode
@@ -676,6 +624,12 @@ private struct ApprovalActions<Trailing: View>: View {
     }
 }
 
+/// Size shared by the action row's buttons.
+private enum PanelButtonMetrics {
+    static let height: CGFloat = 40
+    static let font = Font.system(size: 15, weight: .medium)
+}
+
 /// Deny (no reason) with a menu of reasons. Drawn by SwiftUI like `PanelButtonStyle`,
 /// so it looks the same whether or not the non-activating panel is key.
 private struct DenySplitButton: View {
@@ -689,83 +643,155 @@ private struct DenySplitButton: View {
                 deny("")
             } label: {
                 Text("Deny")
-                    .padding(.leading, 12)
-                    .padding(.trailing, 8)
-                    .frame(maxHeight: .infinity)
-                    .contentShape(Rectangle())
+                    .padding(.leading, 22)
+                    .padding(.trailing, 16)
+                    .frame(minWidth: 70)
             }
-            .buttonStyle(.plain)
-            Divider()
-                .padding(.vertical, 8)
+            .buttonStyle(SegmentButtonStyle())
+            SegmentDivider(style: AnyShapeStyle(.separator))
             Menu {
                 ForEach(cannedReasons, id: \.self) { reason in
                     Button("Deny (\(reason))") { deny(reason) }
                 }
                 Button("Deny with custom reason…", action: customReason)
             } label: {
-                Label("Deny with a reason", systemImage: "chevron.down")
-                    .labelStyle(.iconOnly)
-                    .font(.system(size: 11, weight: .semibold))
+                SplitChevron(label: "Deny with a reason")
             }
-            .menuStyle(.borderlessButton)
+            .menuStyle(.button)
+            .buttonStyle(.plain)
             .menuIndicator(.hidden)
             .fixedSize()
-            .padding(.leading, 5)
-            .padding(.trailing, 8)
         }
-        .font(.system(size: 13, weight: .medium))
-        .frame(height: 30)
+        .font(PanelButtonMetrics.font)
+        .frame(height: PanelButtonMetrics.height)
         .background(.fill.tertiary, in: Capsule())
         .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+        .clipShape(Capsule())
         .fixedSize()
     }
 }
 
-/// Capsule buttons drawn by SwiftUI: a new request does not make the panel key, and
-/// AppKit buttons would then look inactive (no accent fill, dimmed labels).
-private struct PanelButtonStyle: ButtonStyle {
-    enum Role {
-        /// Filled with the accent colour.
-        case primary
-        /// Filled orange: gives away the real value.
-        case caution
+/// Approves a `get`: the primary segment allows in the current mode, the chevron
+/// ("Approval mode") only switches the mode. Proxied: accent fill, Return approves.
+/// Real value: orange fill, never bound to Return.
+private struct AllowSplitButton: View {
+    @Binding var mode: ValueMode
+    /// The primary segment; the chevron always works.
+    let enabled: Bool
+    let isDefault: Bool
+    let allow: () -> Void
+
+    private var realValue: Bool { mode == .realValue }
+
+    var body: some View {
+        let foreground = realValue ? AnyShapeStyle(.black.opacity(0.85)) : AnyShapeStyle(.white)
+        HStack(spacing: 0) {
+            Button(action: allow) {
+                Text(realValue ? "Allow Real Value" : "Allow")
+                    .padding(.leading, 22)
+                    .padding(.trailing, 16)
+                    .frame(minWidth: 96)
+            }
+            .buttonStyle(SegmentButtonStyle())
+            .keyboardShortcut(isDefault ? .defaultAction : nil)
+            .disabled(!enabled)
+            SegmentDivider(style: realValue ? AnyShapeStyle(.black.opacity(0.25)) : AnyShapeStyle(.white.opacity(0.45)))
+            Menu {
+                Toggle(isOn: selects(.proxied)) {
+                    Text("Allow through proxy (hidden)")
+                }
+                Toggle(isOn: selects(.realValue)) {
+                    Text("Allow real value…").foregroundStyle(.orange)
+                }
+            } label: {
+                SplitChevron(label: "Approval mode")
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Choose how the agent gets the secret")
+        }
+        .font(PanelButtonMetrics.font)
+        .lineLimit(1)
+        .foregroundStyle(foreground)
+        .frame(height: PanelButtonMetrics.height)
+        .background(
+            (realValue ? Color.orange : Color.accentColor).opacity(enabled ? 1 : 0.55),
+            in: Capsule()
+        )
+        .clipShape(Capsule())
+        .fixedSize()
     }
 
-    var role: Role
+    /// Checked when `value` is the current mode; picking it only switches the mode.
+    private func selects(_ value: ValueMode) -> Binding<Bool> {
+        Binding(get: { mode == value }, set: { if $0 { mode = value } })
+    }
+}
+
+/// One segment of a split button: full height, darkens while pressed, fades when disabled.
+private struct SegmentButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 13, weight: .medium))
             .lineLimit(1)
-            .padding(.horizontal, 11)
             .fixedSize()
-            .frame(minWidth: 76, minHeight: 30, maxHeight: 30)
-            .foregroundStyle(foreground)
-            .background(background, in: Capsule())
+            .frame(maxHeight: .infinity)
+            .background(configuration.isPressed ? Color.black.opacity(0.12) : Color.clear)
+            .contentShape(Rectangle())
+            .opacity(isEnabled ? 1 : 0.55)
+    }
+}
+
+private struct SegmentDivider: View {
+    let style: AnyShapeStyle
+
+    var body: some View {
+        Rectangle()
+            .fill(style)
+            .frame(width: 1)
+            .padding(.vertical, 10)
+    }
+}
+
+/// The menu segment of a split button: a chevron, labelled for accessibility.
+private struct SplitChevron: View {
+    let label: LocalizedStringKey
+
+    var body: some View {
+        Label(label, systemImage: "chevron.down")
+            .labelStyle(.iconOnly)
+            .font(.system(size: 13, weight: .semibold))
+            .padding(.leading, 12)
+            .padding(.trailing, 16)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+    }
+}
+
+/// Filled capsule button drawn by SwiftUI: a new request does not make the panel key,
+/// and AppKit buttons would then look inactive (no accent fill, dimmed labels).
+private struct PanelButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(PanelButtonMetrics.font)
+            .lineLimit(1)
+            .padding(.horizontal, 28)
+            .fixedSize()
+            .frame(minWidth: 120, minHeight: PanelButtonMetrics.height, maxHeight: PanelButtonMetrics.height)
+            .foregroundStyle(.white)
+            .background(Color.accentColor, in: Capsule())
             .contentShape(Capsule())
             .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.45)
-    }
-
-    private var foreground: AnyShapeStyle {
-        switch role {
-        case .primary: AnyShapeStyle(.white)
-        case .caution: AnyShapeStyle(.black.opacity(0.85))
-        }
-    }
-
-    private var background: AnyShapeStyle {
-        switch role {
-        case .primary: AnyShapeStyle(Color.accentColor)
-        case .caution: AnyShapeStyle(Color.orange)
-        }
     }
 }
 
 extension ButtonStyle where Self == PanelButtonStyle {
-    fileprivate static func panel(_ role: PanelButtonStyle.Role) -> PanelButtonStyle {
-        PanelButtonStyle(role: role)
-    }
+    fileprivate static var panel: PanelButtonStyle { PanelButtonStyle() }
 }
 
 // MARK: - Pair
@@ -908,7 +934,7 @@ private struct PairApproval: View {
             ) {
                 // Not the default button: comparing the codes is the approval, so Return never pairs.
                 Button("Pair", action: approve)
-                    .buttonStyle(.panel(.primary))
+                    .buttonStyle(.panel)
                     .disabled(!context.armed || (!nameKept && nameProblem != nil))
             }
         }
@@ -1098,18 +1124,21 @@ private struct GetApproval: View {
             }
         } content: {
             ReasonBlock(reason: detail.reason)
-            HostsSection(
-                hosts: $hosts,
-                anyHost: $anyHost,
-                editing: $editingHost,
-                newHost: $newHost,
-                error: $hostError,
-                fieldFocused: $hostFieldFocused,
-                suggestions: suggestions,
-                dimmed: mode == .realValue,
-                add: add
-            )
-            VStack(alignment: .leading, spacing: 6) {
+            // Real value: the hosts do not apply, so the section leaves the layout. Its
+            // state stays here, so switching back restores what the operator had.
+            if mode == .proxied {
+                HostsSection(
+                    hosts: $hosts,
+                    anyHost: $anyHost,
+                    editing: $editingHost,
+                    newHost: $newHost,
+                    error: $hostError,
+                    fieldFocused: $hostFieldFocused,
+                    suggestions: suggestions,
+                    add: add
+                )
+            }
+            HStack(alignment: .center, spacing: 10) {
                 SectionLabel("For")
                 Picker("For", selection: $duration) {
                     ForEach(durations) { option in
@@ -1118,6 +1147,7 @@ private struct GetApproval: View {
                 }
                 .labelsHidden()
                 .fixedSize()
+                Spacer(minLength: 0)
             }
         } details: {
             InfoRow(label: "Vault", value: detail.vaultName)
@@ -1134,12 +1164,7 @@ private struct GetApproval: View {
                 editingReason: $editingReason,
                 deny: context.deny
             ) {
-                ValueModeSwitch(mode: $mode)
-                // Real value: orange and never bound to Return.
-                Button("Allow", action: allow)
-                    .buttonStyle(.panel(mode == .proxied ? .primary : .caution))
-                    .keyboardShortcut(allowIsDefault ? .defaultAction : nil)
-                    .disabled(!canAllow)
+                AllowSplitButton(mode: $mode, enabled: canAllow, isDefault: allowIsDefault, allow: allow)
             }
             ValueModeCaption(mode: mode)
         }
@@ -1196,9 +1221,6 @@ private struct HostsSection: View {
     @Binding var error: String?
     var fieldFocused: FocusState<Bool>.Binding
     let suggestions: [HostEntry]
-    /// Real value mode: the hosts do not apply; shown dimmed and inert so the panel
-    /// keeps its height.
-    let dimmed: Bool
     let add: (String) -> Bool
 
     private var filteredSuggestions: [HostEntry] {
@@ -1208,14 +1230,7 @@ private struct HostsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                SectionLabel("Can be used with")
-                if dimmed {
-                    Text("Not used for real values")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                }
-            }
+            SectionLabel("Can be used with")
             VStack(alignment: .leading, spacing: 6) {
                 FlowLayout(spacing: 6) {
                     if anyHost {
@@ -1269,9 +1284,6 @@ private struct HostsSection: View {
                         .foregroundStyle(.orange)
                 }
             }
-            .opacity(dimmed ? 0.45 : 1)
-            .disabled(dimmed)
-            .accessibilityHidden(dimmed)
         }
     }
 
@@ -1479,7 +1491,7 @@ private struct UpdateApproval: View {
                     guard context.armed else { return }
                     context.resolve(.approveWrite(vaultID: vaultID, collectionID: nil))
                 }
-                .buttonStyle(.panel(.primary))
+                .buttonStyle(.panel)
                 .keyboardShortcut(editingReason ? nil : .defaultAction)
                 .disabled(!context.armed)
             }
@@ -1614,7 +1626,7 @@ private struct AddApproval: View {
                     let collection = (target?.kind == .bitwarden && collectionID != Self.personal) ? collectionID : nil
                     context.resolve(.approveWrite(vaultID: vaultID, collectionID: collection))
                 }
-                .buttonStyle(.panel(.primary))
+                .buttonStyle(.panel)
                 .keyboardShortcut(editingReason ? nil : .defaultAction)
                 .disabled(!canAllow)
             }
