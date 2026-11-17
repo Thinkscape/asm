@@ -97,6 +97,8 @@ struct MenuBarPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            MenuBarHeader()
+            Divider()
             if let startError = model.startError {
                 Label {
                     Text(verbatim: startError)
@@ -134,6 +136,27 @@ struct MenuBarPanel: View {
         }
         .padding(12)
         .frame(width: 360)
+    }
+}
+
+/// Slim header at the top of the panel: app icon and app name.
+private struct MenuBarHeader: View {
+    var body: some View {
+        HStack(spacing: 6) {
+            // The icon image carries the macOS grid margin (artwork 824/1024): draw it
+            // larger than its layout frame so the artwork itself is 16 pt.
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 20, height: 20)
+                .frame(width: 16, height: 16)
+            Text(verbatim: "Agents Secrets Manager")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(verbatim: "Agents Secrets Manager"))
+        .accessibilityAddTraits(.isHeader)
     }
 }
 
