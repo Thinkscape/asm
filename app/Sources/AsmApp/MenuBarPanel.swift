@@ -6,7 +6,8 @@ struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        let alert = model.proxyStatus.needsAttention
+        let proxyDown = model.proxyStatus.needsAttention
+        let alert = proxyDown || model.firewall.needsAttention
         let glyph = alert ? MenuBarGlyph.alertImage : MenuBarGlyph.image
         let pendingCount = model.pending.count
         Group {
@@ -16,7 +17,8 @@ struct MenuBarLabel: View {
                 Image(nsImage: glyph)
             }
         }
-        .accessibilityLabel(alert ? Text("Proxy not running") : Text("Agents Secrets Manager"))
+        .accessibilityLabel(proxyDown ? Text("Proxy not running")
+            : model.firewall.problemLabel.map { Text(verbatim: $0) } ?? Text("Agents Secrets Manager"))
         // The label lives as long as the app: lend its `openWindow` to the model (used by
         // notification clicks, which have no view).
         .onAppear { model.openWindow = { openWindow(id: $0) } }
@@ -38,9 +40,9 @@ enum MenuBarGlyph {
         return image
     }()
 
-    /// The glyph with a red dot badge (top right) while the proxy is down. A template
-    /// image cannot carry colour, so this one draws the robot itself in the menu bar's
-    /// text colour for the appearance it is drawn in.
+    /// The glyph with a red dot badge (top right) while the proxy is down or the macOS
+    /// Firewall blocks it. A template image cannot carry colour, so this one draws the
+    /// robot itself in the menu bar's text colour for the appearance it is drawn in.
     @MainActor static let alertImage: NSImage = {
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { _ in
             guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
@@ -56,7 +58,7 @@ enum MenuBarGlyph {
             return true
         }
         image.isTemplate = false
-        image.accessibilityDescription = "Proxy not running"
+        image.accessibilityDescription = "Needs attention"
         return image
     }()
 
@@ -116,6 +118,14 @@ struct MenuBarPanel: View {
                     showDetails: { model.settingsPaneRequest = .proxy }
                 )
             }
+            if let title = model.firewall.problemTitle {
+                FirewallBanner(
+                    title: title,
+                    commands: model.firewall.fixCommands,
+                    dismissPanel: { dismiss() },
+                    showDetails: { model.settingsPaneRequest = .proxy }
+                )
+            }
             let locked = model.lockedVaults
             if !locked.isEmpty {
                 LockedVaultsSection(locked: locked, unlock: { model.unlockingVaultID = $0 }, dismissPanel: { dismiss() })
@@ -160,6 +170,53 @@ private struct MenuBarHeader: View {
     }
 }
 
+/// Shared look of the panel's problem banners: icon, headline, an optional detail line
+/// and a row of capsule buttons, all left-aligned with the headline text. Buttons never
+/// wrap; when they do not fit one line, the `overflow` buttons move to a second line.
+private struct ProblemBanner<Primary: View, Overflow: View>: View {
+    let symbol: String
+    let title: String
+    var detail: String?
+    let tint: Color
+    @ViewBuilder let primary: Primary
+    @ViewBuilder let overflow: Overflow
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            Image(systemName: symbol).font(.callout)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(verbatim: title)
+                    .font(.callout.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                if let detail {
+                    Text(verbatim: detail)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(detail)
+                        .opacity(0.9)
+                }
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 6) {
+                        primary
+                        overflow
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) { primary }
+                        HStack(spacing: 6) { overflow }
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.gradient, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .accessibilityElement(children: .contain)
+    }
+}
+
 /// Red banner while the proxy is down or not responding: headline, the cause on one
 /// line (full text in the tooltip), Restart and Details… (Settings → Proxy).
 private struct ProxyProblemBanner: View {
@@ -173,41 +230,93 @@ private struct ProxyProblemBanner: View {
     @State private var restartError: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Label {
-                Text(title).font(.callout.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
-            } icon: {
-                Image(systemName: "exclamationmark.triangle.fill")
+        ProblemBanner(symbol: "exclamationmark.triangle.fill", title: title, detail: restartError ?? reason, tint: .red) {
+            BannerButton(title: "Restart") {
+                restarting = true
+                Task {
+                    restartError = await restart()
+                    restarting = false
+                }
             }
-            Text(verbatim: restartError ?? reason)
-                .font(.caption)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .help(restartError ?? reason)
-                .opacity(0.9)
-            HStack(spacing: 8) {
-                Spacer()
-                if restarting { ProgressView().controlSize(.small).tint(.white) }
-                BannerButton(title: "Restart") {
-                    restarting = true
-                    Task {
-                        restartError = await restart()
-                        restarting = false
-                    }
-                }
-                .disabled(restarting)
-                BannerButton(title: "Details…") {
-                    dismissPanel()
-                    showDetails()
-                    ActivationPolicyController.shared.openRegularWindow { openWindow(id: "settings") }
-                }
+            .disabled(restarting)
+            if restarting { ProgressView().controlSize(.small).tint(.white) }
+        } overflow: {
+            BannerButton(title: "Details…") {
+                dismissPanel()
+                showDetails()
+                ActivationPolicyController.shared.openRegularWindow { openWindow(id: "settings") }
             }
         }
-        .foregroundStyle(.white)
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.red.gradient, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .accessibilityElement(children: .contain)
+    }
+}
+
+/// Orange banner while the macOS Firewall blocks a listener meant for other machines:
+/// Firewall Settings, How to Fix… (the Terminal command, with Copy) and Details…
+/// (Settings → Proxy). Nothing here changes firewall settings.
+private struct FirewallBanner: View {
+    let title: String
+    let commands: [String]
+    let dismissPanel: () -> Void
+    let showDetails: () -> Void
+    @Environment(\.openWindow) private var openWindow
+    @State private var showingFix = false
+
+    var body: some View {
+        ProblemBanner(symbol: "exclamationmark.shield.fill", title: title, tint: .orange) {
+            BannerButton(title: "Firewall Settings") {
+                dismissPanel()
+                ProxyAlerts.openFirewallSettings()
+            }
+            BannerButton(title: "How to Fix…") { showingFix = true }
+                .popover(isPresented: $showingFix, arrowEdge: .bottom) {
+                    FirewallFixView(commands: commands).padding(14).frame(width: 420)
+                }
+        } overflow: {
+            BannerButton(title: "Details…") {
+                dismissPanel()
+                showDetails()
+                ActivationPolicyController.shared.openRegularWindow { openWindow(id: "settings") }
+            }
+        }
+    }
+}
+
+/// The Terminal command(s) that lift a firewall block, each with Copy.
+struct FirewallFixView: View {
+    let commands: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Allow incoming connections in System Settings → Network → Firewall → Options, or run this in Terminal (it asks for your password):")
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(commands, id: \.self) { command in
+                CopyableCommand(command: command)
+            }
+        }
+    }
+}
+
+/// A shell command in a monospaced, selectable box with a Copy button.
+struct CopyableCommand: View {
+    let command: String
+    @State private var copied = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(verbatim: command)
+                .font(.callout.monospaced())
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            Button(copied ? "Copied" : "Copy") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(command, forType: .string)
+                copied = true
+            }
+        }
     }
 }
 
@@ -219,6 +328,8 @@ private struct BannerButton: View {
         Button(action: action) {
             Text(title)
                 .font(.callout.weight(.medium))
+                .lineLimit(1)
+                .fixedSize()
                 .padding(.horizontal, 10)
                 .padding(.vertical, 3)
                 .background(.white.opacity(0.22), in: Capsule())

@@ -399,6 +399,11 @@ pub struct ProxyInfo {
     pub hints: Vec<String>,
     /// Lowercase hex SHA-256 of the proxy CA certificate (DER).
     pub ca_sha256: String,
+    /// The macOS Firewall on the manager's Mac blocks incoming connections to the proxy
+    /// while it listens for other machines. Absent from older managers and before the
+    /// manager's first check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firewall_blocks_proxy: Option<bool>,
 }
 
 #[cfg(test)]
@@ -576,5 +581,23 @@ mod tests {
         assert!(!format!("{r:?}").contains("secret-token"));
         r.machine_hint = Some("ABC".into());
         assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn proxy_info_firewall_field_is_optional() {
+        let old: ProxyInfo = from_str(r#"{"port":7412,"hints":["mac"],"ca_sha256":"ab"}"#).unwrap();
+        assert_eq!(old.firewall_blocks_proxy, None);
+        assert_eq!(
+            to_value(&old).unwrap(),
+            json!({"port":7412,"hints":["mac"],"ca_sha256":"ab"})
+        );
+        let new = ProxyInfo {
+            firewall_blocks_proxy: Some(true),
+            ..old
+        };
+        assert_eq!(
+            to_value(&new).unwrap(),
+            json!({"port":7412,"hints":["mac"],"ca_sha256":"ab","firewall_blocks_proxy":true})
+        );
     }
 }

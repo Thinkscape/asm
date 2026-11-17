@@ -4,12 +4,16 @@ import UserNotifications
 /// Tells the operator when the proxy stops working: one macOS notification per incident
 /// (Down, or unhealthy for 30 s) with a Restart action. Without notification permission
 /// it opens the menu bar panel, whose banner says the same. Recovery removes the
-/// notification and posts nothing.
+/// notification and posts nothing. The macOS Firewall blocking a listener meant for other
+/// machines is reported the same way, with an Open Firewall Settings action.
 @MainActor
 final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
     private static let category = "net.thinkscape.asm.proxy-problem"
     private static let restartAction = "restart"
     private static let requestID = "proxy-problem"
+    private static let firewallCategory = "net.thinkscape.asm.firewall-blocked"
+    private static let openFirewallAction = "open-firewall"
+    private static let firewallRequestID = "firewall-blocked"
     /// An unhealthy (running but not answering) proxy is reported after this long.
     private static let unhealthyNotifyAfter: TimeInterval = 30
 
@@ -21,6 +25,8 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
     /// The current incident was reported (reset when the proxy runs again).
     private var reported = false
     private var unhealthyCheck: Task<Void, Never>?
+    /// The current firewall incident was reported (reset once nothing is blocked).
+    private var firewallReported = false
 
     /// `nil` when the process has no bundle (`swift run`): the API then traps.
     private var center: UNUserNotificationCenter? {
@@ -31,8 +37,10 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
         guard let center else { return }
         center.delegate = self
         let restart = UNNotificationAction(identifier: Self.restartAction, title: "Restart", options: [])
+        let openFirewall = UNNotificationAction(identifier: Self.openFirewallAction, title: "Open Firewall Settings", options: [])
         center.setNotificationCategories([
             UNNotificationCategory(identifier: Self.category, actions: [restart], intentIdentifiers: [], options: []),
+            UNNotificationCategory(identifier: Self.firewallCategory, actions: [openFirewall], intentIdentifiers: [], options: []),
         ])
     }
 
@@ -68,13 +76,33 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// Feed every new firewall status: one notification when a listener meant for other
+    /// machines becomes blocked; removed once nothing is blocked.
+    func updateFirewall(_ status: FirewallStatusItem) {
+        guard status.needsAttention else {
+            if firewallReported {
+                firewallReported = false
+                center?.removeDeliveredNotifications(withIdentifiers: [Self.firewallRequestID])
+            }
+            return
+        }
+        guard !firewallReported else { return }
+        firewallReported = true
+        let (title, body) = status.proxy.blocked
+            ? ("macOS Firewall blocks iron-proxy",
+               "Other machines can't use their leases. Allow incoming connections for iron-proxy in System Settings → Network → Firewall → Options.")
+            : ("macOS Firewall blocks Agents Secrets Manager",
+               "Other machines can't pair or request secrets. Allow incoming connections for it in System Settings → Network → Firewall → Options.")
+        Task { await post(id: Self.firewallRequestID, category: Self.firewallCategory, title: title, body: body) }
+    }
+
     private func report(title: String, body: String) {
         guard !reported else { return }
         reported = true
-        Task { await post(title: title, body: body) }
+        Task { await post(id: Self.requestID, category: Self.category, title: title, body: body) }
     }
 
-    private func post(title: String, body: String) async {
+    private func post(id: String, category: String, title: String, body: String) async {
         guard let center, await authorized(center) else {
             Self.openMenuBarPanel()
             return
@@ -82,12 +110,21 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        content.categoryIdentifier = Self.category
+        content.categoryIdentifier = category
         content.sound = .default
         do {
-            try await center.add(UNNotificationRequest(identifier: Self.requestID, content: content, trigger: nil))
+            try await center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
         } catch {
             Self.openMenuBarPanel()
+        }
+    }
+
+    /// System Settings → Network → Firewall (the Network pane when that anchor is unknown).
+    static func openFirewallSettings() {
+        let firewall = URL(string: "x-apple.systempreferences:com.apple.Network-Settings.extension?Firewall")!
+        let network = URL(string: "x-apple.systempreferences:com.apple.Network-Settings.extension")!
+        if !NSWorkspace.shared.open(firewall) {
+            _ = NSWorkspace.shared.open(network)
         }
     }
 
@@ -130,6 +167,7 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
         await MainActor.run {
             switch action {
             case Self.restartAction: onRestart()
+            case Self.openFirewallAction: Self.openFirewallSettings()
             case UNNotificationDefaultActionIdentifier: onShowDetails()
             default: break
             }

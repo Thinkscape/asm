@@ -359,6 +359,7 @@ async fn proxy_info(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<P
             port: core.proxy.config().port,
             hints,
             ca_sha256: core.proxy.ca_sha256_hex()?,
+            firewall_blocks_proxy: core.firewall_blocks_proxy(),
         })
     })
     .await?;

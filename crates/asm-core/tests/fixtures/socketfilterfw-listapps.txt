@@ -1,0 +1,65 @@
+Total number of apps = 32 
+1 : /Users/thinkscape/asm/dist/Agents Secrets Manager.app/Contents/MacOS/iron-proxy 
+             (Allow incoming connections)
+2 : /Users/thinkscape/asm/dist/Agents Secrets Manager.app/Contents/MacOS/AsmApp 
+             (Allow incoming connections)
+3 : /Users/thinkscape/.bun/bin/bun 
+             (Allow incoming connections)
+4 : /Applications/Zen Browser.app/Contents/MacOS/plugin-container.app 
+             (Allow incoming connections)
+5 : /Library/SystemExtensions/3B4C3076-C08A-403B-B4A9-1C66D3443275/io.tailscale.ipn.macsys.network-extension.systemextension 
+             (Allow incoming connections)
+6 : /Applications/Xcode.app/Contents/Applications/DeviceHub.app/Contents/MacOS/DeviceHub 
+             (Allow incoming connections)
+7 : /Users/thinkscape/.t3/runtime/versions/0.1.10-nightly.20261116.4761/t3 
+             (Allow incoming connections)
+8 : /usr/libexec/ContinuityCaptureAgent 
+             (Allow incoming connections)
+9 : /Applications/Infuse.app/Contents/MacOS/Infuse 
+             (Allow incoming connections)
+10 : /Users/thinkscape/.t3/runtime/versions/0.1.10-nightly.20261112.4564/t3 
+             (Allow incoming connections)
+11 : /usr/libexec/clocksyncd 
+             (Allow incoming connections)
+12 : /Applications/T3 Code (Nightly).app/Contents/MacOS/T3 Code (Nightly) 
+             (Allow incoming connections)
+13 : /System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app 
+             (Allow incoming connections)
+14 : /Library/Apple/System/Library/PrivateFrameworks/RemotePairing.framework/Versions/A/XPCServices/remotepairingd.xpc 
+             (Allow incoming connections)
+15 : /Applications/Muxy.app/Contents/MacOS/muxy-server 
+             (Allow incoming connections)
+16 : /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python 
+             (Allow incoming connections)
+17 : /Applications/RustDesk.app 
+             (Allow incoming connections)
+18 : /Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app 
+             (Allow incoming connections)
+19 : /Users/thinkscape/projects/app/server/node_modules/@cloudflare/workerd-darwin-arm64/bin/workerd 
+             (Allow incoming connections)
+20 : /System/Library/CoreServices/UniversalControl.app/Contents/MacOS/UniversalControl 
+             (Allow incoming connections)
+21 : /Applications/OpenBot.app/Contents/Frameworks/OpenBot Helper.app 
+             (Allow incoming connections)
+22 : /System/Library/PrivateFrameworks/ReplicatorCore.framework/Support/replicatord 
+             (Allow incoming connections)
+23 : /System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter 
+             (Allow incoming connections)
+24 : /usr/libexec/rapportd 
+             (Allow incoming connections)
+25 : /usr/local/libexec/remotepairingdeviced 
+             (Allow incoming connections)
+26 : /usr/libexec/remoted 
+             (Allow incoming connections)
+27 : /usr/bin/python3 
+             (Allow incoming connections)
+28 : /usr/bin/ruby 
+             (Allow incoming connections)
+29 : /usr/sbin/cupsd 
+             (Allow incoming connections)
+30 : /usr/libexec/sharingd 
+             (Allow incoming connections)
+31 : /usr/libexec/sshd-keygen-wrapper 
+             (Allow incoming connections)
+32 : /usr/sbin/smbd 
+             (Allow incoming connections)

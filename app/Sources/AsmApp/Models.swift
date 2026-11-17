@@ -334,6 +334,82 @@ struct ProxyStatusItem: Equatable, Sendable {
     }
 }
 
+/// What the macOS Application Firewall does to incoming connections (`FirewallState`).
+enum FirewallStateItem: Equatable, Sendable {
+    case allowed
+    case blocked
+    /// "Block all incoming connections" is on.
+    case blockAll
+    case firewallOff
+    /// No rule yet: macOS asks the first time another machine connects.
+    case unknown
+}
+
+/// Whether other machines can reach one listener (`ListenerReach`).
+struct ListenerReachItem: Equatable, Sendable {
+    /// Bound to a non-loopback address: meant for other machines.
+    var intentRemote: Bool = false
+    var state: FirewallStateItem = .unknown
+    /// Meant for other machines, and the firewall blocks it.
+    var blocked: Bool = false
+    var bindAddress: String = ""
+    /// The executable the firewall rule names.
+    var executable: String = ""
+
+    /// `Other machines (0.0.0.0)` or `Local only (127.0.0.1)`.
+    var intentTitle: String {
+        intentRemote ? "Other machines (\(bindAddress))" : "Local only (\(bindAddress))"
+    }
+
+    /// The Terminal command that lifts the block (shown for the operator; never run).
+    var fixCommand: String? {
+        guard blocked else { return nil }
+        return state == .blockAll
+            ? "sudo \(FirewallStatusItem.tool) --setblockall off"
+            : "sudo \(FirewallStatusItem.tool) --unblockapp \"\(executable)\""
+    }
+}
+
+/// macOS Firewall reach of the proxy (iron-proxy) and the manager API (this app).
+struct FirewallStatusItem: Equatable, Sendable {
+    static let tool = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+
+    var proxy = ListenerReachItem()
+    var api = ListenerReachItem()
+    /// `nil` until the first check finished.
+    var checkedAt: Date?
+    var stealthMode: Bool = false
+
+    /// A listener meant for other machines is blocked.
+    var needsAttention: Bool { proxy.blocked || api.blocked }
+
+    /// Banner headline; `nil` while nothing is blocked.
+    var problemTitle: String? {
+        switch (proxy.blocked, api.blocked) {
+        case (true, false): "macOS Firewall blocks iron-proxy: other machines can't use their leases"
+        case (false, true): "macOS Firewall blocks Agents Secrets Manager: other machines can't pair or request secrets"
+        case (true, true): "macOS Firewall blocks iron-proxy and Agents Secrets Manager: other machines can't pair or use their leases"
+        case (false, false): nil
+        }
+    }
+
+    /// Short label for the menu bar icon and the sidebar badge.
+    var problemLabel: String? {
+        if proxy.blocked { return "Firewall blocks the proxy" }
+        if api.blocked { return "Firewall blocks the manager API" }
+        return nil
+    }
+
+    /// Commands that lift the blocks, proxy first, without duplicates.
+    var fixCommands: [String] {
+        var out: [String] = []
+        for command in [proxy.fixCommand, api.fixCommand].compactMap({ $0 }) where !out.contains(command) {
+            out.append(command)
+        }
+        return out
+    }
+}
+
 struct GeneralSettingsItem: Equatable, Sendable {
     var apiBindAddress: String = "0.0.0.0"
     var apiPort: Int = 7411

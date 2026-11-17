@@ -25,7 +25,9 @@ asm proxy-info             # optional: proxy addresses and CA files, for reading
 `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` and the CA bundle variables (`SSL_CERT_FILE`,
 `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `NODE_EXTRA_CA_CERTS`). It prints
 nothing and exits 1 when the proxy is unreachable. `asm proxy-env --unset` prints code that
-removes them; fish users add `--shell fish`.
+removes them; fish users add `--shell fish`. `FAIL firewall` means the macOS Firewall on the
+operator's Mac blocks the proxy: tell the operator (the asm app shows how to allow it); do
+not try to work around it.
 
 ## 3. Finding secrets
 

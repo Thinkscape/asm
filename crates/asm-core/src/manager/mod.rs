@@ -14,7 +14,7 @@ use tokio::sync::{Notify, watch};
 use crate::error::{CoreError, Result};
 use crate::ffi::ManagerObserver;
 use crate::paths::DataDirs;
-use crate::proxy::{ProxyEntry, ProxySupervisor};
+use crate::proxy::{EventSink, ProxyEntry, ProxyEvent, ProxySupervisor};
 use crate::settings::Settings;
 use crate::store::{LeaseRecord, Store};
 use crate::tls::ServerCert;
@@ -24,6 +24,7 @@ use crate::vault::{VaultConfig, creds};
 pub mod activity;
 pub mod admin;
 pub mod api;
+pub mod firewall;
 pub mod netinfo;
 pub mod pairing;
 pub mod requests;
@@ -35,6 +36,7 @@ pub const TOPIC_LEASES: &str = "leases";
 pub const TOPIC_HOSTS: &str = "hosts";
 pub const TOPIC_VAULTS: &str = "vaults";
 pub const TOPIC_PROXY: &str = "proxy";
+pub const TOPIC_FIREWALL: &str = "firewall";
 pub const TOPIC_SETTINGS: &str = "settings";
 pub const TOPIC_ACTIVITY: &str = "activity";
 
@@ -126,6 +128,10 @@ pub struct Core {
     pub(crate) connect_names: Mutex<HashMap<String, String>>,
     /// Exclusive lock on `<data>/manager.lock`; released by `shutdown`.
     instance_lock: Mutex<Option<std::fs::File>>,
+    /// Last macOS Firewall check (see [`firewall`]).
+    pub(crate) firewall: Mutex<firewall::FirewallCheck>,
+    /// Wakes the firewall check loop (listener changes, proxy starts, wake).
+    firewall_wake: Arc<Notify>,
 }
 
 /// One manager per data directory: take an exclusive lock on its lock file, or fail with
@@ -296,13 +302,27 @@ impl Core {
         let obs = observer.clone();
         let on_change: Arc<dyn Fn() + Send + Sync> =
             Arc::new(move || obs.changed(TOPIC_PROXY.to_string()));
+        // A (re)started proxy may meet a firewall rule that changed meanwhile.
+        let firewall_wake = Arc::new(Notify::new());
+        let on_event: EventSink = {
+            let sink = activity.proxy_sink();
+            let wake = firewall_wake.clone();
+            Arc::new(move |e: ProxyEvent| {
+                if let ProxyEvent::Lifecycle { kind, .. } = &e
+                    && matches!(*kind, "started" | "restarted")
+                {
+                    wake.notify_one();
+                }
+                sink(e)
+            })
+        };
         let proxy = ProxySupervisor::start(
             bin_dir.clone(),
             dirs.clone(),
             settings.proxy.clone(),
             proxy_state.flatten(),
             on_change,
-            activity.proxy_sink(),
+            on_event,
         )?;
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -334,6 +354,8 @@ impl Core {
             connect_names: Mutex::new(HashMap::new()),
             instance_lock: Mutex::new(Some(instance_lock)),
             lease_wake: Arc::new(Notify::new()),
+            firewall: Mutex::new(firewall::FirewallCheck::default()),
+            firewall_wake,
         });
         {
             let suspended = lock(&core.proxy_state).suspended.clone();
@@ -400,6 +422,24 @@ impl Core {
                 iv.tick().await;
                 let Some(core) = weak.upgrade() else { return };
                 let _ = tokio::task::spawn_blocking(move || core.sync_bitwarden()).await;
+            }
+        });
+        // macOS Firewall: at start, every CHECK_EVERY and whenever woken.
+        let weak = Arc::downgrade(self);
+        let wake = self.firewall_wake.clone();
+        self.rt_handle.spawn(async move {
+            loop {
+                let notified = wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                {
+                    let Some(core) = weak.upgrade() else { return };
+                    let _ = tokio::task::spawn_blocking(move || core.check_firewall()).await;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(firewall::CHECK_EVERY) => {}
+                    _ = &mut notified => {}
+                }
             }
         });
     }
@@ -634,6 +674,7 @@ impl Core {
     pub fn on_wake(&self) {
         self.sweep();
         self.sync_proxy(true);
+        self.recheck_firewall();
     }
 
     fn sync_bitwarden(&self) {

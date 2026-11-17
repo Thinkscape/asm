@@ -18,6 +18,8 @@ struct ProxyPane: View {
                 Task { error = await model.restartProxy() }
             }
 
+            NetworkAccessSection(firewall: model.firewall) { await model.checkFirewall() }
+
             Section("Listener") {
                 TextField("Bind address", text: $draft.bindAddress)
                 TextField("Port", value: $draft.port, format: .number.grouping(.never))
@@ -197,6 +199,85 @@ private struct ProxyStatusSection: View {
         case .running: .green
         case .starting: .orange
         case .down, .unhealthy: .red
+        }
+    }
+}
+
+/// Who can reach each listener, and whether the macOS Firewall lets them: bind intent and
+/// firewall state of iron-proxy and the app, the fix command and Open Firewall Settings.
+private struct NetworkAccessSection: View {
+    let firewall: FirewallStatusItem
+    let check: () async -> Void
+    @State private var checking = false
+
+    var body: some View {
+        Section {
+            LabeledContent("Proxy listens for") { Text(verbatim: firewall.proxy.intentTitle) }
+            FirewallStateRow(title: "Firewall: iron-proxy", reach: firewall.proxy, checked: firewall.checkedAt != nil)
+            LabeledContent("Manager API listens for") { Text(verbatim: firewall.api.intentTitle) }
+            FirewallStateRow(title: "Firewall: Agents Secrets Manager", reach: firewall.api, checked: firewall.checkedAt != nil)
+            if !firewall.fixCommands.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Allow incoming connections in System Settings → Network → Firewall → Options, or run in Terminal:")
+                        .font(.callout)
+                    ForEach(firewall.fixCommands, id: \.self) { CopyableCommand(command: $0) }
+                }
+            }
+            HStack {
+                Button("Open Firewall Settings") { ProxyAlerts.openFirewallSettings() }
+                Button("Check again") {
+                    checking = true
+                    Task {
+                        await check()
+                        checking = false
+                    }
+                }
+                .disabled(checking)
+                if checking { ProgressView().controlSize(.small) }
+            }
+        } header: {
+            Text("Network access")
+        } footer: {
+            Text("Listeners bound to a loopback address serve this Mac only. For the others, the macOS Firewall must allow incoming connections; asm only reads its settings and never changes them.")
+        }
+    }
+}
+
+private struct FirewallStateRow: View {
+    let title: LocalizedStringKey
+    let reach: ListenerReachItem
+    let checked: Bool
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack(spacing: 6) {
+                if let color { Circle().fill(color).frame(width: 8, height: 8) }
+                Text(text)
+                    .foregroundStyle(reach.blocked ? Color.red : color == nil ? Color.secondary : Color.primary)
+                    .multilineTextAlignment(.trailing)
+            }
+            .help(Text(verbatim: reach.executable))
+        }
+    }
+
+    private var text: LocalizedStringKey {
+        guard reach.intentRemote else { return "Local only: firewall not involved" }
+        guard checked else { return "Checking…" }
+        return switch reach.state {
+        case .allowed: "Allowed"
+        case .blocked: "Blocked: other machines can't connect"
+        case .blockAll: "Blocked: “Block all incoming connections” is on"
+        case .firewallOff: "Firewall off"
+        case .unknown: "Not decided yet: macOS will ask the first time another machine connects"
+        }
+    }
+
+    private var color: Color? {
+        guard reach.intentRemote, checked else { return nil }
+        return switch reach.state {
+        case .allowed, .firewallOff: .green
+        case .blocked, .blockAll: .red
+        case .unknown: nil
         }
     }
 }

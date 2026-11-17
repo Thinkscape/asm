@@ -901,6 +901,7 @@ impl Core {
         self.set_settings(s)?;
         self.notify(TOPIC_PROXY);
         self.notify(TOPIC_SETTINGS);
+        self.recheck_firewall();
         Ok(())
     }
 
@@ -937,6 +938,7 @@ impl Core {
     pub fn restart_proxy(&self) -> Result<()> {
         let r = self.proxy.restart();
         self.notify(TOPIC_PROXY);
+        self.recheck_firewall();
         r
     }
 
@@ -991,6 +993,7 @@ impl Core {
         s.bw_path = bw_path.filter(|p| Some(p.as_str()) != bitwarden::default_bw_path().as_deref());
         self.set_settings(s)?;
         self.notify(TOPIC_SETTINGS);
+        self.recheck_firewall();
         Ok(())
     }
 }

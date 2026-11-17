@@ -419,7 +419,22 @@ pub fn doctor(probe_url: &str) -> Result<(), CliError> {
         }
     }
 
-    // 7. HTTPS probe through the recommended proxy, verified against ca.crt
+    // 7. the manager's macOS Firewall (older managers do not report it: skipped)
+    if let Some(blocks) = info.as_ref().and_then(|i| i.firewall_blocks_proxy) {
+        if blocks {
+            r.fail(
+                "firewall",
+                "macOS Firewall on the manager's Mac blocks iron-proxy; allow incoming connections for it (see the asm app)",
+            );
+        } else {
+            r.ok(
+                "firewall",
+                "the manager's macOS Firewall does not block iron-proxy",
+            );
+        }
+    }
+
+    // 8. HTTPS probe through the recommended proxy, verified against ca.crt
     if let (Some(proxy), true) = (&recommended, ca_ok) {
         match std::fs::read(&ca_path)
             .map_err(|e| e.to_string())
@@ -440,15 +455,41 @@ pub fn doctor(probe_url: &str) -> Result<(), CliError> {
                         error_chain(&e)
                     ),
                 ),
-                Err(e) => r.warn(
-                    "probe",
-                    format!("{probe_url} through {proxy}: {}", error_chain(&e)),
-                ),
+                Err(e) => {
+                    let chain = error_chain(&e);
+                    // TCP reached the proxy (it was recommended), yet the tunnel died.
+                    let hint = if looks_aborted(&chain) {
+                        " (the manager's firewall may be blocking iron-proxy)"
+                    } else {
+                        ""
+                    };
+                    r.warn(
+                        "probe",
+                        format!("{probe_url} through {proxy}: {chain}{hint}"),
+                    )
+                }
             },
             Err(e) => r.fail("probe", e),
         }
     }
     finish(r)
+}
+
+/// A connection that was accepted and then cut: CONNECT aborted, unexpected EOF, reset.
+/// What a client sees when the macOS Firewall blocks the proxy (TCP still connects).
+fn looks_aborted(chain: &str) -> bool {
+    let c = chain.to_ascii_lowercase();
+    [
+        "unexpected end of file",
+        "unexpected eof",
+        "connection reset",
+        "reset by peer",
+        "connection aborted",
+        "broken pipe",
+        "io error establishing tunnel",
+    ]
+    .iter()
+    .any(|m| c.contains(m))
 }
 
 fn check_ca_files(r: &mut Report, ca: &Path, bundle: &Path, info: Option<&ProxyInfo>) -> bool {
@@ -518,5 +559,19 @@ mod tests {
         assert_eq!(shell_quote("a'b"), r"'a'\''b'");
         assert_eq!(authority("fd00::1", 7412), "[fd00::1]:7412");
         assert_eq!(authority("mac.ts.net", 7412), "mac.ts.net:7412");
+    }
+
+    #[test]
+    fn aborted_tunnels_are_recognised() {
+        assert!(looks_aborted(
+            "error sending request for url (https://example.com/): client error (Connect): tunnel error: unexpected end of file"
+        ));
+        assert!(looks_aborted(
+            "client error (Connect): tunnel error: io error establishing tunnel: Connection reset by peer (os error 54)"
+        ));
+        assert!(!looks_aborted(
+            "client error (Connect): dns error: failed to lookup address information"
+        ));
+        assert!(!looks_aborted("operation timed out"));
     }
 }

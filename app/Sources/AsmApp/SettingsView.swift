@@ -38,13 +38,13 @@ struct SettingsView: View {
             List(SettingsPane.allCases, selection: $selection) { pane in
                 HStack {
                     Label(pane.title, systemImage: pane.symbol)
-                    if pane == .proxy && model.proxyStatus.needsAttention {
+                    if pane == .proxy, let problem = proxyProblem {
                         Spacer(minLength: 4)
                         Image(systemName: "exclamationmark.circle.fill")
                             .symbolRenderingMode(.palette)
                             .foregroundStyle(.white, .red)
-                            .help("Proxy not running")
-                            .accessibilityLabel("Proxy not running")
+                            .help(problem)
+                            .accessibilityLabel(problem)
                     }
                 }
                 .tag(pane)
@@ -91,6 +91,11 @@ struct SettingsView: View {
         }) { vault in
             UnlockVaultSheet(model: model, vault: vault)
         }
+    }
+
+    /// Why the Proxy sidebar item carries a badge; `nil` while fine.
+    private var proxyProblem: String? {
+        model.proxyStatus.needsAttention ? "Proxy not running" : model.firewall.problemLabel
     }
 }
 

@@ -8,7 +8,8 @@ use std::time::SystemTime;
 use crate::error::CoreError;
 use crate::manager::{Core, StartOptions};
 
-/// Change notifications. Topics: `requests`, `leases`, `hosts`, `vaults`, `proxy`, `settings`.
+/// Change notifications. Topics: `requests`, `leases`, `hosts`, `vaults`, `proxy`,
+/// `firewall`, `settings`, `activity`.
 /// Called from manager threads; never while the manager holds a lock.
 #[uniffi::export(with_foreign)]
 pub trait ManagerObserver: Send + Sync {
@@ -543,6 +544,45 @@ pub struct ProxyStatus {
     pub suspended_leases: u32,
 }
 
+/// What the macOS Application Firewall does to incoming connections for one executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FirewallState {
+    Allowed,
+    Blocked,
+    /// "Block all incoming connections" is on.
+    BlockAll,
+    FirewallOff,
+    /// No rule yet (macOS asks the first time another machine connects), or the firewall
+    /// could not be read.
+    Unknown,
+}
+
+/// Whether other machines can reach one listener.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ListenerReach {
+    /// Bound to a non-loopback address (`0.0.0.0`, `::`, an interface address): meant
+    /// for other machines. `false` = one-machine setup, the firewall is not involved.
+    pub intent_remote: bool,
+    pub state: FirewallState,
+    /// `intent_remote` and `state` is `Blocked` or `BlockAll`: warn.
+    pub blocked: bool,
+    pub bind_address: String,
+    /// The executable the firewall rule names (for the fix command).
+    pub executable: String,
+}
+
+/// Firewall reach of the proxy (iron-proxy) and the manager API (this app). Observer
+/// topic `firewall`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FirewallStatus {
+    pub proxy: ListenerReach,
+    pub api: ListenerReach,
+    /// `None` until the first check has finished.
+    pub checked_at: Option<SystemTime>,
+    /// Informational.
+    pub stealth_mode: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct GeneralSettings {
     pub api_bind_address: String,
@@ -592,7 +632,9 @@ pub struct ActivityEntry {
     /// `expired`, `cancelled`; leases: `created`, `revoked`, `expired`, `suspended`,
     /// `resumed`; proxy: `substitution`, `rejected`, `started`, `restarted`, `crashed`
     /// (once per distinct cause per outage), `start_failed`, `reload_failed`, `down`,
-    /// `unhealthy`, `recovered` (with the downtime), `orphan_killed`; pairing: `requested`, `approved`, `denied`,
+    /// `unhealthy`, `recovered` (with the downtime), `orphan_killed`, `firewall_blocked`,
+    /// `firewall_allowed` (macOS Firewall started or stopped blocking a listener meant for
+    /// other machines; `detail.listener` is `proxy` or `api`); pairing: `requested`, `approved`, `denied`,
     /// `expired`, `paired_with_code`, `repaired`, `repaired_with_code`, `replaced`,
     /// `renamed`, `revoked`; vaults: `added`, `edited`,
     /// `removed`, `unlocked`, `unlock_failed`, `unavailable`, `available`.
@@ -645,6 +687,22 @@ pub fn subnet_suggestions() -> Vec<String> {
 #[uniffi::export]
 pub fn check_network(entry: String) -> FfiResult<String> {
     Ok(crate::manager::netinfo::check_network(&entry)?)
+}
+
+/// See [`enable_debug_overrides`].
+static DEBUG_OVERRIDES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(cfg!(debug_assertions));
+
+/// Honour debug overrides (`ASM_DEBUG_*` environment variables, e.g.
+/// `ASM_DEBUG_FIREWALL_LISTAPPS`), as debug builds of the core always do. Debug builds of
+/// the app call it before `Manager::start`; release builds never do.
+#[uniffi::export]
+pub fn enable_debug_overrides() {
+    DEBUG_OVERRIDES.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn debug_overrides_enabled() -> bool {
+    DEBUG_OVERRIDES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The running manager.
@@ -796,6 +854,18 @@ impl Manager {
 
     pub fn proxy_log_tail(&self, lines: u32) -> Vec<String> {
         self.core.proxy.log_tail(lines as usize)
+    }
+
+    /// macOS Firewall reach of the proxy and the API from the last check (checked at
+    /// start, every 60 s, on wake and after listener changes).
+    pub fn firewall_status(&self) -> FirewallStatus {
+        self.core.firewall_status()
+    }
+
+    /// Check the firewall now (runs `socketfilterfw`; blocking) and return the result.
+    pub fn check_firewall(&self) -> FirewallStatus {
+        self.core.check_firewall();
+        self.core.firewall_status()
     }
 
     /// Activity log, newest first (see [`ActivityQuery`]).

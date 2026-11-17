@@ -26,6 +26,7 @@ final class AppModel {
     private(set) var leases: [LeaseItem] = []
     private(set) var proxySettings = ProxySettingsItem()
     private(set) var proxyStatus = ProxyStatusItem()
+    private(set) var firewall = FirewallStatusItem()
     private(set) var proxyLog: [String] = []
     private(set) var general = GeneralSettingsItem()
     /// Bumped when the core reports new activity rows (topic `activity`); the Activity Log
@@ -151,6 +152,8 @@ final class AppModel {
                 vaults = try await call { try $0.listVaults() }
             case "proxy":
                 await refreshProxy()
+            case "firewall":
+                applyFirewall(try await call { try $0.firewallStatus() })
             case "settings":
                 general = try await call { try $0.generalSettings() }
                 proxySettings = try await call { try $0.proxySettings() }
@@ -170,6 +173,18 @@ final class AppModel {
         proxyAlerts.update(status)
         if let log = try? await call({ try $0.proxyLogTail(200) }) {
             proxyLog = log
+        }
+    }
+
+    private func applyFirewall(_ status: FirewallStatusItem) {
+        firewall = status
+        proxyAlerts.updateFirewall(status)
+    }
+
+    /// Checks the macOS Firewall now ("Check again" in Settings → Proxy).
+    func checkFirewall() async {
+        if let status = try? await call({ try $0.checkFirewall() }) {
+            applyFirewall(status)
         }
     }
 

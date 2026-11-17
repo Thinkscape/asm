@@ -19,7 +19,7 @@ final class ObserverBridge: ManagerObserver, @unchecked Sendable {
 /// these off the main thread. `Manager` is an `Arc` of a thread-safe Rust object.
 final class CoreBridge: @unchecked Sendable {
     /// Observer topics, in initial-load order.
-    static let topics = ["settings", "vaults", "hosts", "leases", "proxy", "requests"]
+    static let topics = ["settings", "vaults", "hosts", "leases", "proxy", "firewall", "requests"]
 
     /// Lease duration choices, in display order (`id` 0 = unlimited).
     static let leaseDurations: [LeaseDuration] = AsmCore.leaseDurations().map {
@@ -35,6 +35,10 @@ final class CoreBridge: @unchecked Sendable {
     }
 
     static func start(dataDir: String, binDir: String, onChange: @escaping @Sendable (String) -> Void) throws -> CoreBridge {
+        #if DEBUG
+        // The core then honours ASM_DEBUG_* environment overrides (e.g. a firewall fixture).
+        enableDebugOverrides()
+        #endif
         let observer = ObserverBridge(onChange: onChange)
         let manager = try mapped { try Manager.start(dataDir: dataDir, binDir: binDir, observer: observer) }
         return CoreBridge(manager: manager, observer: observer)
@@ -175,6 +179,15 @@ final class CoreBridge: @unchecked Sendable {
 
     func restartProxy() throws {
         try Self.mapped { try manager.restartProxy() }
+    }
+
+    func firewallStatus() throws -> FirewallStatusItem {
+        FirewallStatusItem(manager.firewallStatus())
+    }
+
+    /// Runs `socketfilterfw` now (blocking).
+    func checkFirewall() throws -> FirewallStatusItem {
+        FirewallStatusItem(manager.checkFirewall())
     }
 
     func proxyLogTail(_ lines: UInt32) throws -> [String] {
@@ -466,6 +479,31 @@ private extension ProxySettings {
             managementPort: try validPort(s.managementPort, "Management port"),
             metricsPort: try validPort(s.metricsPort, "Metrics port"),
             maxRequestBodyBytes: maxBody, allowPlainHttp: s.allowPlainHTTP
+        )
+    }
+}
+
+private extension ListenerReachItem {
+    init(_ r: ListenerReach) {
+        let state: FirewallStateItem = switch r.state {
+        case .allowed: .allowed
+        case .blocked: .blocked
+        case .blockAll: .blockAll
+        case .firewallOff: .firewallOff
+        case .unknown: .unknown
+        }
+        self.init(
+            intentRemote: r.intentRemote, state: state, blocked: r.blocked,
+            bindAddress: r.bindAddress, executable: r.executable
+        )
+    }
+}
+
+private extension FirewallStatusItem {
+    init(_ s: FirewallStatus) {
+        self.init(
+            proxy: ListenerReachItem(s.proxy), api: ListenerReachItem(s.api),
+            checkedAt: s.checkedAt, stealthMode: s.stealthMode
         )
     }
 }
