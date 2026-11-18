@@ -1,6 +1,6 @@
 ---
 name: asm
-description: "Use approved secrets with asm: run commands with injected credentials, select vault fields, request files, or renew generated tokens without exposing values in chat."
+description: "Request access to secrets such as API keys, access tokens, login credentials, certificates, GitHub CLI tokens, and gcloud tokens. Use them in commands as environment variables or files."
 ---
 
 # Agents Secrets Manager (`asm`)
