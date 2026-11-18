@@ -12,12 +12,12 @@
 
 Coding agents need API keys and passwords. asm provides operator-approved access through static vaults and scoped dynamic credentials:
 
-- a **macOS menu-bar app** (the *manager*) reads static vaults (Bitwarden/Vaultwarden, `.env` files, the macOS login keychain), generates GitHub App installation tokens, and approves access;
+- a **macOS menu-bar app** (the *manager*) reads static vaults (Bitwarden/Vaultwarden, `.env` files, the macOS login keychain), issues GitHub App and Google service-account tokens, and approves access;
 - the **`asm` CLI** runs on agent machines (Linux or macOS), pairs with the manager and requests secrets;
 - a **patched [iron-proxy](https://github.com/paradigmxyz/iron-proxy)**, run by the manager, puts the real value into requests on the way out;
 - an **agent skill** ([`skill/asm/SKILL.md`](skill/asm/SKILL.md)) teaches agents the workflow.
 
-Static secrets default to **sentinel** delivery (`asm_` + 40 random characters): the proxy substitutes the real value only on approved HTTPS hosts. Generated GitHub tokens default to raw delivery, with optional `--sentinel`. `asm exec` injects approved values directly into a child environment without token files.
+Static secrets default to **sentinel** delivery (`asm_` + 40 random characters): the proxy substitutes the real value only on approved HTTPS hosts. Generated tokens default to raw delivery, with optional `--sentinel`. `asm exec` injects approved values directly into a child environment without token files.
 
 ## Security model
 
@@ -25,6 +25,7 @@ Static secrets default to **sentinel** delivery (`asm_` + 40 random characters):
 - **Bound to approved hosts and HTTPS.** A sentinel is replaced only when the destination matches the approved host patterns and the request uses TLS. A request that carries a sentinel in a header, the URL path or the query string to any other host, or over plain HTTP, is refused with `403 asm: sentinel not valid for this host or scheme`. Sentinels are never replaced in WebSocket upgrades, because the proxy cannot redact WebSocket frames (403).
 - **Redaction is best effort.** If an upstream response echoes a real value (raw, URL-escaped, JSON-escaped, base64 or hex), the proxy replaces it with the sentinel in headers, trailers and the body. Values of other leases become `asm_redacted`. Values shorter than 8 bytes are not redacted. A host you approved can still return the value in some other form. Approving "Any host" amounts to giving the agent the value.
 - **Raw delivery exposes the value to the consumer.** `get` writes private files; `exec` uses child memory/environment without credential files or argv. Generated GitHub tokens support provider revocation, but failed revocation or a manager crash can leave delivered copies usable until provider expiry. Static raw values cannot be recalled. Static raw requests require approval each time; generated raw leases allow reuse and renewal.
+- **Google tokens cannot be individually revoked.** Ending a lease stops ASM delivery and substitution. Copies remain usable until credential expiry. IAM grants may change outside ASM; the project and selected OAuth scopes are not an exclusive service or resource boundary.
 - **Same-user processes on the Mac can read vault data.** Run agents as another user, in a VM or in a container.
 - **Host authorization, not agent isolation.** Pairing is the authorization boundary. Agent labels provide attribution and routing affinity; separate hostile agents need separate paired hosts.
 
@@ -67,7 +68,7 @@ flowchart LR
 ```
 
 1. `asm pair` pairs a machine with the manager: a matching 6-digit code on both sides, or a pre-generated pairing code. The CLI pins the manager's TLS certificate.
-2. `asm get BINDING "reason"` or `asm exec BINDINGS -- command args...` requests access. Compatible leases may be reused; fresh approvals choose fields, mode, duration and hosts, plus the app/repositories/permissions for generated credentials.
+2. `asm get BINDING "reason"` or `asm exec BINDINGS -- command args...` requests access. Compatible leases may be reused; fresh approvals choose fields, mode, duration and hosts. Generated credentials also require an identity and grant: GitHub repositories and permissions, or Google OAuth scopes.
 3. Get writes files and prints paths; exec obtains all bindings before replacing itself with the child, passing argv directly without a shell. No credential values are printed by ASM.
 4. Exec configures proxy/CA environment for substituted fields automatically. File-based sentinel consumers use `eval "$(asm proxy-env)"`.
 
@@ -170,7 +171,7 @@ The app lives in the menu bar (key icon) and has no Dock icon.
 On the Mac:
 
 1. Open **Agents Secrets Manager** and choose **Settings…** from the menu bar item.
-2. In **Vaults**, add a static source, or in **Generators**, connect a GitHub App using its client ID and RSA private key. Add each installation by account or ID, verify it, then set its repository and permission limits.
+2. In **Vaults**, add a static source. In **Generators**, choose **GitHub App** for repository/permission ceilings, or **Google Cloud** to connect a Google account. For Google, name the generator, check the manager Mac’s Cloud SDK (582.0.0 or later), sign in through the browser, and save. Saving does not change cloud IAM, require a project or service account, or import your normal CLI/ADC credentials.
 3. In **Proxy**, add hostname hints that agent machines can reach (for example a Tailscale name). `asm proxy-info` offers these to clients.
 
 On the agent machine:
@@ -190,7 +191,30 @@ asm exec --repositories acme/web --permissions pull_requests=read GH_TOKEN -- gh
 asm exec --repositories acme/web --sentinel --hosts api.github.com GITHUB_TOKEN -- gh api repos/acme/web
 ```
 
-For GitHub, `get` and `exec` require `--repositories OWNER/REPO[,OWNER/REPO...]` unless `get --lease ID` pins an existing grant. Permissions default to `metadata=read`; request additional access with `--permissions contents=read,pull_requests=write`. A previously approved broader raw token is not returned for a narrower request. All requested repos must belong to one configured installation: split cross-installation work into separate invocations, each receiving its own `GH_TOKEN`. Raw GitHub tokens need no proxy.
+For GitHub, `get` and `exec` require `--repositories OWNER/REPO[,OWNER/REPO...]` unless `get --lease ID` pins an existing grant. Permissions default to `metadata=read`; request additional access with `--permissions contents=read,pull_requests=write`. The popup marks what the agent requested. The operator can remove or add repositories and change permission levels within **one configured installation’s limits**. Installations cannot be combined in one token. A narrower request does not silently receive a previously approved broader raw token. Raw GitHub tokens need no proxy.
+
+For a Google Cloud connection, request **one project and an exact set of permissions**. `get` writes the approved token to a private file; `exec` injects `CLOUDSDK_AUTH_ACCESS_TOKEN` into the child without writing a token file:
+
+```sh
+asm get --project my-staging-project --permissions storage=read \
+  CLOUDSDK_AUTH_ACCESS_TOKEN 'Read objects in the staging project'
+asm exec --project my-staging-project --permissions compute=read \
+  CLOUDSDK_AUTH_ACCESS_TOKEN -- gcloud compute instances list --project=my-staging-project
+```
+
+The first `--project` describes the requested grant; the argument after `--` tells the consumer which resources to query. The supported claims are `storage=read`, `storage=create`, `compute=read`, `run=read`, `logs=read`, and `bigquery=metadata-read`. Use a comma-separated list for a combination; arbitrary IAM role names, OAuth scopes, and wildcard claims are not accepted for a connection. A role on the **project** is not a restriction to one bucket or resource.
+
+The Google popup preselects the requested project and marks the requested access in each service’s permission menu. Storage read and create can be granted independently or together. With a compatible client, the operator can check another active project visible to the signed-in connection. This **switches** the grant to that project; it does not add a second project or rewrite the command after `--`. If the list cannot be loaded, the requested project remains available. Changing the project or permissions requires reviewing the new selection. Pinned renewals keep the approved grant.
+
+**First use:** expand **IAM changes on approval** to see the proposed keyless service account, its project-level roles, and who can mint tokens. **Generate token** authorizes those durable changes and the lease. **Deny** makes no changes and delivers nothing. The administrator needs sufficient Google permissions. If setup succeeds but issuance fails, the cloud resources may remain; ASM reports the failure rather than substituting another credential. Later approvals for the same profile do not recreate it.
+
+The agent receives a short-lived token for the profile's service account, never your sign-in token. IAM inheritance and changes outside ASM can affect effective access. A Google token is not itself restricted to a project. Ending a lease stops ASM delivery but does not revoke a released Google token, delete the account, or undo IAM bindings.
+
+To decommission an ASM-created account, open **Settings → Generators → Google Service Accounts**. The tab bar appears when a Google Cloud generator is configured or the local provisioning journal contains an account record. Removing the last generator does not hide its recorded accounts. Select a row to see the immutable Google account ID, project, permissions and dependent leases, or open the account directly in Google Cloud Console. ASM will not delete an account by name alone.
+
+**Delete Account** requires a separate confirmation. It removes all local leases for that Google identity, including ended leases, and deletes the account in Google Cloud. Other workloads using that account can also lose access. If cloud cleanup fails, the leases are not restored: review the error and retry the same account from the ledger. Removing a generator is different: it does not delete its cloud accounts.
+
+Existing generators bound to a service account remain separate legacy configurations; an existing lease does not gain managed-profile issuance rights. `--gcloud-scope` is for that legacy workflow, not an alternative to managed `--project` and `--permissions`. Paired hosts do not need gcloud to acquire credentials. `GOOGLE_APPLICATION_CREDENTIALS` expects a credential file, not the bearer token.
 
 To pair without a popup (scripts, containers), use **Hosts and Agents → Pairing codes → Generate…** in the app. It shows a ready-to-run command:
 
@@ -216,11 +240,11 @@ A lease ends when it expires or the operator revokes it (also when its host is r
 The lease files on the agent machine are deleted by the CLI: at expiry by a background `asm` process, and on revocation within about a minute.
 
 Generated tokens have a separate provider deadline. A 12-hour lease can renew one-hour
-tokens from the same app and immutable approved grant without extending authorization.
+tokens from the same identity and immutable approved grant without extending authorization.
 Raw token expiry removes file material but retains local alias reservations until the lease
 ends. Repeat get to refresh file views; exec never updates them or renews a running child.
-Routine renewal leaves old copies usable until natural expiry; explicit `--refresh` revokes
-known predecessors and may disrupt consumers. `--lease ID` pins an existing generated grant;
+Routine renewal leaves old copies usable until natural expiry. Explicit `--refresh` rotates
+the token; ASM can revoke known GitHub predecessors, not Google tokens. `--lease ID` pins an existing generated grant;
 `--new-lease` requests a fresh decision. After restart, generated grants remain but require
 explicit acquisition to mint token material again.
 
@@ -293,14 +317,14 @@ Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets
 ## The manager app
 
 - **Menu bar**: pending requests (click one to open its approval popup), recent decisions, locked vaults to unlock, **Settings…**, **Show Log…** and **Quit**. While the proxy is down (or running but not answering its health check for over 10 s) the icon gets a red dot and the panel a red banner with the cause, **Restart** and **Details…**. While the macOS Firewall blocks the proxy (or the manager API) and it listens for other machines, the icon gets the same red dot and the panel an orange banner with **Firewall Settings**, **How to Fix…** and **Details…**.
-- **Approval popup**: one request at a time, floating above other windows and excluded from screen sharing. Pairing requests show the verification code. `get` requests show the reason, the requested mode, an editable list of allowed hosts (broad patterns flagged), an **Any host** toggle and the lease duration. Use **Approve and hide value** (sentinel) or **Approve and show raw value**. **Deny** is a split button with canned reasons: *host selection too open*, *provide a better reason*, or a custom one.
+- **Approval popup**: generated-token permission requests are visible in screenshots and screen sharing; they show request metadata, not token values. Pairing and secret-value dialogs still request capture protection. The popup shows the requester, reason, delivery mode, and lease duration. Proxy delivery adds destination-host controls. **Deny** can send a reason to the requester.
 - **Settings window**:
   - **Vaults**: Bitwarden/Vaultwarden (server, API key, exposed collections, personal vault; master password held in memory only), `.env` files (every key is exposed), the macOS login keychain (generic and internet passwords, secure notes).
     The table sizes **Name** to the longest vault name (150pt minimum), keeps **Kind**, **Status** and **Secrets** compact, and gives **Details** the remaining width for the Bitwarden server URL or `.env` file path.
-  - **Generators**: configure a GitHub App's client ID and private key once. Add each installation by account or ID and choose its allowed repositories and permissions. Adding an installation in ASM does not install the app on GitHub. Existing single-installation generators retain their original limits. Agents request `GH_TOKEN` / `GITHUB_TOKEN`; if multiple apps cover the requested scope the operator can choose, or the agent can qualify the source (`release-bot/GH_TOKEN`).
-    GitHub repositories appear in name order in Settings and approvals. In **Edit Limits**, **Select all** and **Deselect all** change only the current installation’s draft; approvals remain read-only. For installations with more than 500 repositories, select up to 500 individually.
+  - **Generators**: configure a GitHub App’s client ID and private key once. Add each installation by account or ID and choose its allowed repositories and permissions. Adding it in ASM does not install it on GitHub. Agents request `GH_TOKEN` / `GITHUB_TOKEN`; the popup identifies the installation, and the operator chooses when several match. Qualify the source (`release-bot/GH_TOKEN`) to request a particular app. Google Cloud connections share `CLOUDSDK_AUTH_ACCESS_TOKEN` and can also be qualified (`gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN`).
+    In **Edit Limits**, **Select all** and **Deselect all** change the current installation’s draft limits. In the approval popup, repository checkboxes and permission menus change only the proposed lease, not the saved installation limits. A GitHub token can include at most 500 repositories.
   - **Hosts and Agents**: paired machines (OS, addresses, agents seen, active leases), renaming and revocation; pairing codes.
-  - **Leases**: active and ended grants with host, source, mode, fields and hosts; generated details show the selected app, approved repositories/permissions, authorization deadline and provider-token deadline.
+  - **Leases**: active and ended grants with host, source, mode, fields and hosts; generated details show the identity, approved grant, authorization deadline and provider-token deadline.
   - **Proxy**: status (running, starting, not running with the cause and since when, not responding), failed starts, health and CA expiry; network access (whether the proxy and the API listen for other machines, and what the macOS Firewall does to iron-proxy and the app); listener address and port; hostname hints; advanced ports, request body limit and plain-HTTP substitution (off by default); the CA certificate; the proxy log. The sidebar marks **Proxy** while it is down or blocked by the firewall.
   - **Settings**: manager API address and port, default lease duration, pending request lifetime, launch at login, the `bw` path, version.
 - **Activity Log** (Window ▸ Show Activity Log, ⌘L): a persistent audit trail of pairing, requests, leases, proxy substitutions, vault and generator events, filterable by category. Generator events contain grant metadata and sanitized status, never keys or tokens.

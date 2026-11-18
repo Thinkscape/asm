@@ -31,14 +31,22 @@ upgrading `asm` to keep this file in step with the CLI.
    Request multiple repos with a comma-separated list only when one installation covers them.
    Otherwise split the work into separate commands. The repo selects the installation;
    qualify the token name only when you need a particular app.
+   For Google Cloud connections, pass `--project PROJECT_ID` and `--permissions CLAIM[,CLAIM...]`
+   to `get` or `exec`. Use `CLOUDSDK_AUTH_ACCESS_TOKEN`, or qualify it as
+   `gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN` to select a particular connection. Example:
+   `asm exec --project my-staging-project --permissions compute=read CLOUDSDK_AUTH_ACCESS_TOKEN -- gcloud compute instances list --project=my-staging-project`.
+   Do not bind a bearer token to `GOOGLE_APPLICATION_CREDENTIALS` (it expects a file).
    Acquisitions are sequential in input order. Every acquisition must succeed before the
    child starts; approval is not an atomic multi-lease transaction.
-4. **Follow the decision.** First generated access needs approval of the app, repositories,
-   permissions, delivery mode and lease duration. Later invocations may reuse or renew
-   that grant. Static sentinel access can reuse a compatible lease; static raw access
+4. **Follow the decision.** First generated access needs approval of the identity, scope,
+   delivery mode and lease duration. Request only what the task needs. The operator may
+   narrow or extend the grant within one GitHub installation or one Google project.
+   Use the **approved grant**, not the original flags, to determine what was granted.
+   On first use of a Google profile, approval also authorizes the IAM setup shown.
+   Later invocations may reuse or renew that grant. Static sentinel access can reuse a compatible lease; static raw access
    requires approval on every invocation.
 
-Generated GitHub credentials default to **raw**; static secrets default to **sentinel**.
+Generated credentials default to **raw**; static secrets default to **sentinel**.
 `--raw` asks for values but the operator may choose sentinel delivery. `--sentinel`
 forbids raw disclosure. Global `--raw`, `--sentinel` and `--hosts` apply to every exec binding.
 Give a specific `--reason` when the executable name alone does not explain the task.
@@ -92,6 +100,7 @@ asm get --repositories acme/web GH_TOKEN 'Inspect repository metadata'
 asm get --repositories acme/web --permissions contents=read GH_TOKEN 'Read repository contents'
 asm get --repositories acme/web --sentinel --hosts api.github.com GH_TOKEN 'Read repository metadata through the proxy'
 asm get --lease LEASE_ID GH_TOKEN 'Continue reading acme/web'
+asm get --project my-staging-project --permissions storage=read CLOUDSDK_AUTH_ACCESS_TOKEN 'Read staging objects'
 ```
 
 Use reported paths, selected app/grant, mode and deadlines; never print file contents.
@@ -107,9 +116,9 @@ same app and approved grant without another approval, not a 12-hour token.
   and collisions; it cannot extend or rebind an ended lease.
 - `--new-lease` requests a fresh operator decision. Changing requested scope may also
   require approval; renewal always retains the actual approved grant.
-- `get --lease LEASE_ID --refresh ...` intentionally rotates and revokes earlier known
-  tokens; it can disrupt running consumers. Routine renewal leaves predecessor copies
-  usable until their natural expiry.
+- `get --lease LEASE_ID --refresh ...` rotates the credential. GitHub attempts to revoke
+  known predecessors, which can disrupt running consumers. Google tokens cannot be
+  individually revoked: copies remain usable until expiry even after the lease ends.
 - Exec acquires before launch and checks ten minutes of provider-token headroom. It does
   not refresh a running child, revoke on child exit, or update files previously written
   by get. Rerun get to synchronize file views.
@@ -158,7 +167,7 @@ Raw exec avoids credential files, argv and ASM stdout, but the child receives va
 memory/environment and can expose them. Avoid tracing, environment dumps and commands that
 print credentials. Never ask for or paste secret values in chat.
 
-Revocation attempts to revoke every known generated token at GitHub. Failed revocation
+For a GitHub grant, revocation attempts to revoke every known installation token. Failed revocation
 or a manager crash can leave delivered raw copies usable until provider expiry; raw
 recall is not guaranteed. Sentinel delivery withholds the token and allows local blocking;
 the proxy's parent-death watchdog stops forwarding when the manager exits.

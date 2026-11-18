@@ -3,10 +3,11 @@
 use crate::api::Api;
 use crate::bindings;
 use crate::error::CliError;
-use crate::requests::{self, GithubScopeArgs, submit_get};
+use crate::requests::{self, GenerationArgs, submit_get};
 use crate::state;
 use asm_proto::generators::{
-    CREDENTIAL_REFRESH_MARGIN_SECS, GITHUB_TOKEN_ALIAS, GITHUB_TOKEN_NAME, GenerationRequest,
+    CREDENTIAL_REFRESH_MARGIN_SECS, GCLOUD_TOKEN_NAME, GITHUB_TOKEN_ALIAS, GITHUB_TOKEN_NAME, GenerationRequest,
+    generated_output_names,
 };
 use asm_proto::wire::{
     GetResult, LeaseInfo, LeaseMode, LeaseStatus, LeasesResponse, RequestBody, RequestedMode,
@@ -28,7 +29,10 @@ pub struct ExecArgs {
     #[arg(long)]
     reason: Option<String>,
     #[command(flatten)]
-    github_scope: GithubScopeArgs,
+    generation_args: GenerationArgs,
+    /// Explicit OAuth scope URI for a legacy bound Google generator; repeat or separate with commas.
+    #[arg(long = "gcloud-scope", value_name = "URI", value_delimiter = ',')]
+    gcloud_scopes: Vec<String>,
     /// Overall acquisition budget, excluding discovery, proxy preparation and the child.
     #[arg(long)]
     wait: Option<u64>,
@@ -42,7 +46,7 @@ pub struct ExecArgs {
 struct Acquisition {
     key: String,
     name: String,
-    generated: bool,
+    generated_output: Option<&'static str>,
     fields: Vec<String>,
     result: Option<GetResult>,
 }
@@ -68,19 +72,19 @@ fn plan(input: &str, entries: &[asm_proto::wire::SecretEntry]) -> Result<(Vec<Ac
             return Err(CliError::invalid(format!("structured fields require DEST=SOURCE::FIELD; available fields: {}", resolved.available_fields.join(", "))));
         }
         let single_name;
-        let names: &[&str] = match &resolved.binding.destination {
-            Some(destination) => {
+        let names = match (&resolved.binding.destination, resolved.generated_output) {
+            (Some(destination), _) => {
                 single_name = [destination.as_str()];
-                &single_name
+                &single_name[..]
             }
-            None if resolved.generated => &[GITHUB_TOKEN_NAME, GITHUB_TOKEN_ALIAS],
-            None => {
+            (None, Some(output)) => generated_output_names(output).expect("resolved generator output"),
+            (None, None) => {
                 let leaf = resolved.binding.source.rsplit('/').next().unwrap_or("");
                 if !bindings::environment_name(leaf) {
                     return Err(CliError::invalid("this source needs an explicit DEST= binding"));
                 }
                 single_name = [leaf];
-                &single_name
+                &single_name[..]
             }
         };
         let group = groups.iter().position(|g| g.key == resolved.canonical_key).unwrap_or_else(|| {
@@ -88,7 +92,7 @@ fn plan(input: &str, entries: &[asm_proto::wire::SecretEntry]) -> Result<(Vec<Ac
             groups.push(Acquisition {
                 key: resolved.canonical_key,
                 name: resolved.request_name,
-                generated: resolved.generated,
+                generated_output: resolved.generated_output,
                 fields: Vec::new(),
                 result: None,
             });
@@ -112,7 +116,7 @@ fn plan(input: &str, entries: &[asm_proto::wire::SecretEntry]) -> Result<(Vec<Ac
         }
     }
     if let (Some(a), Some(b)) = (assigned.get(GITHUB_TOKEN_NAME), assigned.get(GITHUB_TOKEN_ALIAS)) {
-        if (groups[a.0].generated || groups[b.0].generated) && a != b {
+        if [a, b].iter().any(|binding| groups[binding.0].generated_output == Some(GITHUB_TOKEN_NAME)) && a != b {
             return Err(CliError::invalid("GH_TOKEN and GITHUB_TOKEN must identify the same generated credential; use custom destinations for different apps"));
         }
     }
@@ -130,12 +134,14 @@ fn body(
     reason: String,
     lease_id: Option<String>,
     generation: Option<GenerationRequest>,
+    capabilities: bindings::GetCapabilities,
 ) -> RequestBody {
+    let client_capabilities = capabilities.client_capabilities(generation.as_ref(), lease_id.is_some());
     RequestBody::Get {
         name, fields: Some(fields), raw: mode == RequestedMode::Raw,
         sentinel: mode == RequestedMode::Sentinel, hosts, reason, lease_id,
         generation, refresh: false, refresh_from_version: None, new_lease: false,
-        client_capabilities: bindings::capabilities(), agent: crate::hostinfo::agent_label(),
+        client_capabilities, agent: crate::hostinfo::agent_label(),
     }
 }
 
@@ -151,7 +157,7 @@ fn authority<'a>(leases: &'a LeasesResponse, group: &Acquisition) -> Result<&'a 
         || lease.expires_at.as_deref().is_some_and(|t| asm_proto::time::parse_unix(t).is_none_or(|t| t <= requests::unix_now()))
         || group.fields.iter().any(|field| !lease.fields.contains(field))
         || lease.generation != result.generation
-        || (group.generated && lease.generation.is_none())
+        || (group.generated_output.is_some() && lease.generation.is_none())
     {
         return Err(changed());
     }
@@ -179,47 +185,59 @@ pub fn run(args: ExecArgs) -> Result<(), CliError> {
     let default_reason = default_reason(executable);
     let reason = asm_proto::rules::validate_reason(args.reason.as_deref().unwrap_or(&default_reason))?;
     let mode = RequestedMode::from_flags(args.raw, args.sentinel)?;
-    let mut github_scope = args.github_scope.into_generation()?;
+    let mut selectors = args.generation_args.into_selectors(args.gcloud_scopes)?;
     let host = state::require()?;
     let api = Api::for_host(&host)?;
-    bindings::require_capabilities(&api, false, true, false)?;
+    bindings::require_capabilities(&api, false, true, None)?;
     let entries = bindings::catalog(&api)?;
     let (mut groups, destinations) = plan(&args.bindings, &entries)?;
-    let mut github_groups = groups.iter().filter(|g| g.generated).count();
-    match (github_groups, github_scope.is_some()) {
+    let mut github_groups = groups.iter().filter(|g| g.generated_output == Some(GITHUB_TOKEN_NAME)).count();
+    let mut google_groups = groups.iter().filter(|g| g.generated_output == Some(GCLOUD_TOKEN_NAME)).count();
+    if github_groups != 0 && matches!(&selectors.google, Some(GenerationRequest::GcloudAccess(_))) {
+        return Err(CliError::invalid("managed Google Cloud and GitHub credentials require separate asm exec commands; --permissions cannot select both"));
+    }
+    match (github_groups, selectors.github.is_some()) {
         (0, true) => return Err(CliError::invalid("--repositories and --permissions require a generated GitHub binding")),
         (1.., false) => return Err(requests::github_repositories_required()),
         _ => {}
     }
-    let generated = github_groups != 0;
-    bindings::require_capabilities(&api, generated, true, generated)?;
+    match (google_groups, selectors.google.is_some()) {
+        (0, true) => return Err(CliError::invalid("Google Cloud generation flags require a generated Google Cloud binding")),
+        (1.., false) => return Err(requests::gcloud_access_required()),
+        _ => {}
+    }
+    let capabilities = bindings::require_capabilities(&api, github_groups != 0 || google_groups != 0, true, selectors.capability())?;
+
     let mut deadline = requests::deadline(args.wait);
     for group in &mut groups {
-        let generation = if group.generated {
-            github_groups -= 1;
-            if github_groups == 0 { github_scope.take() } else { github_scope.clone() }
-        } else {
-            None
+        let generation = match group.generated_output {
+            Some(GITHUB_TOKEN_NAME) => {
+                github_groups -= 1;
+                if github_groups == 0 { selectors.github.take() } else { selectors.github.clone() }
+            }
+            Some(GCLOUD_TOKEN_NAME) => {
+                google_groups -= 1;
+                if google_groups == 0 { selectors.google.take() } else { selectors.google.clone() }
+            }
+            _ => None,
         };
-        let mut request = body(group.name.clone(), group.fields.clone(), mode, hosts.clone(), reason.clone(), None, generation);
+        let mut request = body(group.name.clone(), group.fields.clone(), mode, hosts.clone(), reason.clone(), None, generation, capabilities);
         request.canonicalize()?;
-        group.result = Some(submit_get(&api, &request, deadline)?);
-        if group.generated && group.result.as_ref().is_none_or(|r| r.generation.is_none()) {
-            return Err(CliError::failure("the manager omitted generated credential metadata"));
-        }
+        group.result = Some(submit_get(&api, &request, deadline, None, capabilities)?);
     }
     // Inspect current authority without reconciling any local get files.
     let leases: LeasesResponse = api.get_until("/leases", deadline)?;
     for group in &mut groups {
         let lease = authority(&leases, group)?;
         let result = group.result.as_ref().expect("acquired");
-        if group.generated && (lease.credential_version != result.credential_version || !headroom(result.credential_expires_at.as_deref()) || !headroom(lease.credential_expires_at.as_deref())) {
+        if group.generated_output.is_some() && (lease.credential_version != result.credential_version || !headroom(result.credential_expires_at.as_deref()) || !headroom(lease.credential_expires_at.as_deref())) {
             let mode = match lease.mode {
                 LeaseMode::Raw => RequestedMode::Raw,
                 LeaseMode::Sentinel => RequestedMode::Sentinel,
             };
-            let request = body(lease.name.clone(), group.fields.clone(), mode, lease.hosts.clone(), reason.clone(), Some(lease.lease_id.clone()), None);
-            group.result = Some(submit_get(&api, &request, deadline)?);
+            let pinned = lease.generation.as_ref();
+            let request = body(lease.name.clone(), group.fields.clone(), mode, lease.hosts.clone(), reason.clone(), Some(lease.lease_id.clone()), requests::replay_managed_claims(pinned), capabilities);
+            group.result = Some(submit_get(&api, &request, deadline, pinned, capabilities)?);
         }
     }
     let needs_proxy = groups.iter().any(|g| g.result.as_ref().expect("acquired").files.iter().any(|f| f.substituted));
@@ -233,7 +251,7 @@ pub fn run(args: ExecArgs) -> Result<(), CliError> {
     for group in &groups {
         let lease = authority(&leases, group)?;
         let result = group.result.as_ref().expect("acquired");
-        if group.generated && (lease.credential_version != result.credential_version || !headroom(result.credential_expires_at.as_deref()) || !headroom(lease.credential_expires_at.as_deref())) {
+        if group.generated_output.is_some() && (lease.credential_version != result.credential_version || !headroom(result.credential_expires_at.as_deref()) || !headroom(lease.credential_expires_at.as_deref())) {
             return Err(changed());
         }
     }
@@ -272,6 +290,7 @@ mod tests {
     fn entries() -> Vec<asm_proto::wire::SecretEntry> {
         serde_json::from_value(json!([
             {"name":"GH_TOKEN","aliases":["GITHUB_TOKEN"],"source_kind":"generator","generators":[{"generator_id":"app","name":"release-bot","available":true}],"vault":"GitHub App","kind":"single","fields":["value"],"lease":null},
+            {"name":"CLOUDSDK_AUTH_ACCESS_TOKEN","source_kind":"generator","generators":[{"generator_id":"gcp","name":"gcloud-dev","available":true}],"vault":"gcloud-dev","kind":"single","fields":["value"],"lease":null},
             {"name":"work/login","vault":"work","kind":"login","fields":["username","password"],"lease":null}
         ])).unwrap()
     }
@@ -282,6 +301,25 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[1].fields, ["password", "username"]);
         assert_eq!(destinations.len(), 4);
+    }
+
+    #[test]
+    fn mixed_providers_use_distinct_acquisitions_and_native_environment_names() {
+        let (groups, destinations) = plan("GITHUB_TOKEN,CLOUDSDK_AUTH_ACCESS_TOKEN,SECOND=CLOUDSDK_AUTH_ACCESS_TOKEN", &entries()).unwrap();
+        assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["GITHUB_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN"]);
+        assert_eq!(
+            destinations.iter().map(|d| (d.name.as_str(), d.group, d.field.as_str())).collect::<Vec<_>>(),
+            [("GH_TOKEN", 0, "value"), ("GITHUB_TOKEN", 0, "value"), ("CLOUDSDK_AUTH_ACCESS_TOKEN", 1, "value"), ("SECOND", 1, "value")],
+        );
+    }
+
+    #[test]
+    fn qualified_google_binding_defaults_only_to_gcloud_token_environment() {
+        let (groups, destinations) = plan("gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN", &entries()).unwrap();
+        assert_eq!(groups[0].name, "gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN");
+        assert_eq!(destinations.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["CLOUDSDK_AUTH_ACCESS_TOKEN"]);
+        assert!(plan("gcloud-dev/GH_TOKEN", &entries()).is_err());
+        assert!(plan("release-bot/CLOUDSDK_AUTH_ACCESS_TOKEN", &entries()).is_err());
     }
 
     #[test]

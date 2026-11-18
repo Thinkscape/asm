@@ -10,8 +10,21 @@ pub const CREDENTIAL_REFRESH_MARGIN_SECS: i64 = 600;
 /// GitHub's logical output and its interchangeable request alias.
 pub const GITHUB_TOKEN_NAME: &str = "GH_TOKEN";
 pub const GITHUB_TOKEN_ALIAS: &str = "GITHUB_TOKEN";
+/// Google Cloud CLI's bearer-token override.
+pub const GCLOUD_TOKEN_NAME: &str = "CLOUDSDK_AUTH_ACCESS_TOKEN";
+pub const GITHUB_TOKEN_NAMES: &[&str] = &[GITHUB_TOKEN_NAME, GITHUB_TOKEN_ALIAS];
+pub const GCLOUD_TOKEN_NAMES: &[&str] = &[GCLOUD_TOKEN_NAME];
 /// GitHub accepts at most 500 explicit repositories in an installation token.
 pub const MAX_GITHUB_REPOSITORIES: usize = 500;
+
+/// All spellings of a generated output, with the canonical name first.
+pub fn generated_output_names(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        GITHUB_TOKEN_NAME | GITHUB_TOKEN_ALIAS => Some(GITHUB_TOKEN_NAMES),
+        GCLOUD_TOKEN_NAME => Some(GCLOUD_TOKEN_NAMES),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,10 +68,169 @@ pub struct GithubScopeRequest {
     pub permissions: Option<BTreeMap<String, GithubPermission>>,
 }
 
+/// OAuth scope selector for legacy generators bound to a service account.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcloudScopeRequest {
+    /// None preserves the historical wire format, not managed access.
+    pub scopes: Option<Vec<String>>,
+}
+
+/// The only project-level Google access profiles a paired host may request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum GcloudPermission {
+    #[serde(rename = "storage=read")]
+    StorageRead,
+    #[serde(rename = "storage=create")]
+    StorageCreate,
+    #[serde(rename = "compute=read")]
+    ComputeRead,
+    #[serde(rename = "run=read")]
+    RunRead,
+    #[serde(rename = "logs=read")]
+    LogsRead,
+    #[serde(rename = "bigquery=metadata-read")]
+    BigqueryMetadataRead,
+}
+
+impl GcloudPermission {
+    /// Parse a host claim, never a role name or raw scope URI.
+    pub fn from_claim(claim: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|permission| permission.claim() == claim)
+    }
+    pub const ALL: [Self; 6] = [
+        Self::StorageRead, Self::StorageCreate, Self::ComputeRead, Self::RunRead,
+        Self::LogsRead, Self::BigqueryMetadataRead,
+    ];
+
+    pub fn claim(self) -> &'static str {
+        match self {
+            Self::StorageRead => "storage=read",
+            Self::StorageCreate => "storage=create",
+            Self::ComputeRead => "compute=read",
+            Self::RunRead => "run=read",
+            Self::LogsRead => "logs=read",
+            Self::BigqueryMetadataRead => "bigquery=metadata-read",
+        }
+    }
+
+    pub fn role(self) -> &'static str {
+        match self {
+            Self::StorageRead => "roles/storage.objectViewer",
+            Self::StorageCreate => "roles/storage.objectCreator",
+            Self::ComputeRead => "roles/compute.viewer",
+            Self::RunRead => "roles/run.viewer",
+            Self::LogsRead => "roles/logging.viewer",
+            Self::BigqueryMetadataRead => "roles/bigquery.metadataViewer",
+        }
+    }
+
+    /// The role is the authorization boundary; the OAuth scope is not a
+    /// substitute for the role (e.g. storage=create uses a read/write scope).
+    pub fn scope(self) -> &'static str {
+        match self {
+            Self::StorageRead => "https://www.googleapis.com/auth/devstorage.read_only",
+            Self::StorageCreate => "https://www.googleapis.com/auth/devstorage.read_write",
+            Self::ComputeRead => "https://www.googleapis.com/auth/compute.readonly",
+            Self::RunRead => "https://www.googleapis.com/auth/run.readonly",
+            Self::LogsRead => "https://www.googleapis.com/auth/logging.read",
+            Self::BigqueryMetadataRead => "https://www.googleapis.com/auth/bigquery.readonly",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcloudAccessRequest {
+    pub project_id: String,
+    /// Nonempty, sorted and deduplicated in enum order.
+    pub permissions: Vec<GcloudPermission>,
+}
+
+impl GcloudAccessRequest {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        validate_gcloud_project_id(&self.project_id)?;
+        if self.permissions.is_empty() {
+            return Err(ApiError::invalid("at least one Google Cloud permission claim is required"));
+        }
+        if self.permissions.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ApiError::invalid("Google Cloud permission claims must be sorted and unique"));
+        }
+        Ok(())
+    }
+
+    pub fn canonicalize(&mut self) -> Result<(), ApiError> {
+        self.permissions.sort_unstable();
+        self.permissions.dedup();
+        self.validate()
+    }
+
+    pub fn scopes(&self) -> Vec<String> {
+        let mut scopes: Vec<_> = self.permissions.iter().map(|permission| permission.scope().to_owned()).collect();
+        scopes.sort_unstable();
+        scopes.dedup();
+        scopes
+    }
+}
+
+/// A managed connection alone grants no access. Pending claims describe what
+/// the host asked for; only an issued profile can back a credential or lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GcloudAccessGrant {
+    Connection,
+    Requested { access: GcloudAccessRequest },
+    Issued {
+        access: GcloudAccessRequest,
+        service_account_unique_id: String,
+        service_account_email: String,
+    },
+}
+
+impl GcloudAccessGrant {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        match self {
+            Self::Connection => Ok(()),
+            Self::Requested { access } => access.validate(),
+            Self::Issued { access, service_account_unique_id, service_account_email } => {
+                validate_gcloud_service_account(service_account_unique_id, service_account_email)?;
+                access.validate()
+            }
+        }
+    }
+
+    pub fn canonicalize(&mut self) -> Result<(), ApiError> {
+        match self {
+            Self::Connection => Ok(()),
+            Self::Requested { access } => access.canonicalize(),
+            Self::Issued { access, service_account_unique_id, service_account_email } => {
+                validate_gcloud_service_account(service_account_unique_id, service_account_email)?;
+                access.canonicalize()
+            }
+        }
+    }
+
+    fn is_subset_of(&self, ceiling: &Self) -> Result<bool, ApiError> {
+        self.validate()?;
+        ceiling.validate()?;
+        Ok(matches!((self, ceiling), (
+            Self::Issued { access, service_account_unique_id, .. },
+            Self::Issued { access: maximum, service_account_unique_id: id, .. },
+        ) if access == maximum && service_account_unique_id == id))
+    }
+
+    fn covers_request(&self, request: &GcloudAccessRequest) -> Result<bool, ApiError> {
+        self.validate()?;
+        request.validate()?;
+        Ok(matches!(self, Self::Requested { access } | Self::Issued { access, .. } if access == request))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", content = "scope", rename_all = "snake_case")]
 pub enum GenerationRequest {
     GithubApp(GithubScopeRequest),
+    Gcloud(GcloudScopeRequest),
+    GcloudAccess(GcloudAccessRequest),
 }
 
 /// Canonical grants have 1–500 positive repository IDs, sorted and deduplicated,
@@ -80,10 +252,35 @@ impl PartialEq for GithubGrant {
 
 impl Eq for GithubGrant {}
 
+/// Canonical scopes are nonempty, sorted, and unique. The immutable numeric
+/// service account ID identifies the authority; the email is display only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcloudGrant {
+    pub service_account_unique_id: String,
+    pub service_account_email: String,
+    pub scopes: Vec<String>,
+    /// Issuance/quota project, not a resource boundary. None in configured
+    /// ceilings and in legacy grants that used the generator's saved default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+}
+
+impl PartialEq for GcloudGrant {
+    fn eq(&self, other: &Self) -> bool {
+        self.service_account_unique_id == other.service_account_unique_id
+            && self.scopes == other.scopes
+            && self.project_id == other.project_id
+    }
+}
+
+impl Eq for GcloudGrant {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", content = "scope", rename_all = "snake_case")]
 pub enum GenerationGrant {
     GithubApp(GithubGrant),
+    Gcloud(GcloudGrant),
+    GcloudAccess(GcloudAccessGrant),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,48 +482,251 @@ impl GithubGrant {
     }
 }
 
+/// Validate a Google Cloud project ID, not a display name or project number.
+pub fn validate_gcloud_project_id(value: &str) -> Result<(), ApiError> {
+    let bytes = value.as_bytes();
+    if !(6..=30).contains(&bytes.len())
+        || !bytes[0].is_ascii_lowercase()
+        || value.ends_with('-')
+        || !bytes.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+    {
+        return Err(ApiError::invalid("Enter a Google Cloud project ID (6 to 30 lowercase letters, digits or hyphens), not its display name or number"));
+    }
+    Ok(())
+}
+
+/// Validate an exact, case-sensitive Google OAuth scope URI. This syntax is
+/// also safe to pass as one member of gcloud's comma-delimited scope argument.
+pub fn validate_gcloud_scope(scope: &str) -> Result<(), ApiError> {
+    const PREFIX: &str = "https://www.googleapis.com/auth/";
+    if !scope.strip_prefix(PREFIX).is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'/' | b'_' | b'-'))
+    }) {
+        return Err(ApiError::invalid("Google Cloud OAuth scopes must be exact https://www.googleapis.com/auth/ URIs"));
+    }
+    Ok(())
+}
+
+fn validate_gcloud_scopes(scopes: &[String]) -> Result<(), ApiError> {
+    if scopes.is_empty() {
+        return Err(ApiError::invalid("at least one Google Cloud OAuth scope is required"));
+    }
+    scopes.iter().try_for_each(|scope| validate_gcloud_scope(scope))
+}
+
+impl GcloudScopeRequest {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if let Some(scopes) = &self.scopes {
+            validate_gcloud_scopes(scopes)?;
+        }
+        Ok(())
+    }
+
+    pub fn canonicalize(&mut self) -> Result<(), ApiError> {
+        self.validate()?;
+        if let Some(scopes) = &mut self.scopes {
+            scopes.sort_unstable();
+            scopes.dedup();
+        }
+        Ok(())
+    }
+}
+
+fn validate_gcloud_service_account(unique_id: &str, email: &str) -> Result<(), ApiError> {
+    if unique_id.is_empty() || !unique_id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ApiError::invalid("Google Cloud grant requires a numeric service account unique ID"));
+    }
+    if email.is_empty() || email.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ApiError::invalid("Google Cloud grant requires a service account email"));
+    }
+    Ok(())
+}
+
+impl GcloudGrant {
+    fn validate_shape(&self) -> Result<(), ApiError> {
+        validate_gcloud_service_account(&self.service_account_unique_id, &self.service_account_email)?;
+        if let Some(project_id) = &self.project_id {
+            validate_gcloud_project_id(project_id)?;
+        }
+        validate_gcloud_scopes(&self.scopes)
+    }
+
+    pub fn validate(&self) -> Result<(), ApiError> {
+        self.validate_shape()?;
+        if self.scopes.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ApiError::invalid("Google Cloud grant scopes must be sorted and unique"));
+        }
+        Ok(())
+    }
+
+    pub fn canonicalize(&mut self) -> Result<(), ApiError> {
+        self.validate_shape()?;
+        self.scopes.sort_unstable();
+        self.scopes.dedup();
+        Ok(())
+    }
+
+    pub fn is_subset_of(&self, ceiling: &Self) -> Result<bool, ApiError> {
+        self.validate()?;
+        ceiling.validate()?;
+        Ok(self.service_account_unique_id == ceiling.service_account_unique_id
+            && ceiling.project_id.as_ref().is_none_or(|project| self.project_id.as_ref() == Some(project))
+            && self.scopes.iter().all(|scope| ceiling.scopes.binary_search(scope).is_ok()))
+    }
+
+    pub fn covers_request(&self, request: &GcloudScopeRequest) -> Result<bool, ApiError> {
+        self.validate()?;
+        request.validate()?;
+        Ok(request.scopes.as_ref().is_none_or(|scopes| {
+            scopes.iter().all(|scope| self.scopes.binary_search(scope).is_ok())
+        }))
+    }
+
+    pub fn scope_issues(&self, request: &GcloudScopeRequest) -> Result<Vec<String>, ApiError> {
+        self.validate()?;
+        request.validate()?;
+        Ok(request.scopes.iter().flatten()
+            .filter(|scope| self.scopes.binary_search(scope).is_err())
+            .map(|scope| format!("Google Cloud OAuth scope {scope} is outside the selected scope"))
+            .collect())
+    }
+}
+
 impl GenerationRequest {
+    pub fn output_name(&self) -> &'static str {
+        match self {
+            Self::GithubApp(_) => GITHUB_TOKEN_NAME,
+            Self::Gcloud(_) => GCLOUD_TOKEN_NAME,
+            Self::GcloudAccess(_) => GCLOUD_TOKEN_NAME,
+        }
+    }
+
     pub fn canonicalize(&mut self) -> Result<(), ApiError> {
         match self {
             Self::GithubApp(scope) => scope.canonicalize(),
+            Self::Gcloud(scope) => scope.canonicalize(),
+            Self::GcloudAccess(access) => access.canonicalize(),
         }
     }
 
     pub fn validate(&self) -> Result<(), ApiError> {
         match self {
             Self::GithubApp(scope) => scope.validate(),
+            Self::Gcloud(scope) => scope.validate(),
+            Self::GcloudAccess(access) => access.validate(),
         }
     }
 }
 
 impl GenerationGrant {
+    pub fn output_name(&self) -> &'static str {
+        self.output_names()[0]
+    }
+
+    /// The first spelling is canonical; subsequent spellings are aliases.
+    pub fn output_names(&self) -> &'static [&'static str] {
+        match self {
+            Self::GithubApp(_) => GITHUB_TOKEN_NAMES,
+            Self::Gcloud(_) | Self::GcloudAccess(_) => GCLOUD_TOKEN_NAMES,
+        }
+    }
+
+    /// Pending and catalog markers cannot authorize a delivered credential.
+    pub fn is_issued(&self) -> bool {
+        !matches!(self, Self::GcloudAccess(GcloudAccessGrant::Connection | GcloudAccessGrant::Requested { .. }))
+    }
+
     pub fn canonicalize(&mut self) -> Result<(), ApiError> {
         match self {
             Self::GithubApp(grant) => grant.canonicalize(),
+            Self::Gcloud(grant) => grant.canonicalize(),
+            Self::GcloudAccess(grant) => grant.canonicalize(),
         }
     }
 
     pub fn validate(&self) -> Result<(), ApiError> {
         match self {
             Self::GithubApp(grant) => grant.validate(),
+            Self::Gcloud(grant) => grant.validate(),
+            Self::GcloudAccess(grant) => grant.validate(),
         }
     }
 
     pub fn is_subset_of(&self, ceiling: &Self) -> Result<bool, ApiError> {
         match (self, ceiling) {
             (Self::GithubApp(grant), Self::GithubApp(ceiling)) => grant.is_subset_of(ceiling),
+            (Self::Gcloud(grant), Self::Gcloud(ceiling)) => grant.is_subset_of(ceiling),
+            (Self::GcloudAccess(grant), Self::GcloudAccess(ceiling)) => grant.is_subset_of(ceiling),
+            _ => Ok(false),
         }
     }
 
     pub fn covers_request(&self, request: &GenerationRequest) -> Result<bool, ApiError> {
         match (self, request) {
             (Self::GithubApp(grant), GenerationRequest::GithubApp(request)) => grant.covers_request(request),
+            (Self::Gcloud(grant), GenerationRequest::Gcloud(request)) => grant.covers_request(request),
+            (Self::GcloudAccess(grant), GenerationRequest::GcloudAccess(request)) => grant.covers_request(request),
+            _ => Ok(false),
         }
+    }
+
+    /// Match explicit claim bounds without adding or dropping authority.
+    /// Requests must be canonicalized. GitHub requires repository names and
+    /// defaults omitted permissions to `metadata:read`; legacy Google OAuth
+    /// scopes may be unspecified.
+    pub fn matches_request_exactly(&self, request: &GenerationRequest) -> Result<bool, ApiError> {
+        match (self, request) {
+            (Self::GithubApp(grant), GenerationRequest::GithubApp(scope)) => {
+                grant.validate()?;
+                scope.validate()?;
+                Ok(scope.permissions.as_ref().map_or(grant.permissions.len() == 1, |permissions| permissions == &grant.permissions)
+                    && scope.repositories.as_ref().is_some_and(|names| names.len() == grant.repositories.len()
+                        && names.iter().all(|name| grant.repositories.iter().any(|repo| repo.full_name.trim().eq_ignore_ascii_case(name)))))
+            }
+            (Self::Gcloud(grant), GenerationRequest::Gcloud(scope)) => {
+                grant.validate()?;
+                scope.validate()?;
+                Ok(scope.scopes.as_ref().is_none_or(|scopes| scopes == &grant.scopes))
+            }
+            _ => self.covers_request(request),
+        }
+    }
+
+    /// The operator may edit claims under the grant-selection capability, but
+    /// cannot use that capability alone to change providers or projects.
+    pub fn can_select_for(&self, request: &GenerationRequest) -> bool {
+        match (self, request) {
+            (Self::GithubApp(_), GenerationRequest::GithubApp(_))
+            | (Self::Gcloud(_), GenerationRequest::Gcloud(_)) => true,
+            (Self::GcloudAccess(GcloudAccessGrant::Requested { access }
+                | GcloudAccessGrant::Issued { access, .. }), GenerationRequest::GcloudAccess(request)) =>
+                access.project_id == request.project_id,
+            _ => false,
+        }
+    }
+
+    /// A separately negotiated project switch is only for issued managed
+    /// Google grants. Changing permissions requires separate authorization.
+    pub fn can_switch_project_for(&self, request: &GenerationRequest, permissions_selectable: bool) -> bool {
+        matches!((self, request), (
+            Self::GcloudAccess(GcloudAccessGrant::Issued { access, .. }),
+            GenerationRequest::GcloudAccess(request),
+        ) if access.project_id != request.project_id
+            && (permissions_selectable || access.permissions == request.permissions))
     }
 
     pub fn scope_issues(&self, request: &GenerationRequest) -> Result<Vec<String>, ApiError> {
         match (self, request) {
             (Self::GithubApp(grant), GenerationRequest::GithubApp(request)) => grant.scope_issues(request),
+            (Self::Gcloud(grant), GenerationRequest::Gcloud(request)) => grant.scope_issues(request),
+            (Self::GcloudAccess(grant), GenerationRequest::GcloudAccess(request)) => {
+                if grant.covers_request(request)? {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec!["Google Cloud approval must match the exact requested project and permissions".into()])
+                }
+            }
+            _ => Ok(vec!["requested scope belongs to a different credential provider".into()]),
         }
     }
 }
@@ -336,12 +736,18 @@ impl GenerationSelection {
         if self.generator_id.is_empty() || self.generator_revision == 0 {
             return Err(ApiError::invalid("generator selection requires an ID and positive revision"));
         }
+        if matches!(&self.grant, GenerationGrant::GcloudAccess(GcloudAccessGrant::Connection)) {
+            return Err(ApiError::invalid("a Google Cloud connection alone is not a grant selection"));
+        }
         self.grant.validate()
     }
 
     pub fn canonicalize(&mut self) -> Result<(), ApiError> {
         if self.generator_id.is_empty() || self.generator_revision == 0 {
             return Err(ApiError::invalid("generator selection requires an ID and positive revision"));
+        }
+        if matches!(&self.grant, GenerationGrant::GcloudAccess(GcloudAccessGrant::Connection)) {
+            return Err(ApiError::invalid("a Google Cloud connection alone is not a grant selection"));
         }
         self.grant.canonicalize()
     }
@@ -509,5 +915,259 @@ mod tests {
         request.canonicalize().unwrap();
         assert_eq!(request.repositories.unwrap(), ["acme/web"]);
         assert_eq!(request.permissions, Some(BTreeMap::from([("metadata".into(), GithubPermission::Read)])));
+    }
+
+    const CLOUD: &str = "https://www.googleapis.com/auth/cloud-platform";
+    const STORAGE: &str = "https://www.googleapis.com/auth/devstorage.read_only";
+
+    fn gcloud(scopes: &[&str]) -> GcloudGrant {
+        GcloudGrant {
+            service_account_unique_id: "123456789012345678901".into(),
+            service_account_email: "app@demo-project.iam.gserviceaccount.com".into(),
+            scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+            project_id: None,
+        }
+    }
+
+    #[test]
+    fn gcloud_scopes_canonicalize_and_roundtrip_without_changing_case() {
+        let upper = "https://www.googleapis.com/auth/Devstorage.read_only";
+        let mut request = GenerationRequest::Gcloud(GcloudScopeRequest {
+            scopes: Some(vec![STORAGE.into(), upper.into(), STORAGE.into()]),
+        });
+        request.canonicalize().unwrap();
+        let wire = json!({"provider":"gcloud","scope":{"scopes":[upper, STORAGE]}});
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<GenerationRequest>(wire).unwrap(), request);
+        assert_eq!(request.output_name(), "CLOUDSDK_AUTH_ACCESS_TOKEN");
+
+        let mut grant = GenerationGrant::Gcloud(gcloud(&[STORAGE, CLOUD, STORAGE]));
+        grant.canonicalize().unwrap();
+        let wire = json!({"provider":"gcloud","scope":{
+            "service_account_unique_id":"123456789012345678901",
+            "service_account_email":"app@demo-project.iam.gserviceaccount.com",
+            "scopes":[CLOUD, STORAGE]
+        }});
+        assert_eq!(serde_json::to_value(&grant).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<GenerationGrant>(wire).unwrap(), grant);
+        assert!(!grant.covers_request(&request).unwrap());
+        assert!(grant.scope_issues(&request).unwrap()[0].contains(upper));
+    }
+
+    #[test]
+    fn gcloud_rejects_explicit_empty_and_invalid_scope_sets() {
+        let mut omitted = GcloudScopeRequest::default();
+        omitted.canonicalize().unwrap();
+        assert_eq!(omitted.scopes, None);
+        assert!(gcloud(&[CLOUD]).covers_request(&omitted).unwrap());
+        assert!(GcloudScopeRequest { scopes: Some(vec![]) }.canonicalize().is_err());
+        assert!(gcloud(&[]).canonicalize().is_err());
+        assert!(gcloud(&[STORAGE, CLOUD]).validate().is_err());
+        assert!(gcloud(&[CLOUD, CLOUD]).validate().is_err());
+        for scope in [
+            "", "http://www.googleapis.com/auth/api", "https://example.com/auth/api",
+            "https://www.googleapis.com/auth/", "https://www.googleapis.com/auth/a,b",
+            "https://www.googleapis.com/auth/^x^y", "https://www.googleapis.com/auth/a%20b",
+            "https://www.googleapis.com/auth/a b", "https://www.googleapis.com/auth/a\u{2003}b",
+            "https://www.googleapis.com/auth/a\nb", "https://www.googleapis.com/auth/a\u{7f}",
+        ] {
+            assert!(GcloudScopeRequest { scopes: Some(vec![scope.into()]) }.canonicalize().is_err(), "{scope:?}");
+            assert!(gcloud(&[scope]).canonicalize().is_err(), "{scope:?}");
+        }
+        for id in ["", "name@example.com", "１２３", "123,456"] {
+            let mut grant = gcloud(&[CLOUD]);
+            grant.service_account_unique_id = id.into();
+            assert!(grant.canonicalize().is_err(), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn gcloud_subsets_require_exact_scopes_and_the_same_immutable_identity() {
+        let ceiling = gcloud(&[CLOUD, STORAGE]);
+        let mut narrower = gcloud(&[STORAGE]);
+        assert!(narrower.is_subset_of(&ceiling).unwrap());
+        assert!(!ceiling.is_subset_of(&narrower).unwrap());
+        assert!(!narrower.is_subset_of(&gcloud(&[CLOUD])).unwrap());
+
+        narrower.service_account_email = "renamed@demo-project.iam.gserviceaccount.com".into();
+        assert!(narrower.is_subset_of(&ceiling).unwrap());
+        narrower.service_account_unique_id.push('2');
+        assert!(!narrower.is_subset_of(&ceiling).unwrap());
+
+        let grant = GenerationGrant::Gcloud(gcloud(&[CLOUD]));
+        let request = GenerationRequest::Gcloud(GcloudScopeRequest { scopes: Some(vec![STORAGE.into()]) });
+        assert!(!grant.covers_request(&request).unwrap());
+        assert!(grant.scope_issues(&request).unwrap()[0].contains(STORAGE));
+    }
+
+    #[test]
+    fn gcloud_concrete_project_constraints_require_an_exact_project() {
+        let ceiling = gcloud(&[STORAGE]);
+        let mut approved = ceiling.clone();
+        approved.project_id = Some("quota-project".into());
+        let mut other = ceiling.clone();
+        other.project_id = Some("other-project".into());
+        assert!(approved.is_subset_of(&ceiling).unwrap());
+        assert!(approved.is_subset_of(&approved).unwrap());
+        assert!(!approved.is_subset_of(&other).unwrap());
+        assert!(!ceiling.is_subset_of(&approved).unwrap());
+        assert_ne!(approved, other);
+        assert_ne!(approved, ceiling);
+
+        let grant = GenerationGrant::Gcloud(approved);
+        let wire = serde_json::to_value(&grant).unwrap();
+        assert_eq!(wire["scope"]["project_id"], "quota-project");
+        assert_eq!(serde_json::from_value::<GenerationGrant>(wire).unwrap(), grant);
+        for project_id in ["", "abcde", "123456", "Upper-project", "quota-", "proj_ect",
+            "proj/ect", "--project=other", "proj\t ect", "abcdefghijklmnopqrstuvwxyz12345"] {
+            let mut invalid = gcloud(&[STORAGE]);
+            invalid.project_id = Some(project_id.into());
+            assert!(invalid.validate().is_err(), "{project_id:?}");
+            assert!(invalid.canonicalize().is_err(), "{project_id:?}");
+        }
+    }
+
+    #[test]
+    fn provider_mismatches_never_cover_or_reinterpret_authority() {
+        let github_grant = GenerationGrant::GithubApp(grant());
+        let github_request = GenerationRequest::GithubApp(GithubScopeRequest::default());
+        let google_grant = GenerationGrant::Gcloud(gcloud(&[CLOUD]));
+        let google_request = GenerationRequest::Gcloud(GcloudScopeRequest::default());
+        assert!(!github_grant.is_subset_of(&google_grant).unwrap());
+        assert!(!google_grant.is_subset_of(&github_grant).unwrap());
+        for (grant, request) in [(&github_grant, &google_request), (&google_grant, &github_request)] {
+            assert!(!grant.covers_request(request).unwrap());
+            assert_eq!(grant.scope_issues(request).unwrap(), ["requested scope belongs to a different credential provider"]);
+        }
+    }
+
+    #[test]
+    fn managed_google_claims_map_to_predefined_roles_and_provider_scopes() {
+        for (claim, role, scope) in [
+            ("storage=read", "roles/storage.objectViewer", STORAGE),
+            ("storage=create", "roles/storage.objectCreator", "https://www.googleapis.com/auth/devstorage.read_write"),
+            ("compute=read", "roles/compute.viewer", "https://www.googleapis.com/auth/compute.readonly"),
+            ("run=read", "roles/run.viewer", "https://www.googleapis.com/auth/run.readonly"),
+            ("logs=read", "roles/logging.viewer", "https://www.googleapis.com/auth/logging.read"),
+            ("bigquery=metadata-read", "roles/bigquery.metadataViewer", "https://www.googleapis.com/auth/bigquery.readonly"),
+        ] {
+            let permission = GcloudPermission::from_claim(claim).unwrap();
+            assert_eq!(permission.claim(), claim);
+            assert_eq!(permission.role(), role);
+            assert_eq!(permission.scope(), scope);
+            assert_eq!(serde_json::from_value::<GcloudPermission>(json!(claim)).unwrap(), permission);
+            assert_eq!(serde_json::to_value(permission).unwrap(), json!(claim));
+        }
+        for invalid in [CLOUD, "roles/owner", "storage=write", "Storage=read", "compute=admin", ""] {
+            assert!(GcloudPermission::from_claim(invalid).is_none());
+            assert!(serde_json::from_value::<GcloudPermission>(json!(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn github_operator_selection_can_differ_from_explicit_request_bounds() {
+        let mut exact = grant();
+        exact.permissions.remove("contents");
+        let mut broad = grant();
+        broad.repositories.push(GithubRepository { id: 9, full_name: "Acme/Other".into() });
+        let request = GenerationRequest::GithubApp(GithubScopeRequest {
+            repositories: Some(vec!["acme/web".into()]),
+            permissions: None,
+        });
+        for (candidate, matches) in [(exact, true), (broad, false)] {
+            let candidate = GenerationGrant::GithubApp(candidate);
+            assert!(candidate.can_select_for(&request));
+            assert_eq!(candidate.matches_request_exactly(&request).unwrap(), matches);
+        }
+    }
+
+    #[test]
+    fn managed_google_leases_require_exact_project_claims_and_pinned_identity() {
+        let mut access = GcloudAccessRequest {
+            project_id: "demo-project".into(),
+            permissions: vec![GcloudPermission::ComputeRead, GcloudPermission::StorageRead, GcloudPermission::ComputeRead],
+        };
+        assert!(access.validate().is_err());
+        access.canonicalize().unwrap();
+        assert_eq!(access.scopes(), ["https://www.googleapis.com/auth/compute.readonly", STORAGE]);
+        let request = GenerationRequest::GcloudAccess(access.clone());
+        let wire = json!({"provider":"gcloud_access","scope":{
+            "project_id":"demo-project","permissions":["storage=read","compute=read"]
+        }});
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<GenerationRequest>(wire).unwrap(), request);
+        let grant = |access, id: &str| GenerationGrant::GcloudAccess(GcloudAccessGrant::Issued {
+            access,
+            service_account_unique_id: id.into(),
+            service_account_email: "app@demo-project.iam.gserviceaccount.com".into(),
+        });
+        let issued = grant(access.clone(), "12345");
+        let wire = serde_json::to_value(&issued).unwrap();
+        assert_eq!(wire["provider"], "gcloud_access");
+        assert_eq!(wire["scope"]["state"], "issued");
+        assert_eq!(serde_json::from_value::<GenerationGrant>(wire).unwrap(), issued);
+        assert!(issued.covers_request(&request).unwrap());
+        assert!(issued.matches_request_exactly(&request).unwrap());
+        assert!(issued.can_select_for(&request));
+        assert!(issued.is_subset_of(&issued).unwrap());
+        assert!(!issued.is_subset_of(&grant(access.clone(), "67890")).unwrap());
+        assert!(grant(access.clone(), "not-an-id").validate().is_err());
+        for other in [
+            GcloudAccessRequest { permissions: vec![GcloudPermission::StorageRead], ..access.clone() },
+            GcloudAccessRequest { permissions: vec![GcloudPermission::StorageRead, GcloudPermission::ComputeRead, GcloudPermission::RunRead], ..access.clone() },
+            GcloudAccessRequest { project_id: "other-project".into(), ..access.clone() },
+        ] {
+            let different = grant(other.clone(), "12345");
+            assert!(!issued.is_subset_of(&different).unwrap());
+            assert!(!different.is_subset_of(&issued).unwrap());
+            let other_request = GenerationRequest::GcloudAccess(other.clone());
+            assert!(!issued.matches_request_exactly(&other_request).unwrap());
+            assert_eq!(issued.can_select_for(&other_request), other.project_id == access.project_id);
+        }
+        let pending = GenerationGrant::GcloudAccess(GcloudAccessGrant::Requested { access: access.clone() });
+        let catalog = GenerationGrant::GcloudAccess(GcloudAccessGrant::Connection);
+        assert!(pending.covers_request(&request).unwrap());
+        assert!(!catalog.covers_request(&request).unwrap());
+        for display in [pending, catalog] {
+            assert!(!display.is_issued());
+            assert!(!display.is_subset_of(&issued).unwrap());
+            assert!(!issued.is_subset_of(&display).unwrap());
+        }
+        let legacy = GenerationGrant::Gcloud(gcloud(&[STORAGE]));
+        assert!(!legacy.covers_request(&request).unwrap());
+        assert!(!legacy.can_select_for(&request));
+        assert!(!issued.is_subset_of(&legacy).unwrap());
+        assert!(!issued.covers_request(&GenerationRequest::Gcloud(GcloudScopeRequest::default())).unwrap());
+        assert!(GcloudAccessRequest { permissions: vec![], ..access }.validate().is_err());
+    }
+
+    #[test]
+    fn project_selection_does_not_imply_permission_selection_or_lease_equivalence() {
+        let access = GcloudAccessRequest {
+            project_id: "demo-project".into(),
+            permissions: vec![GcloudPermission::StorageRead],
+        };
+        let issued = |access| GenerationGrant::GcloudAccess(GcloudAccessGrant::Issued {
+            access,
+            service_account_unique_id: "12345".into(),
+            service_account_email: "managed@demo-project.iam.gserviceaccount.com".into(),
+        });
+        let request = GenerationRequest::GcloudAccess(access.clone());
+        let exact = issued(access.clone());
+        let switched_access = GcloudAccessRequest { project_id: "other-project".into(), ..access };
+        let switched = issued(switched_access.clone());
+        let switched_and_edited = issued(GcloudAccessRequest {
+            permissions: vec![GcloudPermission::ComputeRead],
+            ..switched_access.clone()
+        });
+        let pending = GenerationGrant::GcloudAccess(GcloudAccessGrant::Requested { access: switched_access });
+        assert!(!exact.can_switch_project_for(&request, true));
+        assert!(switched.can_switch_project_for(&request, false));
+        assert!(!switched_and_edited.can_switch_project_for(&request, false));
+        assert!(switched_and_edited.can_switch_project_for(&request, true));
+        assert!(!pending.can_switch_project_for(&request, true));
+        assert!(!switched.can_select_for(&request));
+        assert!(!switched.matches_request_exactly(&request).unwrap());
+        assert!(!switched.is_subset_of(&exact).unwrap());
     }
 }

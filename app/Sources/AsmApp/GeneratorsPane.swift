@@ -2,19 +2,78 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-private struct GeneratorSheet: Identifiable {
-    var generator: GeneratorItem?
-    var id: String { generator?.id ?? "new" }
+private enum GeneratorSheet: Identifiable {
+    case addGithubApp
+    case addGcloudConnection
+    case edit(GeneratorItem)
+
+    var id: String {
+        switch self {
+        case .addGithubApp: "new-github"
+        case .addGcloudConnection: "new-gcloud"
+        case let .edit(generator): generator.id
+        }
+    }
 }
 
 struct GeneratorsPane: View {
     let model: AppModel
+    @State private var section: Section = .generators
+
+    private enum Section: Hashable {
+        case generators, serviceAccounts
+    }
+
+    private var showsServiceAccounts: Bool {
+        model.hasRecordedGcloudAccounts || model.generators.contains { $0.config.isGoogleCloud }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if showsServiceAccounts && section == .serviceAccounts {
+                // Keep the ledger's wrapped header and footer from setting the split
+                // view's minimum height during AppKit's narrow fitting-size probe.
+                GeometryReader { viewport in
+                    GcloudOwnedAccountsPane(model: model)
+                        .frame(width: viewport.size.width, height: viewport.size.height)
+                }
+            } else {
+                GeneratorListPane(model: model)
+            }
+        }
+        .toolbar {
+            if showsServiceAccounts {
+                ToolbarItem(placement: .principal) {
+                    Picker("Generator settings", selection: $section) {
+                        Text("Generators").tag(Section.generators)
+                        Text("Google Service Accounts").tag(Section.serviceAccounts)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                }
+            }
+        }
+        .onChange(of: showsServiceAccounts) { _, visible in
+            if !visible { section = .generators }
+        }
+    }
+}
+
+private struct GeneratorListPane: View {
+    let model: AppModel
+    @Environment(\.openURL) private var openURL
     @State private var selection: String?
     @State private var sheet: GeneratorSheet?
     @State private var removing: GeneratorItem?
     @State private var error: String?
 
     private var selected: GeneratorItem? { model.generators.first { $0.id == selection } }
+
+    private var selectedIsLegacyGcloud: Bool {
+        guard let selected, case .gcloud = selected.config else { return false }
+        return true
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -23,10 +82,15 @@ struct GeneratorsPane: View {
             } else {
                 Table(model.generators, selection: $selection) {
                     TableColumn("Name") { generator in Text(verbatim: generator.name) }
-                    TableColumn("Provider") { _ in Text("GitHub App") }
-                    TableColumn("Output") { _ in
-                        Text(verbatim: "GH_TOKEN · GITHUB_TOKEN").font(.body.monospaced())
+                    TableColumn("Provider") { generator in Text(generator.config.providerName) }
+                    TableColumn("Output") { generator in
+                        let output = switch generator.config {
+                        case .githubApp: "\(generator.config.outputName) · GITHUB_TOKEN"
+                        case .gcloud, .gcloudConnection: generator.config.outputName
+                        }
+                        Text(verbatim: output).font(.body.monospaced()).help(output)
                     }
+                    .width(min: 150, ideal: 245)
                     TableColumn("Status") { generator in
                         Label(generator.state.title, systemImage: generator.state == .ready ? "checkmark.circle" : "exclamationmark.triangle")
                             .help(generator.warning ?? generator.state.title)
@@ -34,12 +98,16 @@ struct GeneratorsPane: View {
                 }
                 .contextMenu(forSelectionType: String.self) { ids in
                     if let id = ids.first, let generator = model.generators.first(where: { $0.id == id }) {
-                        Button("Edit…") { sheet = GeneratorSheet(generator: generator) }
+                        if case .gcloud = generator.config {
+                            Button("Details…") { sheet = .edit(generator) }
+                        } else {
+                            Button("Edit…") { sheet = .edit(generator) }
+                        }
                         Button("Remove…", role: .destructive) { removing = generator }
                     }
                 } primaryAction: { ids in
                     if let id = ids.first, let generator = model.generators.first(where: { $0.id == id }) {
-                        sheet = GeneratorSheet(generator: generator)
+                        sheet = .edit(generator)
                     }
                 }
             }
@@ -47,19 +115,41 @@ struct GeneratorsPane: View {
         .toolbar {
             ToolbarItemGroup {
                 Menu {
-                    Button("GitHub App…") { sheet = GeneratorSheet(generator: nil) }
+                    Button("GitHub App…") { sheet = .addGithubApp }
+                    Button("Google Cloud…") { sheet = .addGcloudConnection }
                 } label: {
                     Label("Add generator", systemImage: "plus")
                 }
                 Button {
-                    if let selected { sheet = GeneratorSheet(generator: selected) }
-                } label: { Label("Edit", systemImage: "pencil") }
+                    if let selected { sheet = .edit(selected) }
+                } label: {
+                    Label(
+                        selectedIsLegacyGcloud ? "Details" : "Edit",
+                        systemImage: selectedIsLegacyGcloud ? "info.circle" : "pencil"
+                    )
+                }
                 .disabled(selected == nil)
                 Button { removing = selected } label: { Label("Remove", systemImage: "minus") }
                     .disabled(selected == nil)
             }
         }
-        .sheet(item: $sheet) { sheet in GithubAppSheet(model: model, generator: sheet.generator) }
+        .sheet(item: $sheet) { sheet in
+            switch sheet {
+            case .addGithubApp:
+                GithubAppSheet(model: model, generator: nil, savedConfig: nil)
+            case .addGcloudConnection:
+                GcloudGeneratorSheet(model: model)
+            case let .edit(generator):
+                switch generator.config {
+                case let .githubApp(config):
+                    GithubAppSheet(model: model, generator: generator, savedConfig: config)
+                case let .gcloud(config):
+                    GcloudLegacyGeneratorSheet(generator: generator, config: config)
+                case let .gcloudConnection(config):
+                    GcloudGeneratorSheet(model: model, editing: (generator, config))
+                }
+            }
+        }
         .confirmationDialog(
             "Remove generator “\(removing?.name ?? "")”?",
             isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
@@ -68,10 +158,29 @@ struct GeneratorsPane: View {
             Button("Remove", role: .destructive) {
                 Task { error = await model.removeGenerator(generator.id) }
             }
-        } message: { _ in
-            Text("Its leases are invalidated and sentinels stop working. ASM attempts to revoke issued tokens; raw copies may remain usable until GitHub expiry if revocation fails.")
+            if generator.config.isGoogleCloud {
+                Button("Google account permissions…") { openURL(GcloudGeneratorSheet.accountPermissionsURL) }
+            }
+        } message: { generator in
+            switch generator.config {
+            case .githubApp:
+                Text("Its leases are invalidated and sentinels stop working. ASM attempts to revoke issued tokens; raw copies may remain usable until GitHub expiry if revocation fails.")
+            case .gcloud:
+                Text("This removes the saved sign-in from ASM and ends its leases. Google consent, the bound service account, and IAM grants are unchanged. Google access tokens cannot be individually revoked; issued copies remain usable until they expire.")
+            case .gcloudConnection:
+                Text("This removes the saved sign-in from ASM and ends its leases. Google consent, provisioned service accounts, and IAM bindings remain. Find those accounts under Google Service Accounts in Generators. Google access tokens cannot be individually revoked; issued copies remain usable until they expire.")
+            }
         }
         .errorAlert($error)
+    }
+}
+
+private extension GeneratorConfigItem {
+    var isGoogleCloud: Bool {
+        switch self {
+        case .gcloud, .gcloudConnection: true
+        case .githubApp: false
+        }
     }
 }
 
@@ -94,10 +203,9 @@ private struct GithubAppSheet: View {
     @State private var error: String?
     @State private var savedWarning: String?
 
-    init(model: AppModel, generator: GeneratorItem?) {
+    init(model: AppModel, generator: GeneratorItem?, savedConfig: GithubAppConfigItem?) {
         self.model = model
         self.generator = generator
-        let savedConfig = generator?.config.github
         self.savedConfig = savedConfig
         _name = State(initialValue: generator?.name ?? "")
         _clientID = State(initialValue: savedConfig?.clientID ?? "")
@@ -130,10 +238,11 @@ private struct GithubAppSheet: View {
     }
 
     private func draft(installations: [GithubGrantItem]) -> GeneratorDraftItem {
-        GeneratorDraftItem(
+        let config = GithubAppConfigItem(clientID: clientID, installations: installations)
+        return GeneratorDraftItem(
             id: generator?.id, name: name.trimmingCharacters(in: .whitespaces),
-            config: .githubApp(GithubAppConfigItem(clientID: clientID, installations: installations)),
-            privateKeyPEM: privateKeyPEM
+            config: .githubApp(config),
+            credentials: privateKeyPEM.isEmpty ? .keep : .githubPrivateKey(pem: privateKeyPEM)
         )
     }
 
@@ -302,12 +411,13 @@ private struct GithubInstallationsSection: View {
             }
             ForEach(installations) { grant in
                 let account = accounts[grant.id] ?? grant.repositoryOwner
+                let label = GithubInstallationLabel(account: account, installationID: grant.id)
                 VStack(alignment: .leading, spacing: 8) {
                     DisclosureGroup {
-                        GithubScopeSummary(grant: grant)
+                        GrantScopeSummary(grant: grant)
                     } label: {
                         VStack(alignment: .leading, spacing: 2) {
-                            GithubInstallationLabel(account: account, installationID: grant.id)
+                            label
                             Text("Repositories: \(grant.repositories.count) · Permissions: \(grant.permissions.count)")
                                 .font(.caption).foregroundStyle(.secondary)
                             if !canUse(grant) {
@@ -404,9 +514,7 @@ private struct GithubInstallationEditor: View {
             return "Verify this installation with GitHub."
         }
         if claims.repositoryIDs.isEmpty { return "Choose at least one repository." }
-        if claims.repositoryIDs.count > GithubGrantItem.repositoryLimit {
-            return "Choose at most \(GithubGrantItem.repositoryLimit) repositories."
-        }
+        if claims.repositoryIDs.count > GithubClaimsEditor.repositoryLimit { return "Choose at most \(GithubClaimsEditor.repositoryLimit) repositories." }
         if claims.permissions["metadata"] != .read { return "Metadata read is required." }
         return nil
     }
@@ -459,7 +567,7 @@ private struct GithubInstallationEditor: View {
                         if choices.repositories.isEmpty {
                             Text("No repositories are available for this installation.")
                         } else {
-                            GithubClaimsEditor(ceiling: choices, selection: $claims)
+                            GithubClaimsEditor(ceiling: choices, selection: $claims, allowsBulkRepositorySelection: true)
                                 .disabled(mustVerify && verifiedAccount == nil)
                         }
                     } else {
@@ -497,9 +605,8 @@ private struct GithubInstallationEditor: View {
             defer { operation = nil }
             do {
                 let found = try await model.githubListInstallations(discoveryDraft)
-                let additional = found.filter { !configuredIDs.contains($0.id) }
-                accounts = additional
-                if let selectedID, !additional.contains(where: { $0.id == selectedID }) {
+                accounts = found.filter { !configuredIDs.contains($0.id) }
+                if let selectedID, accounts?.contains(where: { $0.id == selectedID }) != true {
                     self.selectedID = nil
                 }
             } catch { self.error = error.localizedDescription }
@@ -507,8 +614,8 @@ private struct GithubInstallationEditor: View {
     }
 
     private func verify() {
-        guard operation == nil, idProblem == nil, let installationID else { return }
-        var config = discoveryDraft.config.github
+        guard operation == nil, idProblem == nil, let installationID,
+              case var .githubApp(config) = discoveryDraft.config else { return }
         config.installations = [GithubGrantItem(installationID: installationID, repositories: [], permissions: [])]
         var draft = discoveryDraft
         draft.config = .githubApp(config)
@@ -526,7 +633,7 @@ private struct GithubInstallationEditor: View {
                 }
                 let previous = claims
                 choices = GithubGrantItem(installationID: found.installationID, repositories: found.repositories, permissions: found.permissions)
-                claims.repositoryIDs.formIntersection(found.repositories.lazy.map(\.id))
+                claims.repositoryIDs.formIntersection(found.repositories.map(\.id))
                 claims.permissions = claims.permissions.filter { name, level in
                     found.permissions.contains { $0.name == name && $0.allowedLevels.contains(level) }
                 }
@@ -545,85 +652,220 @@ private struct GithubInstallationEditor: View {
     }
 }
 
-struct GithubScopeSummary: View {
+struct ScopeSummaryHeading: View {
+    let title: LocalizedStringKey
+
+    init(_ title: LocalizedStringKey) {
+        self.title = title
+    }
+
+    var body: some View {
+        Text(title).font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+    }
+}
+
+struct GrantScopeSummary: View {
     let grant: GithubGrantItem
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Repositories").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+            ScopeSummaryHeading("Repositories")
             ForEach(grant.repositories) { repository in
-                Text(verbatim: repository.fullName).font(.callout).textSelection(.enabled)
+                resource(repository.fullName)
             }
-            Text("Permissions").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+            ScopeSummaryHeading("Permissions")
             ForEach(grant.permissions) { permission in
-                Text("\(permission.scopeLabel): \(permission.level.rawValue)").font(.callout)
+                permissionRow(Text(verbatim: permission.scopeLabel), level: Text(verbatim: permission.level.rawValue))
             }
             Text("Repository selection does not restrict organization, account, or enterprise permissions.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
+
+    private func resource(_ name: String) -> some View {
+        Text(verbatim: name).font(.callout).textSelection(.enabled)
+    }
+
+    private func permissionRow(_ name: Text, level: Text) -> some View {
+        Text("\(name): \(level)").font(.callout)
+    }
 }
 
-/// Stable-ID controls for editing a single installation’s ceiling.
-private struct GithubClaimsEditor: View {
-    let ceiling: GithubGrantItem
+/// Shared controls for editing a single installation’s ceiling or an individual grant.
+struct GithubClaimsEditor: View {
+    static let repositoryLimit = 500
+
+    let ceiling: GithubGrantItem?
     @Binding var selection: GithubClaimsSelection
+    var request: GithubScopeRequestItem? = nil
+    var allowsBulkRepositorySelection = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            let selected = selection.repositoryIDs.count
-            let exceedsLimit = ceiling.repositories.count > GithubGrantItem.repositoryLimit
-            let clearSelection = selected == ceiling.repositories.count || exceedsLimit
-            HStack {
-                Text("Repositories (\(selected) selected)").font(.subheadline.weight(.semibold))
-                    .accessibilityAddTraits(.isHeader)
-                Spacer()
-                Button(clearSelection ? "Deselect all" : "Select all") {
-                    if clearSelection {
-                        selection.repositoryIDs.removeAll()
-                    } else {
-                        selection.repositoryIDs = Set(ceiling.repositories.lazy.map(\.id))
-                    }
-                }
-                .disabled(ceiling.repositories.isEmpty || (exceedsLimit && selected == 0))
+            GithubRepositoryClaims(
+                repositories: ceiling?.repositories, requested: request?.repositories ?? [],
+                allowsBulkSelection: allowsBulkRepositorySelection, selection: $selection
+            )
+            GithubPermissionClaims(
+                permissions: ceiling?.permissions, requested: request?.effectivePermissions ?? [], levels: $selection.permissions
+            )
+            if ceiling != nil {
+                Text("Repository selection does not restrict organization, account, or enterprise permissions.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            if exceedsLimit {
-                Text("Choose up to \(GithubGrantItem.repositoryLimit) repositories individually.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            ForEach(ceiling.repositories) { repository in
-                Toggle(isOn: $selection[repository: repository.id]) {
-                    Text(verbatim: repository.fullName)
-                }
-                .accessibilityLabel(Text(verbatim: repository.fullName))
-                .disabled(!selection.repositoryIDs.contains(repository.id) && selected >= GithubGrantItem.repositoryLimit)
-                .help("Repository ID \(repository.id)")
-            }
-            Text("Permissions").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
-            ForEach(ceiling.permissions) { permission in
-                GithubPermissionControl(permission: permission, level: $selection.permissions[permission.name])
-            }
-            Text("Repository selection does not restrict organization, account, or enterprise permissions.")
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
 }
 
-private struct GithubPermissionControl: View {
-    let permission: GithubPermissionItem
-    @Binding var level: GithubPermissionLevel?
+private struct GithubRepositoryClaims: View {
+    let repositories: [GithubRepositoryItem]?
+    let requested: [String]
+    let allowsBulkSelection: Bool
+    @Binding var selection: GithubClaimsSelection
 
     var body: some View {
-        if permission.name == "metadata" {
-            LabeledContent("metadata") { Text("Read (required)") }
-        } else {
-            Picker(permission.scopeLabel, selection: $level) {
-                Text("None").tag(Optional<GithubPermissionLevel>.none)
-                ForEach(permission.allowedLevels, id: \.self) { option in
-                    Text(option.rawValue).tag(Optional(option))
+        if let repositories {
+            let match = GithubRequestedRepositories(requested, in: repositories)
+            let selected = selection.repositoryIDs.count
+            let limit = GithubClaimsEditor.repositoryLimit
+            let exceedsLimit = repositories.count > limit
+            let clearSelection = selected == repositories.count || exceedsLimit
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    SectionLabel("Repositories (\(selected) selected)").accessibilityAddTraits(.isHeader)
+                    if allowsBulkSelection {
+                        Spacer()
+                        Button(clearSelection ? "Deselect all" : "Select all") {
+                            if clearSelection {
+                                selection.repositoryIDs.removeAll()
+                            } else {
+                                selection.repositoryIDs = Set(repositories.lazy.map(\.id))
+                            }
+                        }
+                        .disabled(repositories.isEmpty || (exceedsLimit && selected == 0))
+                    }
+                }
+                if exceedsLimit {
+                    Text("Choose up to \(limit) repositories individually.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                ForEach(repositories) { repository in
+                    let label = if match.matchedIDs.contains(repository.id) {
+                        Text("\(repository.fullName) (requested)", comment: "The placeholder is the GitHub repository requested by the client.")
+                    } else if match.ambiguousIDs.contains(repository.id) {
+                        Text("\(repository.fullName) · ID \(String(repository.id))", comment: "An ambiguous GitHub repository name disambiguated by its stable numeric ID.")
+                    } else {
+                        Text(verbatim: repository.fullName)
+                    }
+                    Toggle(isOn: $selection[repository: repository.id]) { label }
+                        .fixedSize(horizontal: false, vertical: true)
+                        .disabled(selected >= limit && !selection.repositoryIDs.contains(repository.id))
+                        .help("Repository ID \(repository.id)")
+                }
+                ForEach(match.unavailable) { repository in
+                    let label = repository.ambiguous
+                        ? Text("\(repository.name) (requested) (ambiguous)", comment: "The requested GitHub repository name matches multiple repositories.")
+                        : Text("\(repository.name) (requested) (unavailable)", comment: "The requested GitHub repository is outside the selected installation’s limits.")
+                    Toggle(isOn: .constant(false)) { label }
+                        .fixedSize(horizontal: false, vertical: true)
+                        .disabled(true)
                 }
             }
-            .accessibilityLabel(permission.scopeLabel)
+        } else if !requested.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel("Requested repositories").accessibilityAddTraits(.isHeader)
+                ForEach(requested, id: \.self) { name in
+                    Text(verbatim: name).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
+    }
+}
+
+private struct GithubPermissionClaims: View {
+    let permissions: [GithubPermissionItem]?
+    let requested: [GithubPermissionItem]
+    @Binding var levels: [String: GithubPermissionLevel]
+
+    var body: some View {
+        if let permissions {
+            let requestedLevels = Dictionary(requested.lazy.map { ($0.name, $0.level) }, uniquingKeysWith: { first, _ in first })
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel("Permissions").accessibilityAddTraits(.isHeader)
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                    ForEach(permissions) { permission in
+                        GridRow {
+                            if permission.name == "metadata" {
+                                Text("metadata")
+                                let required = String(localized: "Read (required)")
+                                PermissionLevelPicker(label: "metadata", options: [required], requested: nil,
+                                                      allowsNone: false, level: .constant(required))
+                                    .disabled(true)
+                            } else {
+                                let requestedLevel = requestedLevels[permission.name]
+                                GithubPermissionLabel(
+                                    name: permission.scopeLabel,
+                                    unavailableLevel: requestedLevel.flatMap { permission.permits($0) ? nil : $0 }
+                                )
+                                PermissionLevelPicker(
+                                    label: permission.scopeLabel, options: permission.allowedLevels.map(\.rawValue),
+                                    requested: requestedLevel?.rawValue,
+                                    level: Binding(get: { levels[permission.name]?.rawValue }, set: { raw in
+                                        levels[permission.name] = raw.flatMap(GithubPermissionLevel.init(rawValue:))
+                                    })
+                                )
+                            }
+                        }
+                    }
+                    if !requested.isEmpty {
+                        let availableNames = Set(permissions.lazy.map(\.name))
+                        let unavailable = requested.filter { $0.name != "metadata" && !availableNames.contains($0.name) }
+                        ForEach(unavailable) { permission in
+                            GridRow {
+                                GithubPermissionLabel(
+                                    name: permission.scopeLabel, unavailableLevel: permission.level
+                                )
+                                Text("None")
+                            }
+                            .disabled(true)
+                        }
+                    }
+                }
+            }
+        } else if !requested.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel("Requested permissions").accessibilityAddTraits(.isHeader)
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                    ForEach(requested) { permission in
+                        GridRow {
+                            Text(verbatim: permission.scopeLabel)
+                            if permission.name == "metadata" {
+                                Text("Read (required)")
+                            } else {
+                                Text(verbatim: permission.level.rawValue)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+private struct GithubPermissionLabel: View {
+    let name: String
+    let unavailableLevel: GithubPermissionLevel?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(verbatim: name)
+            if let unavailableLevel {
+                Text("Requested: \(unavailableLevel.rawValue) (unavailable)", comment: "Requested GitHub permission level that exceeds the selected installation’s limit.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityElement(children: .combine)
     }
 }

@@ -20,8 +20,14 @@ pub const MAX_POLL_WAIT_SECS: u64 = 25;
 pub const CAPABILITY_GENERATED_CREDENTIALS_V1: &str = "generated_credentials_v1";
 /// Explicit repository and permission bounds for generated GitHub requests.
 pub const CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1: &str = "github_explicit_scope_v1";
+/// Exact project and predefined permission claims for managed Google access.
+pub const CAPABILITY_GCLOUD_ACCESS_V1: &str = "gcloud_access_v1";
 /// Field authorization, catalog aliases and per-field substitution metadata.
 pub const CAPABILITY_SECRET_FIELDS_V1: &str = "secret_fields_v1";
+/// A fresh approval can explicitly select a different grant from the request.
+pub const CAPABILITY_OPERATOR_SELECTED_GRANT_V1: &str = "operator_selected_grant_v1";
+/// A fresh managed Google Cloud approval can select a different project.
+pub const CAPABILITY_OPERATOR_SELECTED_PROJECT_V1: &str = "operator_selected_project_v1";
 /// Lease duration choices: label and seconds (`None` = unlimited).
 pub const LEASE_DURATIONS: &[(&str, Option<u64>)] = &[
     ("5 min", Some(300)),
@@ -420,6 +426,19 @@ impl RequestBody {
         Ok(())
     }
 
+    /// Whether the client understands a grant selected by the operator.
+    pub fn supports_operator_selected_grant(&self) -> bool {
+        matches!(self, Self::Get { client_capabilities, .. } if
+            client_capabilities.iter().any(|c| c == CAPABILITY_OPERATOR_SELECTED_GRANT_V1))
+    }
+
+    /// Whether this unpinned managed Google request permits project selection.
+    pub fn supports_operator_selected_project(&self) -> bool {
+        matches!(self, Self::Get {
+            generation: Some(GenerationRequest::GcloudAccess(_)), lease_id: None, client_capabilities, ..
+        } if client_capabilities.iter().any(|c| c == CAPABILITY_OPERATOR_SELECTED_PROJECT_V1))
+    }
+
     /// Negotiate only features that change request meaning, not arbitrary
     /// unknown JSON fields. Legacy static whole-item requests remain accepted.
     pub fn validate_get_capabilities(&self, source: SourceKind) -> Result<(), ApiError> {
@@ -433,8 +452,11 @@ impl RequestBody {
             };
             if source == SourceKind::Generator {
                 require(CAPABILITY_GENERATED_CREDENTIALS_V1)?;
-                if generation.is_some() {
+                if matches!(generation, Some(GenerationRequest::GithubApp(_))) {
                     require(CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1)?;
+                }
+                if matches!(generation, Some(GenerationRequest::GcloudAccess(_))) {
+                    require(CAPABILITY_GCLOUD_ACCESS_V1)?;
                 }
             }
             if fields.is_some() || *sentinel {
@@ -509,6 +531,12 @@ pub struct GetResult {
     pub files: Vec<ResultFile>,
     #[serde(default)]
     pub generation: Option<GenerationSelection>,
+    /// This fresh request was resolved by explicit operator selection, not
+    /// by reusing or renewing an existing authorization. A changed managed
+    /// Google project is carried in `generation` and also requires the
+    /// project-selection capability; this marker is not sufficient on its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub operator_selected_grant: bool,
     #[serde(default)]
     pub credential_expires_at: Option<String>,
     #[serde(default)]
@@ -524,13 +552,16 @@ impl GetResult {
         match &self.generation {
             Some(selection) => {
                 selection.validate()?;
+                if !selection.grant.is_issued() {
+                    return Err(ApiError::invalid("generated result requires an issued grant"));
+                }
                 if self.credential_version.is_none_or(|version| version == 0)
                     || self.credential_expires_at.as_deref().and_then(crate::time::parse_unix).is_none()
                 {
                     return Err(ApiError::invalid("generated result requires a positive credential version and provider expiry"));
                 }
             }
-            None if self.credential_version.is_some() || self.credential_expires_at.is_some() || self.generator_name.is_some() => {
+            None if self.operator_selected_grant || self.credential_version.is_some() || self.credential_expires_at.is_some() || self.generator_name.is_some() => {
                 return Err(ApiError::invalid("credential metadata requires a generation selection"));
             }
             None => {}
@@ -853,6 +884,24 @@ mod tests {
     }
 
     #[test]
+    fn gcloud_get_scope_is_canonicalized_at_the_request_seam() {
+        let storage = "https://www.googleapis.com/auth/devstorage.read_only";
+        let cloud = "https://www.googleapis.com/auth/cloud-platform";
+        let mut body = get_body(json!({
+            "name":"CLOUDSDK_AUTH_ACCESS_TOKEN",
+            "generation":{"provider":"gcloud","scope":{"scopes":[storage, cloud, storage]}}
+        }));
+        body.canonicalize().unwrap();
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(value["name"], "CLOUDSDK_AUTH_ACCESS_TOKEN");
+        assert_eq!(value["generation"], json!({"provider":"gcloud","scope":{"scopes":[cloud, storage]}}));
+        assert_eq!(serde_json::from_value::<RequestBody>(value).unwrap(), body);
+        assert!(get_body(json!({
+            "generation":{"provider":"gcloud","scope":{"scopes":[]}}
+        })).canonicalize().is_err());
+    }
+
+    #[test]
     fn get_flag_and_conditional_refresh_conflicts_fail_locally() {
         for extra in [
             json!({"raw":true,"sentinel":true}),
@@ -879,6 +928,7 @@ mod tests {
     #[test]
     fn capability_checks_are_targeted_and_do_not_break_legacy_static_requests() {
         let old = get_body(json!({}));
+        assert!(!old.supports_operator_selected_grant());
         old.validate_get_capabilities(SourceKind::Vault).unwrap();
         assert!(old.validate_get_capabilities(SourceKind::Generator).is_err());
         for extra in [json!({"fields":["value"]}), json!({"sentinel":true})] {
@@ -889,6 +939,12 @@ mod tests {
             "client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1,CAPABILITY_SECRET_FIELDS_V1,"future"]
         }));
         capable.validate_get_capabilities(SourceKind::Generator).unwrap();
+        assert!(!capable.supports_operator_selected_grant());
+        let selectable = get_body(json!({
+            "client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1,CAPABILITY_OPERATOR_SELECTED_GRANT_V1]
+        }));
+        assert!(selectable.supports_operator_selected_grant());
+        selectable.validate_get_capabilities(SourceKind::Generator).unwrap();
         let health = HealthResponse { name: MANAGER_NAME.into(), version: "new".into(), capabilities: vec![CAPABILITY_SECRET_FIELDS_V1.into()] };
         health.require_capability(CAPABILITY_SECRET_FIELDS_V1).unwrap();
         let error = health.require_capability(CAPABILITY_GENERATED_CREDENTIALS_V1).unwrap_err();
@@ -907,6 +963,43 @@ mod tests {
         scoped_github.validate_get_capabilities(SourceKind::Generator).unwrap();
         let pinned = get_body(json!({"lease_id":"known","client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1]}));
         pinned.validate_get_capabilities(SourceKind::Generator).unwrap();
+    }
+
+    #[test]
+    fn managed_google_requests_negotiate_their_own_capability() {
+        let request = |capabilities| get_body(json!({
+            "generation":{"provider":"gcloud_access","scope":{"project_id":"demo-project","permissions":["storage=read"]}},
+            "client_capabilities":capabilities
+        }));
+        assert!(request(vec![CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1])
+            .validate_get_capabilities(SourceKind::Generator).unwrap_err().message.contains(CAPABILITY_GCLOUD_ACCESS_V1));
+        request(vec![CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_GCLOUD_ACCESS_V1])
+            .validate_get_capabilities(SourceKind::Generator).unwrap();
+    }
+
+    #[test]
+    fn project_selection_is_an_independent_opt_in_for_unpinned_managed_google() {
+        let mut body = get_body(json!({
+            "generation":{"provider":"gcloud_access","scope":{"project_id":"demo-project","permissions":["storage=read"]}},
+            "client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1,CAPABILITY_GCLOUD_ACCESS_V1,CAPABILITY_OPERATOR_SELECTED_GRANT_V1]
+        }));
+        assert!(!body.supports_operator_selected_project());
+        let RequestBody::Get { client_capabilities, .. } = &mut body else { panic!() };
+        client_capabilities.retain(|capability| capability != CAPABILITY_OPERATOR_SELECTED_GRANT_V1);
+        client_capabilities.push(CAPABILITY_OPERATOR_SELECTED_PROJECT_V1.into());
+        assert!(body.supports_operator_selected_project());
+        assert!(!body.supports_operator_selected_grant());
+
+        let mut value = to_value(&body).unwrap();
+        value["lease_id"] = json!("known");
+        let pinned: RequestBody = serde_json::from_value(value.clone()).unwrap();
+        assert!(!pinned.supports_operator_selected_project());
+        value["lease_id"] = serde_json::Value::Null;
+        for generation in [json!(null), json!({"provider":"gcloud","scope":{"scopes":null}})] {
+            value["generation"] = generation;
+            let other: RequestBody = serde_json::from_value(value.clone()).unwrap();
+            assert!(!other.supports_operator_selected_project());
+        }
     }
 
     #[test]
@@ -929,8 +1022,21 @@ mod tests {
             "credential_expires_at":"2026-11-17T13:00:00Z","credential_version":1,"generator_name":"review-bot"
         });
         let result: GetResult = serde_json::from_value(value.clone()).unwrap();
+        assert!(!result.operator_selected_grant);
         result.validate().unwrap();
         assert_eq!(to_value(&result).unwrap(), value);
+        {
+            let mut approved = value.clone();
+            approved["operator_selected_grant"] = json!(true);
+            let result: GetResult = serde_json::from_value(approved.clone()).unwrap();
+            result.validate().unwrap();
+            assert!(result.operator_selected_grant);
+            assert_eq!(to_value(&result).unwrap(), approved);
+            for key in ["generation", "credential_expires_at", "credential_version", "generator_name"] {
+                approved[key] = json!(null);
+            }
+            assert!(serde_json::from_value::<GetResult>(approved).unwrap().validate().is_err());
+        }
         for version in [json!(null), json!(0)] {
             value["credential_version"] = version;
             assert!(serde_json::from_value::<GetResult>(value.clone()).unwrap().validate().is_err());
@@ -942,5 +1048,23 @@ mod tests {
         }
         value["generation"] = json!(null);
         assert!(serde_json::from_value::<GetResult>(value).unwrap().validate().is_err());
+    }
+
+    #[test]
+    fn generated_results_cannot_deliver_a_google_connection_or_pending_choice() {
+        let access = json!({"project_id":"demo-project","permissions":["storage=read"]});
+        for scope in [
+            json!({"state":"connection"}),
+            json!({"state":"requested","access":access}),
+            json!({"state":"issued","access":access,"service_account_unique_id":"123456","service_account_email":"managed@demo-project.iam.gserviceaccount.com"}),
+        ] {
+            let result: GetResult = serde_json::from_value(json!({
+                "lease_id":"l","mode":"raw","hosts":[],"expires_at":null,
+                "files":[{"field":"value","relative_path":"CLOUDSDK_AUTH_ACCESS_TOKEN","content":"fixture"}],
+                "generation":{"generator_id":"g","generator_revision":1,"grant":{"provider":"gcloud_access","scope":scope}},
+                "credential_expires_at":"2026-11-17T13:00:00Z","credential_version":1
+            })).unwrap();
+            assert_eq!(result.validate().is_ok(), scope["state"] == "issued");
+        }
     }
 }

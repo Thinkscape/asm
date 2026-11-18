@@ -6,7 +6,8 @@ use std::collections::HashMap;
 
 use asm_proto::crypto::{new_uuid_v4, sha256};
 use asm_proto::generators::{
-    GenerationChoice, GenerationRequest, GenerationSelection, SourceKind,
+    GcloudAccessGrant, GcloudAccessRequest, GenerationChoice, GenerationGrant, GenerationRequest,
+    GenerationSelection, SourceKind,
 };
 use asm_proto::rules::{
     is_broad, new_sentinel, normalize_host_pattern, normalize_host_patterns, relative_paths,
@@ -18,6 +19,7 @@ use asm_proto::wire::{
     RequestStatus, ResultFile, SecretKind, WriteResult,
 };
 
+use super::generation::GeneratedApproval;
 use super::pairing::{PairAttempt, PairState, Repair};
 use super::{
     Core, TOPIC_LEASES, TOPIC_REQUESTS, TOPIC_VAULTS, activity, lock, to_system_time,
@@ -53,6 +55,7 @@ pub(crate) struct GeneratedDelivery {
     pub lease_id: String,
     pub credential_version: u64,
     pub consumed: bool,
+    pub operator_selected_grant: bool,
 }
 
 /// A secret as resolved when the request was made.
@@ -100,6 +103,18 @@ pub(crate) struct GeneratorTarget {
     pub pinned_generator_id: Option<String>,
     pub candidates: Vec<GenerationChoice>,
     pub requested_generation: Option<GenerationRequest>,
+    pub operator_selected_grant: bool,
+    pub operator_selected_gcloud_project: bool,
+}
+
+impl GeneratorTarget {
+    pub(super) fn allows_reviewed_gcloud_access(&self, selected: &GcloudAccessRequest) -> bool {
+        let Some(GenerationRequest::GcloudAccess(requested)) = &self.requested_generation else {
+            return false;
+        };
+        (selected.project_id == requested.project_id || self.operator_selected_gcloud_project)
+            && (selected.permissions == requested.permissions || self.operator_selected_grant)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -435,9 +450,10 @@ impl Core {
             return Err(e);
         }
         if let Some((source, leaf)) = query.rsplit_once('/')
-            && matches!(leaf, "GH_TOKEN" | "GITHUB_TOKEN")
+            && let Some(output) = asm_proto::names::canonical_generated_output(leaf)
             && self.store.leases_of_host(host_id)?.iter().any(|lease|
-                lease.source_kind == SourceKind::Generator && lease.vault_name == source) {
+                lease.source_kind == SourceKind::Generator && lease.vault_name == source
+                && lease.generation.as_ref().is_some_and(|grant| grant.output_name() == output)) {
             return Err(e);
         }
         if !matches!(
@@ -610,9 +626,14 @@ impl Core {
                 requested_name, pinned_generator_id, candidates,
             }) => {
                 body.validate_get_capabilities(SourceKind::Generator)?;
+                if generation.as_ref().is_some_and(|request| request.output_name() != output_name) {
+                    return Err(CoreError::invalid("requested scope provider does not match the generated output"));
+                }
                 let target = GeneratorTarget {
                     requested_name, pinned_generator_id, candidates,
                     requested_generation: generation.clone(),
+                    operator_selected_grant: body.supports_operator_selected_grant(),
+                    operator_selected_gcloud_project: body.supports_operator_selected_project(),
                 };
                 let wanted_fields = select_fields(&["value".to_string()], fields.as_deref())?;
                 self.create_generated_get(host, agent, address, target, mode, wanted_fields,
@@ -739,6 +760,7 @@ impl Core {
                 expires_at: lease.expires_at.map(fmt_unix),
                 files,
                 generation: None,
+                operator_selected_grant: false,
                 credential_expires_at: None,
                 credential_version: None,
                 generator_name: None,
@@ -1001,7 +1023,7 @@ impl Core {
                 self.publish_proxy_locked(&authority).map_err(|_|
                     CoreError::vault_unavailable("generated credential publication failed; run asm get to retry"))?;
             }
-            let result = self.validate_generated_delivery(&marker.lease_id, marker.credential_version)?;
+            let mut result = self.validate_generated_delivery(&marker.lease_id, marker.credential_version)?;
             let mut book = lock(&self.book);
             let done = book.done.get_mut(id).filter(|d| d.host_id == host_id)
                 .ok_or_else(|| CoreError::not_found("no such request"))?;
@@ -1012,6 +1034,7 @@ impl Core {
                 return Err(CoreError::vault_unavailable("generated credential is no longer available; run asm get again"));
             }
             if result.mode == LeaseMode::Raw { delivery.consumed = true; }
+            result.operator_selected_grant = delivery.operator_selected_grant;
             let mut state = done.state.clone();
             state.result = Some(RequestResult::Get(result));
             Ok(state)
@@ -1111,11 +1134,18 @@ impl Core {
         self.expire_requests(t);
         // Phase 1: claim the request.
         let p = {
+            // Managed Google approvals can be denied while they are in flight.
+            // Serialize denial with the cloud-write and final-delivery gates.
+            let deny_authority = matches!(&decision, ffi::Decision::Deny { .. }).then(|| lock(&self.authorization));
             let mut b = lock(&self.book);
             let Some(i) = b.pending.iter().position(|p| p.id == id) else {
                 return Err(CoreError::not_found("this request is no longer pending"));
             };
-            if b.pending[i].resolving {
+            let deniable_managed_get = deny_authority.is_some() && matches!(&b.pending[i].detail,
+                Detail::Get(GetDetail { target: GetTarget::Generated(GeneratorTarget {
+                    requested_generation: Some(GenerationRequest::GcloudAccess(_)), ..
+                }), .. }));
+            if b.pending[i].resolving && !deniable_managed_get {
                 return Err(CoreError::invalid("this request is already being resolved"));
             }
             let ok = matches!(
@@ -1135,6 +1165,7 @@ impl Core {
                 let reason = Some(reason.trim().to_string()).filter(|r| !r.is_empty());
                 let p = b.pending.remove(i);
                 drop(b);
+                drop(deny_authority);
                 self.finish(p, Err(reason), t, false);
                 return Ok(());
             }
@@ -1189,14 +1220,7 @@ impl Core {
                 Ok(())
             }
             Err(Fail::Keep(e)) => {
-                {
-                    let mut b = lock(&self.book);
-                    if let Some(q) = b.pending.iter_mut().find(|q| q.id == id) {
-                        q.resolving = false;
-                        q.error = Some(e.message.clone());
-                    }
-                }
-                self.notify(TOPIC_REQUESTS);
+                self.keep_request_pending(id, &e);
                 Err(e)
             }
             Err(Fail::Deny(reason)) => {
@@ -1206,6 +1230,16 @@ impl Core {
                 Err(CoreError::vault_unavailable(reason))
             }
         }
+    }
+
+    pub(super) fn keep_request_pending(&self, id: &str, error: &CoreError) {
+        let mut book = lock(&self.book);
+        if let Some(pending) = book.pending.iter_mut().find(|p| p.id == id) {
+            pending.resolving = false;
+            pending.error = Some(error.message.clone());
+        }
+        drop(book);
+        self.notify(TOPIC_REQUESTS);
     }
 
     fn take_pending(&self, id: &str) -> Option<Pending> {
@@ -1278,11 +1312,13 @@ impl Core {
         hosts: Vec<String>,
         generation: Option<GenerationSelection>,
     ) -> std::result::Result<GetResult, Fail> {
+        if matches!(&g.target, GetTarget::Generated(_)) {
+            let selection = generation.ok_or_else(|| CoreError::invalid("choose a generator and grant"))?;
+            let approval = GeneratedApproval::new(g, mode, duration_secs, &hosts)?;
+            return self.approve_generated_get(p, g, approval, selection, None);
+        }
         if g.mode == RequestedMode::Sentinel && mode == LeaseMode::Raw {
             return Err(Fail::Keep(CoreError::invalid("this request requires sentinel delivery")));
-        }
-        if let GetTarget::Generated(target) = &g.target {
-            return self.approve_generated_get(p, g, target, mode, duration_secs, hosts, generation);
         }
         if generation.is_some() {
             return Err(Fail::Keep(CoreError::invalid("static secrets cannot select a generator")));
@@ -1401,6 +1437,7 @@ impl Core {
             expires_at: expires_at.map(fmt_unix),
             files,
             generation: None,
+            operator_selected_grant: false,
             credential_expires_at: None,
             credential_version: None,
             generator_name: None,
@@ -1587,6 +1624,51 @@ fn pattern_check(p: &str) -> ffi::HostPatternCheck {
     }
 }
 
+fn approval_choice(
+    core: &Core,
+    target: &GeneratorTarget,
+    choice: &GenerationChoice,
+    requested_hosts: &[String],
+) -> ffi::GeneratorApprovalChoice {
+    let mut scope_catalog = Vec::new();
+    let mut suggested_hosts = Vec::new();
+    let mut default_project_id = None;
+    let mut gcloud_ready = None;
+    let _authority = matches!(&choice.ceiling, GenerationGrant::GcloudAccess(_))
+        .then(|| lock(&core.authorization));
+    // Never describe a pending grant using metadata from a replacement revision.
+    if let Some(entry) = core.generators.get(&choice.generator_id)
+        && entry.record.revision == choice.revision
+    {
+        if let GenerationGrant::GcloudAccess(GcloudAccessGrant::Requested { access }) = &choice.ceiling {
+            gcloud_ready = core.ready_gcloud_access_locked(&entry.record, access).ok().map(Into::into);
+        }
+        let config = entry.record.config;
+        let hosts = config.uri_hosts(&choice.ceiling);
+        match config {
+            crate::generator::GeneratorConfig::GithubApp(_) => {
+                let remembered = core.store.secret_hosts(&choice.generator_id, crate::generator::OUTPUT_KEY)
+                    .unwrap_or_default();
+                let (initial, suggestions) = host_candidates(requested_hosts, &remembered, &hosts);
+                suggested_hosts.extend(initial.iter().chain(&suggestions).map(|h| pattern_check(h)));
+            }
+            crate::generator::GeneratorConfig::Gcloud(config) => {
+                default_project_id = Some(config.project_id);
+                suggested_hosts.extend(hosts.iter().map(|h| pattern_check(h)));
+                scope_catalog.extend(config.scope_catalog.into_iter().map(Into::<ffi::GcloudScopeOption>::into));
+            }
+            crate::generator::GeneratorConfig::GcloudConnection(_) => {
+                suggested_hosts.extend(hosts.iter().map(|h| pattern_check(h)));
+            }
+        }
+    }
+    ffi::GeneratorApprovalChoice {
+        choice: choice.clone().into(), scope_catalog, suggested_hosts, default_project_id, gcloud_ready,
+        scope_issues: target.requested_generation.as_ref().map(|request|
+            choice.ceiling.scope_issues(request).unwrap_or_else(|e| vec![e.message])).unwrap_or_default(),
+    }
+}
+
 fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi::PendingRequest {
     let summary = p.summary();
     let kind = kind_from_str(p.kind_str());
@@ -1613,18 +1695,16 @@ fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi
             let (name, vault_id, vault_name, kind, generator_choices, requested_generation) = match &g.target {
                 GetTarget::Vault(s) => (s.display.clone(), Some(s.vault_id.clone()), s.vault_name.clone(),
                     s.kind, Vec::new(), None),
-                GetTarget::Generated(target) => (
-                    target.requested_name.clone(), target.pinned_generator_id.clone(), "GitHub App".into(),
-                    SecretKind::Single, target.candidates.iter().map(|choice| ffi::GeneratorApprovalChoice {
-                        choice: choice.clone().into(),
-                        suggested_hosts: {
-                            let remembered = core.store.secret_hosts(&choice.generator_id, "token").unwrap_or_default();
-                            let (initial, suggestions) = host_candidates(&g.requested_hosts, &remembered, &["api.github.com".into()]);
-                            initial.iter().chain(&suggestions).map(|h| pattern_check(h)).collect()
-                        },
-                        scope_issues: target.requested_generation.as_ref().map(|request|
-                            choice.ceiling.scope_issues(request).unwrap_or_else(|e| vec![e.message])).unwrap_or_default(),
-                    }).collect(), target.requested_generation.clone().map(Into::into)),
+                GetTarget::Generated(target) => {
+                    let label = target.candidates.first()
+                        .and_then(|choice| core.generators.get(&choice.generator_id))
+                        .map(|entry| entry.record.config.provider_label())
+                        .unwrap_or("Generator");
+                    (target.requested_name.clone(), target.pinned_generator_id.clone(), label.into(),
+                        SecretKind::Single, target.candidates.iter().map(|choice|
+                            approval_choice(core, target, choice, &g.requested_hosts)
+                        ).collect(), target.requested_generation.clone().map(Into::into))
+                }
             };
             ffi::RequestDetail::Get {
                 is_generated: matches!(g.target, GetTarget::Generated(_)),
@@ -1633,6 +1713,9 @@ fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi
                     || (g.mode == RequestedMode::Default && matches!(g.target, GetTarget::Generated(_))),
                 sentinel_required: g.mode == RequestedMode::Sentinel, has_substitutable_fields,
                 generator_choices, requested_generation,
+                operator_selected_grant: matches!(&g.target, GetTarget::Generated(target) if target.operator_selected_grant),
+                operator_selected_gcloud_project: matches!(&g.target, GetTarget::Generated(target)
+                    if target.operator_selected_gcloud_project),
                 requested_hosts: g.requested_hosts,
                 initial_hosts: g.initial.iter().map(|h| pattern_check(h)).collect(),
                 suggested_hosts: g.suggestions.iter().map(|h| pattern_check(h)).collect(),

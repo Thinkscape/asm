@@ -8,7 +8,7 @@
 
 use crate::crypto::{hex_encode, sha256};
 use crate::error::ApiError;
-use crate::generators::{GITHUB_TOKEN_ALIAS, GITHUB_TOKEN_NAME, SourceKind};
+use crate::generators::{SourceKind, generated_output_names};
 use crate::wire::SecretEntry;
 use std::collections::{HashMap, HashSet};
 
@@ -113,6 +113,7 @@ pub struct ResolvedCatalogName {
     pub request_name: String,
     pub canonical_key: String,
     pub pinned_generator_id: Option<String>,
+    pub generated_output: Option<&'static str>,
 }
 
 fn static_base(entry: &SecretEntry) -> &str {
@@ -126,8 +127,17 @@ fn static_base(entry: &SecretEntry) -> &str {
     })
 }
 
-fn is_github_spelling(name: &str) -> bool {
-    matches!(name, GITHUB_TOKEN_NAME | GITHUB_TOKEN_ALIAS)
+/// Map an unqualified generated spelling to its provider's canonical output.
+pub fn canonical_generated_output(name: &str) -> Option<&'static str> {
+    generated_output_names(name).map(|names| names[0])
+}
+
+/// The public catalog uses the same output leaf on logical and qualified rows.
+pub fn generated_output(entry: &SecretEntry) -> Option<&'static str> {
+    if entry.source_kind != SourceKind::Generator || entry.generators.is_empty() {
+        return None;
+    }
+    entry.name.rsplit('/').next().and_then(canonical_generated_output)
 }
 
 #[derive(Clone, Copy)]
@@ -139,11 +149,12 @@ struct CatalogMatch<'a> {
 fn add_catalog_match<'a>(matches: &mut Vec<CatalogMatch<'a>>, candidate: CatalogMatch<'a>, entries: &[SecretEntry]) {
     let same_identity = |existing: &CatalogMatch<'_>| {
         match (existing.generator, candidate.generator) {
-            (Some((left, _)), Some((right, _))) => left == right,
+            (Some((left, _)), Some((right, _))) => left == right
+                && generated_output(&entries[existing.index]) == generated_output(&entries[candidate.index]),
             (None, None) => {
                 existing.index == candidate.index
-                    || (entries[existing.index].source_kind == SourceKind::Generator
-                        && entries[candidate.index].source_kind == SourceKind::Generator)
+                    || generated_output(&entries[existing.index])
+                        .is_some_and(|output| generated_output(&entries[candidate.index]) == Some(output))
             }
             _ => false,
         }
@@ -158,10 +169,11 @@ fn finish_catalog_lookup(query: &str, matches: &[CatalogMatch<'_>], entries: &[S
         [] => Err(ApiError::not_found(format!("no secret named {query:?}"))),
         [found] => {
             let entry = &entries[found.index];
-            let (canonical_key, pinned_generator_id) = if entry.source_kind == SourceKind::Generator {
+            let output = generated_output(entry);
+            let (canonical_key, pinned_generator_id) = if let Some(output) = output {
                 match found.generator {
-                    Some((id, name)) => (format!("{name}/{GITHUB_TOKEN_NAME}"), Some(id.to_owned())),
-                    None => (GITHUB_TOKEN_NAME.to_owned(), None),
+                    Some((id, name)) => (format!("{name}/{output}"), Some(id.to_owned())),
+                    None => (output.to_owned(), None),
                 }
             } else {
                 (format!("{}/{}", entry.vault, static_base(entry)), None)
@@ -171,17 +183,18 @@ fn finish_catalog_lookup(query: &str, matches: &[CatalogMatch<'_>], entries: &[S
                 request_name: query.to_owned(),
                 canonical_key,
                 pinned_generator_id,
+                generated_output: output,
             })
         }
         _ => {
             let mut choices = Vec::new();
             for found in matches {
                 let entry = &entries[found.index];
-                if entry.source_kind == SourceKind::Generator {
+                if let Some(output) = generated_output(entry) {
                     if let Some((_, name)) = found.generator {
-                        choices.push(format!("{name}/{GITHUB_TOKEN_NAME}"));
+                        choices.push(format!("{name}/{output}"));
                     } else {
-                        choices.extend(entry.generators.iter().map(|g| format!("{}/{GITHUB_TOKEN_NAME}", g.name)));
+                        choices.extend(entry.generators.iter().map(|g| format!("{}/{output}", g.name)));
                     }
                 } else {
                     choices.push(format!("{}/{}", entry.vault, static_base(entry)));
@@ -201,6 +214,7 @@ pub fn resolve_catalog_name(query: &str, entries: &[SecretEntry]) -> Result<Reso
     let mut matches = Vec::new();
     // Current source qualification wins over a literal slash-containing name.
     if let Some((source, rest)) = query.split_once('/') {
+        let requested_output = canonical_generated_output(rest);
         for (index, entry) in entries.iter().enumerate() {
             match entry.source_kind {
                 SourceKind::Vault if entry.vault == source => {
@@ -208,7 +222,7 @@ pub fn resolve_catalog_name(query: &str, entries: &[SecretEntry]) -> Result<Reso
                         add_catalog_match(&mut matches, CatalogMatch { index, generator: None }, entries);
                     }
                 }
-                SourceKind::Generator if is_github_spelling(rest) => {
+                SourceKind::Generator if requested_output.is_some() && generated_output(entry) == requested_output => {
                     for generator in entry.generators.iter().filter(|g| g.name == source) {
                         add_catalog_match(&mut matches, CatalogMatch { index, generator: Some((&generator.generator_id, &generator.name)) }, entries);
                     }
@@ -222,7 +236,8 @@ pub fn resolve_catalog_name(query: &str, entries: &[SecretEntry]) -> Result<Reso
     }
     // A colliding bare spelling is ambiguous even when it was intentionally
     // omitted from the logical generated row's public aliases.
-    if is_github_spelling(query) {
+    let requested_output = canonical_generated_output(query);
+    if let Some(output) = requested_output {
         for (index, entry) in entries.iter().enumerate() {
             if entry.source_kind == SourceKind::Vault
                 && static_base(entry) == query
@@ -232,7 +247,7 @@ pub fn resolve_catalog_name(query: &str, entries: &[SecretEntry]) -> Result<Reso
         }
         if !matches.is_empty() {
             let static_count = matches.len();
-            for (index, entry) in entries.iter().enumerate().filter(|(_, entry)| entry.source_kind == SourceKind::Generator) {
+            for (index, entry) in entries.iter().enumerate().filter(|(_, entry)| generated_output(entry) == Some(output)) {
                 for generator in &entry.generators {
                     add_catalog_match(&mut matches, CatalogMatch { index, generator: Some((&generator.generator_id, &generator.name)) }, entries);
                 }
@@ -246,7 +261,7 @@ pub fn resolve_catalog_name(query: &str, entries: &[SecretEntry]) -> Result<Reso
     for (index, entry) in entries.iter().enumerate() {
         let matched = match entry.source_kind {
             SourceKind::Vault => entry.name == query || static_base(entry) == query || entry.aliases.iter().any(|alias| alias == query),
-            SourceKind::Generator => is_github_spelling(query) && !entry.generators.is_empty()
+            SourceKind::Generator => requested_output.is_some() && generated_output(entry) == requested_output
                 && (entry.name == query || entry.aliases.iter().any(|alias| alias == query)),
         };
         if matched {
@@ -445,5 +460,48 @@ mod tests {
         let stale = [generator_entry("old/GH_TOKEN", &["old/GITHUB_TOKEN"], &[("a", "renamed")])];
         assert_eq!(resolve_catalog_name("old/GH_TOKEN", &stale).unwrap_err().code, ErrorCode::NotFound);
         assert_eq!(resolve_catalog_name("renamed/GH_TOKEN", &stale).unwrap().pinned_generator_id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn generated_names_route_only_to_the_matching_output_group() {
+        let entries = [
+            generator_entry("GH_TOKEN", &["GITHUB_TOKEN"], &[("gh", "github-bot")]),
+            generator_entry("CLOUDSDK_AUTH_ACCESS_TOKEN", &[], &[("gcp", "gcloud-dev")]),
+        ];
+        let gh = resolve_catalog_name("GITHUB_TOKEN", &entries).unwrap();
+        let gcp = resolve_catalog_name("CLOUDSDK_AUTH_ACCESS_TOKEN", &entries).unwrap();
+        assert_ne!(gh.entry_index, gcp.entry_index);
+        assert_eq!(gh.canonical_key, "GH_TOKEN");
+        assert_eq!(gcp.canonical_key, "CLOUDSDK_AUTH_ACCESS_TOKEN");
+        let pinned = resolve_catalog_name("gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN", &entries).unwrap();
+        assert_eq!(pinned.canonical_key, "gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN");
+        assert_eq!(pinned.pinned_generator_id.as_deref(), Some("gcp"));
+        for wrong in ["gcloud-dev/GH_TOKEN", "gcloud-dev/GITHUB_TOKEN", "github-bot/CLOUDSDK_AUTH_ACCESS_TOKEN"] {
+            assert_eq!(resolve_catalog_name(wrong, &entries).unwrap_err().code, ErrorCode::NotFound);
+        }
+    }
+
+    #[test]
+    fn generated_collisions_list_only_the_matching_provider() {
+        let entries = [
+            vault_entry("work", "GH_TOKEN", "work/GH_TOKEN"),
+            vault_entry("work", "CLOUDSDK_AUTH_ACCESS_TOKEN", "work/CLOUDSDK_AUTH_ACCESS_TOKEN"),
+            generator_entry("GITHUB_TOKEN", &[], &[("gh", "github-bot")]),
+            generator_entry("github-bot/GH_TOKEN", &["github-bot/GITHUB_TOKEN"], &[("gh", "github-bot")]),
+            generator_entry("gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN", &[], &[("gcp", "gcloud-dev")]),
+        ];
+        for (query, matching, unrelated) in [
+            ("GH_TOKEN", "github-bot/GH_TOKEN", "gcloud-dev"),
+            ("CLOUDSDK_AUTH_ACCESS_TOKEN", "gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN", "github-bot"),
+        ] {
+            let error = resolve_catalog_name(query, &entries).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Ambiguous);
+            assert!(error.message.contains(&format!("work/{query}")));
+            assert!(error.message.contains(matching));
+            assert!(!error.message.contains(unrelated));
+            assert_eq!(resolve_catalog_name(&format!("work/{query}"), &entries).unwrap().canonical_key, format!("work/{query}"));
+        }
+        let bare = resolve_catalog_name("GITHUB_TOKEN", &entries).unwrap();
+        assert_eq!(bare.canonical_key, "GH_TOKEN");
     }
 }

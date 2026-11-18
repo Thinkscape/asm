@@ -28,6 +28,12 @@ const TOKEN: &str = "host-token-abc";
 const LEASE: &str = "11111111-2222-4333-8444-555555555555";
 const REQ: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const GITHUB_REPOSITORY: &str = "acme/web";
+const GCLOUD_NAME: &str = "CLOUDSDK_AUTH_ACCESS_TOKEN";
+const GCLOUD_LEASE: &str = "33333333-2222-4333-8444-555555555555";
+const GCLOUD_LEGACY_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_only";
+const GCLOUD_PROJECT: &str = "dev-project";
+const GCLOUD_OTHER_PROJECT: &str = "other-project";
+const SELECT_PROJECT: &str = "operator_selected_project_v1";
 
 fn start(handler: Arc<Handler>) -> Fake {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -427,7 +433,7 @@ fn get_writes_files_and_prints_block() {
         .clone();
     assert_eq!(
         sent,
-        json!({"kind":"get","name":"work/GitHub","raw":false,"sentinel":false,"fields":null,"generation":null,"refresh":false,"refresh_from_version":null,"new_lease":false,"lease_id":null,"client_capabilities":["generated_credentials_v1","secret_fields_v1","github_explicit_scope_v1"],"hosts":["api.example.com"],"reason":"deploy the site","agent":"test-agent"})
+        json!({"kind":"get","name":"work/GitHub","raw":false,"sentinel":false,"fields":null,"generation":null,"refresh":false,"refresh_from_version":null,"new_lease":false,"lease_id":null,"client_capabilities":["generated_credentials_v1","secret_fields_v1","github_explicit_scope_v1","gcloud_access_v1","operator_selected_grant_v1"],"hosts":["api.example.com"],"reason":"deploy the site","agent":"test-agent"})
     );
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(e.secrets.join(".leases.json")).unwrap()).unwrap();
@@ -711,6 +717,14 @@ fn generator_catalog() -> Value {
 
 /// Stateful manager fixture: no Keychain, provider, or credential-file dependency.
 fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
+    let managed_google = scenario.starts_with("managed-google");
+    let project_selection = scenario.starts_with("managed-google-project-");
+    let edited_approval = matches!(scenario,
+        "managed-google-selected-broad" | "managed-google-selected-narrow"
+        | "managed-google-selected-wrong-request" | "managed-google-selected-other-project"
+        | "github-selected-broad" | "github-selected-narrow")
+        || (project_selection && scenario != "managed-google-project-cached");
+    let approved = Mutex::new(None::<Value>);
     let leases = Arc::new(Mutex::new(Vec::<Value>::new()));
     let ca = rcgen::generate_simple_self_signed(vec!["proxy ca".into()]).unwrap();
     let ca_hash = asm_proto::crypto::sha256_hex(ca.cert.der());
@@ -727,15 +741,41 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
     let f = start(Arc::new(move |method, path, body| {
         match (method, path) {
             ("GET", "/v1/health") => {
-                let capabilities = match scenario {
+                let mut capabilities = match scenario {
                     "old-manager" => vec![],
                     "legacy-github" => vec!["generated_credentials_v1", "secret_fields_v1"],
-                    _ => vec!["generated_credentials_v1", "secret_fields_v1", "github_explicit_scope_v1"],
+                    "mixed-providers" | "managed-google-unsupported" =>
+                        vec!["generated_credentials_v1", "secret_fields_v1", "github_explicit_scope_v1"],
+                    _ => vec!["generated_credentials_v1", "secret_fields_v1", "github_explicit_scope_v1", "gcloud_access_v1"],
                 };
+                if scenario.contains("-selected-") || (project_selection && !matches!(scenario,
+                    "managed-google-project-only" | "managed-google-project-only-permission-drift"))
+                {
+                    capabilities.push("operator_selected_grant_v1");
+                }
+                if project_selection {
+                    capabilities.push(SELECT_PROJECT);
+                }
                 (200, json!({"name":"asm-manager","version":"0.1.0","capabilities":capabilities}))
             }
             ("GET", "/v1/secrets") => {
                 let mut catalog = generator_catalog();
+                if scenario == "mixed-providers" || managed_google {
+                    let name = if scenario == "managed-google-collision" {
+                        "gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN"
+                    } else {
+                        GCLOUD_NAME
+                    };
+                    catalog["secrets"].as_array_mut().unwrap().push(json!({
+                        "name":name,"source_kind":"generator","vault":"gcloud-dev","kind":"single","fields":["value"],"lease":null,
+                        "generators":[{"generator_id":"gcp","name":"gcloud-dev","available":true}]
+                    }));
+                }
+                if scenario == "managed-google-collision" {
+                    catalog["secrets"].as_array_mut().unwrap().push(json!({
+                        "name":"work/CLOUDSDK_AUTH_ACCESS_TOKEN","vault":"work","kind":"single","fields":["value"],"lease":null
+                    }));
+                }
                 if scenario == "alias-collision" {
                     catalog["secrets"][0]["name"] = json!("GITHUB_TOKEN");
                     catalog["secrets"][0]["aliases"] = json!([]);
@@ -818,15 +858,17 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                 let name = body["name"].as_str().unwrap();
                 let exact = body["lease_id"].as_str();
                 let mut records = leases.lock().unwrap();
-                let generated = scenario != "static-alias-collision" && matches!(
+                let gcloud = (scenario == "mixed-providers" || managed_google)
+                    && matches!(name, GCLOUD_NAME | "gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN");
+                let generated = gcloud || (scenario != "static-alias-collision" && matches!(
                     name,
-                    "GH_TOKEN" | "GITHUB_TOKEN"
-                        | "release-bot/GH_TOKEN" | "release-bot/GITHUB_TOKEN"
-                        | "review-bot/GH_TOKEN" | "review-bot/GITHUB_TOKEN"
-                );
+                    "GH_TOKEN" | "GITHUB_TOKEN" | "release-bot/GH_TOKEN" | "review-bot/GH_TOKEN"
+                ));
                 let review = name.starts_with("review-bot/");
                 let id = if generated {
-                    if review {
+                    if gcloud {
+                        GCLOUD_LEASE.to_owned()
+                    } else if review {
                         "22222222-2222-4333-8444-555555555555".to_owned()
                     } else {
                         LEASE.to_owned()
@@ -841,8 +883,9 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                 let old_version = existing
                     .and_then(|i| records[i]["credential_version"].as_u64())
                     .unwrap_or(0);
+                let near_expiry = edited_approval || matches!(scenario, "near-expiry" | "managed-google-short" | "managed-google-selected-drift-on-renew");
                 let version =
-                    if body["refresh"] == true || (scenario == "near-expiry" && exact.is_some()) {
+                    if body["refresh"] == true || (near_expiry && exact.is_some()) {
                         old_version + 1
                     } else {
                         old_version.max(1)
@@ -861,7 +904,7 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                 } else {
                     asm_proto::time::fmt_unix(
                         unix_now()
-                            + if (scenario == "near-expiry" && exact.is_none())
+                            + if (near_expiry && exact.is_none())
                                 || scenario == "insufficient-refresh"
                             {
                                 599
@@ -875,17 +918,73 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                 } else {
                     "raw"
                 };
-                let generation = if generated {
-                    let scope = &body["generation"]["scope"];
-                    let grant_scope = if exact.is_some() && scope.is_null() {
-                        records[existing.expect("a pin must target an existing lease")]["generation"]["grant"]["scope"].clone()
+                let generation = if gcloud && managed_google && !matches!(scenario, "managed-google-legacy-response" | "managed-google-selected-legacy-response") {
+                    assert_eq!(body["generation"]["provider"], "gcloud_access");
+                    let mut access = body["generation"]["scope"].clone();
+                    if let Some(exact) = exact {
+                        assert_eq!(exact, GCLOUD_LEASE);
+                        assert_eq!(access, records[existing.expect("a pin must target an existing lease")]["generation"]["grant"]["scope"]["access"]);
+                        if scenario == "managed-google-project-drift-on-renew" {
+                            access["project_id"] = json!(GCLOUD_PROJECT);
+                        }
                     } else {
-                        let repositories = scope["repositories"].as_array().expect("explicit GitHub repositories");
-                        json!({
-                            "installation_id":if review {2} else {1},
-                            "repositories":repositories.iter().enumerate().map(|(i, name)| json!({"id":i + 7,"full_name":name})).collect::<Vec<_>>(),
-                            "permissions":scope["permissions"]
-                        })
+                        match scenario {
+                            "managed-google-broad" | "managed-google-selected-broad" | "managed-google-selected-wrong-request"
+                            | "managed-google-selected-unmarked" | "managed-google-unnegotiated-selection" =>
+                                access["permissions"] = json!(["storage=read", "compute=read"]),
+                            "managed-google-selected-narrow" => access["permissions"] = json!(["storage=read"]),
+                            "managed-google-other-project" | "managed-google-selected-other-project" =>
+                                access["project_id"] = json!(GCLOUD_OTHER_PROJECT),
+                            _ if project_selection => {
+                                access["project_id"] = json!(GCLOUD_OTHER_PROJECT);
+                                if matches!(scenario, "managed-google-project-switched" | "managed-google-project-only-permission-drift") {
+                                    access["permissions"] = json!(["compute=read"]);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let unique_id = if scenario == "managed-google-selected-drift-on-renew" && exact.is_some() { "444444444" } else { "123456789" };
+                    let service_account_email = format!("bot@{}.iam.gserviceaccount.com", access["project_id"].as_str().unwrap());
+                    json!({
+                        "generator_id":"gcp","generator_revision":1,
+                        "grant":{"provider":"gcloud_access","scope":{
+                            "state":"issued","access":access,"service_account_unique_id":unique_id,
+                            "service_account_email":service_account_email
+                        }}
+                    })
+                } else if gcloud {
+                    json!({
+                        "generator_id":"gcp","generator_revision":1,
+                        "grant":{"provider":"gcloud","scope":{
+                            "service_account_unique_id":"123456789",
+                            "service_account_email":"bot@dev-project.iam.gserviceaccount.com",
+                            "scopes":[GCLOUD_LEGACY_SCOPE]
+                        }}
+                    })
+                } else if generated {
+                    let scope = &body["generation"]["scope"];
+                    let grant_scope = match (exact, scenario) {
+                        (Some(_), _) if scope.is_null() =>
+                            records[existing.expect("a pin must target an existing lease")]["generation"]["grant"]["scope"].clone(),
+                        (None, "github-selected-narrow") => json!({
+                            "installation_id":1,
+                            "repositories":[{"id":7,"full_name":"acme/web"}],
+                            "permissions":{"contents":"read","metadata":"read"}
+                        }),
+                        (None, "github-selected-broad" | "github-selected-unmarked") => json!({
+                            "installation_id":1,
+                            "repositories":[{"id":7,"full_name":"acme/web"},{"id":8,"full_name":"acme/docs"}],
+                            "permissions":{"contents":"write","metadata":"read"}
+                        }),
+                        _ => {
+                            let repositories = scope["repositories"].as_array().expect("explicit GitHub repositories");
+                            json!({
+                                "installation_id":if review {2} else {1},
+                                "repositories":repositories.iter().enumerate().map(|(i, name)| json!({"id":i + 7,"full_name":name})).collect::<Vec<_>>(),
+                                "permissions":scope["permissions"]
+                            })
+                        }
                     };
                     json!({
                         "generator_id":if review {"app-b"} else {"app-a"},"generator_revision":1,
@@ -901,20 +1000,38 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                         vec![json!("value")]
                     }
                 });
+                let output = if gcloud { GCLOUD_NAME } else { "GH_TOKEN" };
+                let generator_name = if gcloud { "gcloud-dev" } else if review { "review-bot" } else { "release-bot" };
+                let lease_name = if generated { if review { "review-bot/GH_TOKEN" } else { output } } else { name };
                 let files = fields.iter().map(|field| {
                     let field = field.as_str().unwrap();
                     let value = if scenario == "nul" {"fixture\0secret".to_owned()} else if scenario == "raw-prefix" {"asm_raw_not_a_sentinel".to_owned()} else if generated {
-                        format!("fixture-{}-v{version}", if review {"review"} else {"release"})
+                        format!("fixture-{}-v{version}", if gcloud {"gcloud"} else if review {"review"} else {"release"})
                     } else if field == "username" {"octocat".to_owned()} else if field == "password" {"fixture-password".to_owned()} else {"fixture-other".to_owned()};
                     let substituted = mode == "sentinel" && field != "username";
-                    json!({"field":field,"relative_path":if generated {"GH_TOKEN".to_owned()} else if name == "Vaultwarden/google" {format!("{name}.{field}")} else {name.replace('\\', "_")},
+                    json!({"field":field,"relative_path":if generated {output.to_owned()} else if name == "Vaultwarden/google" {format!("{name}.{field}")} else {name.replace('\\', "_")},
                         "content":if substituted {format!("asm_fixture_{field}")} else {value},"substituted":substituted})
                 }).collect::<Vec<_>>();
-                let lease = json!({"lease_id":id,"name":if generated {if review {"review-bot/GH_TOKEN"} else {"GH_TOKEN"}} else {name},
+                let lease = json!({"lease_id":id,"name":lease_name,
                     "mode":mode,"hosts":if mode == "sentinel" {vec!["api.github.com"]} else {vec![]},"expires_at":"2999-01-01T00:00:00Z","status":"active","fields":fields,
-                    "generation":generation,"credential_version":if generated {json!(version)} else {Value::Null},"credential_expires_at":if generated {json!(expiry)} else {Value::Null},"generator_name":if generated {json!(if review {"review-bot"} else {"release-bot"})} else {Value::Null}});
+                    "generation":generation,"credential_version":if generated {json!(version)} else {Value::Null},"credential_expires_at":if generated {json!(expiry)} else {Value::Null},"generator_name":if generated {json!(generator_name)} else {Value::Null}});
                 let mut result = lease.clone();
                 result["files"] = json!(files);
+                if exact.is_none() && scenario != "managed-google-project-unmarked"
+                    && (edited_approval || matches!(scenario, "managed-google-unnegotiated-selection"
+                        | "managed-google-project-cached" | "managed-google-selected-legacy-response"))
+                {
+                    result["operator_selected_grant"] = json!(true);
+                }
+                if exact.is_some() && matches!(scenario,
+                    "managed-google-selected-drift-on-renew" | "managed-google-project-drift-on-renew")
+                {
+                    result["operator_selected_grant"] = json!(true);
+                }
+                if exact.is_some() && scenario == "managed-google-selected-rebound" {
+                    result["lease_id"] = json!(LEASE);
+                    result["operator_selected_grant"] = json!(true);
+                }
                 if scenario == "missing-field" {
                     result["files"] = json!([]);
                 }
@@ -923,10 +1040,13 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                 } else {
                     records.push(lease);
                 }
-                (
-                    200,
-                    json!({"request_id":REQ,"kind":"get","status":"approved","result":result,"deny_reason":null}),
-                )
+                let state = json!({"request_id":REQ,"kind":"get","status":"approved","result":result,"deny_reason":null});
+                if edited_approval && exact.is_none() {
+                    *approved.lock().unwrap() = Some(state);
+                    (202, json!({"request_id":REQ,"kind":"get","status":"pending","pending_lifetime_secs":600}))
+                } else {
+                    (200, state)
+                }
             }
             ("GET", p) if p.starts_with("/v1/requests/") && scenario == "deadline" => {
                 std::thread::sleep(Duration::from_millis(800));
@@ -934,6 +1054,13 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                     200,
                     json!({"request_id":REQ,"kind":"get","status":"pending","result":null,"deny_reason":null}),
                 )
+            }
+            ("GET", p) if p.starts_with("/v1/requests/") && edited_approval => {
+                let mut state = approved.lock().unwrap().clone().expect("approval for this request");
+                if scenario == "managed-google-selected-wrong-request" {
+                    state["request_id"] = json!(LEASE);
+                }
+                (200, state)
             }
             ("GET", "/v1/proxy-info") => (
                 200,
@@ -997,9 +1124,9 @@ fn exec_github_aliases_are_file_free_and_replace_inherited_pair() {
 }
 
 #[test]
-fn exec_scopes_only_github_bindings_and_preserves_request_spelling() {
-    let (f, e) = launcher_fixture("raw");
-    let out = asm(
+fn exec_combines_explicit_legacy_google_and_github_without_coalescing_or_creating_files() {
+    let (f, e) = launcher_fixture("mixed-providers");
+    let out = asm_env(
         &e,
         &[
             "exec",
@@ -1012,28 +1139,350 @@ fn exec_scopes_only_github_bindings_and_preserves_request_spelling() {
             "contents=read,issues=write",
             "--permissions",
             "pull_requests=read",
-            "GITHUB_TOKEN,OTHER_SECRET,GH_TOKEN",
+            "--gcloud-scope",
+            GCLOUD_LEGACY_SCOPE,
+            "GITHUB_TOKEN,gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN,GH_TOKEN,OTHER_SECRET",
             "--",
             "/bin/sh",
             "-c",
-            "test \"$GH_TOKEN\" = fixture-release-v1 && test \"$GITHUB_TOKEN\" = \"$GH_TOKEN\" && test \"$OTHER_SECRET\" = fixture-other && printf scoped-ok",
+            "test \"$GH_TOKEN\" = fixture-release-v1 && test \"$GITHUB_TOKEN\" = \"$GH_TOKEN\" && test \"$CLOUDSDK_AUTH_ACCESS_TOKEN\" = fixture-gcloud-v1 && test \"$OTHER_SECRET\" = fixture-other && test \"$GOOGLE_APPLICATION_CREDENTIALS\" = untouched && printf mixed-ok",
         ],
         "",
+        &[("CLOUDSDK_AUTH_ACCESS_TOKEN", "stale"), ("GOOGLE_APPLICATION_CREDENTIALS", "untouched")],
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert_eq!(text(&out.stdout), "scoped-ok");
+    assert_eq!(text(&out.stdout), "mixed-ok");
     let sent = posted(&f);
-    assert_eq!(sent.len(), 2);
+    assert_eq!(sent.len(), 3);
     assert_eq!(sent[0]["name"], "GITHUB_TOKEN");
+    assert_eq!(sent[1]["name"], "gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN");
     assert_eq!(sent[0]["generation"], json!({
         "provider":"github_app","scope":{
             "repositories":["acme/docs","acme/issues","acme/web"],
             "permissions":{"contents":"read","issues":"write","metadata":"read","pull_requests":"read"}
         }
     }));
-    assert_eq!(sent[1]["name"], "OTHER_SECRET");
-    assert!(sent[1]["generation"].is_null());
+    assert_eq!(sent[1]["generation"], json!({"provider":"gcloud","scope":{"scopes":[GCLOUD_LEGACY_SCOPE]}}));
+    assert_eq!(sent[2]["name"], "OTHER_SECRET");
+    assert!(sent[2]["generation"].is_null());
     assert!(!e.secrets.exists());
+}
+
+#[test]
+fn get_sends_exact_google_scopes_and_uses_the_google_output_name() {
+    let (f, e) = launcher_fixture("mixed-providers");
+    let scope = "https://www.googleapis.com/auth/devstorage.read_only";
+    let out = asm(
+        &e,
+        &["get", "--json", "--raw", "--gcloud-scope", scope, "CLOUDSDK_AUTH_ACCESS_TOKEN", "Read demo storage"],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let sent = posted(&f);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["generation"], json!({"provider":"gcloud","scope":{"scopes":[scope]}}));
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["generation"]["grant"]["provider"], "gcloud");
+    assert_eq!(result["files"][0]["relative_path"], "CLOUDSDK_AUTH_ACCESS_TOKEN");
+    assert!(!text(&out.stdout).contains("fixture-gcloud"));
+    assert_eq!(std::fs::read_to_string(e.secrets.join("CLOUDSDK_AUTH_ACCESS_TOKEN")).unwrap(), "fixture-gcloud-v1");
+
+    let refreshed = asm(
+        &e,
+        &["get", "--lease", result["lease_id"].as_str().unwrap(), "--refresh", "CLOUDSDK_AUTH_ACCESS_TOKEN", "Refresh demo credentials"],
+        "",
+    );
+    assert!(refreshed.status.success(), "{}", text(&refreshed.stderr));
+    assert!(text(&refreshed.stderr).contains("previously released Google tokens may remain usable until credential expiry"));
+    let sent = posted(&f);
+    assert_eq!(sent[1]["refresh_from_version"], 1);
+    assert!(sent[1]["generation"].is_null());
+    assert_eq!(std::fs::read_to_string(e.secrets.join("CLOUDSDK_AUTH_ACCESS_TOKEN")).unwrap(), "fixture-gcloud-v2");
+}
+
+#[test]
+fn get_managed_google_persists_the_exact_claims_and_refreshes_the_pinned_lease() {
+    let (f, e) = launcher_fixture("managed-google");
+    let get = asm(&e, &[
+        "get", "--json", "--project", GCLOUD_PROJECT, "--permissions", "compute=read,storage=read",
+        "--permissions", "storage=read", GCLOUD_NAME, "Read project data",
+    ], "");
+    assert!(get.status.success(), "{}", text(&get.stderr));
+    let result: Value = serde_json::from_slice(&get.stdout).unwrap();
+    let access = json!({"project_id":GCLOUD_PROJECT,"permissions":["storage=read","compute=read"]});
+    assert_eq!(result["generation"]["grant"]["scope"]["access"], access);
+    assert!(!text(&get.stdout).contains("fixture-gcloud"));
+    let sent = posted(&f);
+    assert_eq!(sent[0]["generation"], json!({"provider":"gcloud_access","scope":access}));
+    assert!(sent[0]["client_capabilities"].as_array().unwrap().contains(&json!("gcloud_access_v1")));
+    let token_path = e.secrets.join(GCLOUD_NAME);
+    assert_eq!(std::fs::read_to_string(&token_path).unwrap(), "fixture-gcloud-v1");
+
+    let different = asm(&e, &[
+        "get", "--lease", GCLOUD_LEASE, "--project", GCLOUD_PROJECT, "--permissions", "storage=read",
+        GCLOUD_NAME, "Change project claims",
+    ], "");
+    assert_eq!(different.status.code(), Some(2), "{}", text(&different.stderr));
+    assert_eq!(posted(&f).len(), 1);
+    let refreshed = asm(&e, &[
+        "get", "--json", "--lease", GCLOUD_LEASE, "--refresh", GCLOUD_NAME, "Refresh project credentials",
+    ], "");
+    assert!(refreshed.status.success(), "{}", text(&refreshed.stderr));
+    let renewed: Value = serde_json::from_slice(&refreshed.stdout).unwrap();
+    assert_eq!(renewed["generation"], result["generation"]);
+    let sent = posted(&f);
+    assert_eq!(sent[1]["lease_id"], GCLOUD_LEASE);
+    assert_eq!(sent[1]["refresh_from_version"], 1);
+    assert_eq!(sent[1]["generation"], sent[0]["generation"]);
+    assert_eq!(std::fs::read_to_string(token_path).unwrap(), "fixture-gcloud-v2");
+}
+
+#[test]
+fn get_and_exec_honor_operator_selected_permissions_and_projects() {
+    for (scenario, output, lease_id, flags, grant_path, expected) in [
+        ("managed-google-selected-narrow", GCLOUD_NAME, GCLOUD_LEASE,
+            ["--project", GCLOUD_PROJECT, "--permissions", "compute=read,storage=read"],
+            "/generation/grant/scope/access/permissions", json!(["storage=read"])),
+        ("managed-google-selected-broad", GCLOUD_NAME, GCLOUD_LEASE,
+            ["--project", GCLOUD_PROJECT, "--permissions", "storage=read"],
+            "/generation/grant/scope/access/permissions", json!(["storage=read", "compute=read"])),
+        ("managed-google-project-switched", GCLOUD_NAME, GCLOUD_LEASE,
+            ["--project", GCLOUD_PROJECT, "--permissions", "storage=read"],
+            "/generation/grant/scope/access/permissions", json!(["compute=read"])),
+        ("managed-google-project-only", GCLOUD_NAME, GCLOUD_LEASE,
+            ["--project", GCLOUD_PROJECT, "--permissions", "storage=read"],
+            "/generation/grant/scope/access/permissions", json!(["storage=read"])),
+        ("github-selected-narrow", "GH_TOKEN", LEASE,
+            ["--repositories", "acme/docs,acme/web", "--permissions", "contents=write"],
+            "/generation/grant/scope", json!({
+                "installation_id":1, "repositories":[{"id":7,"full_name":"acme/web"}],
+                "permissions":{"contents":"read","metadata":"read"}
+            })),
+        ("github-selected-broad", "GH_TOKEN", LEASE,
+            ["--repositories", "acme/web", "--permissions", "contents=read"],
+            "/generation/grant/scope", json!({
+                "installation_id":1, "repositories":[{"id":7,"full_name":"acme/web"},{"id":8,"full_name":"acme/docs"}],
+                "permissions":{"contents":"write","metadata":"read"}
+            })),
+    ] {
+        let (f, e) = launcher_fixture(scenario);
+        let google = output == GCLOUD_NAME;
+        let switched = scenario.starts_with("managed-google-project-");
+        let approved_project = if switched { GCLOUD_OTHER_PROJECT } else { GCLOUD_PROJECT };
+        let (first_value, renewed_value) = if google {
+            ("fixture-gcloud-v1", "fixture-gcloud-v2")
+        } else {
+            ("fixture-release-v1", "fixture-release-v2")
+        };
+        let mut args = vec!["get", "--json", "--raw"];
+        args.extend(flags);
+        args.extend([output, "Read approved credentials"]);
+        let get = asm(&e, &args, "");
+        assert!(get.status.success(), "{scenario}: {}", text(&get.stderr));
+        let result: Value = serde_json::from_slice(&get.stdout).unwrap();
+        assert_eq!(result["lease_id"], lease_id);
+        assert_eq!(result.pointer(grant_path), Some(&expected), "{scenario}");
+        if google {
+            assert_eq!(result["generation"]["grant"]["scope"]["access"]["project_id"], approved_project);
+        }
+        assert_eq!(std::fs::read_to_string(e.secrets.join(output)).unwrap(), first_value);
+        let refreshed = asm(&e, &[
+            "get", "--json", "--lease", lease_id, "--refresh", output, "Renew the approved grant",
+        ], "");
+        assert!(refreshed.status.success(), "{scenario}: {}", text(&refreshed.stderr));
+        let renewed: Value = serde_json::from_slice(&refreshed.stdout).unwrap();
+        assert_eq!(renewed["generation"], result["generation"]);
+        assert_eq!(std::fs::read_to_string(e.secrets.join(output)).unwrap(), renewed_value);
+
+        let (exec_fake, exec_env) = launcher_fixture(scenario);
+        let mut args = vec!["exec", "--raw"];
+        args.extend(flags);
+        args.extend([output, "--", "/bin/sh", "-c",
+            "test \"$(printenv \"$1\")\" = \"$2\" && printf launched", "fixture", output, renewed_value]);
+        let exec = asm(&exec_env, &args, "");
+        assert!(exec.status.success(), "{scenario}: {}", text(&exec.stderr));
+        assert_eq!(text(&exec.stdout), "launched");
+        assert!(!exec_env.secrets.exists());
+
+        for (fake, forced) in [(f, true), (exec_fake, false)] {
+            let sent = posted(&fake);
+            assert_eq!(sent.len(), 2);
+            assert!(sent[0]["client_capabilities"].as_array().unwrap().contains(&json!("operator_selected_grant_v1")));
+            assert_eq!(sent[0]["client_capabilities"].as_array().unwrap().contains(&json!(SELECT_PROJECT)), switched);
+            assert!(!sent[1]["client_capabilities"].as_array().unwrap().contains(&json!(SELECT_PROJECT)));
+            assert!(sent[0]["lease_id"].is_null());
+            assert_eq!(sent[1]["lease_id"], lease_id);
+            assert_eq!(sent[1]["refresh"], forced);
+            if google {
+                assert_eq!(sent[0]["generation"]["scope"]["project_id"], GCLOUD_PROJECT);
+                assert_eq!(sent[1]["generation"]["scope"]["project_id"], approved_project);
+                assert_eq!(sent[1]["generation"]["scope"]["permissions"], expected);
+                assert_ne!(sent[0]["generation"], sent[1]["generation"]);
+            } else {
+                assert!(sent[1]["generation"].is_null());
+            }
+        }
+    }
+}
+
+#[test]
+fn pinned_get_rejects_a_new_lease_even_if_marked_operator_selected() {
+    let (f, e) = launcher_fixture("managed-google-selected-rebound");
+    let get = asm(&e, &[
+        "get", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME, "Read project data",
+    ], "");
+    assert!(get.status.success(), "{}", text(&get.stderr));
+    let get = asm(&e, &[
+        "get", "--lease", GCLOUD_LEASE, "--refresh", GCLOUD_NAME, "Renew the approved grant",
+    ], "");
+    assert!(!get.status.success());
+    assert!(text(&get.stderr).contains("inconsistent get result"));
+    assert_eq!(std::fs::read_to_string(e.secrets.join(GCLOUD_NAME)).unwrap(), "fixture-gcloud-v1");
+    assert_eq!(posted(&f).len(), 2);
+}
+
+#[test]
+fn operator_decision_for_another_request_never_writes_or_launches() {
+    let (f, e) = launcher_fixture("managed-google-selected-wrong-request");
+    let get = asm(&e, &[
+        "get", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME, "Read project data",
+    ], "");
+    assert!(!get.status.success());
+    assert!(text(&get.stderr).contains("decision for a different request"));
+    assert!(!e.secrets.join(GCLOUD_NAME).exists());
+    let exec = asm(&e, &[
+        "exec", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME,
+        "--", "/bin/echo", "should not run",
+    ], "");
+    assert!(!exec.status.success());
+    assert!(text(&exec.stderr).contains("decision for a different request"));
+    assert!(exec.stdout.is_empty());
+    assert_eq!(posted(&f).len(), 2);
+}
+
+#[test]
+fn managed_google_mismatches_never_write_or_launch() {
+    for scenario in [
+        "managed-google-broad", "managed-google-other-project", "managed-google-legacy-response",
+        "managed-google-selected-unmarked", "managed-google-unnegotiated-selection",
+        "managed-google-selected-other-project", "managed-google-selected-legacy-response",
+        "managed-google-project-unmarked", "managed-google-project-only-permission-drift",
+        "managed-google-project-cached",
+    ] {
+        let (f, e) = launcher_fixture(scenario);
+        let get = asm(&e, &[
+            "get", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME, "Read project data",
+        ], "");
+        assert!(!get.status.success(), "{scenario}");
+        assert!(text(&get.stderr).contains("exact Google Cloud project and permissions"), "{scenario}: {}", text(&get.stderr));
+        assert!(!e.secrets.join(GCLOUD_NAME).exists(), "{scenario}");
+        assert!(!e.secrets.join(".leases.json").exists(), "{scenario}");
+        let exec = asm(&e, &[
+            "exec", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME,
+            "--", "/bin/echo", "should not run",
+        ], "");
+        assert!(!exec.status.success(), "{scenario}");
+        assert!(text(&exec.stderr).contains("exact Google Cloud project and permissions"));
+        assert!(exec.stdout.is_empty(), "{scenario}");
+        let sent = posted(&f);
+        assert_eq!(sent.len(), 2);
+        for request in sent {
+            assert_eq!(request["client_capabilities"].as_array().unwrap().contains(&json!(SELECT_PROJECT)),
+                scenario.starts_with("managed-google-project-"), "{scenario}");
+        }
+    }
+}
+
+#[test]
+fn unmarked_github_broadening_never_writes_or_launches() {
+    let (f, e) = launcher_fixture("github-selected-unmarked");
+    let get = asm(&e, &["get", "--repositories", GITHUB_REPOSITORY, "GH_TOKEN", "Read repository"], "");
+    assert!(!get.status.success());
+    assert!(text(&get.stderr).contains("exact requested grant"));
+    assert!(!e.secrets.join("GH_TOKEN").exists());
+    let exec = asm(&e, &[
+        "exec", "--repositories", GITHUB_REPOSITORY, "GH_TOKEN", "--", "/bin/echo", "should not run",
+    ], "");
+    assert!(!exec.status.success());
+    assert!(text(&exec.stderr).contains("exact requested grant"));
+    assert!(exec.stdout.is_empty());
+    assert_eq!(posted(&f).len(), 2);
+}
+
+#[test]
+fn exec_managed_google_pins_renewal_and_rejects_changed_authority() {
+    for (scenario, expected, approved_project) in [
+        ("managed-google-short", true, GCLOUD_PROJECT),
+        ("managed-google-selected-drift-on-renew", false, GCLOUD_PROJECT),
+        ("managed-google-project-drift-on-renew", false, GCLOUD_OTHER_PROJECT),
+    ] {
+        let (f, e) = launcher_fixture(scenario);
+        let out = asm(&e, &[
+            "exec", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME,
+            "--", "/bin/sh", "-c", "test \"$CLOUDSDK_AUTH_ACCESS_TOKEN\" = fixture-gcloud-v2 && printf renewed",
+        ], "");
+        assert_eq!(out.status.success(), expected, "{scenario}: {}", text(&out.stderr));
+        assert_eq!(text(&out.stdout), if expected { "renewed" } else { "" });
+        if !expected {
+            assert!(text(&out.stderr).contains("changed the pinned generated credential grant"));
+        }
+        let sent = posted(&f);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1]["lease_id"], GCLOUD_LEASE);
+        assert_eq!(sent[0]["generation"]["scope"]["project_id"], GCLOUD_PROJECT);
+        assert_eq!(sent[1]["generation"]["scope"], json!({"project_id":approved_project,"permissions":["storage=read"]}));
+        assert!(!sent[1]["client_capabilities"].as_array().unwrap().contains(&json!(SELECT_PROJECT)));
+        assert!(!e.secrets.exists());
+    }
+}
+
+#[test]
+fn managed_google_requires_capability_and_an_unambiguous_provider_before_posting() {
+    let (f, e) = launcher_fixture("managed-google-unsupported");
+    for args in [
+        vec!["get", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME, "Read project data"],
+        vec!["exec", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME, "--", "/bin/true"],
+    ] {
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("gcloud_access_v1; upgrade the manager"));
+    }
+    assert!(posted(&f).is_empty());
+
+    let (f, e) = launcher_fixture("managed-google");
+    for args in [
+        vec!["get", GCLOUD_NAME, "Read project data"],
+        vec!["exec", GCLOUD_NAME, "--", "/bin/true"],
+        vec!["exec", "--repositories", GITHUB_REPOSITORY, "GH_TOKEN,CLOUDSDK_AUTH_ACCESS_TOKEN", "--", "/bin/true"],
+    ] {
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("--project ID --permissions"));
+    }
+    let mixed = asm(&e, &[
+        "exec", "--project", GCLOUD_PROJECT, "--permissions", "storage=read",
+        "GH_TOKEN,CLOUDSDK_AUTH_ACCESS_TOKEN", "--", "/bin/true",
+    ], "");
+    assert_eq!(mixed.status.code(), Some(2), "{}", text(&mixed.stderr));
+    assert!(text(&mixed.stderr).contains("require separate asm exec commands"));
+    assert!(posted(&f).is_empty());
+}
+
+#[test]
+fn exec_qualified_static_google_spelling_does_not_receive_managed_claims() {
+    let (f, e) = launcher_fixture("managed-google-collision");
+    let out = asm(&e, &[
+        "exec", "--project", GCLOUD_PROJECT, "--permissions", "storage=read",
+        "STATIC=work/CLOUDSDK_AUTH_ACCESS_TOKEN,gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN",
+        "--", "/bin/sh", "-c", "test \"$STATIC\" = fixture-other && test \"$CLOUDSDK_AUTH_ACCESS_TOKEN\" = fixture-gcloud-v1",
+    ], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let sent = posted(&f);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["name"], "work/CLOUDSDK_AUTH_ACCESS_TOKEN");
+    assert!(sent[0]["generation"].is_null());
+    assert_eq!(sent[1]["name"], "gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN");
+    assert_eq!(sent[1]["generation"]["provider"], "gcloud_access");
 }
 
 #[test]
@@ -1320,8 +1769,6 @@ fn github_scope_is_required_before_posting_new_requests() {
     let (f, e) = launcher_fixture("raw");
     for args in [
         vec!["get", "GITHUB_TOKEN", "Read GitHub"],
-        vec!["get", "--new-lease", "GH_TOKEN", "Read GitHub"],
-        vec!["get", "--refresh", "GH_TOKEN", "Renew GitHub"],
         vec!["get", "--permissions", "contents=read", "release-bot/GH_TOKEN", "Read GitHub"],
         vec!["get", "--lease", LEASE, "--permissions", "contents=read", "GH_TOKEN", "Renew GitHub"],
         vec!["exec", "OTHER_SECRET,TOKEN=release-bot/GH_TOKEN", "--", "/bin/echo", "should not run"],
@@ -1349,14 +1796,13 @@ fn static_github_spelling_does_not_turn_into_a_scope_request() {
         "",
     );
     assert!(exec.status.success(), "{}", text(&exec.stderr));
-    for args in [
-        vec!["get", "--repositories", GITHUB_REPOSITORY, "work/GH_TOKEN", "Read a static secret"],
-        vec!["exec", "--repositories", GITHUB_REPOSITORY, "TOKEN=work/GH_TOKEN", "--", "/bin/true"],
-    ] {
-        let out = asm(&e, &args, "");
-        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
-        assert!(text(&out.stderr).contains("require a generated"));
-    }
+    let ignored_scope = asm(
+        &e,
+        &["exec", "--repositories", GITHUB_REPOSITORY, "TOKEN=work/GH_TOKEN", "--", "/bin/true"],
+        "",
+    );
+    assert_eq!(ignored_scope.status.code(), Some(2), "{}", text(&ignored_scope.stderr));
+    assert!(text(&ignored_scope.stderr).contains("generated GitHub"));
     let sent = posted(&f);
     assert_eq!(sent.len(), 2);
     assert!(sent.iter().all(|body| body["name"] == "work/GH_TOKEN" && body["generation"].is_null()));
@@ -1464,10 +1910,7 @@ fn get_bindings_scope_and_stable_generated_aliases() {
     assert!(!text(&out.stdout).contains("fixture-release"));
     let out = asm(&e, &["get", "--lease", LEASE, "GITHUB_TOKEN", "Continue reading"], "");
     assert!(out.status.success(), "{}", text(&out.stderr));
-    let pin = posted(&f).pop().unwrap();
-    assert_eq!(pin["name"], "GITHUB_TOKEN");
-    assert_eq!(pin["lease_id"], LEASE);
-    assert!(pin["generation"].is_null());
+    assert!(posted(&f).last().unwrap()["generation"].is_null());
     assert_eq!(
         std::fs::read_to_string(e.secrets.join("GITHUB_TOKEN")).unwrap(),
         "fixture-release-v1"

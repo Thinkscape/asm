@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Floating, non-activating, borderless panel that can still take keyboard input (host
 /// field, custom deny reason). The SwiftUI content draws the rounded glass background.
-/// Excluded from screen sharing and screenshots.
+/// Token permission requests can be captured; pairing and secret-edit panels stay private.
 final class ApprovalPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
@@ -65,12 +65,29 @@ final class ApprovalPanelController {
         let panel = panel ?? makePanel()
         self.panel = panel
         if !panel.isVisible {
+            model.approvalPanelWillOpen()
             position(panel)
         }
         panel.orderFrontRegardless()
         if takeFocus {
             panel.makeKey()
         }
+    }
+
+    /// Use a fresh backing window at privacy boundaries. Never make a window
+    /// containing old pairing codes or secret values shareable during a redraw.
+    func prepare(for request: PendingItem?) -> Bool {
+        guard let panel, panel.sharingType != Self.sharingType(for: request) else { return false }
+        let visible = panel.isVisible
+        panel.orderOut(nil)
+        panel.contentViewController = nil
+        self.panel = nil
+        return visible
+    }
+
+    private static func sharingType(for request: PendingItem?) -> NSWindow.SharingType {
+        guard case let .get(detail)? = request?.detail, detail.isGenerated else { return .none }
+        return .readOnly
     }
 
     /// Hides the panel; requests stay pending.
@@ -92,11 +109,10 @@ final class ApprovalPanelController {
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
-        panel.sharingType = .none
+        panel.sharingType = Self.sharingType(for: model.shownRequest)
         #if DEBUG
-        // Lets screenshots capture the panel when reviewing its look in a debug build.
+        // Optional self-rendering of capturable token panels for debug layout checks.
         if ProcessInfo.processInfo.environment["ASM_DEBUG_SHAREABLE_PANEL"] == "1" {
-            panel.sharingType = .readOnly
             installSnapshotSignal()
         }
         #endif
@@ -127,7 +143,8 @@ final class ApprovalPanelController {
     }
 
     private func writeSnapshot() {
-        guard let view = panel?.contentView, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+        guard let panel, panel.sharingType == .readOnly, let view = panel.contentView,
+              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
         view.effectiveAppearance.performAsCurrentDrawingAppearance {
             view.cacheDisplay(in: view.bounds, to: rep)
         }

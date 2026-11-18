@@ -17,7 +17,7 @@ axum.workspace = true
 axum-server.workspace = true
 rusqlite.workspace = true
 rcgen.workspace = true
-reqwest = { workspace = true, features = ["blocking", "json", "rustls-no-provider"] }
+reqwest = { workspace = true, features = ["blocking", "form", "json", "rustls-no-provider"] }
 jsonwebtoken = { version = "12", default-features = false, features = ["use_pem", "rust_crypto"] }
 # Keep the parsed RSA signer live: jsonwebtoken's encode reparses DER per call.
 rsa = { version = "0.10", features = ["getrandom", "pkcs1v15"] }

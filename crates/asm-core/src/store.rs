@@ -7,7 +7,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Mutex;
 
-use asm_proto::generators::{GenerationGrant, GenerationRequest, SourceKind};
+use asm_proto::generators::{
+    GcloudAccessGrant, GcloudAccessRequest, GenerationGrant, GenerationRequest, SourceKind,
+};
 use asm_proto::wire::{HostInfo, LeaseMode, LeaseStatus};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,25 @@ CREATE TABLE IF NOT EXISTS generators(
     revision INTEGER NOT NULL,
     position INTEGER NOT NULL
 );
+-- Preserve the exact cloud resource for cleanup even if creation was ambiguous,
+-- the generator was disconnected/removed, or another attempt replaces this one.
+CREATE TABLE IF NOT EXISTS gcloud_profiles(
+    generator_id TEXT NOT NULL,
+    account_subject TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    permissions TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    admin_email TEXT NOT NULL,
+    unique_id TEXT UNIQUE,
+    phase INTEGER NOT NULL DEFAULT 0 CHECK (phase BETWEEN 0 AND 4),
+    superseded INTEGER NOT NULL DEFAULT 0 CHECK (superseded IN (0, 1)),
+    CHECK ((phase = 0 AND unique_id IS NULL) OR (phase > 0 AND unique_id IS NOT NULL)),
+    CHECK (superseded = 0 OR phase = 0),
+    PRIMARY KEY(project_id, account_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS gcloud_profiles_current
+    ON gcloud_profiles(generator_id, account_subject, project_id, permissions)
+    WHERE superseded = 0;
 CREATE TABLE IF NOT EXISTS hosts(
     id         TEXT PRIMARY KEY,
     token_hash BLOB NOT NULL UNIQUE,
@@ -106,6 +127,16 @@ CREATE TABLE IF NOT EXISTS secret_hosts(
 );
 ";
 
+// The issued UID identifies the account even for legacy OAuth leases whose
+// generator and quota project differ. Never derive it from mutable config or
+// match a lease's requested claims, email, or account name.
+const GCLOUD_LEASE_UID: &str = "CASE WHEN json_valid(generation) THEN
+    CASE WHEN json_extract(generation, '$.provider') = 'gcloud'
+        OR (json_extract(generation, '$.provider') = 'gcloud_access'
+            AND json_extract(generation, '$.scope.state') = 'issued')
+    THEN json_extract(generation, '$.scope.service_account_unique_id') END
+END";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultRecord {
     pub id: String,
@@ -122,6 +153,116 @@ pub struct GeneratorRecord {
     pub config: GeneratorConfig,
     pub revision: u64,
     pub position: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GcloudProfileKey {
+    pub generator_id: String,
+    pub account_subject: String,
+    pub access: GcloudAccessRequest,
+}
+
+impl GcloudProfileKey {
+    fn permissions(&self) -> Result<String> {
+        profile_permissions(&self.access)
+    }
+}
+
+fn profile_permissions(access: &GcloudAccessRequest) -> Result<String> {
+    access.validate()?;
+    Ok(serde_json::to_string(&access.permissions)?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GcloudProfilePhase {
+    /// No immutable ID was recorded. Never look up by this attempt's name.
+    Creating,
+    Created,
+    ProjectBound,
+    TokenCreatorBound,
+    Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GcloudProfileRecord {
+    pub account_id: String,
+    pub admin_email: String,
+    pub unique_id: Option<String>,
+    pub phase: GcloudProfilePhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GcloudAccountDeletion {
+    None,
+    Pending,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GcloudManagedAccount {
+    /// Local journal row; never a substitute for checking the immutable Google UID.
+    pub id: i64,
+    pub key: GcloudProfileKey,
+    pub profile: GcloudProfileRecord,
+    pub superseded: bool,
+    pub deletion: GcloudAccountDeletion,
+    pub leases: Vec<LeaseRecord>,
+}
+
+pub(crate) fn gcloud_profile_email(project_id: &str, account_id: &str) -> String {
+    format!("{account_id}@{project_id}.iam.gserviceaccount.com")
+}
+
+fn validate_profile_account_id(value: &str) -> Result<()> {
+    if (6..=30).contains(&value.len())
+        && value.starts_with("asm-")
+        && value.ends_with(|ch: char| ch.is_ascii_alphanumeric())
+        && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        Ok(())
+    } else {
+        Err(CoreError::invalid("invalid ASM Google service account name"))
+    }
+}
+
+pub(crate) fn validate_profile_admin_email(value: &str) -> Result<()> {
+    if value.len() <= 254
+        && value.bytes().all(|ch| ch.is_ascii_graphic() && ch != b':')
+        && value.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty() && !domain.is_empty() && !domain.contains('@')
+        })
+    {
+        Ok(())
+    } else {
+        Err(CoreError::invalid("invalid verified Google account email"))
+    }
+}
+
+fn profile_changed() -> CoreError {
+    CoreError::vault_unavailable("Google IAM profile changed; review it again")
+}
+
+fn gcloud_profile_deleting() -> CoreError {
+    CoreError::vault_unavailable("Google IAM profile deletion is pending; retry it in generator settings")
+}
+
+fn decode_gcloud_profile(
+    account_id: String, admin_email: String, unique_id: Option<String>, phase: i64,
+) -> Result<GcloudProfileRecord> {
+    validate_profile_account_id(&account_id)?;
+    validate_profile_admin_email(&admin_email)?;
+    if let Some(id) = &unique_id {
+        crate::generator::gcloud::validate_unique_id(id)?;
+    }
+    let phase = match (phase, unique_id.is_some()) {
+        (0, false) => GcloudProfilePhase::Creating,
+        (1, true) => GcloudProfilePhase::Created,
+        (2, true) => GcloudProfilePhase::ProjectBound,
+        (3, true) => GcloudProfilePhase::TokenCreatorBound,
+        (4, true) => GcloudProfilePhase::Ready,
+        _ => return Err(CoreError::internal("invalid stored Google IAM profile phase")),
+    };
+    Ok(GcloudProfileRecord { account_id, admin_email, unique_id, phase })
 }
 
 #[derive(Debug, Clone)]
@@ -203,7 +344,7 @@ pub struct LeaseField {
     pub path: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseRecord {
     pub id: String,
     pub host_id: String,
@@ -310,6 +451,23 @@ fn validate_lease_generation(lease: &LeaseRecord) -> Result<()> {
             grant
                 .validate()
                 .map_err(|_| CoreError::internal("invalid generated lease grant"))?;
+            if !grant.is_issued() {
+                return Err(CoreError::internal("a managed Google lease must have an issued profile"));
+            }
+            match (grant, &lease.requested_generation) {
+                // The original project and permissions are historical metadata.
+                // Only the separately validated issued profile grants authority.
+                (GenerationGrant::GcloudAccess(GcloudAccessGrant::Issued { .. }),
+                    Some(GenerationRequest::GcloudAccess(_))) => {}
+                (GenerationGrant::GcloudAccess(_), _) => {
+                    return Err(CoreError::internal("managed Google lease has no original Google request"));
+                }
+                // Request metadata documents what the host asked for; it cannot
+                // confer authority or replace the separately validated grant.
+                (GenerationGrant::GithubApp(_), None | Some(GenerationRequest::GithubApp(_)))
+                | (GenerationGrant::Gcloud(_), None | Some(GenerationRequest::Gcloud(_))) => {}
+                _ => return Err(CoreError::internal("generated lease request does not match its provider")),
+            }
             let revision = lease
                 .generator_revision
                 .filter(|n| *n > 0)
@@ -335,11 +493,13 @@ fn validate_lease_generation(lease: &LeaseRecord) -> Result<()> {
                 canonical
                     .canonicalize()
                     .map_err(|_| CoreError::internal("invalid generated lease request"))?;
-                // A legacy request could omit permissions. Preserve its historical
-                // metadata; the separate canonical grant is the lease authority.
-                let (GenerationRequest::GithubApp(stored), GenerationRequest::GithubApp(normalized)) =
-                    (request, &mut canonical);
-                if stored.permissions.is_none() {
+                // Older approvals stored omitted GitHub permissions as None.
+                // Preserve that historical request metadata; the separate
+                // canonical grant above remains the source of lease authority.
+                if let (GenerationRequest::GithubApp(stored), GenerationRequest::GithubApp(normalized)) =
+                    (request, &mut canonical)
+                    && stored.permissions.is_none()
+                {
                     normalized.permissions = None;
                 }
                 if &canonical != request {
@@ -349,6 +509,16 @@ fn validate_lease_generation(lease: &LeaseRecord) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn issued_gcloud_uid(grant: Option<&GenerationGrant>) -> Option<&str> {
+    match grant? {
+        GenerationGrant::Gcloud(grant) => Some(&grant.service_account_unique_id),
+        GenerationGrant::GcloudAccess(GcloudAccessGrant::Issued { service_account_unique_id, .. }) => {
+            Some(service_account_unique_id)
+        }
+        _ => None,
+    }
 }
 
 fn source_name_error(name: &str) -> CoreError {
@@ -375,6 +545,8 @@ impl Store {
         let conn = Connection::open(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Cloud deletion cannot start until the local retirement survived commit.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
@@ -554,7 +726,11 @@ impl Store {
         if g.revision == 0 {
             return Err(CoreError::invalid("generator revision must be positive"));
         }
-        g.config.validate()?;
+        match &g.config {
+            GeneratorConfig::GithubApp(config) => config.validate()?,
+            GeneratorConfig::GcloudConnection(config) => config.validate()?,
+            GeneratorConfig::Gcloud(_) => {}
+        }
         let revision = sqlite_u64(g.revision, "generator revision")?;
         let config = serde_json::to_string(&g.config)?;
         let mut db = self.db();
@@ -582,6 +758,278 @@ impl Store {
         tx.execute("DELETE FROM generators WHERE id = ?1", [id])?;
         tx.execute("DELETE FROM secret_hosts WHERE vault_id = ?1", [id])?;
         tx.commit()?;
+        Ok(())
+    }
+}
+
+impl Store {
+    pub(crate) fn gcloud_profile(&self, key: &GcloudProfileKey) -> Result<Option<GcloudProfileRecord>> {
+        self.gcloud_profile_for(&key.generator_id, &key.account_subject, &key.access)
+    }
+
+    pub(crate) fn gcloud_profile_for(
+        &self, generator_id: &str, account_subject: &str, access: &GcloudAccessRequest,
+    ) -> Result<Option<GcloudProfileRecord>> {
+        let permissions = profile_permissions(access)?;
+        let row = self.db().query_row(
+            "SELECT account_id, admin_email, unique_id, phase, deletion_state FROM gcloud_profiles
+             WHERE generator_id = ?1 AND account_subject = ?2 AND project_id = ?3
+                 AND permissions = ?4 AND superseded = 0 AND deletion_state != 2",
+            params![generator_id, account_subject, access.project_id, permissions],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, i64>(4)?)),
+        ).optional()?;
+        match row {
+            None => Ok(None),
+            Some((account_id, admin_email, unique_id, phase, 0)) => {
+                decode_gcloud_profile(account_id, admin_email, unique_id, phase).map(Some)
+            }
+            Some(_) => Err(gcloud_profile_deleting()),
+        }
+    }
+
+    pub(crate) fn has_recorded_gcloud_accounts(&self) -> Result<bool> {
+        Ok(self.db().prepare_cached("SELECT EXISTS(SELECT 1 FROM gcloud_profiles)")?
+            .query_row([], |row| row.get(0))?)
+    }
+
+    pub(crate) fn list_gcloud_managed_accounts(&self) -> Result<Vec<GcloudManagedAccount>> {
+        let db = self.db();
+        let tx = db.unchecked_transaction()?;
+        let accounts = Self::query_gcloud_managed_accounts(&tx, "", &[])?;
+        tx.commit()?;
+        Ok(accounts)
+    }
+
+    pub(crate) fn gcloud_managed_account(&self, id: i64) -> Result<Option<GcloudManagedAccount>> {
+        let db = self.db();
+        let tx = db.unchecked_transaction()?;
+        let account = Self::gcloud_managed_account_with(&tx, id)?;
+        tx.commit()?;
+        Ok(account)
+    }
+
+    fn gcloud_managed_account_with(db: &Connection, id: i64) -> Result<Option<GcloudManagedAccount>> {
+        Ok(Self::query_gcloud_managed_accounts(db, "WHERE rowid = ?1", &[&id])?.pop())
+    }
+
+    fn query_gcloud_managed_accounts(
+        db: &Connection, filter: &str, args: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<GcloudManagedAccount>> {
+        let sql = format!(
+            "SELECT rowid, generator_id, account_subject, project_id, permissions, account_id,
+                    admin_email, unique_id, phase, superseded, deletion_state
+             FROM gcloud_profiles {filter} ORDER BY project_id, account_id"
+        );
+        let mut stmt = db.prepare(&sql)?;
+        let mut rows = stmt.query(args)?;
+        let mut accounts = Vec::new();
+        while let Some(row) = rows.next()? {
+            let access = GcloudAccessRequest {
+                project_id: row.get(3)?,
+                permissions: serde_json::from_str(&row.get::<_, String>(4)?)?,
+            };
+            access.validate()?;
+            let profile = decode_gcloud_profile(row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)?;
+            let superseded: bool = row.get(9)?;
+            let deletion = match row.get::<_, i64>(10)? {
+                0 => GcloudAccountDeletion::None,
+                1 => GcloudAccountDeletion::Pending,
+                2 => GcloudAccountDeletion::Deleted,
+                _ => return Err(CoreError::internal("invalid stored Google IAM deletion state")),
+            };
+            let leases = if let Some(uid) = &profile.unique_id {
+                let filter = format!("WHERE source_kind = 'generator' AND ({GCLOUD_LEASE_UID}) = ?1");
+                Self::query_leases_with(db, &filter, &[uid])?
+            } else {
+                Vec::new()
+            };
+            accounts.push(GcloudManagedAccount {
+                id: row.get(0)?,
+                key: GcloudProfileKey { generator_id: row.get(1)?, account_subject: row.get(2)?, access },
+                profile,
+                superseded,
+                deletion,
+                leases,
+            });
+        }
+        Ok(accounts)
+    }
+
+    /// A pending deletion and the removal of all its local leases become visible
+    /// together, before any cloud write. A failed cloud call never rolls this back.
+    pub(crate) fn begin_gcloud_account_deletion(
+        &self, expected: &GcloudManagedAccount, generator_revision: u64,
+    ) -> Result<GcloudManagedAccount> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut current = Self::gcloud_managed_account_with(&tx, expected.id)?.ok_or_else(profile_changed)?;
+        if &current != expected || current.deletion == GcloudAccountDeletion::Deleted {
+            return Err(profile_changed());
+        }
+        if current.superseded || current.profile.unique_id.is_none() {
+            return Err(CoreError::invalid("Google IAM profile has no verified account identity"));
+        }
+        let config = tx.query_row(
+            "SELECT config FROM generators WHERE id = ?1 AND revision = ?2",
+            params![current.key.generator_id, sqlite_u64(generator_revision, "generator revision")?],
+            |row| row.get::<_, String>(0),
+        ).optional()?.ok_or_else(profile_changed)?;
+        let GeneratorConfig::GcloudConnection(config) = serde_json::from_str(&config)? else {
+            return Err(profile_changed());
+        };
+        if config.account_subject != current.key.account_subject || config.account_email != current.profile.admin_email {
+            return Err(profile_changed());
+        }
+
+        if current.deletion == GcloudAccountDeletion::None {
+            if tx.execute("UPDATE gcloud_profiles SET deletion_state = 1 WHERE rowid = ?1", [current.id])? != 1 {
+                return Err(profile_changed());
+            }
+        }
+        {
+            let mut delete = tx.prepare("DELETE FROM leases WHERE id = ?1")?;
+            for lease in &current.leases {
+                if delete.execute([&lease.id])? != 1 {
+                    return Err(profile_changed());
+                }
+            }
+        }
+        tx.commit()?;
+        current.deletion = GcloudAccountDeletion::Pending;
+        current.leases = Vec::new();
+        Ok(current)
+    }
+
+    /// The cloud account is confirmed gone. Keep the journal and its unique
+    /// immutable UID reserved, but allow a fresh account for the same claims.
+    pub(crate) fn finish_gcloud_account_deletion(&self, expected_pending: &GcloudManagedAccount) -> Result<()> {
+        if expected_pending.deletion != GcloudAccountDeletion::Pending || !expected_pending.leases.is_empty() {
+            return Err(profile_changed());
+        }
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut current = Self::gcloud_managed_account_with(&tx, expected_pending.id)?.ok_or_else(profile_changed)?;
+        let deletion = current.deletion;
+        current.deletion = GcloudAccountDeletion::Pending;
+        if &current != expected_pending || deletion == GcloudAccountDeletion::None {
+            return Err(profile_changed());
+        }
+        if deletion == GcloudAccountDeletion::Pending {
+            if tx.execute("UPDATE gcloud_profiles SET deletion_state = 2 WHERE rowid = ?1", [current.id])? != 1 {
+                return Err(profile_changed());
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn gcloud_account_is_retired(&self, unique_id: &str) -> Result<bool> {
+        Self::gcloud_account_is_retired_with(&self.db(), unique_id)
+    }
+
+    fn gcloud_account_is_retired_with(db: &Connection, unique_id: &str) -> Result<bool> {
+        Ok(db.prepare_cached("SELECT 1 FROM gcloud_profiles WHERE unique_id = ?1 AND deletion_state != 0")?
+            .exists([unique_id])?)
+    }
+
+    pub(crate) fn gcloud_profile_cleanup_resources(
+        &self, generator_id: &str, account_subject: &str, admin_email: &str,
+    ) -> Result<Vec<(GcloudAccessRequest, String, Option<String>)>> {
+        let db = self.db();
+        let mut stmt = db.prepare(
+            "SELECT project_id, permissions, account_id, unique_id FROM gcloud_profiles
+             WHERE generator_id = ?1 AND account_subject = ?2 AND admin_email = ?3 AND deletion_state != 2
+             ORDER BY project_id, account_id",
+        )?;
+        let rows = stmt.query_map(params![generator_id, account_subject, admin_email], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
+        })?;
+        rows.map(|row| {
+            let (project_id, permissions, account_id, unique_id) = row?;
+            let access = GcloudAccessRequest { project_id, permissions: serde_json::from_str(&permissions)? };
+            access.validate()?;
+            validate_profile_account_id(&account_id)?;
+            if let Some(id) = &unique_id {
+                crate::generator::gcloud::validate_unique_id(id)?;
+            }
+            Ok((access, account_id, unique_id))
+        }).collect()
+    }
+
+    /// Record the reviewed name before calling Google. An ambiguous attempt can be
+    /// replaced only by explicitly naming it; its tombstone prevents name reuse.
+    pub(crate) fn begin_gcloud_profile(
+        &self, key: &GcloudProfileKey, account_id: &str, admin_email: &str,
+        superseded_account_id: Option<&str>,
+    ) -> Result<()> {
+        validate_profile_account_id(account_id)?;
+        validate_profile_admin_email(admin_email)?;
+        let permissions = key.permissions()?;
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(superseded) = superseded_account_id {
+            let changed = tx.execute(
+                "UPDATE gcloud_profiles SET superseded = 1
+                 WHERE generator_id = ?1 AND account_subject = ?2 AND project_id = ?3
+                     AND permissions = ?4 AND account_id = ?5 AND superseded = 0 AND phase = 0
+                     AND deletion_state = 0",
+                params![key.generator_id, key.account_subject, key.access.project_id, permissions, superseded],
+            )?;
+            if changed != 1 {
+                return Err(profile_changed());
+            }
+        }
+        tx.execute(
+            "INSERT INTO gcloud_profiles(generator_id, account_subject, project_id, permissions, account_id, admin_email)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![key.generator_id, key.account_subject, key.access.project_id, permissions, account_id, admin_email],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn record_gcloud_profile_identity(
+        &self, key: &GcloudProfileKey, account_id: &str, unique_id: &str,
+    ) -> Result<()> {
+        self.advance_gcloud_profile(key, account_id, unique_id, 0)
+    }
+
+    pub(crate) fn mark_gcloud_profile_project_bound(
+        &self, key: &GcloudProfileKey, account_id: &str, unique_id: &str,
+    ) -> Result<()> {
+        self.advance_gcloud_profile(key, account_id, unique_id, 1)
+    }
+
+    pub(crate) fn mark_gcloud_profile_token_creator_bound(
+        &self, key: &GcloudProfileKey, account_id: &str, unique_id: &str,
+    ) -> Result<()> {
+        self.advance_gcloud_profile(key, account_id, unique_id, 2)
+    }
+
+    pub(crate) fn mark_gcloud_profile_ready(
+        &self, key: &GcloudProfileKey, account_id: &str, unique_id: &str,
+    ) -> Result<()> {
+        self.advance_gcloud_profile(key, account_id, unique_id, 3)
+    }
+
+    // Every step is a compare-and-swap on the tuple and exact resource. The unique
+    // constraint also stops one immutable identity backing two different claims.
+    fn advance_gcloud_profile(
+        &self, key: &GcloudProfileKey, account_id: &str, unique_id: &str, prior: i64,
+    ) -> Result<()> {
+        crate::generator::gcloud::validate_unique_id(unique_id)?;
+        let permissions = key.permissions()?;
+        let changed = self.db().execute(
+            "UPDATE gcloud_profiles SET unique_id = ?6, phase = phase + 1
+             WHERE generator_id = ?1 AND account_subject = ?2 AND project_id = ?3
+                 AND permissions = ?4 AND account_id = ?5 AND phase = ?7 AND superseded = 0
+                 AND deletion_state = 0
+                 AND ((?7 = 0 AND unique_id IS NULL) OR unique_id = ?6)",
+            params![key.generator_id, key.account_subject, key.access.project_id, permissions, account_id, unique_id, prior],
+        )?;
+        if changed != 1 {
+            return Err(profile_changed());
+        }
         Ok(())
     }
 }
@@ -666,22 +1114,45 @@ fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!("ALTER TABLE leases ADD COLUMN {name} {definition};"))?;
         }
     }
-    // Move the old singular ceiling into the list only if both copies of its
-    // ID agree. A disagreeing row stays visible but cannot grant either ID.
-    // Keep its original fields for diagnosis; leave revisions and leases intact.
+    // Atomically keep in-progress deletions in the uniqueness constraint while
+    // allowing a completed tombstone and a new account to share reviewed claims.
+    let has_deletion_state = |db: &Connection| -> rusqlite::Result<bool> {
+        db.prepare("SELECT 1 FROM pragma_table_info('gcloud_profiles') WHERE name = 'deletion_state'")?
+            .exists([])
+    };
+    if !has_deletion_state(conn)? {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        if !has_deletion_state(&tx)? {
+            tx.execute_batch(
+                "ALTER TABLE gcloud_profiles ADD COLUMN deletion_state INTEGER NOT NULL DEFAULT 0
+                    CHECK (deletion_state IN (0, 1, 2))
+                    CHECK (deletion_state = 0 OR (unique_id IS NOT NULL AND superseded = 0));
+                 DROP INDEX gcloud_profiles_current;
+                 CREATE UNIQUE INDEX gcloud_profiles_current
+                     ON gcloud_profiles(generator_id, account_subject, project_id, permissions)
+                     WHERE superseded = 0 AND deletion_state != 2;",
+            )?;
+            tx.execute_batch(&format!(
+                "CREATE INDEX leases_gcloud_uid ON leases (({GCLOUD_LEASE_UID}))
+                 WHERE source_kind = 'generator';",
+            ))?;
+        }
+        tx.commit()?;
+    }
+    // A former one-installation config already records both copies of the ID.
+    // Migrate only matching IDs; leave invalid rows unreadable rather than
+    // granting authority to either ID. Do not touch revisions or leases.
     conn.execute_batch(
         "UPDATE generators
-         SET config = CASE WHEN (config -> '$.installation_id') = (config -> '$.ceiling.installation_id')
-             THEN json_remove(
-                 json_set(config, '$.installations', json_array(json_extract(config, '$.ceiling'))),
-                 '$.installation_id', '$.ceiling')
-             ELSE json_set(config, '$.installations', json_array())
-         END
+         SET config = json_remove(
+             json_set(config, '$.installations', json_array(json_extract(config, '$.ceiling'))),
+             '$.installation_id', '$.ceiling')
          WHERE CASE WHEN json_valid(config) THEN
              json_extract(config, '$.type') = 'github_app'
              AND json_type(config, '$.installations') IS NULL
              AND json_type(config, '$.installation_id') = 'integer'
              AND json_type(config, '$.ceiling.installation_id') = 'integer'
+             AND (config -> '$.installation_id') = (config -> '$.ceiling.installation_id')
          ELSE 0 END;",
     )?;
     Ok(())
@@ -1130,13 +1601,16 @@ impl Store {
 
     pub fn insert_lease(&self, l: &LeaseRecord) -> Result<()> {
         validate_lease_generation(l)?;
-        self.db().execute(
+        let inserted = self.db().execute(
             "INSERT INTO leases(id, host_id, vault_id, vault_name, secret_key, name, mode, fields, hosts,
                                 reason, agent, created_at, expires_at, revoked_at, source_kind, generation,
                                 generator_revision, credential_expires_at, approval_order, credential_version,
                                 requested_generation)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                    ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                    ?15, ?16, ?17, ?18, ?19, ?20, ?21
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM gcloud_profiles WHERE unique_id = ?22 AND deletion_state != 0
+             )",
             params![
                 l.id,
                 l.host_id,
@@ -1159,8 +1633,12 @@ impl Store {
                 l.approval_order.map(|n| sqlite_u64(n, "generator approval order")).transpose()?,
                 sqlite_u64(l.credential_version, "credential version")?,
                 l.requested_generation.as_ref().map(serde_json::to_string).transpose()?,
+                issued_gcloud_uid(l.generation.as_ref()),
             ],
         )?;
+        if inserted != 1 {
+            return Err(CoreError::vault_unavailable("Google service account is retired"));
+        }
         Ok(())
     }
 
@@ -1308,6 +1786,11 @@ impl Store {
         }
         if lease.revoked_at.is_some() {
             return Err(CoreError::invalid("lease is revoked"));
+        }
+        if let Some(uid) = issued_gcloud_uid(lease.generation.as_ref())
+            && Self::gcloud_account_is_retired_with(&tx, uid)?
+        {
+            return Err(CoreError::vault_unavailable("Google service account is retired"));
         }
         if expected_version != lease.credential_version {
             return Err(CoreError::invalid("credential version changed"));
@@ -1471,6 +1954,10 @@ impl Store {
 }
 
 #[cfg(test)]
+#[path = "store_gcloud_profiles_tests.rs"]
+mod gcloud_profile_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use asm_proto::generators::{
@@ -1554,9 +2041,8 @@ mod tests {
         let mut lease = generated_lease("generated");
         lease.generator_revision = Some(17);
         lease.credential_version = 4;
-        if let Some(GenerationRequest::GithubApp(scope)) = &mut lease.requested_generation {
-            scope.permissions = None; // Legacy encoding, prior to the metadata-only default.
-        }
+        let Some(GenerationRequest::GithubApp(scope)) = &mut lease.requested_generation else { unreachable!() };
+        scope.permissions = None; // Legacy encoding, prior to the metadata-only default.
         let legacy = serde_json::json!({
             "type": "github_app",
             "client_id": "Iv1.fixture",
@@ -1595,7 +2081,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_keeps_disagreeing_installation_ids_unavailable_without_blocking_other_generators() {
+    fn migration_never_repairs_a_disagreeing_installation_id() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("asm.db");
         let legacy = serde_json::json!({
@@ -1609,27 +2095,9 @@ mod tests {
             store.db().execute(
                 "INSERT INTO generators VALUES ('bad', 'release-bot', ?1, 1, 1)", [&legacy],
             ).unwrap();
-            store.upsert_generator(&generator("good", "review-bot", 0)).unwrap();
         }
         let store = Store::open(&path).unwrap();
-        let bad = store.get_generator("bad").unwrap().unwrap();
-        assert!(bad.config.ceilings().next().is_none());
-        assert!(bad.config.validate().is_err());
-        let persisted: String = store.db().query_row(
-            "SELECT config FROM generators WHERE id = 'bad'", [], |row| row.get(0),
-        ).unwrap();
-        let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
-        assert_eq!(persisted["installation_id"], 43);
-        assert_eq!(persisted["ceiling"], serde_json::json!(github_grant()));
-        let registry = crate::generator::GeneratorRegistry::new();
-        let mut looked_up = Vec::new();
-        registry.load_with(store.list_generators().unwrap(), |id, _| {
-            looked_up.push(id.to_owned());
-            Ok(None)
-        });
-        assert_eq!(looked_up, ["good"]);
-        let bad = registry.get("bad").unwrap();
-        assert!(bad.client().err().unwrap().message.contains("select at least one"));
+        assert!(store.get_generator("bad").is_err());
     }
 
     #[test]
@@ -1637,7 +2105,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("asm.db")).unwrap();
         let mut record = generator("multi", "multi-bot", 0);
-        let GeneratorConfig::GithubApp(config) = &mut record.config;
+        let GeneratorConfig::GithubApp(config) = &mut record.config else { unreachable!() };
         let mut second = github_grant();
         second.installation_id = 43;
         second.repositories[0].id = 9;
@@ -1647,7 +2115,7 @@ mod tests {
         store.upsert_generator(&record).unwrap();
         assert_eq!(store.get_generator("multi").unwrap().unwrap().config.ceilings().count(), 2);
         assert_eq!(store.get_generator("multi").unwrap(), Some(record.clone()));
-        let GeneratorConfig::GithubApp(config) = &mut record.config;
+        let GeneratorConfig::GithubApp(config) = &mut record.config else { unreachable!() };
         config.installations.push(second);
         assert!(store.upsert_generator(&record).is_err());
     }
@@ -1666,7 +2134,7 @@ mod tests {
         let mut edited = first;
         edited.name = "renamed".into();
         edited.revision = 2;
-        let GeneratorConfig::GithubApp(config) = &mut edited.config;
+        let GeneratorConfig::GithubApp(config) = &mut edited.config else { unreachable!() };
         config.client_id = "Iv1.updated".into();
         s.upsert_generator(&edited).unwrap();
         assert_eq!(s.get_generator("a").unwrap(), Some(edited.clone()));
@@ -1791,6 +2259,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("asm.db");
         let mut lease = generated_lease("generated");
+        // The host's original repository name is provenance, not the approved
+        // installation and repository IDs used on renewal.
+        let Some(GenerationRequest::GithubApp(request)) = &mut lease.requested_generation else { unreachable!() };
+        request.repositories = Some(vec!["acme/other".into()]);
         {
             let s = Store::open(&path).unwrap();
             lease.approval_order = Some(s.reserve_generator_approval_order().unwrap());
@@ -1894,6 +2366,7 @@ mod tests {
             "requested_generation = 'not json'",
             "requested_generation = '{\"provider\":\"github_app\",\"scope\":{\"repositories\":[]}}'",
             "requested_generation = '{\"provider\":\"github_app\",\"scope\":{\"repositories\":[\"Acme/Web\"]}}'",
+            "requested_generation = '{\"provider\":\"gcloud\",\"scope\":{}}'",
             "expires_at = created_at",
         ];
         for assignment in assignments {

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use asm_core::ffi::{RequestDetail, VaultConfig, VaultDraft};
 use asm_core::settings as keys;
 use asm_core::{Decision, Manager, ManagerObserver, StartOptions};
-use asm_core::generator::{GeneratorConfig, GithubAppConfig, GithubAppGenerator};
+use asm_core::generator::{GeneratorClient, GeneratorConfig, GithubAppConfig, GithubAppGenerator};
 use asm_core::store::GeneratorRecord;
 use asm_proto::generators::{
     GenerationGrant, GenerationSelection, GithubGrant, GithubPermission, GithubRepository,
@@ -1295,7 +1295,7 @@ impl GithubFixture {
                 config: GeneratorConfig::GithubApp(self.config.clone()),
                 revision: 1, position: self.config.installations[0].installation_id as i64,
             },
-            Arc::new(generator),
+            Arc::new(GeneratorClient::GithubApp(generator)),
         ).unwrap();
     }
 
@@ -1336,16 +1336,36 @@ impl GeneratedApprover {
                     .or_else(|| (generator_choices.len() == 1).then(|| &generator_choices[0]))
                     .expect("offered source is selectable");
                 assert!(selected.choice.available);
-                let asm_core::ffi::GenerationGrant::GithubApp { scope } = &selected.choice.ceiling;
-                let mut grant = approved_grant(scope.installation_id);
-                if scope.installation_id == 93 {
-                    grant.repositories = vec![repository(505, "other-org/platform")];
-                    grant.permissions.retain(|key, _| key == "metadata");
-                }
+                let grant = match &selected.choice.ceiling {
+                    asm_core::ffi::GenerationGrant::GithubApp { scope } if scope.repositories.iter().any(|r| r.id == 505) =>
+                        GenerationGrant::GithubApp(GithubGrant {
+                            installation_id: scope.installation_id, repositories: vec![repository(505, "other-org/platform")],
+                            permissions: BTreeMap::from([("metadata".into(), GithubPermission::Read)]),
+                        }),
+                    asm_core::ffi::GenerationGrant::GithubApp { scope } =>
+                        GenerationGrant::GithubApp(approved_grant(scope.installation_id)),
+                    asm_core::ffi::GenerationGrant::Gcloud { scope } =>
+                        GenerationGrant::Gcloud(asm_proto::generators::GcloudGrant {
+                            service_account_unique_id: scope.service_account_unique_id.clone(),
+                            service_account_email: scope.service_account_email.clone(),
+                            scopes: vec![gcloud::READ_SCOPE.into()],
+                            project_id: Some(selected.default_project_id.clone().expect("Google candidate has a saved default project")),
+                        }),
+                    asm_core::ffi::GenerationGrant::GcloudAccess {
+                        grant: asm_core::ffi::GcloudAccessGrant::Requested { access },
+                    } => {
+                        assert!(selected.gcloud_ready.is_some(), "provision profiles separately from lease approval");
+                        GenerationGrant::GcloudAccess(asm_proto::generators::GcloudAccessGrant::Requested {
+                            access: access.clone().into(),
+                        })
+                    }
+                    asm_core::ffi::GenerationGrant::GcloudAccess { .. } =>
+                        panic!("managed approval requires the exact request selector"),
+                };
                 Some(GenerationSelection {
                     generator_id: selected.choice.generator_id.clone(),
                     generator_revision: selected.choice.revision,
-                    grant: GenerationGrant::GithubApp(grant),
+                    grant,
                 }.into())
             };
             let mode = if *sentinel_required {
@@ -1478,6 +1498,33 @@ impl asm_core::vault::VaultProvider for LoginFixture {
     }
 }
 
+fn generated_manager(tmp: &Path, ports: &[u16], bin_dir: PathBuf) -> (Arc<GeneratedApprover>, ShutdownManager) {
+    let approver = Arc::new(GeneratedApprover {
+        manager: OnceLock::new(), busy: Mutex::new(()),
+        details: Mutex::new(Vec::new()), errors: Mutex::new(Vec::new()),
+    });
+    let manager = Manager::start_with(
+        tmp.join("data"), bin_dir, Arc::new(GeneratedObserver(approver.clone())),
+        StartOptions {
+            values_root: Some(tmp.join("values")),
+            settings: vec![
+                (keys::API_BIND.into(), json!("127.0.0.1")), (keys::API_PORT.into(), json!(0)),
+                (keys::PROXY_BIND.into(), json!("127.0.0.1")),
+                (keys::PROXY_PORT.into(), json!(ports[0])),
+                (keys::PROXY_HTTP_PORT.into(), json!(ports[1])),
+                (keys::PROXY_HTTPS_PORT.into(), json!(ports[2])),
+                (keys::PROXY_MGMT_PORT.into(), json!(ports[3])),
+                (keys::PROXY_METRICS_PORT.into(), json!(ports[4])),
+                (keys::PROXY_UPSTREAM_DENY_CIDRS.into(), json!(["192.0.2.0/24"])),
+                (keys::PROXY_ALLOW_PLAIN_HTTP.into(), json!(true)),
+                (keys::PROXY_HINTS.into(), json!(["127.0.0.1"])),
+            ],
+        },
+    ).expect("start isolated manager");
+    approver.manager.set(manager.clone()).ok().unwrap();
+    (approver, ShutdownManager(manager))
+}
+
 #[test]
 fn generated_github_lease_end_to_end() {
     let bin_dir = workspace().join("dist/bin");
@@ -1508,32 +1555,8 @@ fn generated_github_lease_end_to_end() {
     let approved_url = upstream.url("/repos/acme/web");
     let outside_url = upstream.url("/repos/acme/private");
     let ports = free_ports(5);
-    let approver = Arc::new(GeneratedApprover {
-        manager: OnceLock::new(), busy: Mutex::new(()),
-        details: Mutex::new(Vec::new()), errors: Mutex::new(Vec::new()),
-    });
-    let manager = Manager::start_with(
-        tmp.path().join("data"), bin_dir,
-        Arc::new(GeneratedObserver(approver.clone())),
-        StartOptions {
-            values_root: Some(tmp.path().join("values")),
-            settings: vec![
-                (keys::API_BIND.into(), json!("127.0.0.1")),
-                (keys::API_PORT.into(), json!(0)),
-                (keys::PROXY_BIND.into(), json!("127.0.0.1")),
-                (keys::PROXY_PORT.into(), json!(ports[0])),
-                (keys::PROXY_HTTP_PORT.into(), json!(ports[1])),
-                (keys::PROXY_HTTPS_PORT.into(), json!(ports[2])),
-                (keys::PROXY_MGMT_PORT.into(), json!(ports[3])),
-                (keys::PROXY_METRICS_PORT.into(), json!(ports[4])),
-                (keys::PROXY_UPSTREAM_DENY_CIDRS.into(), json!(["192.0.2.0/24"])),
-                (keys::PROXY_ALLOW_PLAIN_HTTP.into(), json!(true)),
-                (keys::PROXY_HINTS.into(), json!(["127.0.0.1"])),
-            ],
-        },
-    ).expect("start isolated manager");
-    let _shutdown = ShutdownManager(manager.clone());
-    approver.manager.set(manager.clone()).ok().unwrap();
+    let (approver, _shutdown) = generated_manager(tmp.path(), &ports, bin_dir);
+    let manager = _shutdown.0.clone();
     release.install(&manager, "00000000-0000-4000-8000-000000000041", "release-bot");
     review.install(&manager, "00000000-0000-4000-8000-000000000084", "review-bot");
     wait_healthy(&manager);
@@ -1585,9 +1608,17 @@ fn generated_github_lease_end_to_end() {
     assert_eq!(approver.count(), 1);
     {
         let details = approver.details.lock().unwrap();
-        let RequestDetail::Get { generator_choices, requested_generation, .. } = &details[0]
+        let RequestDetail::Get { generator_choices, requested_generation, operator_selected_grant, .. } = &details[0]
             else { panic!("generated approval detail expected") };
+        assert!(*operator_selected_grant);
         assert_eq!(generator_choices.len(), 2, "the approval must offer both identities");
+        for candidate in generator_choices {
+            let asm_core::ffi::GenerationGrant::GithubApp { scope } = &candidate.choice.ceiling
+                else { panic!("GitHub ceiling expected") };
+            assert_eq!(scope.repositories.len(), 2, "the approval must show the installation ceiling");
+            assert!(scope.permissions.iter().any(|permission|
+                permission.name == "contents" && permission.level == asm_core::ffi::GithubPermission::Write));
+        }
         let Some(asm_core::ffi::GenerationRequest::GithubApp { scope }) = requested_generation
             else { panic!("requested GitHub scope expected") };
         assert_eq!(scope.repositories.as_deref(), Some(["acme/web".to_owned()].as_slice()));
@@ -1886,12 +1917,16 @@ printf 'structured-child-ok\n'"#;
     assert!(!exec_env.secrets.exists());
     assert!(approver.errors.lock().unwrap().is_empty(), "an approval failed");
     let approvals = approver.count();
-    let split = exec_env.run(&[
-        "exec", "--repositories", "acme/web,other-org/platform", "GH_TOKEN", "--", "/bin/sh", "-c", "printf should-not-launch",
-    ], None);
-    assert_ne!(split.code, 0);
-    assert!(split.stdout.is_empty() && split.stderr.to_ascii_lowercase().contains("split"), "{}", split.stderr);
-    assert_eq!(approver.count(), approvals, "mixed installations must fail before approval");
+    let split = json_get(&env, &[
+        "--repositories", "acme/web,other-org/platform",
+        "GH_TOKEN", "Choose one installation for the related repositories",
+    ]);
+    assert_eq!(approver.count(), approvals + 1, "mixed installations need an explicit decision");
+    assert_eq!(split["generation"]["grant"]["scope"]["installation_id"], 84);
+    assert_eq!(split["generation"]["grant"]["scope"]["repositories"],
+        json!([{"id":202,"full_name":"acme/web"}]));
+    assert_eq!(split["generation"]["grant"]["scope"]["permissions"],
+        json!({"contents":"read","metadata":"read"}));
     let org = json_get(&env, &["--repositories", "other-org/platform", "GH_TOKEN", "Inspect platform metadata"]);
     assert_eq!(org["generator_name"], "release-bot");
     assert_eq!(org["generation"]["grant"]["scope"]["installation_id"], 93);
@@ -1929,3 +1964,6 @@ printf 'structured-child-ok\n'"#;
     assert!(review.was_revoked(&review.token(review.count() - 1)),
         "shutdown revokes the final sentinel credential");
 }
+
+#[path = "e2e/gcloud.rs"]
+mod gcloud;

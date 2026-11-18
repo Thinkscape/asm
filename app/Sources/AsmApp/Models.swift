@@ -93,11 +93,15 @@ struct GetDetail: Equatable, Sendable {
     /// Offered but not pre-filled.
     var suggestedHosts: [HostPatternCheckItem]
     var defaultDurationSecs: UInt64?
-    var isGenerated: Bool
+    var isGenerated: Bool = false
     var generatorChoices: [GeneratorApprovalChoiceItem] = []
     var requestedGeneration: GenerationRequestItem?
     var sentinelRequired: Bool = false
     var hasSubstitutableFields: Bool = true
+    /// The paired client negotiated accepting an explicitly operator-selected generated grant.
+    var operatorSelectedGrant: Bool = false
+    /// The paired client accepts a managed Google grant for a project other than the one it requested.
+    var operatorSelectedGcloudProject: Bool = false
 }
 
 struct PendingItem: Identifiable, Equatable, Sendable {
@@ -165,11 +169,16 @@ struct GithubPermissionItem: Identifiable, Hashable, Sendable {
     }
 
     var allowedLevels: [GithubPermissionLevel] {
-        if name == "metadata" { return [.read] }
-        if name == "workflows" || name == "profile" {
-            return level >= .write ? [.write] : []
+        GithubPermissionLevel.allCases.filter(permits)
+    }
+
+    func permits(_ candidate: GithubPermissionLevel) -> Bool {
+        guard candidate <= level else { return false }
+        return switch name {
+        case "metadata": candidate == .read
+        case "workflows", "profile": candidate == .write
+        default: true
         }
-        return GithubPermissionLevel.allCases.filter { $0 <= level }
     }
 
     private static let accountPermissions: Set<String> = [
@@ -194,6 +203,45 @@ struct GithubRepositoryItem: Identifiable, Hashable, Sendable {
     var fullName: String
 }
 
+/// Resolve requested names only when a single immutable repository ID matches.
+struct GithubRequestedRepositories {
+    struct Unavailable: Identifiable {
+        var id: String { name }
+        let name: String
+        let ambiguous: Bool
+    }
+
+    private(set) var matchedIDs: Set<UInt64> = []
+    private(set) var ambiguousIDs: Set<UInt64> = []
+    private(set) var unavailable: [Unavailable] = []
+
+    init(_ requested: [String], in repositories: [GithubRepositoryItem]) {
+        guard !requested.isEmpty else { return }
+        let names = Set(requested.lazy.map { $0.lowercased() })
+        var matches: [String: UInt64] = [:]
+        var ambiguousNames: Set<String> = []
+        for repository in repositories {
+            let name = repository.fullName.lowercased()
+            guard names.contains(name) else { continue }
+            if let previous = matches.updateValue(repository.id, forKey: name) {
+                ambiguousNames.insert(name)
+                ambiguousIDs.insert(previous)
+                ambiguousIDs.insert(repository.id)
+            }
+        }
+        for requestedName in requested {
+            let name = requestedName.lowercased()
+            if ambiguousNames.contains(name) {
+                unavailable.append(Unavailable(name: requestedName, ambiguous: true))
+            } else if let id = matches[name] {
+                matchedIDs.insert(id)
+            } else {
+                unavailable.append(Unavailable(name: requestedName, ambiguous: false))
+            }
+        }
+    }
+}
+
 struct GithubScopeRequestItem: Equatable, Sendable {
     var repositories: [String]?
     var permissions: [GithubPermissionItem]?
@@ -205,30 +253,126 @@ struct GithubScopeRequestItem: Equatable, Sendable {
     }
 }
 
-enum GenerationRequestItem: Equatable, Sendable {
-    case githubApp(GithubScopeRequestItem)
+struct GcloudScopeRequestItem: Equatable, Sendable {
+    var scopes: [String]?
+}
 
-    var github: GithubScopeRequestItem {
-        switch self { case let .githubApp(scope): scope }
+enum GcloudPermissionItem: CaseIterable, Hashable, Sendable {
+    case storageRead
+    case storageCreate
+    case computeRead
+    case runRead
+    case logsRead
+    case bigqueryMetadataRead
+
+    var claim: String { CoreBridge.gcloudPermissionDetails(self).claim }
+    var role: String { CoreBridge.gcloudPermissionDetails(self).role }
+    var scope: String { CoreBridge.gcloudPermissionDetails(self).scope }
+
+    var approvalTitle: LocalizedStringResource {
+        switch self {
+        case .storageRead: "Read Cloud Storage objects"
+        case .storageCreate: "Create Cloud Storage objects"
+        case .computeRead: "Read Compute Engine resources"
+        case .runRead: "Read Cloud Run resources"
+        case .logsRead: "Read Cloud Logging entries"
+        case .bigqueryMetadataRead: "Read BigQuery metadata"
+        }
     }
 }
 
-struct GithubGrantItem: Identifiable, Equatable, Sendable {
-    static let repositoryLimit = 500
+struct GcloudAccessRequestItem: Equatable, Sendable {
+    let projectID: String
+    var permissions: [GcloudPermissionItem]
 
+    /// Use the reviewed project and retain protocol enum order when editing permissions.
+    func selecting(projectID: String, permissions selection: Set<GcloudPermissionItem>) -> Self {
+        Self(projectID: projectID, permissions: GcloudPermissionItem.allCases.filter(selection.contains))
+    }
+
+    func unmetClaims(_ request: Self) -> [String] {
+        request.permissions.filter { !permissions.contains($0) }.map {
+            String(localized: "Permission not selected: \($0.claim)")
+        }
+    }
+
+    func addedClaims(_ request: Self) -> [String] {
+        permissions.filter { !request.permissions.contains($0) }.map {
+            String(localized: "Additional permission: \($0.claim)")
+        }
+    }
+}
+
+enum GenerationRequestItem: Equatable, Sendable {
+    case githubApp(GithubScopeRequestItem)
+    case gcloud(GcloudScopeRequestItem)
+    case gcloudAccess(GcloudAccessRequestItem)
+}
+
+struct GithubGrantItem: Identifiable, Equatable, Sendable {
     var id: UInt64 { installationID }
     var installationID: UInt64
     var repositories: [GithubRepositoryItem]
     var permissions: [GithubPermissionItem]
 
-    // Saved grants carry canonical repository names, not the account from discovery.
-    // Only describe an owner when those names agree.
+    // Persisted ceilings carry canonical GitHub repository names, not the login
+    // from discovery. Only describe an owner when those names agree.
     var repositoryOwner: String? {
         guard let first = repositories.first?.fullName.prefix(while: { $0 != "/" }),
               !first.isEmpty else { return nil }
         let owner = first.lowercased()
         guard repositories.allSatisfy({ $0.fullName.prefix(while: { $0 != "/" }).lowercased() == owner }) else {
             return nil
+        }
+        return String(first)
+    }
+
+    func exactlyMatches(_ request: GithubScopeRequestItem) -> Bool {
+        guard let requested = request.repositories, !requested.isEmpty else { return false }
+        let match = GithubRequestedRepositories(requested, in: repositories)
+        guard match.unavailable.isEmpty, match.matchedIDs.count == repositories.count else { return false }
+        return Set(request.effectivePermissions) == Set(permissions)
+    }
+
+    func unmetClaims(_ request: GithubScopeRequestItem?) -> [String] {
+        guard let request else { return [] }
+        let match = GithubRequestedRepositories(request.repositories ?? [], in: repositories)
+        var issues = match.unavailable.map { repository in
+            repository.ambiguous
+                ? String(localized: "Requested repository name is ambiguous: \(repository.name)")
+                : String(localized: "Repository not selected: \(repository.name)")
+        }
+        let levels = Dictionary(permissions.map { ($0.name, $0.level) }, uniquingKeysWith: { first, _ in first })
+        for permission in request.permissions ?? [] where permission.name != "metadata" {
+            let level = levels[permission.name]
+            if let level, level < permission.level {
+                issues.append(String(localized: "\(permission.name): \(level.rawValue) selected instead of requested \(permission.level.rawValue)"))
+            } else if level == nil {
+                issues.append(String(localized: "Permission not selected: \(permission.name): \(permission.level.rawValue)"))
+            }
+        }
+        return issues
+    }
+
+    func addedClaims(_ request: GithubScopeRequestItem?, within ceiling: GithubGrantItem? = nil) -> [String] {
+        guard let request else { return [] }
+        let match = GithubRequestedRepositories(request.repositories ?? [], in: ceiling?.repositories ?? repositories)
+        var issues = repositories.filter { !match.matchedIDs.contains($0.id) }.map { repository in
+            if match.ambiguousIDs.contains(repository.id) {
+                return String(localized: "Additional repository: \(repository.fullName) · ID \(String(repository.id))")
+            }
+            return String(localized: "Additional repository: \(repository.fullName)")
+        }
+        // An explicit request with no permission flags asks only for mandatory metadata:read.
+        let levels = Dictionary((request.permissions ?? []).map { ($0.name, $0.level) }, uniquingKeysWith: { first, _ in first })
+        for permission in permissions where permission.name != "metadata" {
+            if let level = levels[permission.name] {
+                if level < permission.level {
+                    issues.append(String(localized: "\(permission.name): \(permission.level.rawValue) selected instead of requested \(level.rawValue)"))
+                }
+            } else {
+                issues.append(String(localized: "Additional permission: \(permission.name): \(permission.level.rawValue)"))
+            }
         }
         return String(first)
     }
@@ -241,12 +385,23 @@ struct GithubGrantItem: Identifiable, Equatable, Sendable {
     }
 }
 
+struct GcloudGrantItem: Equatable, Sendable {
+    var serviceAccountUniqueID: String
+    var serviceAccountEmail: String
+    var scopes: [String]
+    var projectID: String? = nil
+}
+
+enum GcloudAccessGrantItem: Equatable, Sendable {
+    case connection
+    case requested(access: GcloudAccessRequestItem)
+    case issued(access: GcloudAccessRequestItem, serviceAccountUniqueID: String, serviceAccountEmail: String)
+}
+
 enum GenerationGrantItem: Equatable, Sendable {
     case githubApp(GithubGrantItem)
-
-    var github: GithubGrantItem {
-        switch self { case let .githubApp(grant): grant }
-    }
+    case gcloud(GcloudGrantItem)
+    case gcloudAccess(GcloudAccessGrantItem)
 }
 
 struct GenerationChoiceItem: Identifiable, Equatable, Sendable {
@@ -261,13 +416,22 @@ struct GenerationChoiceItem: Identifiable, Equatable, Sendable {
 struct GeneratorApprovalChoiceItem: Identifiable, Equatable, Sendable {
     struct ID: Hashable, Sendable {
         var generatorID: String
-        var installationID: UInt64
+        var installationID: UInt64?
     }
 
-    var id: ID { ID(generatorID: choice.id, installationID: choice.ceiling.github.installationID) }
+    var id: ID {
+        let installationID: UInt64? = switch choice.ceiling {
+        case let .githubApp(grant): grant.installationID
+        case .gcloud, .gcloudAccess: nil
+        }
+        return ID(generatorID: choice.id, installationID: installationID)
+    }
     var choice: GenerationChoiceItem
     var suggestedHosts: [HostPatternCheckItem]
     var scopeIssues: [String]
+    var scopeCatalog: [GcloudScopeOptionItem] = []
+    var defaultProjectID: String? = nil
+    var gcloudReady: GcloudAccessGrantItem? = nil
 }
 
 struct GenerationSelectionItem: Equatable, Sendable {
@@ -281,11 +445,54 @@ struct GithubAppConfigItem: Equatable, Sendable {
     var installations: [GithubGrantItem]
 }
 
+struct GcloudServiceItem: Identifiable, Hashable, Sendable {
+    var id: String { name }
+    var name: String
+    var title: String
+    var enabled: Bool
+}
+
+struct GcloudScopeOptionItem: Identifiable, Hashable, Sendable {
+    var id: String { uri }
+    var uri: String
+    var description: String
+    var services: [GcloudServiceItem]
+}
+
+struct GcloudConfigItem: Equatable, Sendable {
+    var sdkPath: String
+    var accountSubject: String
+    var accountEmail: String
+    var projectID: String
+    var projectNumber: String
+    var ceiling: GcloudGrantItem
+    var scopeCatalog: [GcloudScopeOptionItem]
+}
+
+struct GcloudConnectionConfigItem: Equatable, Sendable {
+    var sdkPath: String
+    var accountSubject: String
+    var accountEmail: String
+}
+
 enum GeneratorConfigItem: Equatable, Sendable {
     case githubApp(GithubAppConfigItem)
+    case gcloud(GcloudConfigItem)
+    case gcloudConnection(GcloudConnectionConfigItem)
 
-    var github: GithubAppConfigItem {
-        switch self { case let .githubApp(config): config }
+    var providerName: String {
+        switch self {
+        case .githubApp: "GitHub App"
+        case .gcloud: "Google Cloud (legacy)"
+        case .gcloudConnection: "Google Cloud"
+        }
+    }
+
+    var outputName: String {
+        switch self {
+        case .githubApp: "GH_TOKEN"
+        case .gcloud, .gcloudConnection: "CLOUDSDK_AUTH_ACCESS_TOKEN"
+        }
     }
 }
 
@@ -298,11 +505,17 @@ struct GeneratorItem: Identifiable, Equatable, Sendable {
     var warning: String?
 }
 
+enum GeneratorCredentialsItem: Sendable {
+    case keep
+    case githubPrivateKey(pem: String)
+    case gcloudSession(sessionID: String)
+}
+
 struct GeneratorDraftItem: Sendable {
     var id: String?
     var name: String
     var config: GeneratorConfigItem
-    var privateKeyPEM: String
+    var credentials: GeneratorCredentialsItem
 }
 
 struct GithubInstallationItem: Equatable, Sendable {
@@ -319,6 +532,73 @@ struct GithubInstallationAccountItem: Identifiable, Equatable, Sendable {
     var account: String
 }
 
+struct GcloudSdkItem: Equatable, Sendable {
+    var path: String
+    var version: String
+}
+
+struct GcloudIdentityItem: Equatable, Sendable {
+    var subject: String
+    var email: String
+}
+
+struct GcloudProfilePlanItem: Equatable, Sendable {
+    var planID: String?
+    var ready: Bool
+    var projectID: String
+    var serviceAccountName: String
+    var serviceAccountEmail: String
+    var serviceAccountUniqueID: String?
+    var serviceAccountRole: String
+    var projectRoles: [String]
+    var scopes: [String]
+    var adminPrincipal: String
+    var messages: [String]
+}
+
+enum GcloudOwnedAccountStateItem: Equatable, Sendable {
+    case creating, created, projectBound, tokenCreatorBound, ready, deletionPending, deleted
+
+    var label: String {
+        switch self {
+        case .creating: String(localized: "Creation unverified")
+        case .created: String(localized: "Created")
+        case .projectBound: String(localized: "Project access granted")
+        case .tokenCreatorBound: String(localized: "Impersonation granted")
+        case .ready: String(localized: "Ready")
+        case .deletionPending: String(localized: "Deletion pending")
+        case .deleted: String(localized: "Deleted")
+        }
+    }
+}
+
+struct GcloudOwnedAccountLeaseItem: Identifiable, Equatable, Sendable {
+    let id: String
+    let hostLabel: String
+    let agentLabel: String
+    let status: LeaseStatus
+    let deadline: Date?
+}
+
+struct GcloudOwnedAccountItem: Identifiable, Equatable, Sendable {
+    let id: Int64
+    let generatorID: String
+    let generatorName: String?
+    let generatorRevision: UInt64?
+    let generatorStatus: VaultState?
+    let projectID: String
+    let accountName: String
+    let accountEmail: String
+    let accountUniqueID: String?
+    let operatorEmail: String
+    let permissions: [GcloudPermissionItem]
+    let state: GcloudOwnedAccountStateItem
+    let superseded: Bool
+    let deletable: Bool
+    let blockingReason: String?
+    let leases: [GcloudOwnedAccountLeaseItem]
+}
+
 /// Repository IDs, not editable display names, are the authority in a selected scope.
 struct GithubClaimsSelection: Equatable {
     var repositoryIDs: Set<UInt64> = []
@@ -329,6 +609,19 @@ struct GithubClaimsSelection: Equatable {
     init(ceiling: GithubGrantItem) {
         repositoryIDs = Set(ceiling.repositories.map(\.id))
         permissions = Dictionary(uniqueKeysWithValues: ceiling.permissions.map { ($0.name, $0.level) })
+    }
+
+    static func requested(_ request: GithubScopeRequestItem?, within ceiling: GithubGrantItem) -> Self {
+        var selection = Self()
+        guard let request else { return selection }
+        selection.repositoryIDs = GithubRequestedRepositories(request.repositories ?? [], in: ceiling.repositories).matchedIDs
+        let levels = Dictionary((request.permissions ?? []).map { ($0.name, $0.level) }, uniquingKeysWith: { first, _ in first })
+        for permission in ceiling.permissions where permission.name != "metadata" {
+            if let level = levels[permission.name], permission.permits(level) {
+                selection.permissions[permission.name] = level
+            }
+        }
+        return selection
     }
 
     subscript(repository id: UInt64) -> Bool {
@@ -343,7 +636,7 @@ struct GithubClaimsSelection: Equatable {
             installationID: ceiling.installationID,
             repositories: ceiling.repositories.filter { repositoryIDs.contains($0.id) },
             permissions: ceiling.permissions.compactMap { permission in
-                guard let level = permissions[permission.name], level <= permission.level else { return nil }
+                guard let level = permissions[permission.name], permission.permits(level) else { return nil }
                 return GithubPermissionItem(name: permission.name, level: level)
             }
         )

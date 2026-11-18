@@ -28,6 +28,9 @@ pub(crate) mod catalog;
 pub mod api;
 pub mod firewall;
 pub mod generation;
+pub(crate) mod gcloud;
+mod gcloud_ledger;
+pub(crate) mod gcloud_profiles;
 pub mod netinfo;
 pub mod pairing;
 pub mod requests;
@@ -39,6 +42,7 @@ pub const TOPIC_LEASES: &str = "leases";
 pub const TOPIC_HOSTS: &str = "hosts";
 pub const TOPIC_VAULTS: &str = "vaults";
 pub const TOPIC_GENERATORS: &str = "generators";
+pub const TOPIC_GCLOUD_ACCOUNTS: &str = "gcloud_accounts";
 pub const TOPIC_PROXY: &str = "proxy";
 pub const TOPIC_FIREWALL: &str = "firewall";
 pub const TOPIC_SETTINGS: &str = "settings";
@@ -91,6 +95,8 @@ pub struct ProxyState {
     pub dirty: bool,
     /// Resume transitions await successful publication and are audited after locks.
     pending_resumed: BTreeMap<String, LeaseRecord>,
+    /// Journal rows whose prior sentinel cutover still needs publication in this process.
+    account_cutovers: HashSet<i64>,
 }
 
 impl ProxyState {
@@ -120,6 +126,8 @@ pub struct Core {
     /// Generation authority linearization; never held during provider calls.
     pub(crate) authorization: Mutex<()>,
     pub(crate) generation: Mutex<generation::GenerationState>,
+    pub(crate) gcloud: gcloud::GcloudSetup,
+    gcloud_profiles: gcloud_profiles::GcloudProfiles,
     pub proxy: Arc<ProxySupervisor>,
     pub cert: ServerCert,
     pub settings: RwLock<Settings>,
@@ -274,6 +282,7 @@ impl Core {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dirs = DataDirs::create(&data_dir, options.values_root.as_deref())?;
         let instance_lock = lock_data_dir(&dirs.data)?;
+        let gcloud = gcloud::GcloudSetup::new(dirs.gcloud.clone())?;
         let store = Arc::new(Store::open(&dirs.db())?);
         let activity = activity::ActivityLog::start(store.clone(), observer.clone());
         Settings::seed(&store, &options.settings)?;
@@ -325,7 +334,7 @@ impl Core {
             }
         }
         let generators = crate::generator::GeneratorRegistry::new();
-        generators.load(store.list_generators()?);
+        generators.load(store.list_generators()?, &gcloud.runner);
 
         // Proxy entries of active sentinel leases.
         let t = now();
@@ -384,6 +393,8 @@ impl Core {
             generators,
             authorization: Mutex::new(()),
             generation: Mutex::new(generation::GenerationState::new(Arc::new(now))),
+            gcloud,
+            gcloud_profiles: gcloud_profiles::GcloudProfiles::default(),
             proxy,
             cert,
             settings: RwLock::new(settings.clone()),
@@ -707,11 +718,26 @@ impl Core {
         let result = self.proxy.apply_deferred(state.flatten());
         if result.is_ok() {
             state.dirty = false;
+            state.account_cutovers.clear();
         }
         else {
             for lease in active.iter().filter(|l| l.source_kind == SourceKind::Generator && l.mode == LeaseMode::Sentinel) {
                 state.suspended.insert(lease.id.clone(), "credential publication failed; run asm get to retry".into());
             }
+        }
+        result
+    }
+
+    /// Account deletion already removed the affected entries under authorization.
+    /// Cut off forwarding on the old process even if writing new config fails.
+    fn publish_proxy_account_retirement_locked(&self, _guard: &MutexGuard<'_, ()>, profile_id: i64) -> Result<()> {
+        let mut state = lock(&self.proxy_state);
+        let result = self.proxy.apply_after_stopping_deferred(state.flatten());
+        state.dirty = result.is_err();
+        if state.dirty {
+            state.account_cutovers.insert(profile_id);
+        } else {
+            state.account_cutovers.clear();
         }
         result
     }
@@ -753,6 +779,7 @@ impl Core {
         let t = now();
         self.expire_requests(t);
         self.sweep_generated_at(self.generation_now());
+        self.sweep_gcloud_setup(t);
         let _ = self.store.prune_history(t - HISTORY_SECS);
         self.prune_activity(t);
         if let Ok(active) = self.store.active_leases(t) {
@@ -802,6 +829,8 @@ impl Core {
 
     pub fn shutdown(&self) {
         self.begin_generation_shutdown();
+        self.shutdown_gcloud_setup();
+        self.gcloud_profiles.shutdown();
         if let Some(api) = lock(&self.api).take() {
             api.handle.shutdown();
         }

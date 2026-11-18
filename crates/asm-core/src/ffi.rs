@@ -5,11 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use asm_proto::generators as protocol;
+
 use crate::error::CoreError;
 use crate::manager::{Core, StartOptions};
 
 /// Change notifications. Topics: `requests`, `leases`, `hosts`, `vaults`, `proxy`,
-/// `generators`, `firewall`, `settings`, `activity`.
+/// `generators`, `gcloud_accounts`, `firewall`, `settings`, `activity`.
 /// Called from manager threads; never while the manager holds a lock.
 #[uniffi::export(with_foreign)]
 pub trait ManagerObserver: Send + Sync {
@@ -128,9 +130,93 @@ pub struct GithubScopeRequest {
     pub permissions: Option<Vec<GithubPermissionEntry>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudScopeRequest {
+    pub scopes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum GcloudPermission {
+    StorageRead,
+    StorageCreate,
+    ComputeRead,
+    RunRead,
+    LogsRead,
+    BigqueryMetadataRead,
+}
+
+impl From<protocol::GcloudPermission> for GcloudPermission {
+    fn from(permission: protocol::GcloudPermission) -> Self {
+        match permission {
+            protocol::GcloudPermission::StorageRead => Self::StorageRead,
+            protocol::GcloudPermission::StorageCreate => Self::StorageCreate,
+            protocol::GcloudPermission::ComputeRead => Self::ComputeRead,
+            protocol::GcloudPermission::RunRead => Self::RunRead,
+            protocol::GcloudPermission::LogsRead => Self::LogsRead,
+            protocol::GcloudPermission::BigqueryMetadataRead => Self::BigqueryMetadataRead,
+        }
+    }
+}
+
+impl From<GcloudPermission> for protocol::GcloudPermission {
+    fn from(permission: GcloudPermission) -> Self {
+        match permission {
+            GcloudPermission::StorageRead => Self::StorageRead,
+            GcloudPermission::StorageCreate => Self::StorageCreate,
+            GcloudPermission::ComputeRead => Self::ComputeRead,
+            GcloudPermission::RunRead => Self::RunRead,
+            GcloudPermission::LogsRead => Self::LogsRead,
+            GcloudPermission::BigqueryMetadataRead => Self::BigqueryMetadataRead,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudPermissionDetails {
+    pub claim: String,
+    pub role: String,
+    pub scope: String,
+}
+
+#[uniffi::export]
+pub fn gcloud_permission_details(permission: GcloudPermission) -> GcloudPermissionDetails {
+    let permission = protocol::GcloudPermission::from(permission);
+    GcloudPermissionDetails {
+        claim: permission.claim().into(),
+        role: permission.role().into(),
+        scope: permission.scope().into(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudAccessRequest {
+    pub project_id: String,
+    pub permissions: Vec<GcloudPermission>,
+}
+
+impl From<protocol::GcloudAccessRequest> for GcloudAccessRequest {
+    fn from(access: protocol::GcloudAccessRequest) -> Self {
+        Self {
+            project_id: access.project_id,
+            permissions: access.permissions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<GcloudAccessRequest> for protocol::GcloudAccessRequest {
+    fn from(access: GcloudAccessRequest) -> Self {
+        Self {
+            project_id: access.project_id,
+            permissions: access.permissions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum GenerationRequest {
     GithubApp { scope: GithubScopeRequest },
+    Gcloud { scope: GcloudScopeRequest },
+    GcloudAccess { access: GcloudAccessRequest },
 }
 
 impl From<asm_proto::generators::GenerationRequest> for GenerationRequest {
@@ -141,6 +227,12 @@ impl From<asm_proto::generators::GenerationRequest> for GenerationRequest {
                     repositories: scope.repositories,
                     permissions: scope.permissions.map(permission_entries),
                 },
+            },
+            asm_proto::generators::GenerationRequest::Gcloud(scope) => Self::Gcloud {
+                scope: GcloudScopeRequest { scopes: scope.scopes },
+            },
+            protocol::GenerationRequest::GcloudAccess(access) => Self::GcloudAccess {
+                access: access.into(),
             },
         }
     }
@@ -157,6 +249,10 @@ impl TryFrom<GenerationRequest> for asm_proto::generators::GenerationRequest {
                     permissions: scope.permissions.map(permission_map).transpose()?,
                 },
             ),
+            GenerationRequest::Gcloud { scope } => Self::Gcloud(
+                asm_proto::generators::GcloudScopeRequest { scopes: scope.scopes },
+            ),
+            GenerationRequest::GcloudAccess { access } => Self::GcloudAccess(access.into()),
         };
         request.canonicalize()?;
         Ok(request)
@@ -201,15 +297,101 @@ impl TryFrom<GithubGrant> for asm_proto::generators::GithubGrant {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudGrant {
+    pub service_account_unique_id: String,
+    pub service_account_email: String,
+    pub scopes: Vec<String>,
+    /// Issuance project; absent on legacy grants and selections using the generator default.
+    pub project_id: Option<String>,
+}
+
+impl From<asm_proto::generators::GcloudGrant> for GcloudGrant {
+    fn from(grant: asm_proto::generators::GcloudGrant) -> Self {
+        Self {
+            service_account_unique_id: grant.service_account_unique_id,
+            service_account_email: grant.service_account_email,
+            scopes: grant.scopes,
+            project_id: grant.project_id,
+        }
+    }
+}
+
+impl From<GcloudGrant> for asm_proto::generators::GcloudGrant {
+    fn from(grant: GcloudGrant) -> Self {
+        Self {
+            service_account_unique_id: grant.service_account_unique_id,
+            service_account_email: grant.service_account_email,
+            scopes: grant.scopes,
+            project_id: grant.project_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum GcloudAccessGrant {
+    Connection,
+    Requested { access: GcloudAccessRequest },
+    Issued {
+        access: GcloudAccessRequest,
+        service_account_unique_id: String,
+        service_account_email: String,
+    },
+}
+
+impl From<protocol::GcloudAccessGrant> for GcloudAccessGrant {
+    fn from(grant: protocol::GcloudAccessGrant) -> Self {
+        match grant {
+            protocol::GcloudAccessGrant::Connection => Self::Connection,
+            protocol::GcloudAccessGrant::Requested { access } => Self::Requested {
+                access: access.into(),
+            },
+            protocol::GcloudAccessGrant::Issued {
+                access,
+                service_account_unique_id,
+                service_account_email,
+            } => Self::Issued {
+                access: access.into(),
+                service_account_unique_id,
+                service_account_email,
+            },
+        }
+    }
+}
+
+impl From<GcloudAccessGrant> for protocol::GcloudAccessGrant {
+    fn from(grant: GcloudAccessGrant) -> Self {
+        match grant {
+            GcloudAccessGrant::Connection => Self::Connection,
+            GcloudAccessGrant::Requested { access } => Self::Requested {
+                access: access.into(),
+            },
+            GcloudAccessGrant::Issued {
+                access,
+                service_account_unique_id,
+                service_account_email,
+            } => Self::Issued {
+                access: access.into(),
+                service_account_unique_id,
+                service_account_email,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum GenerationGrant {
     GithubApp { scope: GithubGrant },
+    Gcloud { scope: GcloudGrant },
+    GcloudAccess { grant: GcloudAccessGrant },
 }
 
 impl From<asm_proto::generators::GenerationGrant> for GenerationGrant {
     fn from(grant: asm_proto::generators::GenerationGrant) -> Self {
         match grant {
             asm_proto::generators::GenerationGrant::GithubApp(scope) => Self::GithubApp { scope: scope.into() },
+            asm_proto::generators::GenerationGrant::Gcloud(scope) => Self::Gcloud { scope: scope.into() },
+            protocol::GenerationGrant::GcloudAccess(grant) => Self::GcloudAccess { grant: grant.into() },
         }
     }
 }
@@ -218,9 +400,13 @@ impl TryFrom<GenerationGrant> for asm_proto::generators::GenerationGrant {
     type Error = CoreError;
 
     fn try_from(grant: GenerationGrant) -> Result<Self, Self::Error> {
-        match grant {
-            GenerationGrant::GithubApp { scope } => Ok(Self::GithubApp(scope.try_into()?)),
-        }
+        let mut grant = match grant {
+            GenerationGrant::GithubApp { scope } => return Ok(Self::GithubApp(scope.try_into()?)),
+            GenerationGrant::Gcloud { scope } => Self::Gcloud(scope.into()),
+            GenerationGrant::GcloudAccess { grant } => Self::GcloudAccess(grant.into()),
+        };
+        grant.canonicalize()?;
+        Ok(grant)
     }
 }
 
@@ -278,6 +464,12 @@ pub struct GeneratorApprovalChoice {
     pub choice: GenerationChoice,
     pub suggested_hosts: Vec<HostPatternCheck>,
     pub scope_issues: Vec<String>,
+    /// Descriptive labels only; the exact approved ceiling lives in `choice`.
+    pub scope_catalog: Vec<GcloudScopeOption>,
+    /// The saved issuance project for legacy Google generators.
+    pub default_project_id: Option<String>,
+    /// Manager-resolved issued authority for a ready managed Google profile.
+    pub gcloud_ready: Option<GcloudAccessGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -286,9 +478,75 @@ pub struct GithubAppConfig {
     pub installations: Vec<GithubGrant>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudService {
+    pub name: String,
+    pub title: String,
+    pub enabled: bool,
+}
+
+impl From<crate::generator::GcloudService> for GcloudService {
+    fn from(service: crate::generator::GcloudService) -> Self {
+        Self { name: service.name, title: service.title, enabled: service.enabled }
+    }
+}
+
+impl From<GcloudService> for crate::generator::GcloudService {
+    fn from(service: GcloudService) -> Self {
+        Self { name: service.name, title: service.title, enabled: service.enabled }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudScopeOption {
+    pub uri: String,
+    pub description: String,
+    pub services: Vec<GcloudService>,
+}
+
+impl From<crate::generator::GcloudScopeOption> for GcloudScopeOption {
+    fn from(option: crate::generator::GcloudScopeOption) -> Self {
+        Self {
+            uri: option.uri,
+            description: option.description,
+            services: option.services.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<GcloudScopeOption> for crate::generator::GcloudScopeOption {
+    fn from(option: GcloudScopeOption) -> Self {
+        Self {
+            uri: option.uri,
+            description: option.description,
+            services: option.services.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudConfig {
+    pub sdk_path: String,
+    pub account_subject: String,
+    pub account_email: String,
+    pub project_id: String,
+    pub project_number: String,
+    pub ceiling: GcloudGrant,
+    pub scope_catalog: Vec<GcloudScopeOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudConnectionConfig {
+    pub sdk_path: String,
+    pub account_subject: String,
+    pub account_email: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum GeneratorConfig {
     GithubApp { config: GithubAppConfig },
+    Gcloud { config: GcloudConfig },
+    GcloudConnection { config: GcloudConnectionConfig },
 }
 
 impl From<crate::generator::GeneratorConfig> for GeneratorConfig {
@@ -298,6 +556,24 @@ impl From<crate::generator::GeneratorConfig> for GeneratorConfig {
                 config: GithubAppConfig {
                     client_id: config.client_id,
                     installations: config.installations.into_iter().map(Into::into).collect(),
+                },
+            },
+            crate::generator::GeneratorConfig::Gcloud(config) => Self::Gcloud {
+                config: GcloudConfig {
+                    sdk_path: config.sdk_path,
+                    account_subject: config.account_subject,
+                    account_email: config.account_email,
+                    project_id: config.project_id,
+                    project_number: config.project_number,
+                    ceiling: config.ceiling.into(),
+                    scope_catalog: config.scope_catalog.into_iter().map(Into::into).collect(),
+                },
+            },
+            crate::generator::GeneratorConfig::GcloudConnection(config) => Self::GcloudConnection {
+                config: GcloudConnectionConfig {
+                    sdk_path: config.sdk_path,
+                    account_subject: config.account_subject,
+                    account_email: config.account_email,
                 },
             },
         }
@@ -321,25 +597,53 @@ impl TryFrom<GeneratorConfig> for crate::generator::GeneratorConfig {
                     client_id: config.client_id, installations,
                 }))
             }
+            // A legacy bound generator keeps its existing project, account, and scopes.
+            GeneratorConfig::Gcloud { config } => Ok(Self::Gcloud(crate::generator::GcloudConfig {
+                sdk_path: config.sdk_path,
+                account_subject: config.account_subject,
+                account_email: config.account_email,
+                project_id: config.project_id,
+                project_number: config.project_number,
+                ceiling: config.ceiling.into(),
+                scope_catalog: config.scope_catalog.into_iter().map(Into::into).collect(),
+            })),
+            // The core replaces submitted identity data with the verified login
+            // session (or the saved connection when keeping credentials).
+            GeneratorConfig::GcloudConnection { config } => Ok(Self::GcloudConnection(
+                crate::generator::GcloudConnectionConfig {
+                    sdk_path: config.sdk_path,
+                    account_subject: config.account_subject,
+                    account_email: config.account_email,
+                },
+            )),
         }
     }
 }
 
-/// Only an operator's transient draft contains a root signing key.
-#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+#[derive(Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum GeneratorCredentials {
+    Keep,
+    GithubPrivateKey { pem: String },
+    GcloudSession { session_id: String },
+}
+
+impl std::fmt::Debug for GeneratorCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Keep => "Keep",
+            Self::GithubPrivateKey { .. } => "GithubPrivateKey([REDACTED])",
+            Self::GcloudSession { .. } => "GcloudSession([REDACTED])",
+        })
+    }
+}
+
+/// A transient operator draft. Long-lived credentials are never returned to the UI.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct GeneratorDraft {
     pub id: Option<String>,
     pub name: String,
     pub config: GeneratorConfig,
-    pub private_key_pem: String,
-}
-
-impl std::fmt::Debug for GeneratorDraft {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GeneratorDraft")
-            .field("id", &self.id).field("name", &self.name).field("config", &self.config)
-            .field("private_key_pem", &"[REDACTED]").finish()
-    }
+    pub credentials: GeneratorCredentials,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -353,15 +657,139 @@ pub struct GeneratorInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudSdk {
+    pub path: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudIdentity {
+    pub subject: String,
+    pub email: String,
+}
+
+impl From<crate::generator::gcloud::GcloudIdentity> for GcloudIdentity {
+    fn from(identity: crate::generator::gcloud::GcloudIdentity) -> Self {
+        Self { subject: identity.subject, email: identity.email }
+    }
+}
+
+/// Local administrative review. The opaque ID is consumed only by the matching approval.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudProfilePlan {
+    pub plan_id: Option<String>,
+    pub expires_at: Option<i64>,
+    pub ready: bool,
+    pub project_id: String,
+    pub service_account_name: String,
+    pub service_account_email: String,
+    pub service_account_unique_id: Option<String>,
+    pub service_account_role: String,
+    pub project_roles: Vec<String>,
+    pub scopes: Vec<String>,
+    pub admin_principal: String,
+    pub messages: Vec<String>,
+}
+
+impl std::fmt::Debug for GcloudProfilePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcloudProfilePlan")
+            .field("plan_id", &self.plan_id.as_ref().map(|_| "[REDACTED]"))
+            .field("expires_at", &self.expires_at)
+            .field("ready", &self.ready)
+            .field("project_id", &self.project_id)
+            .field("service_account_name", &self.service_account_name)
+            .field("service_account_email", &self.service_account_email)
+            .field("service_account_unique_id", &self.service_account_unique_id)
+            .field("service_account_role", &self.service_account_role)
+            .field("project_roles", &self.project_roles)
+            .field("scopes", &self.scopes)
+            .field("admin_principal", &self.admin_principal)
+            .field("messages", &self.messages)
+            .finish()
+    }
+}
+
+impl From<crate::manager::gcloud_profiles::GcloudProfilePlan> for GcloudProfilePlan {
+    fn from(plan: crate::manager::gcloud_profiles::GcloudProfilePlan) -> Self {
+        Self {
+            plan_id: plan.plan_id,
+            expires_at: plan.expires_at,
+            ready: plan.ready,
+            project_id: plan.project_id,
+            service_account_name: plan.service_account_name,
+            service_account_email: plan.service_account_email,
+            service_account_unique_id: plan.service_account_unique_id,
+            service_account_role: plan.service_account_role,
+            project_roles: plan.project_roles,
+            scopes: plan.scopes,
+            admin_principal: plan.admin_principal,
+            messages: plan.messages,
+        }
+    }
+}
+
+/// Local state recorded by ASM; it is not a live observation of Google IAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum GcloudOwnedAccountState {
+    Creating,
+    Created,
+    ProjectBound,
+    TokenCreatorBound,
+    Ready,
+    DeletionPending,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudOwnedAccountLease {
+    pub id: String,
+    pub host_label: String,
+    pub agent_label: String,
+    pub status: LeaseStatus,
+    /// `None` means the lease has no local deadline.
+    pub deadline: Option<SystemTime>,
+}
+
+/// Manager-local journal metadata, without credentials or live cloud state.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudOwnedAccount {
+    pub id: i64,
+    pub generator_id: String,
+    pub generator_name: Option<String>,
+    pub generator_revision: Option<u64>,
+    pub generator_status: Option<VaultStatus>,
+    pub project_id: String,
+    pub account_name: String,
+    pub account_email: String,
+    pub account_unique_id: Option<String>,
+    pub operator_email: String,
+    pub permissions: Vec<GcloudPermission>,
+    pub state: GcloudOwnedAccountState,
+    pub superseded: bool,
+    pub deletable: bool,
+    pub blocking_reason: Option<String>,
+    pub leases: Vec<GcloudOwnedAccountLease>,
+}
+
+/// The exact local account and leases the operator reviewed, not a fresh lookup.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GcloudOwnedAccountDelete {
+    pub profile_id: i64,
+    pub generator_id: String,
+    pub generator_revision: u64,
+    pub project_id: String,
+    pub account_name: String,
+    pub account_email: String,
+    pub account_unique_id: String,
+    pub expected_lease_ids: Vec<String>,
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct GithubInstallationAccount {
     pub installation_id: u64,
     pub account: String,
-}
-
-impl From<crate::generator::GithubInstallationAccount> for GithubInstallationAccount {
-    fn from(account: crate::generator::GithubInstallationAccount) -> Self {
-        Self { installation_id: account.installation_id, account: account.account }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -563,6 +991,10 @@ pub enum RequestDetail {
         requested_generation: Option<GenerationRequest>,
         sentinel_required: bool,
         has_substitutable_fields: bool,
+        /// The requesting client can receive an operator-selected grant.
+        operator_selected_grant: bool,
+        /// The requesting client can receive a managed Google grant for another project.
+        operator_selected_gcloud_project: bool,
     },
     Update {
         name: String,
@@ -1149,6 +1581,65 @@ impl Manager {
         Ok(self.core.github_list_installations(draft)?)
     }
 
+    pub fn gcloud_check_sdk(&self, path: Option<String>) -> FfiResult<GcloudSdk> {
+        let sdk = self.core.gcloud_check_sdk(path)?;
+        let path = sdk.path.into_os_string().into_string()
+            .map_err(|_| CoreError::invalid("The gcloud installation path is not valid Unicode."))?;
+        Ok(GcloudSdk { path, version: sdk.version })
+    }
+
+    pub fn gcloud_begin_login(&self, sdk_path: String) -> FfiResult<String> {
+        Ok(self.core.gcloud_begin_login(sdk_path)?)
+    }
+
+    pub fn gcloud_finish_login(&self, session_id: String) -> FfiResult<GcloudIdentity> {
+        Ok(self.core.gcloud_finish_login(&session_id)?.into())
+    }
+
+    pub fn gcloud_cancel_login(&self, session_id: String) -> FfiResult<()> {
+        Ok(self.core.gcloud_cancel_login(&session_id)?)
+    }
+
+    /// Read active project IDs for the offered Google connection on this pending approval.
+    pub fn gcloud_approval_projects(
+        &self, request_id: String, generator_id: String, generator_revision: u64,
+    ) -> FfiResult<Vec<String>> {
+        Ok(self.core.gcloud_approval_projects(&request_id, &generator_id, generator_revision)?)
+    }
+
+    /// Prepare local review without writing IAM or issuing a credential.
+    pub fn gcloud_profile_plan(
+        &self,
+        request_id: String,
+        decision: Decision,
+    ) -> FfiResult<GcloudProfilePlan> {
+        Ok(self.core.gcloud_profile_plan(request_id, decision)?.into())
+    }
+
+    /// Apply the reviewed IAM plan and approve the original request in a single local action.
+    pub fn gcloud_approve_profile(&self, request_id: String, plan_id: String, decision: Decision) -> FfiResult<()> {
+        Ok(self.core.gcloud_approve_profile(&request_id, &plan_id, decision)?)
+    }
+
+    pub fn gcloud_cancel_profile(&self, plan_id: String) -> FfiResult<()> {
+        Ok(self.core.gcloud_cancel_profile(plan_id)?)
+    }
+
+    /// Check the local journal for any recorded account, including deleted accounts.
+    pub fn has_recorded_gcloud_accounts(&self) -> FfiResult<bool> {
+        Ok(self.core.has_recorded_gcloud_accounts()?)
+    }
+
+    /// Read the local journal and its dependent leases without contacting Google Cloud.
+    pub fn list_gcloud_owned_accounts(&self) -> FfiResult<Vec<GcloudOwnedAccount>> {
+        Ok(self.core.list_gcloud_owned_accounts()?)
+    }
+
+    /// Delete only the immutable IAM identity and dependent leases explicitly confirmed locally.
+    pub fn delete_gcloud_owned_account(&self, target: GcloudOwnedAccountDelete) -> FfiResult<()> {
+        Ok(self.core.delete_gcloud_owned_account(target)?)
+    }
+
     /// "Connect" in the Bitwarden sheet: log in with the draft and list collections.
     pub fn bitwarden_connect(&self, draft: VaultDraft) -> FfiResult<Vec<CollectionInfo>> {
         Ok(self.core.bitwarden_connect(draft)?)
@@ -1348,7 +1839,7 @@ mod generator_ffi_tests {
     }
 
     #[test]
-    fn connection_draft_can_have_an_empty_ceiling_and_redacts_its_key() {
+    fn github_discovery_draft_can_have_an_empty_ceiling_and_redacts_its_key() {
         let draft = GeneratorDraft {
             id: None,
             name: "test".into(),
@@ -1361,10 +1852,184 @@ mod generator_ffi_tests {
                     }],
                 },
             },
-            private_key_pem: "PRIVATE_FIXTURE_DO_NOT_DISCLOSE".into(),
+            credentials: GeneratorCredentials::GithubPrivateKey { pem: "PRIVATE_FIXTURE_DO_NOT_DISCLOSE".into() },
         };
-        assert!(!format!("{draft:?}").contains(&draft.private_key_pem));
+        assert!(!format!("{draft:?}").contains("PRIVATE_FIXTURE_DO_NOT_DISCLOSE"));
         assert!(crate::generator::GeneratorConfig::try_from(draft.config).is_ok());
+    }
+
+    #[test]
+    fn legacy_gcloud_approval_conversions_canonicalize_exact_scopes() {
+        let read_only = "https://www.googleapis.com/auth/devstorage.read_only".to_string();
+        let request = GenerationRequest::Gcloud {
+            scope: GcloudScopeRequest { scopes: Some(vec![read_only.clone(), read_only.clone()]) },
+        };
+        let protocol_request = protocol::GenerationRequest::try_from(request).unwrap();
+        assert_eq!(GenerationRequest::from(protocol_request), GenerationRequest::Gcloud {
+            scope: GcloudScopeRequest { scopes: Some(vec![read_only.clone()]) },
+        });
+        assert!(protocol::GenerationRequest::try_from(GenerationRequest::Gcloud {
+            scope: GcloudScopeRequest { scopes: Some(vec![]) },
+        }).is_err());
+
+        let mut scope = GcloudGrant {
+            service_account_unique_id: "12345678901234567890".into(),
+            service_account_email: "storage@test-project.iam.gserviceaccount.com".into(),
+            scopes: vec![read_only],
+            project_id: None,
+        };
+        for project_id in [None, Some("other-project".into())] {
+            scope.project_id = project_id;
+            let grant = GenerationGrant::Gcloud { scope: scope.clone() };
+            let protocol_grant = protocol::GenerationGrant::try_from(grant.clone()).unwrap();
+            assert_eq!(GenerationGrant::from(protocol_grant), grant);
+        }
+        scope.service_account_unique_id = "storage".into();
+        assert!(protocol::GenerationGrant::try_from(GenerationGrant::Gcloud { scope }).is_err());
+    }
+
+    #[test]
+    fn legacy_gcloud_config_round_trips_without_becoming_a_connection() {
+        let uri = "https://www.googleapis.com/auth/devstorage.read_only".to_string();
+        let config = GeneratorConfig::Gcloud {
+            config: GcloudConfig {
+                sdk_path: "/opt/homebrew/bin/gcloud".into(),
+                account_subject: "subject".into(),
+                account_email: "operator@example.com".into(),
+                project_id: "test-project".into(),
+                project_number: "123456".into(),
+                ceiling: GcloudGrant {
+                    service_account_unique_id: "12345678901234567890".into(),
+                    service_account_email: "storage@test-project.iam.gserviceaccount.com".into(),
+                    scopes: vec![uri.clone()],
+                    project_id: None,
+                },
+                scope_catalog: vec![GcloudScopeOption {
+                    uri,
+                    description: "Read Storage objects".into(),
+                    services: vec![GcloudService {
+                        name: "storage.googleapis.com".into(),
+                        title: "Cloud Storage".into(),
+                        enabled: true,
+                    }],
+                }],
+            },
+        };
+        let core = crate::generator::GeneratorConfig::try_from(config.clone()).unwrap();
+        assert!(matches!(&core, crate::generator::GeneratorConfig::Gcloud(_)));
+        assert_eq!(GeneratorConfig::from(core), config);
+    }
+
+    #[test]
+    fn gcloud_connection_round_trips_and_redacts_its_session() {
+        let draft = GeneratorDraft {
+            id: None,
+            name: "Google".into(),
+            config: GeneratorConfig::GcloudConnection {
+                config: GcloudConnectionConfig {
+                    sdk_path: "/opt/homebrew/bin/gcloud".into(),
+                    account_subject: "subject".into(),
+                    account_email: "operator@example.com".into(),
+                },
+            },
+            credentials: GeneratorCredentials::GcloudSession {
+                session_id: "PRIVATE_SESSION_ID".into(),
+            },
+        };
+        assert!(!format!("{draft:?}").contains("PRIVATE_SESSION_ID"));
+        let config = crate::generator::GeneratorConfig::try_from(draft.config.clone()).unwrap();
+        assert!(matches!(&config, crate::generator::GeneratorConfig::GcloudConnection(_)));
+        assert_eq!(GeneratorConfig::from(config), draft.config);
+    }
+
+    #[test]
+    fn gcloud_access_approval_canonicalizes_exact_typed_claims() {
+        let access = GcloudAccessRequest {
+            project_id: "test-project".into(),
+            permissions: vec![
+                GcloudPermission::ComputeRead,
+                GcloudPermission::StorageCreate,
+                GcloudPermission::ComputeRead,
+            ],
+        };
+        let canonical = GcloudAccessRequest {
+            permissions: vec![GcloudPermission::StorageCreate, GcloudPermission::ComputeRead],
+            ..access.clone()
+        };
+        let request = protocol::GenerationRequest::try_from(GenerationRequest::GcloudAccess {
+            access: access.clone(),
+        }).unwrap();
+        assert_eq!(GenerationRequest::from(request), GenerationRequest::GcloudAccess {
+            access: canonical.clone(),
+        });
+        assert!(protocol::GenerationRequest::try_from(GenerationRequest::GcloudAccess {
+            access: GcloudAccessRequest { permissions: vec![], ..access.clone() },
+        }).is_err());
+
+        let selection = GenerationSelection {
+            generator_id: "0ab8cf79-1481-4476-8f42-93eb774678cf".into(),
+            generator_revision: 2,
+            grant: GenerationGrant::GcloudAccess {
+                grant: GcloudAccessGrant::Requested { access },
+            },
+        };
+        let protocol_selection = protocol::GenerationSelection::try_from(selection.clone()).unwrap();
+        assert_eq!(GenerationSelection::from(protocol_selection), GenerationSelection {
+            grant: GenerationGrant::GcloudAccess {
+                grant: GcloudAccessGrant::Requested { access: canonical.clone() },
+            },
+            ..selection.clone()
+        });
+        let marker = GenerationGrant::GcloudAccess { grant: GcloudAccessGrant::Connection };
+        assert_eq!(GenerationGrant::from(protocol::GenerationGrant::GcloudAccess(
+            protocol::GcloudAccessGrant::Connection,
+        )), marker);
+        assert!(protocol::GenerationSelection::try_from(GenerationSelection {
+            grant: marker, ..selection
+        }).is_err());
+
+        let grant = GenerationGrant::GcloudAccess {
+            grant: GcloudAccessGrant::Issued {
+                access: canonical,
+                service_account_unique_id: "12345678901234567890".into(),
+                service_account_email: "managed@test-project.iam.gserviceaccount.com".into(),
+            },
+        };
+        assert_eq!(
+            GenerationGrant::from(protocol::GenerationGrant::try_from(grant.clone()).unwrap()),
+            grant,
+        );
+    }
+
+    #[test]
+    fn gcloud_profile_review_exposes_bindings_but_redacts_confirmation_id() {
+        let plan = GcloudProfilePlan::from(crate::manager::gcloud_profiles::GcloudProfilePlan {
+            plan_id: Some("PRIVATE_CONFIRMATION_ID".into()),
+            expires_at: Some(1_700_000_000),
+            ready: false,
+            project_id: "test-project".into(),
+            service_account_name: "projects/test-project/serviceAccounts/managed@test-project.iam.gserviceaccount.com".into(),
+            service_account_email: "managed@test-project.iam.gserviceaccount.com".into(),
+            service_account_unique_id: None,
+            service_account_role: "roles/iam.serviceAccountTokenCreator".into(),
+            project_roles: vec!["roles/storage.objectViewer".into()],
+            scopes: vec!["https://www.googleapis.com/auth/devstorage.read_only".into()],
+            admin_principal: "user:operator@example.com".into(),
+            messages: vec!["Google resources outlive ASM leases.".into()],
+        });
+        let metadata = gcloud_permission_details(GcloudPermission::StorageRead);
+        assert_eq!(metadata.claim, "storage=read");
+        assert_eq!(plan.project_roles, [metadata.role]);
+        assert_eq!(plan.scopes, [metadata.scope]);
+        assert_eq!(plan.admin_principal, "user:operator@example.com");
+        assert_eq!(plan.service_account_role, "roles/iam.serviceAccountTokenCreator");
+        assert_eq!(plan.project_id, "test-project");
+        assert_eq!(plan.service_account_name,
+            "projects/test-project/serviceAccounts/managed@test-project.iam.gserviceaccount.com");
+        assert_eq!(plan.service_account_email, "managed@test-project.iam.gserviceaccount.com");
+        assert_eq!(plan.plan_id.as_deref(), Some("PRIVATE_CONFIRMATION_ID"));
+        assert_eq!(plan.expires_at, Some(1_700_000_000));
+        assert!(!format!("{plan:?}").contains("PRIVATE_CONFIRMATION_ID"));
     }
 
     #[test]

@@ -3,36 +3,56 @@
 use crate::api::Api;
 use crate::error::CliError;
 use asm_proto::bindings::SecretBinding;
-use asm_proto::generators::SourceKind;
+use asm_proto::generators::GenerationRequest;
 use asm_proto::names::resolve_catalog_name;
 use asm_proto::wire::{
-    HealthResponse, SecretEntry, SecretsResponse, CAPABILITY_GENERATED_CREDENTIALS_V1,
-    CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_SECRET_FIELDS_V1,
+    CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GENERATED_CREDENTIALS_V1,
+    CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_OPERATOR_SELECTED_GRANT_V1,
+    CAPABILITY_OPERATOR_SELECTED_PROJECT_V1, CAPABILITY_SECRET_FIELDS_V1,
+    HealthResponse, SecretEntry, SecretsResponse,
 };
 
-pub(crate) fn require_capabilities(api: &Api, generated: bool, fields: bool, github_scope: bool) -> Result<(), CliError> {
-    if !generated && !fields && !github_scope {
-        return Ok(());
-    }
-    let health: HealthResponse = api.get("/health")?;
-    for (needed, capability) in [
-        (generated, CAPABILITY_GENERATED_CREDENTIALS_V1),
-        (fields, CAPABILITY_SECRET_FIELDS_V1),
-        (github_scope, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1),
-    ] {
-        if needed && !health.capabilities.iter().any(|c| c == capability) {
-            return Err(CliError::invalid(format!("this operation requires {capability}; upgrade the manager")));
-        }
-    }
-    Ok(())
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GetCapabilities {
+    pub(crate) operator_selected_grant: bool,
+    pub(crate) operator_selected_project: bool,
 }
 
-pub(crate) fn capabilities() -> Vec<String> {
-    vec![
-        CAPABILITY_GENERATED_CREDENTIALS_V1.into(),
-        CAPABILITY_SECRET_FIELDS_V1.into(),
-        CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1.into(),
-    ]
+pub(crate) fn require_capabilities(
+    api: &Api, generated: bool, fields: bool, provider: Option<&str>,
+) -> Result<GetCapabilities, CliError> {
+    if !generated && !fields && provider.is_none() {
+        return Ok(GetCapabilities::default());
+    }
+    let health: HealthResponse = api.get("/health")?;
+    for capability in [
+        generated.then_some(CAPABILITY_GENERATED_CREDENTIALS_V1),
+        fields.then_some(CAPABILITY_SECRET_FIELDS_V1),
+        provider,
+    ].into_iter().flatten() {
+        health.require_capability(capability)?;
+    }
+    Ok(GetCapabilities {
+        operator_selected_grant: health.capabilities.iter().any(|c| c == CAPABILITY_OPERATOR_SELECTED_GRANT_V1),
+        operator_selected_project: health.capabilities.iter().any(|c| c == CAPABILITY_OPERATOR_SELECTED_PROJECT_V1),
+    })
+}
+
+impl GetCapabilities {
+    pub(crate) fn client_capabilities(
+        self, generation: Option<&GenerationRequest>, pinned: bool,
+    ) -> Vec<String> {
+        let project = (self.operator_selected_project && !pinned
+            && matches!(generation, Some(GenerationRequest::GcloudAccess(_))))
+            .then_some(CAPABILITY_OPERATOR_SELECTED_PROJECT_V1);
+        [
+            CAPABILITY_GENERATED_CREDENTIALS_V1,
+            CAPABILITY_SECRET_FIELDS_V1,
+            CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1,
+            CAPABILITY_GCLOUD_ACCESS_V1,
+            CAPABILITY_OPERATOR_SELECTED_GRANT_V1,
+        ].into_iter().chain(project).map(str::to_owned).collect()
+    }
 }
 
 pub(crate) fn catalog(api: &Api) -> Result<Vec<SecretEntry>, CliError> {
@@ -44,7 +64,7 @@ pub(crate) struct ResolvedBinding {
     pub binding: SecretBinding,
     pub request_name: String,
     pub canonical_key: String,
-    pub generated: bool,
+    pub generated_output: Option<&'static str>,
     pub available_fields: Vec<String>,
 }
 
@@ -63,7 +83,7 @@ pub(crate) fn resolve(binding: SecretBinding, entries: &[SecretEntry]) -> Result
         binding,
         request_name: resolved.request_name,
         canonical_key: resolved.canonical_key,
-        generated: entry.source_kind == SourceKind::Generator,
+        generated_output: resolved.generated_output,
         available_fields: entry.fields.clone(),
     })
 }

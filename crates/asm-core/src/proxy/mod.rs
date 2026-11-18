@@ -269,6 +269,14 @@ impl ProxySupervisor {
         self.apply_locked(entries)
     }
 
+    /// Drop existing client connections before publishing replacement entries.
+    /// As with `apply_deferred`, automatic recovery only uses the new desired set.
+    pub(crate) fn apply_after_stopping_deferred(&self, entries: Vec<ProxyEntry>) -> Result<()> {
+        let _ops = lock(&self.ops);
+        self.kill_locked();
+        self.apply_locked(entries)
+    }
+
     /// Deliver the observer notification deferred by [`Self::apply_deferred`].
     /// The caller must release its locks before calling this method.
     pub fn notify_changed(&self) {

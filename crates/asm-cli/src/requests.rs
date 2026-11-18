@@ -6,10 +6,13 @@ use crate::files::{FileBinding, SecretsDir};
 use crate::state::{self, HostState};
 use asm_proto::error::ErrorCode;
 use asm_proto::generators::{
-    GITHUB_TOKEN_ALIAS, GITHUB_TOKEN_NAME, GenerationRequest, GithubPermission, GithubScopeRequest,
-    SourceKind,
+    GCLOUD_TOKEN_NAME, GITHUB_TOKEN_ALIAS, GITHUB_TOKEN_NAME, GcloudAccessGrant, GcloudAccessRequest,
+    GcloudPermission, GcloudScopeRequest, GenerationGrant, GenerationRequest, GenerationSelection,
+    GithubPermission, GithubScopeRequest,
 };
+use asm_proto::names::{canonical_generated_output, generated_output};
 use asm_proto::wire::{
+    CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1,
     GetResult, LeaseMode, LeaseStatus, LeasesResponse, MAX_POLL_WAIT_SECS, RequestBody,
     RequestResult, RequestState, RequestStatus, SecretsResponse, WriteResult,
 };
@@ -181,16 +184,17 @@ impl Backoff {
 }
 
 /// Submit without filesystem side effects. One deadline covers POST, polling and backoff.
-pub(crate) fn submit(
+fn submit(
     api: &Api,
     body: &RequestBody,
     deadline: Option<Instant>,
-) -> Result<RequestResult, CliError> {
+) -> Result<(RequestResult, bool), CliError> {
     let started = Instant::now();
     let mut state: RequestState = api.post_until("/requests", body, deadline)?;
     if !asm_proto::crypto::is_uuid(&state.request_id) {
         return Err(CliError::failure("the manager sent an invalid request id"));
     }
+    let was_pending = state.status == RequestStatus::Pending;
     let lifetime = state.pending_lifetime_secs;
     let expected = started
         + pending_window(
@@ -218,8 +222,11 @@ pub(crate) fn submit(
             None => MAX_POLL_WAIT_SECS,
         };
         let polled = Instant::now();
-        match api.get_until(&format!("/requests/{}?wait={secs}", state.request_id), hard) {
+        match api.get_until::<RequestState>(&format!("/requests/{}?wait={secs}", state.request_id), hard) {
             Ok(s) => {
+                if s.request_id != state.request_id {
+                    return Err(CliError::failure("the manager returned a decision for a different request"));
+                }
                 state = s;
                 backoff.reset();
                 last_error = None;
@@ -240,7 +247,7 @@ pub(crate) fn submit(
         }
     }
     match state.status {
-        RequestStatus::Approved => state.result.ok_or_else(|| {
+        RequestStatus::Approved => state.result.map(|result| (result, was_pending)).ok_or_else(|| {
             CliError::failure("the manager approved the request but sent no result")
         }),
         RequestStatus::Denied => Err(CliError::denied(state.deny_reason.as_deref())),
@@ -259,12 +266,16 @@ pub(crate) fn submit(
     }
 }
 
-pub(crate) fn submit_get(api: &Api, body: &RequestBody, deadline: Option<Instant>) -> Result<GetResult, CliError> {
-    let result = match submit(api, body, deadline)? {
+pub(crate) fn submit_get(
+    api: &Api, body: &RequestBody, deadline: Option<Instant>, pinned: Option<&GenerationSelection>,
+    capabilities: crate::bindings::GetCapabilities,
+) -> Result<GetResult, CliError> {
+    let (result, was_pending) = submit(api, body, deadline)?;
+    let result = match result {
         RequestResult::Get(result) => result,
         RequestResult::Write(_) => return Err(CliError::failure("the manager sent a write result for a get")),
     };
-    let RequestBody::Get { fields, sentinel, lease_id, .. } = body else {
+    let RequestBody::Get { fields, generation, sentinel, lease_id, .. } = body else {
         return Err(CliError::failure("invalid get request"));
     };
     let actual: HashSet<&str> = result.files.iter().map(|f| f.field.as_str()).collect();
@@ -273,6 +284,7 @@ pub(crate) fn submit_get(api: &Api, body: &RequestBody, deadline: Option<Instant
         || actual.len() != result.files.len()
         || fields.as_ref().is_some_and(|wanted| wanted.len() != actual.len() || wanted.iter().any(|f| !actual.contains(f.as_str())))
         || lease_id.as_ref().is_some_and(|id| id != &result.lease_id)
+        || lease_id.is_some() != pinned.is_some()
         || (*sentinel && result.mode != LeaseMode::Sentinel)
         || (result.mode == LeaseMode::Raw && result.files.iter().any(|f| f.substituted))
     {
@@ -281,12 +293,53 @@ pub(crate) fn submit_get(api: &Api, body: &RequestBody, deadline: Option<Instant
     if result.expires_at.as_deref().is_some_and(|expiry| asm_proto::time::parse_unix(expiry).is_none_or(|t| t <= unix_now())) {
         return Err(CliError::failure("the manager sent an invalid or ended lease"));
     }
-    if result.generation.is_some() && (result.credential_version.is_none_or(|v| v == 0)
-        || result.credential_expires_at.as_deref().and_then(asm_proto::time::parse_unix).is_none_or(|t| t <= unix_now()))
+    if result.validate().is_err() || (result.generation.is_some()
+        && result.credential_expires_at.as_deref().and_then(asm_proto::time::parse_unix).is_none_or(|t| t <= unix_now()))
     {
         return Err(CliError::failure("the manager sent invalid generated credential metadata"));
     }
+    if let Some(pinned) = pinned {
+        if result.generation.as_ref() != Some(pinned) {
+            return Err(CliError::failure("the manager changed the pinned generated credential grant"));
+        }
+        if result.operator_selected_grant {
+            return Err(CliError::failure("the manager returned a fresh approval for a pinned lease"));
+        }
+        return Ok(result);
+    }
+    let operator_selected = result.operator_selected_grant
+        && capabilities.operator_selected_grant && body.supports_operator_selected_grant();
+    // Immediate results may reuse a lease, even when no lease ID was pinned.
+    let operator_selected_project = was_pending && result.operator_selected_grant
+        && capabilities.operator_selected_project && body.supports_operator_selected_project();
+    match (generation, result.generation.as_ref().map(|selection| &selection.grant)) {
+        (Some(request), Some(grant)) if grant.matches_request_exactly(request)?
+            || (operator_selected && grant.can_select_for(request))
+            || (operator_selected_project && grant.can_switch_project_for(request, operator_selected)) => {}
+        // Legacy bound Google approvals already allowed edited OAuth scopes
+        // before this capability existed. A capable manager must mark edits.
+        (Some(GenerationRequest::Gcloud(_)), Some(GenerationGrant::Gcloud(_)))
+            if !capabilities.operator_selected_grant => {}
+        (Some(GenerationRequest::GcloudAccess(_)), _) => {
+            return Err(CliError::failure("the manager did not approve the exact Google Cloud project and permissions or return a negotiated operator selection"));
+        }
+        (Some(request), Some(grant)) if grant.can_select_for(request) => {
+            return Err(CliError::failure("the manager did not approve the exact requested grant or return a negotiated operator selection"));
+        }
+        (None, None) => {}
+        _ => return Err(CliError::failure("the manager sent a result for a different credential source")),
+    }
     Ok(result)
+}
+
+/// Managed renewal repeats the exact claims from the previously validated
+/// lease, so callers need only its ID and never reconstruct authority.
+pub(crate) fn replay_managed_claims(pinned: Option<&GenerationSelection>) -> Option<GenerationRequest> {
+    match pinned.map(|selection| &selection.grant) {
+        Some(GenerationGrant::GcloudAccess(GcloudAccessGrant::Issued { access, .. })) =>
+            Some(GenerationRequest::GcloudAccess(access.clone())),
+        _ => None,
+    }
 }
 
 pub(crate) fn deadline(wait: Option<u64>) -> Option<Instant> {
@@ -321,12 +374,18 @@ struct JsonGet<'a> {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct GithubScopeArgs {
+pub(crate) struct GenerationArgs {
     /// Explicit GitHub owner/repo names; repeat or separate with commas.
     #[arg(long, value_name = "OWNER/REPO", value_delimiter = ',')]
     repositories: Vec<String>,
-    /// GitHub permissions KEY=read|write|admin; repeat or separate with commas. Defaults to metadata=read.
-    #[arg(long, value_name = "KEY=LEVEL", value_delimiter = ',')]
+    /// Google Cloud project ID; conflicts with --repositories and --gcloud-scope.
+    /// A compatible manager can let the operator select a different project on fresh approval.
+    #[arg(long, value_name = "ID", requires = "permissions", conflicts_with_all = ["repositories", "gcloud_scopes"])]
+    project: Option<String>,
+    /// GitHub KEY=LEVEL with --repositories, or Google claims (e.g. storage=read) with --project.
+    /// Repeat or separate with commas. GitHub defaults to metadata=read; Google claims are required.
+    /// A compatible manager can let the operator approve a different set of claims.
+    #[arg(long, value_name = "CLAIM", value_delimiter = ',')]
     permissions: Vec<String>,
 }
 
@@ -334,8 +393,54 @@ pub(crate) fn github_repositories_required() -> CliError {
     CliError::invalid("generated GitHub credentials require --repositories OWNER/REPO")
 }
 
-impl GithubScopeArgs {
-    pub(crate) fn into_generation(self) -> Result<Option<GenerationRequest>, CliError> {
+pub(crate) fn gcloud_access_required() -> CliError {
+    CliError::invalid("generated Google Cloud credentials require --project ID --permissions CLAIM (or --gcloud-scope URI for a legacy bound generator)")
+}
+
+pub(crate) struct GenerationSelectors {
+    pub github: Option<GenerationRequest>,
+    pub google: Option<GenerationRequest>,
+}
+
+impl GenerationSelectors {
+    pub(crate) fn capability(&self) -> Option<&'static str> {
+        if matches!(&self.google, Some(GenerationRequest::GcloudAccess(_))) {
+            Some(CAPABILITY_GCLOUD_ACCESS_V1)
+        } else if self.github.is_some() {
+            Some(CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1)
+        } else {
+            None
+        }
+    }
+}
+
+impl GenerationArgs {
+    pub(crate) fn into_selectors(self, gcloud_scopes: Vec<String>) -> Result<GenerationSelectors, CliError> {
+        if let Some(project_id) = self.project {
+            let mut permissions = Vec::with_capacity(self.permissions.len());
+            for claim in &self.permissions {
+                let permission = GcloudPermission::from_claim(claim)
+                    .ok_or_else(|| CliError::invalid(
+                        "unknown Google Cloud permission claim; use storage=read, storage=create, compute=read, run=read, logs=read or bigquery=metadata-read"
+                    ))?;
+                permissions.push(permission);
+            }
+            let mut access = GcloudAccessRequest { project_id, permissions };
+            access.canonicalize()?;
+            return Ok(GenerationSelectors { github: None, google: Some(GenerationRequest::GcloudAccess(access)) });
+        }
+        let google = if gcloud_scopes.is_empty() {
+            None
+        } else {
+            let mut request = GenerationRequest::Gcloud(GcloudScopeRequest { scopes: Some(gcloud_scopes) });
+            request.canonicalize()?;
+            Some(request)
+        };
+        let github = self.github_request()?;
+        Ok(GenerationSelectors { github, google })
+    }
+
+    fn github_request(self) -> Result<Option<GenerationRequest>, CliError> {
         if self.repositories.is_empty() {
             return if self.permissions.is_empty() { Ok(None) } else { Err(github_repositories_required()) };
         }
@@ -380,7 +485,10 @@ pub struct GetArgs {
     #[arg(long)]
     pub no_reaper: bool,
     #[command(flatten)]
-    github_scope: GithubScopeArgs,
+    generation_args: GenerationArgs,
+    /// Explicit OAuth scope URI for a legacy bound Google generator; repeat or separate with commas.
+    #[arg(long = "gcloud-scope", value_name = "URI", value_delimiter = ',', conflicts_with_all = ["repositories", "permissions"])]
+    pub gcloud_scopes: Vec<String>,
     /// Renew exactly this host-owned generated lease, without rebinding.
     #[arg(long, conflicts_with = "new_lease")]
     pub lease: Option<String>,
@@ -399,22 +507,42 @@ pub struct GetArgs {
 pub fn get(a: GetArgs) -> Result<(), CliError> {
     let reason = asm_proto::rules::validate_reason(&a.reason)?;
     let hosts = parse_hosts(&a.hosts)?;
-    let generation = a.github_scope.into_generation()?;
+    let selectors = a.generation_args.into_selectors(a.gcloud_scopes)?;
+    let mut capability = selectors.capability();
+    let generation = selectors.github.or(selectors.google);
     let generated_flags = generation.is_some() || a.lease.is_some() || a.refresh || a.new_lease;
     let s = Session::open()?;
     let dir = s.secrets_dir()?;
-    crate::bindings::require_capabilities(&s.api, generated_flags, a.sentinel || a.lease.is_some(), false)?;
+    crate::bindings::require_capabilities(&s.api, generated_flags, a.sentinel || a.lease.is_some(), capability)?;
     let owned = s.sync_leases()?;
     let mut refresh_from_version = None;
-    let (binding, request_name, generated, fields) = if let Some(id) = &a.lease {
+    let mut pinned = None;
+    let (binding, request_name, output, fields) = if let Some(id) = &a.lease {
         if !asm_proto::crypto::is_uuid(id) {
             return Err(CliError::invalid("invalid lease id"));
         }
         let binding = asm_proto::bindings::parse_binding(&a.name)?;
         let lease = owned.leases.iter().find(|l| &l.lease_id == id)
             .ok_or_else(|| CliError::from(asm_proto::error::ApiError::new(ErrorCode::NotFound, "lease not found")))?;
-        if lease.generation.is_none() {
-            return Err(CliError::invalid("--lease requires a generated lease"));
+        let selection = lease.generation.as_ref()
+            .ok_or_else(|| CliError::invalid("--lease requires a generated lease"))?;
+        if selection.validate().is_err() || !selection.grant.is_issued() {
+            return Err(CliError::failure("the manager sent invalid generated credential metadata"));
+        }
+        pinned = Some(selection);
+        let managed = matches!(&selection.grant, GenerationGrant::GcloudAccess(_));
+        if managed {
+            capability = Some(CAPABILITY_GCLOUD_ACCESS_V1);
+        }
+        if let Some(request) = &generation {
+            if !selection.grant.matches_request_exactly(request)? {
+                let message = if managed || matches!(request, GenerationRequest::GcloudAccess(_)) {
+                    "the pinned Google Cloud lease does not match the exact requested project and permissions"
+                } else {
+                    "the pinned generated lease does not match the exact requested grant"
+                };
+                return Err(CliError::invalid(message));
+            }
         }
         if lease.status != LeaseStatus::Active {
             return Err(CliError::denied(Some("lease ended; request a new lease without --lease")));
@@ -435,47 +563,60 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
             return Err(CliError::failure("the manager sent invalid generated credential metadata"));
         }
         let name = binding.source.clone();
-        (binding, name, true, field.map(|f| vec![f]))
+        (binding, name, Some(selection.grant.output_name()), field.map(|f| vec![f]))
     } else {
         let entries = crate::bindings::catalog(&s.api)?;
         let binding = asm_proto::bindings::parse_get_binding(&a.name, &entries)?;
         let resolved = crate::bindings::resolve(binding.clone(), &entries);
-        // Whole-item static gets retain the manager's historical leased-name
-        // fallback. Generated spellings must not reach that fallback, even when
-        // their colliding bare alias was omitted from the public generated row.
-        let generated_spelling = matches!(
-            binding.source.as_str(),
-            GITHUB_TOKEN_NAME | GITHUB_TOKEN_ALIAS
-        ) && entries.iter().any(|entry| {
-            entry.source_kind == SourceKind::Generator && !entry.generators.is_empty()
-        });
         match resolved {
             Ok(resolved) => {
                 let fields = binding.field.clone().or_else(|| binding.destination.as_ref().map(|_| resolved.available_fields[0].clone())).map(|f| vec![f]);
-                (binding, resolved.request_name, resolved.generated, fields)
+                (binding, resolved.request_name, resolved.generated_output, fields)
             }
+            // Whole-item static gets retain the manager's historical leased-name
+            // fallback, but a generated spelling (including a hidden colliding
+            // alias) must not go through it.
             Err(e) if matches!(e.code, Some(ErrorCode::NotFound | ErrorCode::Ambiguous))
                 && binding.destination.is_none() && binding.field.is_none()
-                && !generated_flags && !generated_spelling => {
+                && !generated_flags
+                && !canonical_generated_output(&binding.source).is_some_and(|output| {
+                    entries.iter().any(|entry| generated_output(entry) == Some(output))
+                }) => {
                 let name = binding.source.clone();
-                (binding, name, false, None)
+                (binding, name, None, None)
             }
             Err(e) => return Err(e),
         }
     };
     check_name(&request_name)?;
+    let generated = output.is_some();
     if generated_flags && !generated {
         return Err(CliError::invalid("generation options require a generated secret"));
     }
-    if generated && a.lease.is_none() && generation.is_none() {
-        return Err(github_repositories_required());
+    if let Some(request) = &generation {
+        if output != Some(request.output_name()) {
+            let message = match request {
+                GenerationRequest::GithubApp(_) => "--repositories and --permissions require a generated GitHub secret",
+                GenerationRequest::GcloudAccess(_) => "--project and --permissions require a generated Google Cloud secret",
+                GenerationRequest::Gcloud(_) => "--gcloud-scope requires a legacy bound Google Cloud secret",
+            };
+            return Err(CliError::invalid(message));
+        }
+    } else if pinned.is_none() {
+        match output {
+            Some(GITHUB_TOKEN_NAME) => return Err(github_repositories_required()),
+            Some(GCLOUD_TOKEN_NAME) => return Err(gcloud_access_required()),
+            _ => {}
+        }
     }
-    crate::bindings::require_capabilities(
+    let capabilities = crate::bindings::require_capabilities(
         &s.api,
         generated,
         fields.is_some() || a.sentinel || (generated && binding.source.ends_with(GITHUB_TOKEN_ALIAS)),
-        generation.is_some(),
+        capability,
     )?;
+    let generation = generation.or_else(|| replay_managed_claims(pinned));
+    let client_capabilities = capabilities.client_capabilities(generation.as_ref(), pinned.is_some());
     let mut body = RequestBody::Get {
         name: request_name,
         raw: a.raw,
@@ -486,16 +627,14 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
         refresh_from_version,
         new_lease: a.new_lease,
         lease_id: a.lease.clone(),
-        client_capabilities: crate::bindings::capabilities(),
+        client_capabilities,
         hosts,
         reason: reason.clone(),
         agent: crate::hostinfo::agent_label(),
     };
     body.canonicalize()?;
-    let result = submit_get(&s.api, &body, deadline(a.wait)).map_err(|e| if e.message == CliError::acquisition_elapsed().message { CliError::pending() } else { e })?;
-    if generated && result.generation.is_none() {
-        return Err(CliError::failure("the manager omitted generated credential metadata"));
-    }
+    let result = submit_get(&s.api, &body, deadline(a.wait), pinned, capabilities)
+        .map_err(|e| if e.message == CliError::acquisition_elapsed().message { CliError::pending() } else { e })?;
     let views = result.files.iter().map(|f| FileBinding {
         field: f.field.clone(),
         requested_path: binding.destination.clone().unwrap_or_else(|| if generated { binding.source.clone() } else { f.relative_path.clone() }),
@@ -537,11 +676,15 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
             )
         );
     }
-    if result.generation.is_some() {
+    if let Some(selection) = &result.generation {
         let mode = if result.mode == LeaseMode::Sentinel { " --sentinel" } else { "" };
         eprintln!("refresh: asm get --lease {} --refresh{} {} {}", result.lease_id, mode, crate::bindings::shell_quote(&a.name), crate::bindings::shell_quote(&reason));
         if a.refresh {
-            eprintln!("warning: explicit refresh can invalidate tokens used by running consumers");
+            match &selection.grant {
+                GenerationGrant::GithubApp(_) => eprintln!("warning: explicit refresh can invalidate tokens used by running consumers"),
+                GenerationGrant::Gcloud(_) | GenerationGrant::GcloudAccess(_) =>
+                    eprintln!("warning: previously released Google tokens may remain usable until credential expiry"),
+            }
         }
     }
     Ok(())
@@ -602,7 +745,8 @@ pub fn update(field: Option<String>, wait: Option<u64>, name: String) -> Result<
         value,
         agent: crate::hostinfo::agent_label(),
     };
-    let w = write_result(submit(&s.api, &body, deadline(wait))?)?;
+    let (result, _) = submit(&s.api, &body, deadline(wait))?;
+    let w = write_result(result)?;
     // Raw leases on this secret were revoked by the update: remove their files.
     if let Err(e) = s.sync_leases() {
         eprintln!("warning: {}", e.message);
@@ -625,7 +769,8 @@ pub fn add(wait: Option<u64>, name: String) -> Result<(), CliError> {
         value,
         agent: crate::hostinfo::agent_label(),
     };
-    let w = write_result(submit(&s.api, &body, deadline(wait))?)?;
+    let (result, _) = submit(&s.api, &body, deadline(wait))?;
+    let w = write_result(result)?;
     println!("added {} to {}; run asm get to use it", w.name, w.vault);
     Ok(())
 }
@@ -636,23 +781,66 @@ mod tests {
     use asm_proto::wire::ResultFile;
     use clap::{Parser, error::ErrorKind};
 
+    const GCLOUD_NAME: &str = "CLOUDSDK_AUTH_ACCESS_TOKEN";
+    const CLOUD_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+    const STORAGE_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_only";
+
     fn parse_get(options: &[&str]) -> Result<GetArgs, clap::Error> {
-        let args = ["asm", "get"].into_iter().chain(options.iter().copied()).chain([GITHUB_TOKEN_NAME, "Read GitHub"]);
+        let args = ["asm", "get"].into_iter().chain(options.iter().copied()).chain([GCLOUD_NAME, "Read demo data"]);
         let crate::Command::Get(get) = crate::Cli::try_parse_from(args)?.command else { unreachable!() };
         Ok(get)
     }
 
     #[test]
-    fn github_scope_rejects_invalid_repositories_and_permissions() {
-        for options in [
-            vec!["--repositories", "repo"],
-            vec!["--repositories", "acme/repo", "--permissions", "contents"],
-            vec!["--repositories", "acme/repo", "--permissions", "contents=none"],
-            vec!["--repositories", "acme/repo", "--permissions", "contents=read,contents=read"],
-            vec!["--repositories", "acme/repo", "--permissions", "metadata=write"],
+    fn gcloud_scope_flags_are_repeatable_comma_delimited_and_exact() {
+        let both = format!("{STORAGE_SCOPE},{CLOUD_SCOPE}");
+        let get = parse_get(&["--gcloud-scope", &both, "--gcloud-scope", STORAGE_SCOPE]).unwrap();
+        let generation = get.generation_args.into_selectors(get.gcloud_scopes).unwrap().google.unwrap();
+        assert_eq!(serde_json::to_value(generation).unwrap(), serde_json::json!({
+            "provider":"gcloud", "scope":{"scopes":[CLOUD_SCOPE, STORAGE_SCOPE]}
+        }));
+        let get = parse_get(&[]).unwrap();
+        let selectors = get.generation_args.into_selectors(get.gcloud_scopes).unwrap();
+        assert!(selectors.google.is_none() && selectors.github.is_none());
+        for malformed in ["", "openid", "https://www.googleapis.com/auth/a b"] {
+            let flag = format!("--gcloud-scope={malformed}");
+            assert!(parse_get(&[&flag]).map_or(true, |get| get.generation_args.into_selectors(get.gcloud_scopes).is_err()));
+        }
+    }
+
+    #[test]
+    fn gcloud_scope_flags_conflict_with_both_github_dimensions() {
+        for (flag, value) in [
+            ("--repositories", "acme/repo"),
+            ("--permissions", "contents=read"),
         ] {
-            let get = parse_get(&options).unwrap();
-            assert!(get.github_scope.into_generation().is_err(), "{options:?}");
+            let Err(err) = parse_get(&[flag, value, "--gcloud-scope", STORAGE_SCOPE]) else {
+                panic!("{flag} accepted conflicting gcloud scope");
+            };
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn managed_google_flags_require_an_exact_selector() {
+        let get = parse_get(&[
+            "--project", "demo-project", "--permissions", "run=read,storage=read",
+            "--permissions", "storage=read",
+        ]).unwrap();
+        let selectors = get.generation_args.into_selectors(get.gcloud_scopes).unwrap();
+        assert!(selectors.github.is_none());
+        assert_eq!(serde_json::to_value(selectors.google.unwrap()).unwrap(), serde_json::json!({
+            "provider":"gcloud_access","scope":{"project_id":"demo-project","permissions":["storage=read","run=read"]}
+        }));
+        assert_eq!(parse_get(&["--project", "demo-project"]).err().unwrap().kind(), ErrorKind::MissingRequiredArgument);
+        for conflict in [("--repositories", "acme/web"), ("--gcloud-scope", STORAGE_SCOPE)] {
+            let error = parse_get(&["--project", "demo-project", "--permissions", "storage=read", conflict.0, conflict.1])
+                .err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        }
+        for invalid in ["storage=write", "roles/owner", CLOUD_SCOPE, "Storage=read", "", " storage=read"] {
+            let parsed = parse_get(&["--project", "demo-project", "--permissions", invalid]);
+            assert!(parsed.map_or(true, |get| get.generation_args.into_selectors(get.gcloud_scopes).is_err()), "{invalid:?}");
         }
     }
 
@@ -664,7 +852,7 @@ mod tests {
                 panic!("get accepted {flag}");
             };
             assert_eq!(error.kind(), ErrorKind::UnknownArgument);
-            let Err(error) = crate::Cli::try_parse_from(["asm", "exec", flag, value, GITHUB_TOKEN_NAME, "--", "gh"]) else {
+            let Err(error) = crate::Cli::try_parse_from(["asm", "exec", flag, value, "GH_TOKEN", "--", "gh"]) else {
                 panic!("exec accepted {flag}");
             };
             assert_eq!(error.kind(), ErrorKind::UnknownArgument);
@@ -679,6 +867,7 @@ mod tests {
             hosts: vec!["api.github.com".into(), "*.githubusercontent.com".into()],
             expires_at: Some("2026-11-16T12:34:56Z".into()),
             generation: None,
+            operator_selected_grant: false,
             credential_expires_at: None,
             credential_version: None,
             generator_name: None,

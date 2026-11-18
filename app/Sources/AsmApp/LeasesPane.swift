@@ -96,13 +96,13 @@ struct LeasesPane: View {
             }
         }
         .confirmationDialog(
-            "Revoke \(confirming?.count ?? 0) leases?",
+            confirming?.count == 1 ? "End this lease?" : "End \(confirming?.count ?? 0) leases?",
             isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
             presenting: confirming
         ) { ids in
-            Button("Revoke", role: .destructive) { perform(ids) }
-        } message: { _ in
-            Text("Their sentinels stop working at once. ASM attempts to revoke generated tokens, but raw copies may remain usable until provider expiry if revocation fails. Static raw values cannot be recalled.")
+            Button("End lease access", role: .destructive) { perform(ids) }
+        } message: { ids in
+            revokeMessage(for: ids)
         }
         .errorAlert($error)
         .onAppear(perform: recompute)
@@ -157,15 +157,35 @@ struct LeasesPane: View {
     private func revoke(_ ids: Set<String>) {
         let active = activeIDs(in: ids)
         guard !active.isEmpty else { return }
-        if active.count > 1 {
+        if active.count > 1 || model.leases.contains(where: { active.contains($0.id) && $0.isGoogleGenerated }) {
             confirming = active
         } else {
             perform(active)
         }
     }
 
+    private func revokeMessage(for ids: Set<String>) -> Text {
+        let googleCount = model.leases.lazy.filter { ids.contains($0.id) && $0.isGoogleGenerated }.count
+        if googleCount == ids.count {
+            return Text(GcloudTokenWarning.text)
+        }
+        if googleCount > 0 {
+            return Text("Ending these leases stops ASM delivery. Google access tokens cannot be individually revoked; copies remain usable until credential expiry. ASM attempts to revoke GitHub tokens, and static raw values cannot be recalled.")
+        }
+        return Text("Their sentinels stop working at once. ASM attempts to revoke GitHub tokens, but raw copies may remain usable until provider expiry if revocation fails. Static raw values cannot be recalled.")
+    }
+
     private func perform(_ ids: Set<String>) {
         Task { error = await model.revokeLeases(ids) }
+    }
+}
+
+private extension LeaseItem {
+    var isGoogleGenerated: Bool {
+        switch generation?.grant {
+        case .gcloud?, .gcloudAccess?: true
+        case .githubApp?, nil: false
+        }
     }
 }
 
@@ -189,22 +209,36 @@ private struct LeaseDetail: View {
                 LabeledContent("Lease expires") { ExpiryCell(date: lease.expiresAt) }
                 if let generation = lease.generation {
                     Divider()
-                    Text("GitHub App").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+                    Text(lease.isGoogleGenerated ? "Google Cloud" : "GitHub App")
+                        .font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
                     Text(lease.generatorName ?? lease.source).font(.headline)
                     LabeledContent("Revision", value: String(generation.generatorRevision))
                     LabeledContent("Generator ID", value: generation.generatorID).textSelection(.enabled)
-                    GithubGrantSummary(grant: generation.grant.github)
+                    switch generation.grant {
+                    case let .githubApp(grant): GithubGrantSummary(grant: grant)
+                    case let .gcloud(grant): GcloudGrantSummary(grant: grant)
+                    case let .gcloudAccess(.issued(access, uniqueID, email)):
+                        GcloudManagedGrantSummary(access: access, uniqueID: uniqueID, email: email)
+                    case .gcloudAccess:
+                        Text("No issued Google access grant is recorded for this lease.")
+                            .foregroundStyle(.secondary)
+                    }
                     if let expiry = lease.credentialExpiresAt {
                         LabeledContent("Credential expires") {
                             Text(expiry, format: .dateTime.year().month().day().hour().minute().second())
                         }
+                    } else if lease.isGoogleGenerated {
+                        Text("ASM is not tracking a live Google credential for this lease.")
                     } else {
                         Text("No live credential has been issued.")
                     }
                     if let version = lease.credentialVersion { LabeledContent("Credential version", value: String(version)) }
                     Text("Credential expiry and lease expiry are independent. Run asm get again to renew a token within this authorization; renewal never extends the lease.")
                         .font(.callout).foregroundStyle(.secondary)
-                    if lease.mode == .raw {
+                    if lease.isGoogleGenerated {
+                        Label(GcloudTokenWarning.text, systemImage: "exclamationmark.triangle")
+                            .font(.callout).fixedSize(horizontal: false, vertical: true)
+                    } else if lease.mode == .raw {
                         Label("Delivered tokens may remain usable until GitHub expiry after failed revocation or a manager crash.", systemImage: "exclamationmark.triangle")
                             .font(.callout).fixedSize(horizontal: false, vertical: true)
                     }
@@ -241,6 +275,48 @@ private struct GithubGrantSummary: View {
             }
             Text("Repository selection does not restrict organization, account, or enterprise permissions.")
                 .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct GcloudGrantSummary: View {
+    let grant: GcloudGrantItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            GcloudServiceAccountSummary(email: grant.serviceAccountEmail, uniqueID: grant.serviceAccountUniqueID)
+            LabeledContent("Approved issuance quota project") {
+                if let projectID = grant.projectID {
+                    Text(projectID).monospaced().textSelection(.enabled)
+                } else {
+                    Text("Not recorded on this lease").foregroundStyle(.secondary)
+                }
+            }
+            Text(GcloudIAMWarning.issuanceProjectText).font(.caption).foregroundStyle(.secondary)
+            Text("Approved OAuth scopes").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+            GcloudScopeURIList(scopes: grant.scopes)
+            if grant.scopes.contains(where: GcloudIAMWarning.isCrossService) {
+                Label(GcloudIAMWarning.crossServiceText, systemImage: "exclamationmark.triangle")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(GcloudIAMWarning.text)
+            Text(GcloudTokenWarning.clientUsage)
+        }
+    }
+}
+
+private struct GcloudManagedGrantSummary: View {
+    let access: GcloudAccessRequestItem
+    let uniqueID: String
+    let email: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            GcloudServiceAccountSummary(email: email, uniqueID: uniqueID)
+            GcloudAccessClaimsSummary(heading: "Approved permissions", access: access)
+            Text(GcloudManagedIAMWarning.text)
+            Text("Ending this lease does not remove the service account or its IAM bindings.")
+            Text(GcloudTokenWarning.clientUsage)
         }
     }
 }

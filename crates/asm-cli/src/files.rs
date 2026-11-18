@@ -668,6 +668,7 @@ mod tests {
             hosts: vec!["api.example.com".into()],
             expires_at: expires.map(Into::into),
             generation: None,
+            operator_selected_grant: false,
             credential_expires_at: None,
             credential_version: None,
             generator_name: None,
