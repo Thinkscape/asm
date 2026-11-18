@@ -845,6 +845,20 @@ mod tests {
     }
 
     #[test]
+    fn github_scope_rejects_invalid_repositories_and_permissions() {
+        for options in [
+            vec!["--repositories", "repo"],
+            vec!["--repositories", "acme/repo", "--permissions", "contents"],
+            vec!["--repositories", "acme/repo", "--permissions", "contents=none"],
+            vec!["--repositories", "acme/repo", "--permissions", "contents=read,contents=read"],
+            vec!["--repositories", "acme/repo", "--permissions", "metadata=write"],
+        ] {
+            let get = parse_get(&options).unwrap();
+            assert!(get.generation_args.into_selectors(get.gcloud_scopes).is_err(), "{options:?}");
+        }
+    }
+
+    #[test]
     fn obsolete_github_flags_are_not_accepted_by_get_or_exec() {
         for flag in ["--permission", "--github-permission", "--github-repositories"] {
             let value = if flag == "--github-repositories" { "acme/web" } else { "contents=read" };
