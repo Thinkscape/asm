@@ -49,8 +49,9 @@ pub struct GithubRepository {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubScopeRequest {
-    /// None leaves this dimension to the operator (or an existing approval).
+    /// Full owner/name pairs. Required for a new generated GitHub lease.
     pub repositories: Option<Vec<String>>,
+    /// Omission grants only GitHub's mandatory metadata:read permission.
     pub permissions: Option<BTreeMap<String, GithubPermission>>,
 }
 
@@ -166,8 +167,8 @@ impl GithubScopeRequest {
         Ok(())
     }
 
-    /// None stays None; an explicitly empty repository dimension is invalid.
-    /// An explicitly empty permission dimension means mandatory metadata:read.
+    /// Repository omission is preserved for validation by the request target.
+    /// Omitted and empty permissions both mean mandatory metadata:read.
     pub fn canonicalize(&mut self) -> Result<(), ApiError> {
         if let Some(repositories) = &mut self.repositories {
             if repositories.is_empty() {
@@ -183,10 +184,11 @@ impl GithubScopeRequest {
             }
             repositories.sort_unstable();
             repositories.dedup();
+            if repositories.len() > MAX_GITHUB_REPOSITORIES {
+                return Err(ApiError::invalid("at most 500 GitHub repositories can be requested"));
+            }
         }
-        if let Some(permissions) = &mut self.permissions {
-            canonicalize_permissions(permissions)?;
-        }
+        canonicalize_permissions(self.permissions.get_or_insert_with(BTreeMap::new))?;
         Ok(())
     }
 }
@@ -359,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_requests_normalize_without_losing_omission() {
+    fn repository_requests_normalize_and_default_to_metadata_only() {
         let mut request = GithubScopeRequest {
             repositories: Some(vec![" Acme/Web ".into(), "acme/web".into(), "Other/repo.name".into()]),
             permissions: Some(BTreeMap::new()),
@@ -370,12 +372,17 @@ mod tests {
         let mut omitted = GithubScopeRequest::default();
         omitted.canonicalize().unwrap();
         assert_eq!(omitted.repositories, None);
-        assert_eq!(omitted.permissions, None);
+        assert_eq!(omitted.permissions, Some(BTreeMap::from([("metadata".into(), GithubPermission::Read)])));
         for name in ["", "a", "a/", "/b", "a/b/c", "./repo", "a/..", "a/b c", "ä/b", "a/b@c"] {
             assert!(normalize_repository_name(name).is_err(), "{name:?}");
         }
         assert!(normalize_repository_name(" a_b/c-d.e ").is_ok());
         assert!(GithubScopeRequest { repositories: Some(vec![]), permissions: None }.canonicalize().is_err());
+        let mut too_many = GithubScopeRequest {
+            repositories: Some((0..=MAX_GITHUB_REPOSITORIES).map(|i| format!("acme/repo-{i}")).collect()),
+            permissions: None,
+        };
+        assert!(too_many.canonicalize().is_err());
     }
 
     #[test]
@@ -501,6 +508,6 @@ mod tests {
         };
         request.canonicalize().unwrap();
         assert_eq!(request.repositories.unwrap(), ["acme/web"]);
-        assert_eq!(request.permissions, None);
+        assert_eq!(request.permissions, Some(BTreeMap::from([("metadata".into(), GithubPermission::Read)])));
     }
 }

@@ -143,6 +143,12 @@ final class CoreBridge: @unchecked Sendable {
         GithubInstallationItem(try Self.mapped { try manager.githubConnect(draft: GeneratorDraft(draft)) })
     }
 
+    func githubListInstallations(_ draft: GeneratorDraftItem) throws -> [GithubInstallationAccountItem] {
+        try Self.mapped { try manager.githubListInstallations(draft: GeneratorDraft(draft)) }.map {
+            GithubInstallationAccountItem(installationID: $0.installationId, account: $0.account)
+        }
+    }
+
     // MARK: Hosts and pairing codes
 
     func listHosts() throws -> [HostItem] {
@@ -337,7 +343,7 @@ private extension PendingItem {
         case let .pair(hostInfo, observedAddress, code, repair):
             .pair(info: HostInfoItem(hostInfo), observedAddress: observedAddress, code: code, repair: repair.flatMap(RepairItem.init))
         case let .get(name, vaultID, vaultName, _, fields, reason, rawRequested, requestedHosts,
-                      initialHosts, suggestedHosts, defaultDurationSecs, generatorChoices,
+                      initialHosts, suggestedHosts, defaultDurationSecs, isGenerated, generatorChoices,
                       requestedGeneration, sentinelRequired, hasSubstitutableFields):
             .get(GetDetail(
                 name: name, vaultID: vaultID, vaultName: vaultName, fields: fields, reason: reason, rawRequested: rawRequested,
@@ -345,6 +351,7 @@ private extension PendingItem {
                 initialHosts: initialHosts.map(HostPatternCheckItem.init),
                 suggestedHosts: suggestedHosts.map(HostPatternCheckItem.init),
                 defaultDurationSecs: defaultDurationSecs,
+                isGenerated: isGenerated,
                 generatorChoices: generatorChoices.map(GeneratorApprovalChoiceItem.init),
                 requestedGeneration: requestedGeneration.map(GenerationRequestItem.init),
                 sentinelRequired: sentinelRequired, hasSubstitutableFields: hasSubstitutableFields
@@ -598,10 +605,14 @@ private extension GithubPermissionEntry {
     }
 }
 
-private extension GithubRepositoryItem {
-    init(_ repository: GithubRepository) {
-        self.init(id: repository.id, fullName: repository.fullName)
-    }
+private func repositoryDisplayOrder(_ lhs: String, _ rhs: String) -> Bool {
+    lhs.localizedStandardCompare(rhs) == .orderedAscending
+}
+
+private func displayRepositories(_ repositories: [GithubRepository]) -> [GithubRepositoryItem] {
+    var items = repositories.map { GithubRepositoryItem(id: $0.id, fullName: $0.fullName) }
+    items.sort { repositoryDisplayOrder($0.fullName, $1.fullName) }
+    return items
 }
 
 private extension GithubRepository {
@@ -612,7 +623,7 @@ private extension GithubRepository {
 
 private extension GithubGrantItem {
     init(_ grant: GithubGrant) {
-        self.init(installationID: grant.installationId, repositories: grant.repositories.map(GithubRepositoryItem.init),
+        self.init(installationID: grant.installationId, repositories: displayRepositories(grant.repositories),
                   permissions: grant.permissions.map(GithubPermissionItem.init))
     }
 }
@@ -645,7 +656,8 @@ private extension GenerationRequestItem {
         switch request {
         case let .githubApp(scope):
             self = .githubApp(GithubScopeRequestItem(
-                repositories: scope.repositories, permissions: scope.permissions?.map(GithubPermissionItem.init)
+                repositories: scope.repositories?.sorted(by: repositoryDisplayOrder),
+                permissions: scope.permissions?.map(GithubPermissionItem.init)
             ))
         }
     }
@@ -685,7 +697,7 @@ private extension GeneratorConfigItem {
         switch config {
         case let .githubApp(config):
             self = .githubApp(GithubAppConfigItem(
-                clientID: config.clientId, installationID: config.installationId, ceiling: GithubGrantItem(config.ceiling)
+                clientID: config.clientId, installations: config.installations.map(GithubGrantItem.init)
             ))
         }
     }
@@ -696,7 +708,7 @@ private extension GeneratorConfig {
         switch config {
         case let .githubApp(config):
             self = .githubApp(config: GithubAppConfig(
-                clientId: config.clientID, installationId: config.installationID, ceiling: GithubGrant(config.ceiling)
+                clientId: config.clientID, installations: config.installations.map(GithubGrant.init)
             ))
         }
     }
@@ -723,7 +735,7 @@ private extension GeneratorDraft {
 private extension GithubInstallationItem {
     init(_ installation: GithubInstallation) {
         self.init(installationID: installation.installationId, accountLogin: installation.accountLogin,
-                  repositories: installation.repositories.map(GithubRepositoryItem.init),
+                  repositories: displayRepositories(installation.repositories),
                   permissions: installation.permissions.map(GithubPermissionItem.init), warning: installation.warning)
     }
 }

@@ -19,13 +19,18 @@ upgrading `asm` to keep this file in step with the CLI.
 3. **Launch with credentials**, preferably without files:
 
    ```bash
-   asm exec GH_TOKEN -- gh pr list --repo acme/web
-   asm exec 'GH_TOKEN,OTHER_SECRET' -- my-command
+   asm exec --repositories acme/web --permissions pull_requests=read GH_TOKEN -- gh pr list --repo acme/web
+   asm exec --repositories acme/web 'GH_TOKEN,OTHER_SECRET' -- my-command
    ```
 
    GitHub Apps expose `GH_TOKEN` and `GITHUB_TOKEN` as aliases of one credential. Bare
    shorthand replaces both inherited variables together; requesting both acquires once.
-   Multiple configured apps offer an operator choice, or qualify the source to pin an app.
+   For generated GitHub tokens, pass `--repositories OWNER/REPO` to `exec` and `get`,
+   except when pinning an existing lease with `get --lease ID`. Omitted permissions
+   mean `metadata=read`; request additional levels with `--permissions key=level[,key=level]`.
+   Request multiple repos with a comma-separated list only when one installation covers them.
+   Otherwise split the work into separate commands. The repo selects the installation;
+   qualify the token name only when you need a particular app.
    Acquisitions are sequential in input order. Every acquisition must succeed before the
    child starts; approval is not an atomic multi-lease transaction.
 4. **Follow the decision.** First generated access needs approval of the app, repositories,
@@ -60,7 +65,7 @@ Arguments are passed directly, not interpreted by a shell.
 asm exec --raw 'GOOGLE_USER=Vaultwarden/google::username,GOOGLE_PASS=Vaultwarden/google::password' -- my-command
 asm get 'GOOGLE_USER=Vaultwarden/google::username' 'Sign in'
 asm get 'Vaultwarden/google::username' 'Sign in to the requested site'
-asm exec 'BOT_A_TOKEN=release-bot/GH_TOKEN,BOT_B_TOKEN=review-bot/GH_TOKEN' -- my-command
+asm exec --repositories acme/web 'BOT_A_TOKEN=release-bot/GH_TOKEN,BOT_B_TOKEN=review-bot/GH_TOKEN' -- my-command
 asm get 'NAME=work/item\,with\,commas::field' 'Use the selected field'
 asm get 'NAME=work/item\:\:literal::value' 'Use the selected value'
 ```
@@ -83,10 +88,9 @@ If the manager lacks field/generator capabilities, upgrade it rather than droppi
 ## Files and renewal
 
 ```bash
-asm get GH_TOKEN 'Read acme/web'
-asm get GITHUB_TOKEN 'Continue reading acme/web'
-asm get --repositories acme/web --permission contents=read GH_TOKEN 'Read repository contents'
-asm get --sentinel --hosts api.github.com GH_TOKEN 'Read acme/web through the proxy'
+asm get --repositories acme/web GH_TOKEN 'Inspect repository metadata'
+asm get --repositories acme/web --permissions contents=read GH_TOKEN 'Read repository contents'
+asm get --repositories acme/web --sentinel --hosts api.github.com GH_TOKEN 'Read repository metadata through the proxy'
 asm get --lease LEASE_ID GH_TOKEN 'Continue reading acme/web'
 ```
 
@@ -129,8 +133,8 @@ Run proxy-env in the shell that will use sentinel files. It exports proxy and CA
 Verify GitHub App access against `repos/OWNER/REPO`, not `/user`:
 
 ```bash
-asm exec GH_TOKEN -- gh api repos/acme/web
-asm exec --sentinel --hosts api.github.com GITHUB_TOKEN -- gh api repos/acme/web
+asm exec --repositories acme/web GH_TOKEN -- gh api repos/acme/web
+asm exec --repositories acme/web --sentinel --hosts api.github.com GITHUB_TOKEN -- gh api repos/acme/web
 ```
 
 Sentinels are restricted to approved HTTPS hosts. Request only needed hosts; broad

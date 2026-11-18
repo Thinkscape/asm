@@ -3,10 +3,14 @@
 use crate::api::Api;
 use crate::bindings;
 use crate::error::CliError;
-use crate::requests::{self, submit_get};
+use crate::requests::{self, GithubScopeArgs, submit_get};
 use crate::state;
-use asm_proto::generators::CREDENTIAL_REFRESH_MARGIN_SECS;
-use asm_proto::wire::{GetResult, LeaseInfo, LeaseMode, LeaseStatus, LeasesResponse, RequestBody};
+use asm_proto::generators::{
+    CREDENTIAL_REFRESH_MARGIN_SECS, GITHUB_TOKEN_ALIAS, GITHUB_TOKEN_NAME, GenerationRequest,
+};
+use asm_proto::wire::{
+    GetResult, LeaseInfo, LeaseMode, LeaseStatus, LeasesResponse, RequestBody, RequestedMode,
+};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
@@ -23,6 +27,8 @@ pub struct ExecArgs {
     hosts: Vec<String>,
     #[arg(long)]
     reason: Option<String>,
+    #[command(flatten)]
+    github_scope: GithubScopeArgs,
     /// Overall acquisition budget, excluding discovery, proxy preparation and the child.
     #[arg(long)]
     wait: Option<u64>,
@@ -61,15 +67,20 @@ fn plan(input: &str, entries: &[asm_proto::wire::SecretEntry]) -> Result<(Vec<Ac
         if resolved.available_fields.len() > 1 && resolved.binding.destination.is_none() {
             return Err(CliError::invalid(format!("structured fields require DEST=SOURCE::FIELD; available fields: {}", resolved.available_fields.join(", "))));
         }
-        let names = match &resolved.binding.destination {
-            Some(destination) => vec![destination.clone()],
-            None if resolved.generated => vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()],
+        let single_name;
+        let names: &[&str] = match &resolved.binding.destination {
+            Some(destination) => {
+                single_name = [destination.as_str()];
+                &single_name
+            }
+            None if resolved.generated => &[GITHUB_TOKEN_NAME, GITHUB_TOKEN_ALIAS],
             None => {
                 let leaf = resolved.binding.source.rsplit('/').next().unwrap_or("");
                 if !bindings::environment_name(leaf) {
                     return Err(CliError::invalid("this source needs an explicit DEST= binding"));
                 }
-                vec![leaf.to_owned()]
+                single_name = [leaf];
+                &single_name
             }
         };
         let group = groups.iter().position(|g| g.key == resolved.canonical_key).unwrap_or_else(|| {
@@ -86,21 +97,21 @@ fn plan(input: &str, entries: &[asm_proto::wire::SecretEntry]) -> Result<(Vec<Ac
         if !groups[group].fields.contains(&field) {
             groups[group].fields.push(field.clone());
         }
-        for name in names {
+        for &name in names {
             if crate::proxy::ENV_NAMES.iter().any(|key| name.eq_ignore_ascii_case(key)) {
                 return Err(CliError::invalid(format!("{name} is reserved for proxy/CA settings")));
             }
-            if let Some((old_group, old_field)) = assigned.get(&name) {
+            if let Some((old_group, old_field)) = assigned.get(name) {
                 if *old_group != group || old_field != &field {
                     return Err(CliError::invalid(format!("conflicting bindings for {name}")));
                 }
                 continue;
             }
-            assigned.insert(name.clone(), (group, field.clone()));
-            destinations.push(Destination { name, group, field: field.clone() });
+            assigned.insert(name.to_owned(), (group, field.clone()));
+            destinations.push(Destination { name: name.to_owned(), group, field: field.clone() });
         }
     }
-    if let (Some(a), Some(b)) = (assigned.get("GH_TOKEN"), assigned.get("GITHUB_TOKEN")) {
+    if let (Some(a), Some(b)) = (assigned.get(GITHUB_TOKEN_NAME), assigned.get(GITHUB_TOKEN_ALIAS)) {
         if (groups[a.0].generated || groups[b.0].generated) && a != b {
             return Err(CliError::invalid("GH_TOKEN and GITHUB_TOKEN must identify the same generated credential; use custom destinations for different apps"));
         }
@@ -111,10 +122,19 @@ fn plan(input: &str, entries: &[asm_proto::wire::SecretEntry]) -> Result<(Vec<Ac
     Ok((groups, destinations))
 }
 
-fn body(name: String, fields: Vec<String>, raw: bool, sentinel: bool, hosts: Vec<String>, reason: String, lease_id: Option<String>) -> RequestBody {
+fn body(
+    name: String,
+    fields: Vec<String>,
+    mode: RequestedMode,
+    hosts: Vec<String>,
+    reason: String,
+    lease_id: Option<String>,
+    generation: Option<GenerationRequest>,
+) -> RequestBody {
     RequestBody::Get {
-        name, fields: Some(fields), raw, sentinel, hosts, reason, lease_id,
-        generation: None, refresh: false, refresh_from_version: None, new_lease: false,
+        name, fields: Some(fields), raw: mode == RequestedMode::Raw,
+        sentinel: mode == RequestedMode::Sentinel, hosts, reason, lease_id,
+        generation, refresh: false, refresh_from_version: None, new_lease: false,
         client_capabilities: bindings::capabilities(), agent: crate::hostinfo::agent_label(),
     }
 }
@@ -158,15 +178,30 @@ pub fn run(args: ExecArgs) -> Result<(), CliError> {
     let hosts = requests::parse_hosts(&args.hosts)?;
     let default_reason = default_reason(executable);
     let reason = asm_proto::rules::validate_reason(args.reason.as_deref().unwrap_or(&default_reason))?;
+    let mode = RequestedMode::from_flags(args.raw, args.sentinel)?;
+    let mut github_scope = args.github_scope.into_generation()?;
     let host = state::require()?;
     let api = Api::for_host(&host)?;
-    bindings::require_capabilities(&api, false, true)?;
+    bindings::require_capabilities(&api, false, true, false)?;
     let entries = bindings::catalog(&api)?;
     let (mut groups, destinations) = plan(&args.bindings, &entries)?;
-    bindings::require_capabilities(&api, groups.iter().any(|g| g.generated), true)?;
+    let mut github_groups = groups.iter().filter(|g| g.generated).count();
+    match (github_groups, github_scope.is_some()) {
+        (0, true) => return Err(CliError::invalid("--repositories and --permissions require a generated GitHub binding")),
+        (1.., false) => return Err(requests::github_repositories_required()),
+        _ => {}
+    }
+    let generated = github_groups != 0;
+    bindings::require_capabilities(&api, generated, true, generated)?;
     let mut deadline = requests::deadline(args.wait);
     for group in &mut groups {
-        let mut request = body(group.name.clone(), group.fields.clone(), args.raw, args.sentinel, hosts.clone(), reason.clone(), None);
+        let generation = if group.generated {
+            github_groups -= 1;
+            if github_groups == 0 { github_scope.take() } else { github_scope.clone() }
+        } else {
+            None
+        };
+        let mut request = body(group.name.clone(), group.fields.clone(), mode, hosts.clone(), reason.clone(), None, generation);
         request.canonicalize()?;
         group.result = Some(submit_get(&api, &request, deadline)?);
         if group.generated && group.result.as_ref().is_none_or(|r| r.generation.is_none()) {
@@ -179,7 +214,11 @@ pub fn run(args: ExecArgs) -> Result<(), CliError> {
         let lease = authority(&leases, group)?;
         let result = group.result.as_ref().expect("acquired");
         if group.generated && (lease.credential_version != result.credential_version || !headroom(result.credential_expires_at.as_deref()) || !headroom(lease.credential_expires_at.as_deref())) {
-            let request = body(lease.name.clone(), group.fields.clone(), lease.mode == LeaseMode::Raw, lease.mode == LeaseMode::Sentinel, lease.hosts.clone(), reason.clone(), Some(lease.lease_id.clone()));
+            let mode = match lease.mode {
+                LeaseMode::Raw => RequestedMode::Raw,
+                LeaseMode::Sentinel => RequestedMode::Sentinel,
+            };
+            let request = body(lease.name.clone(), group.fields.clone(), mode, lease.hosts.clone(), reason.clone(), Some(lease.lease_id.clone()), None);
             group.result = Some(submit_get(&api, &request, deadline)?);
         }
     }

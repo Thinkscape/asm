@@ -27,6 +27,7 @@ const SERVER_NONCE: [u8; 16] = [9; 16];
 const TOKEN: &str = "host-token-abc";
 const LEASE: &str = "11111111-2222-4333-8444-555555555555";
 const REQ: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const GITHUB_REPOSITORY: &str = "acme/web";
 
 fn start(handler: Arc<Handler>) -> Fake {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -426,7 +427,7 @@ fn get_writes_files_and_prints_block() {
         .clone();
     assert_eq!(
         sent,
-        json!({"kind":"get","name":"work/GitHub","raw":false,"sentinel":false,"fields":null,"generation":null,"refresh":false,"refresh_from_version":null,"new_lease":false,"lease_id":null,"client_capabilities":["generated_credentials_v1","secret_fields_v1"],"hosts":["api.example.com"],"reason":"deploy the site","agent":"test-agent"})
+        json!({"kind":"get","name":"work/GitHub","raw":false,"sentinel":false,"fields":null,"generation":null,"refresh":false,"refresh_from_version":null,"new_lease":false,"lease_id":null,"client_capabilities":["generated_credentials_v1","secret_fields_v1","github_explicit_scope_v1"],"hosts":["api.example.com"],"reason":"deploy the site","agent":"test-agent"})
     );
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(e.secrets.join(".leases.json")).unwrap()).unwrap();
@@ -725,10 +726,14 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
     let posts = std::sync::atomic::AtomicUsize::new(0);
     let f = start(Arc::new(move |method, path, body| {
         match (method, path) {
-            ("GET", "/v1/health") => (
-                200,
-                json!({"name":"asm-manager","version":"0.1.0","capabilities":if scenario == "old-manager" {vec![]} else {vec!["generated_credentials_v1","secret_fields_v1"]}}),
-            ),
+            ("GET", "/v1/health") => {
+                let capabilities = match scenario {
+                    "old-manager" => vec![],
+                    "legacy-github" => vec!["generated_credentials_v1", "secret_fields_v1"],
+                    _ => vec!["generated_credentials_v1", "secret_fields_v1", "github_explicit_scope_v1"],
+                };
+                (200, json!({"name":"asm-manager","version":"0.1.0","capabilities":capabilities}))
+            }
             ("GET", "/v1/secrets") => {
                 let mut catalog = generator_catalog();
                 if scenario == "alias-collision" {
@@ -813,8 +818,12 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                 let name = body["name"].as_str().unwrap();
                 let exact = body["lease_id"].as_str();
                 let mut records = leases.lock().unwrap();
-                let generated = scenario != "static-alias-collision"
-                    && (name.ends_with("GH_TOKEN") || name.ends_with("GITHUB_TOKEN"));
+                let generated = scenario != "static-alias-collision" && matches!(
+                    name,
+                    "GH_TOKEN" | "GITHUB_TOKEN"
+                        | "release-bot/GH_TOKEN" | "release-bot/GITHUB_TOKEN"
+                        | "review-bot/GH_TOKEN" | "review-bot/GITHUB_TOKEN"
+                );
                 let review = name.starts_with("review-bot/");
                 let id = if generated {
                     if review {
@@ -867,9 +876,20 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                     "raw"
                 };
                 let generation = if generated {
+                    let scope = &body["generation"]["scope"];
+                    let grant_scope = if exact.is_some() && scope.is_null() {
+                        records[existing.expect("a pin must target an existing lease")]["generation"]["grant"]["scope"].clone()
+                    } else {
+                        let repositories = scope["repositories"].as_array().expect("explicit GitHub repositories");
+                        json!({
+                            "installation_id":if review {2} else {1},
+                            "repositories":repositories.iter().enumerate().map(|(i, name)| json!({"id":i + 7,"full_name":name})).collect::<Vec<_>>(),
+                            "permissions":scope["permissions"]
+                        })
+                    };
                     json!({
                         "generator_id":if review {"app-b"} else {"app-a"},"generator_revision":1,
-                        "grant":{"provider":"github_app","scope":{"installation_id":if review {2} else {1},"repositories":[{"id":7,"full_name":"acme/web"}],"permissions":{"metadata":"read","contents":"read"}}}
+                        "grant":{"provider":"github_app","scope":grant_scope}
                     })
                 } else {
                     Value::Null
@@ -948,6 +968,8 @@ fn exec_github_aliases_are_file_free_and_replace_inherited_pair() {
         &e,
         &[
             "exec",
+            "--repositories",
+            GITHUB_REPOSITORY,
             "GH_TOKEN,GITHUB_TOKEN",
             "--",
             "/bin/sh",
@@ -961,13 +983,57 @@ fn exec_github_aliases_are_file_free_and_replace_inherited_pair() {
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "child-ok");
-    assert_eq!(posted(&f).len(), 1);
-    assert_eq!(posted(&f)[0]["fields"], json!(["value"]));
+    let sent = posted(&f);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["fields"], json!(["value"]));
+    assert_eq!(sent[0]["generation"], json!({
+        "provider":"github_app","scope":{"repositories":["acme/web"],"permissions":{"metadata":"read"}}
+    }));
     assert!(
         !e.secrets.exists(),
         "exec must not create secrets, manifest or reaper lock"
     );
     assert!(!text(&out.stderr).contains("fixture-release"));
+}
+
+#[test]
+fn exec_scopes_only_github_bindings_and_preserves_request_spelling() {
+    let (f, e) = launcher_fixture("raw");
+    let out = asm(
+        &e,
+        &[
+            "exec",
+            "--raw",
+            "--repositories",
+            " ACME/Web , acme/issues ",
+            "--repositories",
+            "Acme/Docs,acme/WEB",
+            "--permissions",
+            "contents=read,issues=write",
+            "--permissions",
+            "pull_requests=read",
+            "GITHUB_TOKEN,OTHER_SECRET,GH_TOKEN",
+            "--",
+            "/bin/sh",
+            "-c",
+            "test \"$GH_TOKEN\" = fixture-release-v1 && test \"$GITHUB_TOKEN\" = \"$GH_TOKEN\" && test \"$OTHER_SECRET\" = fixture-other && printf scoped-ok",
+        ],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "scoped-ok");
+    let sent = posted(&f);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["name"], "GITHUB_TOKEN");
+    assert_eq!(sent[0]["generation"], json!({
+        "provider":"github_app","scope":{
+            "repositories":["acme/docs","acme/issues","acme/web"],
+            "permissions":{"contents":"read","issues":"write","metadata":"read","pull_requests":"read"}
+        }
+    }));
+    assert_eq!(sent[1]["name"], "OTHER_SECRET");
+    assert!(sent[1]["generation"].is_null());
+    assert!(!e.secrets.exists());
 }
 
 #[test]
@@ -994,6 +1060,8 @@ fn exec_explicit_destinations_and_grouped_fields() {
         &e,
         &[
             "exec",
+            "--repositories",
+            GITHUB_REPOSITORY,
             "BOT_A_TOKEN=release-bot/GH_TOKEN,BOT_B_TOKEN=review-bot/GH_TOKEN",
             "--",
             "/bin/sh",
@@ -1005,7 +1073,13 @@ fn exec_explicit_destinations_and_grouped_fields() {
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "apps-ok");
-    assert_eq!(posted(&f).len(), 3);
+    let sent = posted(&f);
+    assert_eq!(sent.len(), 3);
+    for request in &sent[1..] {
+        assert_eq!(request["generation"], json!({
+            "provider":"github_app","scope":{"repositories":["acme/web"],"permissions":{"metadata":"read"}}
+        }));
+    }
     assert!(!e.secrets.exists());
 }
 
@@ -1110,6 +1184,8 @@ fn exec_never_launches_on_acquisition_or_prelaunch_failure() {
             &e,
             &[
                 "exec",
+                "--repositories",
+                GITHUB_REPOSITORY,
                 bindings,
                 "--",
                 "/bin/sh",
@@ -1133,6 +1209,8 @@ fn exec_refreshes_once_without_forcing_or_rebinding() {
             &e,
             &[
                 "exec",
+                "--repositories",
+                GITHUB_REPOSITORY,
                 "GITHUB_TOKEN",
                 "--",
                 "/bin/sh",
@@ -1149,6 +1227,7 @@ fn exec_refreshes_once_without_forcing_or_rebinding() {
         assert_eq!(sent[1]["refresh"], false);
         assert_eq!(sent[1]["name"], "GH_TOKEN");
         assert_eq!(sent[1]["fields"], json!(["value"]));
+        assert!(sent[1]["generation"].is_null());
     }
 }
 
@@ -1159,6 +1238,8 @@ fn exec_sentinel_proxy_settings_are_automatic_and_plain_fields_skip_them() {
         &e,
         &[
             "exec",
+            "--repositories",
+            GITHUB_REPOSITORY,
             "--sentinel",
             "--hosts",
             "api.github.com",
@@ -1219,6 +1300,8 @@ fn exec_sentinel_proxy_settings_are_automatic_and_plain_fields_skip_them() {
         &e,
         &[
             "exec",
+            "--repositories",
+            GITHUB_REPOSITORY,
             "--sentinel",
             "GH_TOKEN",
             "--",
@@ -1230,6 +1313,67 @@ fn exec_sentinel_proxy_settings_are_automatic_and_plain_fields_skip_them() {
     );
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn github_scope_is_required_before_posting_new_requests() {
+    let (f, e) = launcher_fixture("raw");
+    for args in [
+        vec!["get", "GITHUB_TOKEN", "Read GitHub"],
+        vec!["get", "--new-lease", "GH_TOKEN", "Read GitHub"],
+        vec!["get", "--refresh", "GH_TOKEN", "Renew GitHub"],
+        vec!["get", "--permissions", "contents=read", "release-bot/GH_TOKEN", "Read GitHub"],
+        vec!["get", "--lease", LEASE, "--permissions", "contents=read", "GH_TOKEN", "Renew GitHub"],
+        vec!["exec", "OTHER_SECRET,TOKEN=release-bot/GH_TOKEN", "--", "/bin/echo", "should not run"],
+        vec!["exec", "--permissions", "contents=read", "GH_TOKEN", "--", "/bin/echo", "should not run"],
+    ] {
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("--repositories"));
+        assert!(out.stdout.is_empty());
+    }
+    assert!(posted(&f).is_empty());
+}
+
+#[test]
+fn static_github_spelling_does_not_turn_into_a_scope_request() {
+    let (f, e) = launcher_fixture("alias-collision");
+    let get = asm(&e, &["get", "work/GH_TOKEN", "Read a static secret"], "");
+    assert!(get.status.success(), "{}", text(&get.stderr));
+    let exec = asm(
+        &e,
+        &[
+            "exec", "TOKEN=work/GH_TOKEN", "--", "/bin/sh", "-c",
+            "test \"$TOKEN\" = fixture-other",
+        ],
+        "",
+    );
+    assert!(exec.status.success(), "{}", text(&exec.stderr));
+    for args in [
+        vec!["get", "--repositories", GITHUB_REPOSITORY, "work/GH_TOKEN", "Read a static secret"],
+        vec!["exec", "--repositories", GITHUB_REPOSITORY, "TOKEN=work/GH_TOKEN", "--", "/bin/true"],
+    ] {
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("require a generated"));
+    }
+    let sent = posted(&f);
+    assert_eq!(sent.len(), 2);
+    assert!(sent.iter().all(|body| body["name"] == "work/GH_TOKEN" && body["generation"].is_null()));
+}
+
+#[test]
+fn github_scope_requires_manager_support_before_posting() {
+    let (f, e) = launcher_fixture("legacy-github");
+    for args in [
+        vec!["get", "--repositories", GITHUB_REPOSITORY, "GH_TOKEN", "Read GitHub"],
+        vec!["exec", "--repositories", GITHUB_REPOSITORY, "OTHER_SECRET,GH_TOKEN", "--", "/bin/true"],
+    ] {
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("github_explicit_scope_v1; upgrade the manager"));
+    }
+    assert!(posted(&f).is_empty());
 }
 
 #[test]
@@ -1248,7 +1392,7 @@ fn capabilities_fail_closed_and_alias_lookup_preserves_noncolliding_spelling() {
     let (f, e) = launcher_fixture("alias-collision");
     let out = asm(
         &e,
-        &["exec", "GITHUB_TOKEN", "--", "/bin/sh", "-c", "exit 0"],
+        &["exec", "--repositories", GITHUB_REPOSITORY, "GITHUB_TOKEN", "--", "/bin/sh", "-c", "exit 0"],
         "",
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -1258,6 +1402,9 @@ fn capabilities_fail_closed_and_alias_lookup_preserves_noncolliding_spelling() {
         &["exec", "GH_TOKEN", "--", "/bin/sh", "-c", "exit 0"],
         "",
     );
+    assert_eq!(out.status.code(), Some(asm_proto::error::EXIT_NOT_FOUND));
+    assert!(text(&out.stderr).contains("ambiguous"));
+    let out = asm(&e, &["get", "GH_TOKEN", "Read a secret"], "");
     assert_eq!(out.status.code(), Some(asm_proto::error::EXIT_NOT_FOUND));
     assert!(text(&out.stderr).contains("ambiguous"));
     assert_eq!(
@@ -1296,7 +1443,7 @@ fn get_bindings_scope_and_stable_generated_aliases() {
             "get",
             "--repositories",
             " ACME/Web ",
-            "--permission",
+            "--permissions",
             "contents=read",
             "GH_TOKEN",
             "Read acme/web",
@@ -1315,12 +1462,35 @@ fn get_bindings_scope_and_stable_generated_aliases() {
     );
     assert!(text(&out.stdout).contains("credential version: 1"));
     assert!(!text(&out.stdout).contains("fixture-release"));
-    let out = asm(&e, &["get", "GITHUB_TOKEN", "Continue reading"], "");
+    let out = asm(&e, &["get", "--lease", LEASE, "GITHUB_TOKEN", "Continue reading"], "");
     assert!(out.status.success(), "{}", text(&out.stderr));
+    let pin = posted(&f).pop().unwrap();
+    assert_eq!(pin["name"], "GITHUB_TOKEN");
+    assert_eq!(pin["lease_id"], LEASE);
+    assert!(pin["generation"].is_null());
     assert_eq!(
         std::fs::read_to_string(e.secrets.join("GITHUB_TOKEN")).unwrap(),
         "fixture-release-v1"
     );
+    let scoped_pin = asm(
+        &e,
+        &[
+            "get",
+            "--lease",
+            LEASE,
+            "--repositories",
+            GITHUB_REPOSITORY,
+            "--permissions",
+            "contents=read",
+            "GITHUB_TOKEN",
+            "Continue with the same scope",
+        ],
+        "",
+    );
+    assert!(scoped_pin.status.success(), "{}", text(&scoped_pin.stderr));
+    let pin = posted(&f).pop().unwrap();
+    assert_eq!(pin["lease_id"], LEASE);
+    assert_eq!(pin["generation"], sent[1]["generation"]);
     let out = asm(
         &e,
         &[
@@ -1335,6 +1505,7 @@ fn get_bindings_scope_and_stable_generated_aliases() {
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(posted(&f).last().unwrap()["refresh_from_version"], 1);
+    assert!(posted(&f).last().unwrap()["generation"].is_null());
     for alias in ["GH_TOKEN", "GITHUB_TOKEN"] {
         assert_eq!(
             std::fs::read_to_string(e.secrets.join(alias)).unwrap(),
@@ -1345,7 +1516,7 @@ fn get_bindings_scope_and_stable_generated_aliases() {
     let before = std::fs::read(e.secrets.join(".leases.json")).unwrap();
     let out = asm(
         &e,
-        &["exec", "GH_TOKEN", "--", "/bin/sh", "-c", "exit 0"],
+        &["exec", "--repositories", GITHUB_REPOSITORY, "--permissions", "contents=read", "GH_TOKEN", "--", "/bin/sh", "-c", "exit 0"],
         "",
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -1396,6 +1567,8 @@ fn exec_wait_is_one_budget_across_sequential_acquisitions() {
         &e,
         &[
             "exec",
+            "--repositories",
+            GITHUB_REPOSITORY,
             "--wait",
             "1",
             "GH_TOKEN,OTHER_SECRET",
@@ -1429,6 +1602,7 @@ fn get_exact_lease_bypasses_catalog_and_refresh_can_be_auto_routed() {
             assert_eq!(body["name"], "old-name/GITHUB_TOKEN");
             assert_eq!(body["lease_id"], LEASE);
             assert_eq!(body["refresh_from_version"], 9);
+            assert!(body["generation"].is_null());
             let mut result = lease.clone();
             result["credential_version"] = json!(10);
             result["files"] = json!([{"field":"value","relative_path":"old-name/GH_TOKEN","content":"fixture-renamed-token","substituted":false}]);
@@ -1468,10 +1642,24 @@ fn get_exact_lease_bypasses_catalog_and_refresh_can_be_auto_routed() {
         std::fs::read_to_string(e.secrets.join("old-name/GITHUB_TOKEN")).unwrap(),
         "fixture-renamed-token"
     );
+    let scoped = asm(
+        &e,
+        &[
+            "get", "--lease", LEASE, "--repositories", GITHUB_REPOSITORY,
+            "old-name/GITHUB_TOKEN", "Continue with explicit scope",
+        ],
+        "",
+    );
+    assert_eq!(scoped.status.code(), Some(2), "{}", text(&scoped.stderr));
+    assert!(text(&scoped.stderr).contains("github_explicit_scope_v1; upgrade the manager"));
+    assert_eq!(posted(&f).len(), 1);
     let (f, e) = launcher_fixture("raw");
-    let out = asm(&e, &["get", "--refresh", "GH_TOKEN", "Recover token"], "");
+    let out = asm(&e, &["get", "--refresh", "--repositories", GITHUB_REPOSITORY, "GH_TOKEN", "Recover token"], "");
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(posted(&f)[0]["refresh"], true);
+    assert_eq!(posted(&f)[0]["generation"], json!({
+        "provider":"github_app","scope":{"repositories":["acme/web"],"permissions":{"metadata":"read"}}
+    }));
     assert!(posted(&f)[0]["refresh_from_version"].is_null());
     assert!(posted(&f)[0]["lease_id"].is_null());
 }
@@ -1484,6 +1672,8 @@ fn exec_preserves_explicit_standard_variable_and_raw_network_environment() {
         &e,
         &[
             "exec",
+            "--repositories",
+            GITHUB_REPOSITORY,
             "GH_TOKEN=release-bot/GH_TOKEN",
             "--",
             "/bin/sh",
@@ -1517,6 +1707,8 @@ fn exec_mixed_delivery_uses_field_metadata_not_token_prefixes() {
         &e,
         &[
             "exec",
+            "--repositories",
+            GITHUB_REPOSITORY,
             "--raw",
             "GH_TOKEN,OTHER_SECRET",
             "--",
@@ -1539,6 +1731,8 @@ fn exec_insufficient_headroom_and_unknown_post_timeout_fail_without_retry() {
         &e,
         &[
             "exec",
+            "--repositories",
+            GITHUB_REPOSITORY,
             "GH_TOKEN",
             "--",
             "/bin/sh",
@@ -1560,6 +1754,8 @@ fn exec_insufficient_headroom_and_unknown_post_timeout_fail_without_retry() {
         &e,
         &[
             "exec",
+            "--repositories",
+            GITHUB_REPOSITORY,
             "--wait",
             "1",
             "GH_TOKEN",
@@ -1590,6 +1786,8 @@ fn exec_raw_prefix_does_not_trigger_proxy_setup() {
         &e,
         &[
             "exec",
+            "--repositories",
+            GITHUB_REPOSITORY,
             "GH_TOKEN",
             "--",
             "/bin/sh",

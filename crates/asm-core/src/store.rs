@@ -335,6 +335,13 @@ fn validate_lease_generation(lease: &LeaseRecord) -> Result<()> {
                 canonical
                     .canonicalize()
                     .map_err(|_| CoreError::internal("invalid generated lease request"))?;
+                // A legacy request could omit permissions. Preserve its historical
+                // metadata; the separate canonical grant is the lease authority.
+                let (GenerationRequest::GithubApp(stored), GenerationRequest::GithubApp(normalized)) =
+                    (request, &mut canonical);
+                if stored.permissions.is_none() {
+                    normalized.permissions = None;
+                }
                 if &canonical != request {
                     return Err(CoreError::internal("noncanonical generated lease request"));
                 }
@@ -547,6 +554,7 @@ impl Store {
         if g.revision == 0 {
             return Err(CoreError::invalid("generator revision must be positive"));
         }
+        g.config.validate()?;
         let revision = sqlite_u64(g.revision, "generator revision")?;
         let config = serde_json::to_string(&g.config)?;
         let mut db = self.db();
@@ -658,6 +666,24 @@ fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!("ALTER TABLE leases ADD COLUMN {name} {definition};"))?;
         }
     }
+    // Move the old singular ceiling into the list only if both copies of its
+    // ID agree. A disagreeing row stays visible but cannot grant either ID.
+    // Keep its original fields for diagnosis; leave revisions and leases intact.
+    conn.execute_batch(
+        "UPDATE generators
+         SET config = CASE WHEN (config -> '$.installation_id') = (config -> '$.ceiling.installation_id')
+             THEN json_remove(
+                 json_set(config, '$.installations', json_array(json_extract(config, '$.ceiling'))),
+                 '$.installation_id', '$.ceiling')
+             ELSE json_set(config, '$.installations', json_array())
+         END
+         WHERE CASE WHEN json_valid(config) THEN
+             json_extract(config, '$.type') = 'github_app'
+             AND json_type(config, '$.installations') IS NULL
+             AND json_type(config, '$.installation_id') = 'integer'
+             AND json_type(config, '$.ceiling.installation_id') = 'integer'
+         ELSE 0 END;",
+    )?;
     Ok(())
 }
 
@@ -1472,8 +1498,7 @@ mod tests {
             name: name.into(),
             config: GeneratorConfig::GithubApp(crate::generator::GithubAppConfig {
                 client_id: "Iv1.fixture".into(),
-                installation_id: 42,
-                ceiling: github_grant(),
+                installations: vec![github_grant()],
             }),
             revision: 1,
             position,
@@ -1517,9 +1542,114 @@ mod tests {
             credential_version: 1,
             requested_generation: Some(GenerationRequest::GithubApp(GithubScopeRequest {
                 repositories: Some(vec!["acme/web".into()]),
-                permissions: None,
+                permissions: Some([("metadata".into(), GithubPermission::Read)].into()),
             })),
         }
+    }
+
+    #[test]
+    fn migrates_singular_github_installation_without_changing_the_revision_or_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        let mut lease = generated_lease("generated");
+        lease.generator_revision = Some(17);
+        lease.credential_version = 4;
+        if let Some(GenerationRequest::GithubApp(scope)) = &mut lease.requested_generation {
+            scope.permissions = None; // Legacy encoding, prior to the metadata-only default.
+        }
+        let legacy = serde_json::json!({
+            "type": "github_app",
+            "client_id": "Iv1.fixture",
+            "installation_id": 42,
+            "ceiling": github_grant(),
+        });
+        {
+            let store = Store::open(&path).unwrap();
+            store.insert_lease(&lease).unwrap();
+            store.db().execute(
+                "INSERT INTO generators VALUES ('generator', 'release-bot', ?1, 17, 3)",
+                [legacy.to_string()],
+            ).unwrap();
+        }
+
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            let actual = store.get_generator("generator").unwrap().unwrap();
+            let mut expected = generator("generator", "release-bot", 3);
+            expected.revision = 17;
+            assert_eq!(actual, expected);
+            let persisted: String = store.db().query_row(
+                "SELECT config FROM generators WHERE id = 'generator'", [], |row| row.get(0),
+            ).unwrap();
+            let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+            assert_eq!(persisted["installations"], serde_json::json!([github_grant()]));
+            assert!(persisted.get("ceiling").is_none());
+            assert!(persisted.get("installation_id").is_none());
+            let actual = store.get_lease(&lease.id).unwrap().unwrap();
+            assert!(actual.is_active(101));
+            assert_eq!(actual.generation, lease.generation);
+            assert_eq!(actual.generator_revision, lease.generator_revision);
+            assert_eq!(actual.credential_version, lease.credential_version);
+            assert_eq!(actual.requested_generation, lease.requested_generation);
+        }
+    }
+
+    #[test]
+    fn migration_keeps_disagreeing_installation_ids_unavailable_without_blocking_other_generators() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        let legacy = serde_json::json!({
+            "type": "github_app",
+            "client_id": "Iv1.fixture",
+            "installation_id": 43,
+            "ceiling": github_grant(),
+        }).to_string();
+        {
+            let store = Store::open(&path).unwrap();
+            store.db().execute(
+                "INSERT INTO generators VALUES ('bad', 'release-bot', ?1, 1, 1)", [&legacy],
+            ).unwrap();
+            store.upsert_generator(&generator("good", "review-bot", 0)).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let bad = store.get_generator("bad").unwrap().unwrap();
+        assert!(bad.config.ceilings().next().is_none());
+        assert!(bad.config.validate().is_err());
+        let persisted: String = store.db().query_row(
+            "SELECT config FROM generators WHERE id = 'bad'", [], |row| row.get(0),
+        ).unwrap();
+        let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(persisted["installation_id"], 43);
+        assert_eq!(persisted["ceiling"], serde_json::json!(github_grant()));
+        let registry = crate::generator::GeneratorRegistry::new();
+        let mut looked_up = Vec::new();
+        registry.load_with(store.list_generators().unwrap(), |id, _| {
+            looked_up.push(id.to_owned());
+            Ok(None)
+        });
+        assert_eq!(looked_up, ["good"]);
+        let bad = registry.get("bad").unwrap();
+        assert!(bad.client().err().unwrap().message.contains("select at least one"));
+    }
+
+    #[test]
+    fn github_installations_round_trip_with_independent_ceilings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("asm.db")).unwrap();
+        let mut record = generator("multi", "multi-bot", 0);
+        let GeneratorConfig::GithubApp(config) = &mut record.config;
+        let mut second = github_grant();
+        second.installation_id = 43;
+        second.repositories[0].id = 9;
+        second.repositories[0].full_name = "another/web".into();
+        second.permissions.remove("contents");
+        config.installations.push(second.clone());
+        store.upsert_generator(&record).unwrap();
+        assert_eq!(store.get_generator("multi").unwrap().unwrap().config.ceilings().count(), 2);
+        assert_eq!(store.get_generator("multi").unwrap(), Some(record.clone()));
+        let GeneratorConfig::GithubApp(config) = &mut record.config;
+        config.installations.push(second);
+        assert!(store.upsert_generator(&record).is_err());
     }
 
     #[test]

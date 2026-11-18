@@ -18,6 +18,8 @@ pub const DEFAULT_PROXY_PORT: u16 = 7412;
 pub const MAX_POLL_WAIT_SECS: u64 = 25;
 /// Scope-aware generated-credential requests and durable credential versions.
 pub const CAPABILITY_GENERATED_CREDENTIALS_V1: &str = "generated_credentials_v1";
+/// Explicit repository and permission bounds for generated GitHub requests.
+pub const CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1: &str = "github_explicit_scope_v1";
 /// Field authorization, catalog aliases and per-field substitution metadata.
 pub const CAPABILITY_SECRET_FIELDS_V1: &str = "secret_fields_v1";
 /// Lease duration choices: label and seconds (`None` = unlimited).
@@ -421,7 +423,7 @@ impl RequestBody {
     /// Negotiate only features that change request meaning, not arbitrary
     /// unknown JSON fields. Legacy static whole-item requests remain accepted.
     pub fn validate_get_capabilities(&self, source: SourceKind) -> Result<(), ApiError> {
-        if let Self::Get { fields, sentinel, client_capabilities, .. } = self {
+        if let Self::Get { fields, generation, sentinel, client_capabilities, .. } = self {
             let require = |capability| {
                 if client_capabilities.iter().any(|c| c == capability) {
                     Ok(())
@@ -431,6 +433,9 @@ impl RequestBody {
             };
             if source == SourceKind::Generator {
                 require(CAPABILITY_GENERATED_CREDENTIALS_V1)?;
+                if generation.is_some() {
+                    require(CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1)?;
+                }
             }
             if fields.is_some() || *sentinel {
                 require(CAPABILITY_SECRET_FIELDS_V1)?;
@@ -889,6 +894,19 @@ mod tests {
         let error = health.require_capability(CAPABILITY_GENERATED_CREDENTIALS_V1).unwrap_err();
         assert_eq!(error.code, crate::ErrorCode::Invalid);
         assert!(error.message.contains("upgrade the manager"));
+        let legacy_github = get_body(json!({
+            "generation":{"provider":"github_app","scope":{"repositories":["acme/repo"]}},
+            "client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1]
+        }));
+        assert!(legacy_github.validate_get_capabilities(SourceKind::Generator).unwrap_err()
+            .message.contains(CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1));
+        let scoped_github = get_body(json!({
+            "generation":{"provider":"github_app","scope":{"repositories":["acme/repo"]}},
+            "client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1,CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1]
+        }));
+        scoped_github.validate_get_capabilities(SourceKind::Generator).unwrap();
+        let pinned = get_body(json!({"lease_id":"known","client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1]}));
+        pinned.validate_get_capabilities(SourceKind::Generator).unwrap();
     }
 
     #[test]

@@ -5,14 +5,21 @@ use crate::error::CliError;
 use asm_proto::bindings::SecretBinding;
 use asm_proto::generators::SourceKind;
 use asm_proto::names::resolve_catalog_name;
-use asm_proto::wire::{HealthResponse, SecretEntry, SecretsResponse, CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_SECRET_FIELDS_V1};
+use asm_proto::wire::{
+    HealthResponse, SecretEntry, SecretsResponse, CAPABILITY_GENERATED_CREDENTIALS_V1,
+    CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_SECRET_FIELDS_V1,
+};
 
-pub(crate) fn require_capabilities(api: &Api, generated: bool, fields: bool) -> Result<(), CliError> {
-    if !generated && !fields {
+pub(crate) fn require_capabilities(api: &Api, generated: bool, fields: bool, github_scope: bool) -> Result<(), CliError> {
+    if !generated && !fields && !github_scope {
         return Ok(());
     }
     let health: HealthResponse = api.get("/health")?;
-    for (needed, capability) in [(generated, CAPABILITY_GENERATED_CREDENTIALS_V1), (fields, CAPABILITY_SECRET_FIELDS_V1)] {
+    for (needed, capability) in [
+        (generated, CAPABILITY_GENERATED_CREDENTIALS_V1),
+        (fields, CAPABILITY_SECRET_FIELDS_V1),
+        (github_scope, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1),
+    ] {
         if needed && !health.capabilities.iter().any(|c| c == capability) {
             return Err(CliError::invalid(format!("this operation requires {capability}; upgrade the manager")));
         }
@@ -21,7 +28,11 @@ pub(crate) fn require_capabilities(api: &Api, generated: bool, fields: bool) -> 
 }
 
 pub(crate) fn capabilities() -> Vec<String> {
-    vec![CAPABILITY_GENERATED_CREDENTIALS_V1.into(), CAPABILITY_SECRET_FIELDS_V1.into()]
+    vec![
+        CAPABILITY_GENERATED_CREDENTIALS_V1.into(),
+        CAPABILITY_SECRET_FIELDS_V1.into(),
+        CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1.into(),
+    ]
 }
 
 pub(crate) fn catalog(api: &Api) -> Result<Vec<SecretEntry>, CliError> {

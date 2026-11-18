@@ -5,8 +5,8 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Condvar, mpsc};
 
-use asm_proto::generators::{GithubPermission, GithubRepository, GithubScopeRequest};
-use asm_proto::wire::{CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_SECRET_FIELDS_V1, HostInfo, RequestBody};
+use asm_proto::generators::GithubPermission;
+use asm_proto::wire::{CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_SECRET_FIELDS_V1, HostInfo, RequestBody};
 use serde_json::{Value, json};
 use crate::generator::GithubAppConfig;
 use crate::manager::{StartOptions, now};
@@ -61,6 +61,10 @@ impl Drop for Provider {
         if let Some(thread) = self.thread.take() { thread.join().unwrap(); }
     }
 }
+fn github_repository_json(id: u64) -> Value {
+    json!({ "id": id, "full_name": format!("acme/repo{id}") })
+}
+
 fn respond(mut stream: TcpStream, state: Arc<ProviderState>) {
     // Darwin can inherit O_NONBLOCK from this fixture's accept loop. Socket
     // timeouts do not clear that flag, and treating WouldBlock as EOF races POST.
@@ -102,6 +106,10 @@ fn respond(mut stream: TcpStream, state: Arc<ProviderState>) {
     }
     assert_eq!(body.len(), length, "unexpected bytes after local provider request");
     let (status, body) = if first.starts_with("DELETE /installation/token ") {
+        if authorization.starts_with("discovery-") {
+            let _ = write!(stream, "HTTP/1.1 204 Test\r\nConnection: close\r\n\r\n");
+            return;
+        }
         lock(&state.revoked).push(authorization);
         let active = state.active_revocations.fetch_add(1, Ordering::SeqCst) + 1;
         state.peak_revocations.fetch_max(active, Ordering::SeqCst);
@@ -109,23 +117,49 @@ fn respond(mut stream: TcpStream, state: Arc<ProviderState>) {
         while Instant::now() < until && !state.stop.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(5)); }
         state.active_revocations.fetch_sub(1, Ordering::SeqCst);
         (204, String::new())
+    } else if let Some(id) = first.strip_prefix("GET /app/installations/")
+        .and_then(|path| path.strip_suffix(" HTTP/1.1")).and_then(|id| id.parse::<u64>().ok())
+    {
+        assert!([7, 8].contains(&id));
+        (200, json!({"id":id,"account":{"login":"acme"},"suspended_at":null,
+            "permissions":{"metadata":"read","contents":"write"}}).to_string())
+    } else if first == "GET /installation/repositories?per_page=100&page=1 HTTP/1.1" {
+        let ids = match authorization.as_str() {
+            "discovery-7" => [1, 2],
+            "discovery-8" => [3, 4],
+            _ => panic!("expected a discovery token"),
+        };
+        (200, json!({"total_count":ids.len(),"repositories":ids.map(github_repository_json)}).to_string())
     } else {
-        assert!(first.starts_with("POST /app/installations/7/access_tokens "), "unexpected local request: {first}");
+        let installation = first.strip_prefix("POST /app/installations/")
+            .and_then(|path| path.strip_suffix("/access_tokens HTTP/1.1"))
+            .and_then(|id| id.parse::<u64>().ok()).expect("expected a GitHub installation token request");
+        let permitted_ids = match installation { 7 => [1, 2], 8 => [3, 4], _ => panic!("unexpected installation") };
         let request: Value = serde_json::from_slice(&body).unwrap();
-        lock(&state.bodies).push(request.clone());
-        let version = state.issued.fetch_add(1, Ordering::SeqCst) + 1;
-        let gate = lock(&state.gate).take();
-        if let Some(gate) = gate {
-            gate.entered.send(()).unwrap();
-            let mut released = lock(&gate.released);
-            while !*released { released = gate.wake.wait(released).unwrap(); }
+        let expires_at = fmt_unix(state.clock.load(Ordering::SeqCst) + state.ttl.load(Ordering::SeqCst));
+        if request.get("repository_ids").is_none() {
+            assert_eq!(request, json!({"permissions":{"metadata":"read"}}));
+            (201, json!({"token":format!("discovery-{installation}"),"expires_at":expires_at,
+                "permissions":request["permissions"]}).to_string())
+        } else {
+            lock(&state.bodies).push(request.clone());
+            let version = state.issued.fetch_add(1, Ordering::SeqCst) + 1;
+            let gate = lock(&state.gate).take();
+            if let Some(gate) = gate {
+                gate.entered.send(()).unwrap();
+                let mut released = lock(&gate.released);
+                while !*released { released = gate.wake.wait(released).unwrap(); }
+            }
+            let status = state.status.load(Ordering::SeqCst);
+            let repositories: Vec<_> = request["repository_ids"].as_array().unwrap().iter()
+                .map(|id| {
+                    let id = id.as_u64().unwrap();
+                    assert!(permitted_ids.contains(&id));
+                    github_repository_json(id)
+                }).collect();
+            (status, json!({"token":format!("isolated-credential-{version}"),"expires_at":expires_at,
+                "permissions":request["permissions"],"repositories":repositories}).to_string())
         }
-        let status = state.status.load(Ordering::SeqCst);
-        let repositories: Vec<Value> = request["repository_ids"].as_array().unwrap().iter()
-            .map(|id| json!({ "id": id, "full_name": format!("acme/repo{}", id.as_u64().unwrap()) })).collect();
-        (status, json!({ "token": format!("isolated-credential-{version}"),
-            "expires_at": fmt_unix(state.clock.load(Ordering::SeqCst) + state.ttl.load(Ordering::SeqCst)),
-            "permissions": request["permissions"], "repositories": repositories }).to_string())
     };
     let _ = write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
 }
@@ -180,22 +214,33 @@ impl Fixture {
             permissions: [("metadata".into(), GithubPermission::Read), ("contents".into(), GithubPermission::Read)].into_iter().collect() }
     }
     fn install(&self, id: &str, name: &str, position: i64) {
-        let config = GithubAppConfig { client_id: format!("client-{id}"), installation_id: 7, ceiling: Self::grant() };
-        let client = Arc::new(GithubAppGenerator::with_client_for_tests(&config, crate::generator::github::test_pem(),
-            reqwest::blocking::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap(), self.provider.url.clone()).unwrap());
+        self.install_with_ceilings(id, name, position, vec![Self::grant()]);
+    }
+    fn install_with_ceilings(&self, id: &str, name: &str, position: i64, installations: Vec<GithubGrant>) {
+        let config = GithubAppConfig { client_id: format!("client-{id}"), installations };
+        let client = Arc::new(self.github_client(&config, crate::generator::github::test_pem()).unwrap());
         self.core.install_generator_client(GeneratorRecord { id: id.into(), name: name.into(), config: GeneratorConfig::GithubApp(config), revision: 1, position }, client).unwrap();
+    }
+    fn github_client(&self, config: &GithubAppConfig, pem: &str) -> Result<GithubAppGenerator> {
+        GithubAppGenerator::with_client_for_tests(config, pem,
+            reqwest::blocking::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap(),
+            self.provider.url.clone())
     }
     fn at(&self, elapsed: i64) { self.clock.store(self.start + elapsed, Ordering::SeqCst); }
     fn body(&self, name: &str) -> RequestBody {
         serde_json::from_value(json!({ "kind":"get", "name":name, "reason":"Read the approved repository", "agent":"agent-a",
-            "client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_SECRET_FIELDS_V1] })).unwrap()
+            "generation":{"provider":"github_app","scope":{"repositories":["acme/repo1"],"permissions":{"contents":"read"}}},
+            "client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_SECRET_FIELDS_V1] })).unwrap()
     }
     fn request(&self, body: RequestBody) -> Result<RequestState> { self.core.create_request(&self.host, "127.0.0.1", body) }
     fn approve(&self, id: &str, generator: &str, mode: LeaseMode, duration: u64) -> Result<()> {
+        self.approve_github(id, generator, 1, Self::grant(), mode, duration)
+    }
+    fn approve_github(&self, id: &str, generator: &str, revision: u64, grant: GithubGrant, mode: LeaseMode, duration: u64) -> Result<()> {
         self.core.resolve_request(id, ffi::Decision::ApproveGet { mode: mode.into(), duration_secs: Some(duration),
             hosts: if mode == LeaseMode::Sentinel { vec!["api.github.com".into()] } else { Vec::new() },
-            generation: Some(GenerationSelection { generator_id: generator.into(), generator_revision: 1,
-                grant: GenerationGrant::GithubApp(Self::grant()) }.into()) })
+            generation: Some(GenerationSelection { generator_id: generator.into(), generator_revision: revision,
+                grant: GenerationGrant::GithubApp(grant) }.into()) })
     }
     fn first(&self) -> GetResult {
         let pending = self.request(self.body("GH_TOKEN")).unwrap();
@@ -386,24 +431,124 @@ fn generation_latest_ended_approval_does_not_rebind_to_older_active_identity() {
 }
 
 #[test]
-fn generation_original_unmet_request_reuses_only_the_approved_narrower_grant() {
+fn generation_github_scope_is_required_before_reusing_an_approved_lease() {
     let f = Fixture::new();
-    let mut requested = f.body("GH_TOKEN");
-    if let RequestBody::Get { generation, .. } = &mut requested {
-        *generation = Some(GenerationRequest::GithubApp(GithubScopeRequest { repositories: Some(vec!["acme/missing".into()]),
-            permissions: Some([("contents".into(), GithubPermission::Write)].into_iter().collect()) }));
+    let first = f.first();
+    let mut no_scope = f.body("GH_TOKEN");
+    if let RequestBody::Get { generation, .. } = &mut no_scope { *generation = None; }
+    assert!(f.request(no_scope.clone()).unwrap_err().message.contains("--repositories"));
+    let mut no_repositories = f.body("GH_TOKEN");
+    if let RequestBody::Get { generation: Some(GenerationRequest::GithubApp(scope)), .. } = &mut no_repositories {
+        scope.repositories = None;
     }
-    let pending = f.request(requested.clone()).unwrap();
-    f.approve(&pending.request_id, "app-a", LeaseMode::Raw, 43_200).unwrap();
-    let approved = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
+    assert!(f.request(no_repositories).unwrap_err().message.contains("--repositories"));
+    assert!(f.core.snapshot().pending.is_empty());
+    assert_eq!(f.issued(), 1);
+
+    if let RequestBody::Get { lease_id, client_capabilities, .. } = &mut no_scope {
+        *lease_id = Some(first.lease_id.clone());
+        client_capabilities.retain(|c| c != CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1);
+    }
+    // A legacy client can explicitly pin and renew its existing authority.
     f.at(3_000);
-    let reused = get(f.request(requested).unwrap());
-    assert_eq!(reused.generation, approved.generation);
-    assert_eq!(reused.lease_id, approved.lease_id);
-    let mut changed = f.body("GH_TOKEN");
-    if let RequestBody::Get { generation, .. } = &mut changed { *generation = Some(GenerationRequest::GithubApp(
-        GithubScopeRequest { repositories: Some(vec!["acme/different".into()]), permissions: None })); }
-    assert_eq!(f.request(changed).unwrap().status, RequestStatus::Pending);
+    let renewed = get(f.request(no_scope).unwrap());
+    assert_eq!(renewed.lease_id, first.lease_id);
+    assert_eq!(renewed.generation, first.generation);
+    assert_eq!(renewed.credential_version, Some(2));
+}
+
+#[test]
+fn generation_github_requests_cannot_reuse_or_approve_broader_authority() {
+    let f = Fixture::new();
+    let broad = f.first();
+    let mut ceiling = Fixture::grant();
+    ceiling.repositories.push(GithubRepository { id: 2, full_name: "acme/repo2".into() });
+    f.install_with_ceilings("app-b", "review-bot", 2, vec![ceiling.clone()]);
+
+    let metadata_only = |lease: Option<String>| {
+        let mut body = f.body("GITHUB_TOKEN");
+        if let RequestBody::Get { generation, lease_id, .. } = &mut body {
+            *generation = Some(GenerationRequest::GithubApp(GithubScopeRequest {
+                repositories: Some(vec![" ACME/REPO1 ".into()]), permissions: None,
+            }));
+            *lease_id = lease;
+        }
+        body
+    };
+    assert!(f.request(metadata_only(Some(broad.lease_id))).is_err());
+    let pending = f.request(metadata_only(None)).unwrap();
+    assert_eq!(pending.status, RequestStatus::Pending);
+
+    // Both grants would fit the configured ceiling, but not this request.
+    assert!(f.approve(&pending.request_id, "app-b", LeaseMode::Raw, 43_200).is_err());
+    ceiling.permissions.remove("contents");
+    assert!(f.approve_github(&pending.request_id, "app-b", 1, ceiling.clone(), LeaseMode::Raw, 43_200).is_err());
+    assert_eq!(f.issued(), 1);
+
+    ceiling.repositories.pop();
+    let expected = ceiling.clone();
+    ceiling.repositories[0].full_name = "forged/name".into();
+    f.approve_github(&pending.request_id, "app-b", 1, ceiling, LeaseMode::Raw, 43_200).unwrap();
+    let approved = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
+    let GenerationGrant::GithubApp(actual) = approved.generation.unwrap().grant;
+    assert_eq!(actual, expected);
+    assert_eq!(actual.repositories[0].full_name, "acme/repo1");
+    assert_eq!(lock(&f.provider.state.bodies).last(),
+        Some(&json!({"repository_ids":[1],"permissions":{"metadata":"read"}})));
+    assert_eq!(get(f.request(metadata_only(None)).unwrap()).lease_id, approved.lease_id);
+    assert_eq!(f.issued(), 2);
+}
+
+#[test]
+fn generation_github_routes_within_one_installation_and_respects_pins() {
+    let f = Fixture::new();
+    let mut other = Fixture::grant();
+    other.installation_id = 8;
+    other.repositories = vec![GithubRepository { id: 3, full_name: "acme/repo3".into() }];
+    f.install_with_ceilings("app-b", "review-bot", 2, vec![Fixture::grant(), other.clone()]);
+    let request = |name, names: &[&str]| {
+        let mut body = f.body(name);
+        if let RequestBody::Get { generation: Some(GenerationRequest::GithubApp(scope)), .. } = &mut body {
+            scope.repositories = Some(names.iter().map(|name| (*name).to_owned()).collect());
+        }
+        body
+    };
+    assert!(f.request(request("GH_TOKEN", &["acme/repo1", "acme/repo3"])).unwrap_err().message.contains("split"));
+    assert!(f.request(request("release-bot/GH_TOKEN", &["acme/repo3"])).is_err());
+    assert!(f.request(request("GH_TOKEN", &["acme/missing"])).is_err());
+    assert!(f.core.snapshot().pending.is_empty());
+    let pending = f.request(request("GH_TOKEN", &["ACME/REPO3"])).unwrap();
+    assert!(f.approve(&pending.request_id, "app-b", LeaseMode::Raw, 43_200).is_err());
+    assert_eq!(f.issued(), 0);
+    f.approve_github(&pending.request_id, "app-b", 1, other.clone(), LeaseMode::Raw, 43_200).unwrap();
+    let approved = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
+    assert_eq!(approved.generation.unwrap().grant, GenerationGrant::GithubApp(other));
+    assert_eq!(f.issued(), 1);
+    let first_installation = f.request(request("GH_TOKEN", &["acme/repo1"])).unwrap();
+    assert_eq!(first_installation.status, RequestStatus::Pending);
+    f.approve(&first_installation.request_id, "app-b", LeaseMode::Raw, 43_200).unwrap();
+    let again = get(f.request(request("GITHUB_TOKEN", &["acme/repo3"])).unwrap());
+    assert_eq!(again.lease_id, approved.lease_id);
+    assert_eq!(f.issued(), 2);
+}
+
+#[test]
+fn generation_github_reattaches_pending_work_when_another_generator_appears_during_mint() {
+    let f = Fixture::new();
+    let pending = f.request(f.body("GH_TOKEN")).unwrap();
+    let (gate, entered) = f.provider.block_next();
+    let f_ref = &f;
+    std::thread::scope(|scope| {
+        let approve = scope.spawn(|| f_ref.approve(&pending.request_id, "app-a", LeaseMode::Raw, 43_200));
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        f.install("app-b", "review-bot", 2);
+        let reattached = f.request(f.body("GITHUB_TOKEN"));
+        gate.release();
+        approve.join().unwrap().unwrap();
+        assert_eq!(reattached.unwrap().request_id, pending.request_id);
+    });
+    assert!(f.core.snapshot().pending.is_empty());
+    assert_eq!(f.issued(), 1);
 }
 
 #[test]
@@ -434,12 +579,13 @@ fn generation_save_persistence_failure_rolls_back_new_key_without_live_changes()
     let f = Fixture::new();
     let keys = Mutex::new(HashMap::<String, String>::new());
     let draft = ffi::GeneratorDraft { id: None, name: "release-bot".into(),
-        config: GeneratorConfig::GithubApp(GithubAppConfig { client_id: "new-client".into(), installation_id: 7, ceiling: Fixture::grant() }).into(),
+        config: GeneratorConfig::GithubApp(GithubAppConfig { client_id: "new-client".into(), installations: vec![Fixture::grant()] }).into(),
         private_key_pem: crate::generator::github::test_pem().into() };
-    assert!(f.core.save_generator_with(draft,
+    assert!(f.core.save_generator_with_github(draft,
         |id| Ok(lock(&keys).get(id).cloned()),
         |id, pem| { lock(&keys).insert(id.into(), pem.into()); Ok(()) },
-        |id| { lock(&keys).remove(id); Ok(()) }).is_err());
+        |id| { lock(&keys).remove(id); Ok(()) },
+        |config, pem| f.github_client(config, pem)).is_err());
     assert!(lock(&keys).is_empty());
     assert_eq!(f.core.generators.entries().len(), 1);
     assert_eq!(f.core.store.list_generators().unwrap().len(), 1);
@@ -503,9 +649,9 @@ fn generation_revision_change_or_shutdown_during_mint_discards_result() {
         } else {
             let draft = ffi::GeneratorDraft { id: Some("app-a".into()), name: "release-bot".into(),
                 config: GeneratorConfig::GithubApp(GithubAppConfig { client_id: "changed-client".into(),
-                    installation_id: 7, ceiling: Fixture::grant() }).into(), private_key_pem: String::new() };
-            f.core.save_generator_with(draft, |_| Ok(Some(crate::generator::github::test_pem().into())),
-                |_, _| Ok(()), |_| Ok(())).unwrap();
+                    installations: vec![Fixture::grant()] }).into(), private_key_pem: String::new() };
+            f.core.save_generator_with_github(draft, |_| Ok(Some(crate::generator::github::test_pem().into())),
+                |_, _| Ok(()), |_| Ok(()), |config, pem| f.github_client(config, pem)).unwrap();
         }
         gate.release();
         assert!(worker.join().unwrap().is_err());
@@ -607,7 +753,9 @@ fn generation_shutdown_has_four_workers_and_one_shared_five_second_deadline() {
 fn generation_capability_and_candidate_snapshot_checks_fail_before_issuance() {
     let f = Fixture::new();
     let mut legacy = f.body("GH_TOKEN");
-    if let RequestBody::Get { client_capabilities, .. } = &mut legacy { client_capabilities.clear(); }
+    if let RequestBody::Get { client_capabilities, .. } = &mut legacy {
+        client_capabilities.retain(|c| c != CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1);
+    }
     assert_eq!(f.request(legacy).unwrap_err().code, asm_proto::ErrorCode::Invalid);
     let pending = f.request(f.body("GH_TOKEN")).unwrap();
     f.install("app-b", "review-bot", 2);

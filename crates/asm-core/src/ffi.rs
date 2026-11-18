@@ -180,17 +180,23 @@ impl From<asm_proto::generators::GithubGrant> for GithubGrant {
     }
 }
 
+impl GithubGrant {
+    // Discovery drafts can contain an installation ID with no repositories yet.
+    fn into_protocol(self) -> Result<asm_proto::generators::GithubGrant, CoreError> {
+        Ok(asm_proto::generators::GithubGrant {
+            installation_id: self.installation_id,
+            repositories: self.repositories.into_iter().map(Into::into).collect(),
+            permissions: permission_map(self.permissions)?,
+        })
+    }
+}
+
 impl TryFrom<GithubGrant> for asm_proto::generators::GithubGrant {
     type Error = CoreError;
 
     fn try_from(grant: GithubGrant) -> Result<Self, Self::Error> {
-        let mut grant = asm_proto::generators::GenerationGrant::GithubApp(Self {
-            installation_id: grant.installation_id,
-            repositories: grant.repositories.into_iter().map(Into::into).collect(),
-            permissions: permission_map(grant.permissions)?,
-        });
+        let mut grant = grant.into_protocol()?;
         grant.canonicalize()?;
-        let asm_proto::generators::GenerationGrant::GithubApp(grant) = grant;
         Ok(grant)
     }
 }
@@ -277,8 +283,7 @@ pub struct GeneratorApprovalChoice {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct GithubAppConfig {
     pub client_id: String,
-    pub installation_id: u64,
-    pub ceiling: GithubGrant,
+    pub installations: Vec<GithubGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -291,8 +296,8 @@ impl From<crate::generator::GeneratorConfig> for GeneratorConfig {
         match config {
             crate::generator::GeneratorConfig::GithubApp(config) => Self::GithubApp {
                 config: GithubAppConfig {
-                    client_id: config.client_id, installation_id: config.installation_id,
-                    ceiling: config.ceiling.into(),
+                    client_id: config.client_id,
+                    installations: config.installations.into_iter().map(Into::into).collect(),
                 },
             },
         }
@@ -304,16 +309,18 @@ impl TryFrom<GeneratorConfig> for crate::generator::GeneratorConfig {
 
     fn try_from(config: GeneratorConfig) -> Result<Self, Self::Error> {
         match config {
-            GeneratorConfig::GithubApp { config } => Ok(Self::GithubApp(
-                crate::generator::GithubAppConfig {
-                    client_id: config.client_id, installation_id: config.installation_id,
-                    ceiling: asm_proto::generators::GithubGrant {
-                        installation_id: config.ceiling.installation_id,
-                        repositories: config.ceiling.repositories.into_iter().map(Into::into).collect(),
-                        permissions: permission_map(config.ceiling.permissions)?,
-                    },
-                },
-            )),
+            GeneratorConfig::GithubApp { config } => {
+                let mut ids = std::collections::BTreeSet::new();
+                let installations = config.installations.into_iter().map(|grant| {
+                    if !ids.insert(grant.installation_id) {
+                        return Err(CoreError::invalid("duplicate GitHub installation ID"));
+                    }
+                    grant.into_protocol()
+                }).collect::<Result<_, _>>()?;
+                Ok(Self::GithubApp(crate::generator::GithubAppConfig {
+                    client_id: config.client_id, installations,
+                }))
+            }
         }
     }
 }
@@ -343,6 +350,18 @@ pub struct GeneratorInfo {
     pub revision: u64,
     pub status: VaultStatus,
     pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GithubInstallationAccount {
+    pub installation_id: u64,
+    pub account: String,
+}
+
+impl From<crate::generator::GithubInstallationAccount> for GithubInstallationAccount {
+    fn from(account: crate::generator::GithubInstallationAccount) -> Self {
+        Self { installation_id: account.installation_id, account: account.account }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -538,6 +557,8 @@ pub enum RequestDetail {
         /// Offered but not pre-filled.
         suggested_hosts: Vec<HostPatternCheck>,
         default_duration_secs: Option<u64>,
+        /// A generated target remains generated even if all candidates disappear.
+        is_generated: bool,
         generator_choices: Vec<GeneratorApprovalChoice>,
         requested_generation: Option<GenerationRequest>,
         sentinel_required: bool,
@@ -1124,6 +1145,10 @@ impl Manager {
         Ok(self.core.github_connect(draft)?)
     }
 
+    pub fn github_list_installations(&self, draft: GeneratorDraft) -> FfiResult<Vec<GithubInstallationAccount>> {
+        Ok(self.core.github_list_installations(draft)?)
+    }
+
     /// "Connect" in the Bitwarden sheet: log in with the draft and list collections.
     pub fn bitwarden_connect(&self, draft: VaultDraft) -> FfiResult<Vec<CollectionInfo>> {
         Ok(self.core.bitwarden_connect(draft)?)
@@ -1268,11 +1293,58 @@ mod generator_ffi_tests {
         let config = GeneratorConfig::GithubApp {
             config: GithubAppConfig {
                 client_id: "Iv1.test".into(),
-                installation_id: 1,
-                ceiling: GithubGrant { installation_id: 1, repositories: vec![], permissions: duplicate },
+                installations: vec![GithubGrant { installation_id: 1, repositories: vec![], permissions: duplicate }],
             },
         };
         assert!(crate::generator::GeneratorConfig::try_from(config).is_err());
+    }
+
+    #[test]
+    fn duplicate_installation_ids_are_rejected() {
+        let grant = GithubGrant {
+            installation_id: 1,
+            repositories: vec![GithubRepository { id: 7, full_name: "acme/web".into() }],
+            permissions: vec![GithubPermissionEntry { name: "metadata".into(), level: GithubPermission::Read }],
+        };
+        let config = GeneratorConfig::GithubApp {
+            config: GithubAppConfig { client_id: "Iv1.test".into(), installations: vec![grant.clone(), grant] },
+        };
+        assert!(crate::generator::GeneratorConfig::try_from(config).is_err());
+    }
+
+    #[test]
+    fn app_discovery_draft_can_have_no_installations() {
+        let config = GeneratorConfig::GithubApp {
+            config: GithubAppConfig { client_id: "Iv1.test".into(), installations: vec![] },
+        };
+        let core = crate::generator::GeneratorConfig::try_from(config.clone()).unwrap();
+        assert_eq!(GeneratorConfig::from(core), config);
+    }
+
+    #[test]
+    fn github_config_round_trips_distinct_installation_ceilings() {
+        let config = GeneratorConfig::GithubApp {
+            config: GithubAppConfig {
+                client_id: "Iv1.test".into(),
+                installations: vec![
+                    GithubGrant {
+                        installation_id: 1,
+                        repositories: vec![GithubRepository { id: 7, full_name: "acme/web".into() }],
+                        permissions: vec![GithubPermissionEntry { name: "metadata".into(), level: GithubPermission::Read }],
+                    },
+                    GithubGrant {
+                        installation_id: 2,
+                        repositories: vec![GithubRepository { id: 8, full_name: "other/ops".into() }],
+                        permissions: vec![
+                            GithubPermissionEntry { name: "contents".into(), level: GithubPermission::Write },
+                            GithubPermissionEntry { name: "metadata".into(), level: GithubPermission::Read },
+                        ],
+                    },
+                ],
+            },
+        };
+        let core = crate::generator::GeneratorConfig::try_from(config.clone()).unwrap();
+        assert_eq!(GeneratorConfig::from(core), config);
     }
 
     #[test]
@@ -1283,11 +1355,10 @@ mod generator_ffi_tests {
             config: GeneratorConfig::GithubApp {
                 config: GithubAppConfig {
                     client_id: "Iv1.test".into(),
-                    installation_id: 1,
-                    ceiling: GithubGrant {
+                    installations: vec![GithubGrant {
                         installation_id: 1, repositories: vec![],
                         permissions: vec![GithubPermissionEntry { name: "metadata".into(), level: GithubPermission::Read }],
-                    },
+                    }],
                 },
             },
             private_key_pem: "PRIVATE_FIXTURE_DO_NOT_DISCLOSE".into(),

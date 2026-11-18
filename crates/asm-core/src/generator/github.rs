@@ -17,17 +17,19 @@ use rsa::traits::PublicKeyParts;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use super::{GeneratedCredential, GithubAppConfig, GithubInstallation};
+use super::{GeneratedCredential, GithubAppConfig, GithubInstallation, GithubInstallationAccount};
 use crate::error::{CoreError, Result};
 
 const API_BASE: &str = "https://api.github.com/";
 const API_VERSION: &str = "2026-03-10";
 const GENERATE: &str = "GitHub token generation";
 const CONNECT: &str = "GitHub installation connection";
+const LIST_INSTALLATIONS: &str = "GitHub installation discovery";
 const DISCOVER: &str = "GitHub repository discovery";
 const REVOKE: &str = "GitHub token revocation";
 const LISTING_CHANGED: &str = "GitHub repository listing changed or was incomplete; reconnect";
 const OUTSIDE_SCOPE: &str = "GitHub returned a token outside the approved scope";
+const PER_PAGE: usize = 100;
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Concrete adapter, not a VaultProvider. The parsed signer and HTTP client are
@@ -105,6 +107,16 @@ pub fn validate_private_key(pem: &str) -> Result<()> {
 impl GithubAppGenerator {
     /// Fixed GitHub.com endpoint and private, non-proxied transport.
     pub fn new(config: &GithubAppConfig, pem: &str) -> Result<Self> {
+        config.validate()?;
+        Self::direct(config.clone(), pem)
+    }
+
+    pub(crate) fn for_discovery(client_id: String, pem: &str) -> Result<Self> {
+        GithubAppConfig::validate_client_id(&client_id)?;
+        Self::direct(GithubAppConfig { client_id, installations: Vec::new() }, pem)
+    }
+
+    fn direct(config: GithubAppConfig, pem: &str) -> Result<Self> {
         Self::construct(config, pem, Self::client_builder().https_only(true)
             .build().map_err(|_| failed(CONNECT, "HTTP client unavailable"))?,
             Url::parse(API_BASE).expect("constant GitHub API URL"))
@@ -141,16 +153,16 @@ impl GithubAppGenerator {
         {
             return Err(CoreError::invalid("invalid isolated GitHub test endpoint"));
         }
-        Self::construct(config, pem, client, base_url)
+        config.validate()?;
+        Self::construct(config.clone(), pem, client, base_url)
     }
 
-    fn construct(config: &GithubAppConfig, pem: &str, client: Client, base_url: Url) -> Result<Self> {
-        let mut config = config.clone();
-        config.validate_connection()?;
-        if !config.ceiling.repositories.is_empty() {
-            config.ceiling.canonicalize()?;
-        }
+    fn construct(config: GithubAppConfig, pem: &str, client: Client, base_url: Url) -> Result<Self> {
         Ok(Self { config, signer: signing_key(pem)?, client, base_url })
+    }
+
+    pub(crate) fn matches_config(&self, config: &GithubAppConfig) -> bool {
+        &self.config == config
     }
 
     fn jwt(&self) -> Result<String> {
@@ -193,21 +205,63 @@ impl GithubAppGenerator {
         Self::send(request, operation)?.json().map_err(|_| failed(operation, "invalid response"))
     }
 
-    fn create_token(&self, body: &impl Serialize, operation: &str) -> Result<Value> {
-        let jwt = self.jwt()?;
+    fn create_token(&self, installation_id: u64, jwt: &str, body: &impl Serialize, operation: &str) -> Result<Value> {
         Self::json(self.request(Method::POST,
-            &format!("app/installations/{}/access_tokens", self.config.installation_id), &jwt)
+            &format!("app/installations/{installation_id}/access_tokens"), jwt)
             .json(body), operation)
+    }
+
+    /// The app JWT lists installation accounts without minting an installation token.
+    pub fn list_installations(&self) -> Result<Vec<GithubInstallationAccount>> {
+        let jwt = self.jwt()?;
+        let malformed = || failed(LIST_INSTALLATIONS, "invalid installation listing");
+        let mut accounts = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut page = 1u64;
+        loop {
+            let response = Self::send(self.request(Method::GET,
+                &format!("app/installations?per_page={PER_PAGE}&page={page}"), &jwt), LIST_INSTALLATIONS)?;
+            // Use Link only as a pagination hint; never send a JWT to a URL
+            // supplied by a response.
+            let has_next = response.headers().get_all(reqwest::header::LINK).iter()
+                .filter_map(|header| header.to_str().ok())
+                .flat_map(|header| header.split(','))
+                .any(|link| link.split(';').skip(1).any(|param| param.trim() == "rel=\"next\""));
+            let items: Vec<Value> = response.json().map_err(|_| malformed())?;
+            if items.len() > PER_PAGE || (items.is_empty() && has_next) {
+                return Err(malformed());
+            }
+            let count = items.len();
+            for item in items {
+                let (installation_id, account) = installation_account(&item).ok_or_else(malformed)?;
+                if !seen.insert(installation_id) {
+                    return Err(malformed());
+                }
+                accounts.push(GithubInstallationAccount { installation_id, account: account.to_owned() });
+            }
+            if count < PER_PAGE && !has_next {
+                accounts.sort_unstable_by_key(|account| account.installation_id);
+                return Ok(accounts);
+            }
+            page = page.checked_add(1).ok_or_else(malformed)?;
+        }
     }
 
     /// Verify the installation and discover current stable repository IDs. The
     /// metadata-only discovery token is never returned, cached or persisted.
-    pub fn connect(&self) -> Result<GithubInstallation> {
-        let jwt = self.jwt()?;
+    pub fn connect(&self, installation_id: u64) -> Result<GithubInstallation> {
+        if installation_id == 0 {
+            return Err(CoreError::invalid("GitHub installation ID must be positive"));
+        }
+        self.connect_with_app_jwt(installation_id, &self.jwt()?)
+    }
+
+    fn connect_with_app_jwt(&self, installation_id: u64, jwt: &str) -> Result<GithubInstallation> {
         let installation = Self::json(self.request(Method::GET,
-            &format!("app/installations/{}", self.config.installation_id), &jwt), CONNECT)?;
+            &format!("app/installations/{installation_id}"), jwt), CONNECT)?;
         let malformed = || failed(CONNECT, "invalid installation response");
-        if installation.get("id").and_then(Value::as_u64) != Some(self.config.installation_id) {
+        let (returned_id, account_login) = installation_account(&installation).ok_or_else(malformed)?;
+        if returned_id != installation_id {
             return Err(malformed());
         }
         // A missing suspension field is not proof that an installation is active.
@@ -216,11 +270,9 @@ impl GithubAppGenerator {
             Some(_) => return Err(failed(CONNECT, "installation is suspended")),
             None => return Err(malformed()),
         }
-        let account_login = installation.get("account").and_then(|a| a.get("login"))
-            .and_then(Value::as_str).filter(|login| !login.is_empty() && !login.chars().any(char::is_control))
-            .ok_or_else(malformed)?.to_owned();
+        let account_login = account_login.to_owned();
         let permissions = permissions(installation.get("permissions")).map_err(|_| malformed())?;
-        let mut response = self.create_token(&DiscoveryRequest {
+        let mut response = self.create_token(installation_id, jwt, &DiscoveryRequest {
             permissions: DiscoveryPermissions { metadata: GithubPermission::Read },
         }, DISCOVER)?;
         let token = take_token(&mut response).ok_or_else(|| failed(DISCOVER, "invalid token response"))?;
@@ -240,7 +292,7 @@ impl GithubAppGenerator {
                 return Err(failed(DISCOVER, "token expired during discovery"));
             }
             Ok(GithubInstallation {
-                installation_id: self.config.installation_id,
+                installation_id,
                 account_login,
                 repositories,
                 permissions,
@@ -262,13 +314,61 @@ impl GithubAppGenerator {
         }
     }
 
+    /// Verify the configured ID/name pairs and permission ceilings with this
+    /// exact app key before saving an authority change.
+    pub(crate) fn verify_installations(&self) -> Result<Option<String>> {
+        let jwt = self.jwt()?;
+        let mut warnings = Vec::new();
+        let verified = (|| {
+            for ceiling in &self.config.installations {
+                let id = ceiling.installation_id;
+                let installation = self.connect_with_app_jwt(id, &jwt).map_err(|mut error| {
+                    error.message = format!("GitHub installation {id}: {}", error.message);
+                    error
+                })?;
+                if let Some(warning) = installation.warning {
+                    warnings.push(format!("GitHub installation {id}: {warning}"));
+                }
+                for repo in &ceiling.repositories {
+                    let matches = installation.repositories.binary_search_by_key(&repo.id, |actual| actual.id)
+                        .is_ok_and(|index| repo.full_name.trim()
+                            .eq_ignore_ascii_case(installation.repositories[index].full_name.trim()));
+                    if !matches {
+                        return Err(CoreError::invalid(format!(
+                            "GitHub repository ID {} and name do not match installation {id}; reconnect", repo.id)));
+                    }
+                }
+                for (name, level) in &ceiling.permissions {
+                    if !installation.permissions.get(name).is_some_and(|maximum| level <= maximum) {
+                        return Err(CoreError::invalid(format!(
+                            "GitHub permission {name}:{} exceeds installation {id}'s permissions; reconnect", level.as_str())));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
+        match verified {
+            Ok(()) => Ok(warning),
+            Err(mut error) => {
+                if let Some(warning) = warning {
+                    error.message.push_str("; ");
+                    error.message.push_str(&warning);
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Mint exactly the approved immutable grant. Never retry with restrictions
     /// omitted, accept a narrower response, or publish unverifiable credentials.
     pub fn issue(&self, grant: &GithubGrant) -> Result<GeneratedCredential> {
-        if !grant.is_subset_of(&self.config.ceiling)? {
+        let ceiling = self.config.ceiling(grant.installation_id)
+            .ok_or_else(|| CoreError::invalid("GitHub installation is not configured for this generator"))?;
+        if !grant.is_subset_of(ceiling)? {
             return Err(CoreError::invalid("GitHub grant exceeds this generator's ceiling"));
         }
-        let mut response = self.create_token(&TokenRequest {
+        let mut response = self.create_token(grant.installation_id, &self.jwt()?, &TokenRequest {
             repository_ids: RepositoryIds(&grant.repositories),
             permissions: &grant.permissions,
         }, GENERATE)?;
@@ -329,7 +429,7 @@ impl GithubAppGenerator {
         loop {
             let changed = || CoreError::vault_unavailable(LISTING_CHANGED);
             let value: Value = Self::send(self.request(Method::GET,
-                &format!("installation/repositories?per_page=100&page={page}"), token), DISCOVER)?
+                &format!("installation/repositories?per_page={PER_PAGE}&page={page}"), token), DISCOVER)?
                 .json().map_err(|_| changed())?;
             let total = value.get("total_count").and_then(Value::as_u64).ok_or_else(changed)?;
             let count = usize::try_from(total).map_err(|_| changed())?;
@@ -339,7 +439,7 @@ impl GithubAppGenerator {
             expected = Some(count);
             let items = parse_repositories(value.get("repositories").ok_or_else(changed)?)
                 .map_err(|_| changed())?;
-            if items.len() > 100 || (items.is_empty() && repositories.len() != count) {
+            if items.len() > PER_PAGE || (items.is_empty() && repositories.len() != count) {
                 return Err(changed());
             }
             for repository in items {
@@ -372,6 +472,13 @@ impl GithubAppGenerator {
         Self::send(self.request(Method::DELETE, "installation/token", token)
             .timeout(timeout.min(TOTAL_TIMEOUT)), REVOKE).map(|_| ())
     }
+}
+
+fn installation_account(value: &Value) -> Option<(u64, &str)> {
+    let id = value.get("id")?.as_u64().filter(|id| *id > 0)?;
+    let account = value.get("account")?.get("login")?.as_str()
+        .filter(|login| !login.is_empty() && !login.chars().any(|c| c.is_whitespace() || c.is_control()))?;
+    Some((id, account))
 }
 
 fn take_token(response: &mut Value) -> Option<String> {

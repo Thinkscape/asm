@@ -286,6 +286,10 @@ final class AppModel {
         try await call { try $0.githubConnect(draft) }
     }
 
+    func githubListInstallations(_ draft: GeneratorDraftItem) async throws -> [GithubInstallationAccountItem] {
+        try await call { try $0.githubListInstallations(draft) }
+    }
+
     func saveGenerator(_ draft: GeneratorDraftItem) async throws -> GeneratorItem {
         let generator = try await call { try $0.saveGenerator(draft) }
         await refresh("generators")

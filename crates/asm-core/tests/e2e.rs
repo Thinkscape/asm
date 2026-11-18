@@ -1139,6 +1139,7 @@ fn read_local_request(stream: &TcpStream) -> std::io::Result<LocalRequest> {
 struct IssuedToken {
     token: String,
     expires_at: i64,
+    org_repo: bool,
 }
 
 struct GithubFixtureState {
@@ -1172,7 +1173,7 @@ fn approved_grant(installation_id: u64) -> GithubGrant {
 }
 
 impl GithubFixture {
-    fn new(client_id: &str, installation_id: u64, other_repository: u64) -> Self {
+    fn new(client_id: &str, installation_id: u64, other_repository: u64, org_installation: Option<u64>) -> Self {
         let private = rsa::PrivateKey::new(&mut rand::rng(), 2048).unwrap();
         let pem = private.to_pkcs1_pem(Default::default()).unwrap().to_string();
         let public = rsa::PublicKey::from(&private)
@@ -1204,7 +1205,8 @@ impl GithubFixture {
                 .and_then(|header| header.strip_prefix("Bearer "))
                 .ok_or("GitHub bearer authentication missing")?;
             let mint_path = format!("/app/installations/{installation_id}/access_tokens");
-            if request.method == "POST" && request.target == mint_path {
+            let org_repo = org_installation.is_some_and(|id| request.target == format!("/app/installations/{id}/access_tokens"));
+            if request.method == "POST" && (request.target == mint_path || org_repo) {
                 let jwt = jsonwebtoken::decode::<serde_json::Value>(
                     bearer, &decoding_key,
                     &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256),
@@ -1220,10 +1222,8 @@ impl GithubFixture {
                 }
                 let body: serde_json::Value = serde_json::from_slice(&request.body)
                     .map_err(|_| "GitHub mint request is not JSON")?;
-                if body != json!({
-                    "repository_ids":[202],
-                    "permissions":{"contents":"read","metadata":"read"}
-                }) {
+                let permissions = if org_repo { json!({"metadata":"read"}) } else { json!({"contents":"read","metadata":"read"}) };
+                if body != json!({"repository_ids":[if org_repo { 505 } else { 202 }], "permissions":permissions}) {
                     return Err("GitHub mint did not use the exact operator-approved scope".into());
                 }
                 let mut state = serving.lock().unwrap();
@@ -1231,19 +1231,20 @@ impl GithubFixture {
                 let token = format!("fixture.{issuer}.{}.installation-token", state.issued.len() + 1);
                 let expires_at = now + state.next_lifetime;
                 state.next_lifetime = 3600;
-                state.issued.push(IssuedToken { token: token.clone(), expires_at });
+                state.issued.push(IssuedToken { token: token.clone(), expires_at, org_repo });
                 // Omit repositories deliberately: real adapter must enumerate this
                 // token's actual scope before the manager can publish it.
                 return Ok((201, json!({
                     "token":token,
                     "expires_at":asm_proto::time::fmt_rfc3339(asm_core::manager::to_system_time(expires_at)),
-                    "permissions":{"contents":"read","metadata":"read"}
+                    "permissions":permissions
                 })));
             }
             let mut state = serving.lock().unwrap();
-            if !state.issued.iter().any(|issued| issued.token == bearer) {
+            let Some(issued) = state.issued.iter().find(|issued| issued.token == bearer) else {
                 return Err("unknown installation token used at GitHub".into());
-            }
+            };
+            let org_repo = issued.org_repo;
             if request.method == "DELETE" && request.target == "/installation/token" {
                 state.revoked.push(bearer.to_owned());
                 return Ok((204, serde_json::Value::Null));
@@ -1253,7 +1254,9 @@ impl GithubFixture {
             {
                 state.repository_checks += 1;
                 return Ok((200, json!({
-                    "total_count":1,"repositories":[{"id":202,"full_name":"acme/web"}]
+                    "total_count":1,"repositories":[if org_repo {
+                        json!({"id":505,"full_name":"other-org/platform"})
+                    } else { json!({"id":202,"full_name":"acme/web"}) }]
                 })));
             }
             Err("unexpected GitHub method or endpoint".into())
@@ -1262,8 +1265,15 @@ impl GithubFixture {
         ceiling.repositories.push(repository(other_repository, "acme/other"));
         ceiling.permissions.insert("contents".into(), GithubPermission::Write);
         ceiling.canonicalize().unwrap();
+        let mut installations = vec![ceiling];
+        if let Some(id) = org_installation {
+            installations.push(GithubGrant {
+                installation_id: id, repositories: vec![repository(505, "other-org/platform")],
+                permissions: BTreeMap::from([("metadata".into(), GithubPermission::Read)]),
+            });
+        }
         Self {
-            http, config: GithubAppConfig { client_id, installation_id, ceiling },
+            http, config: GithubAppConfig { client_id, installations },
             pem, state,
         }
     }
@@ -1283,7 +1293,7 @@ impl GithubFixture {
             GeneratorRecord {
                 id: id.into(), name: name.into(),
                 config: GeneratorConfig::GithubApp(self.config.clone()),
-                revision: 1, position: self.config.installation_id as i64,
+                revision: 1, position: self.config.installations[0].installation_id as i64,
             },
             Arc::new(generator),
         ).unwrap();
@@ -1327,10 +1337,15 @@ impl GeneratedApprover {
                     .expect("offered source is selectable");
                 assert!(selected.choice.available);
                 let asm_core::ffi::GenerationGrant::GithubApp { scope } = &selected.choice.ceiling;
+                let mut grant = approved_grant(scope.installation_id);
+                if scope.installation_id == 93 {
+                    grant.repositories = vec![repository(505, "other-org/platform")];
+                    grant.permissions.retain(|key, _| key == "metadata");
+                }
                 Some(GenerationSelection {
                     generator_id: selected.choice.generator_id.clone(),
                     generator_revision: selected.choice.revision,
-                    grant: GenerationGrant::GithubApp(approved_grant(scope.installation_id)),
+                    grant: GenerationGrant::GithubApp(grant),
                 }.into())
             };
             let mode = if *sentinel_required {
@@ -1473,8 +1488,8 @@ fn generated_github_lease_end_to_end() {
     );
     let cli = build_cli();
     let tmp = tempfile::tempdir().unwrap();
-    let release = GithubFixture::new("release-client", 41, 101);
-    let review = GithubFixture::new("review-client", 84, 303);
+    let release = GithubFixture::new("release-client", 41, 101, Some(93));
+    let review = GithubFixture::new("review-client", 84, 303, None);
     let upstream_seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
     let seen = upstream_seen.clone();
     let issuers = [release.state.clone(), review.state.clone()];
@@ -1547,7 +1562,7 @@ fn generated_github_lease_end_to_end() {
     // write/two-repository ceiling to one repository with read permission.
     let first = json_get(&env, &[
         "--sentinel", "--hosts", "127.0.0.1",
-        "--repositories", "ACME/web", "--permission", "contents=read",
+        "--repositories", "ACME/web", "--permissions", "contents=read",
         "GH_TOKEN", "Read acme/web through the proxy",
     ]);
     assert_eq!(first["mode"], "sentinel");
@@ -1589,7 +1604,7 @@ fn generated_github_lease_end_to_end() {
 
     // Alias reuse is one grant/version, not a second issuance or approval.
     let alias = json_get(&env, &[
-        "--sentinel", "GITHUB_TOKEN", "Continue reading acme/web",
+        "--sentinel", "--repositories", "acme/web", "--permissions", "contents=read", "GITHUB_TOKEN", "Continue reading acme/web",
     ]);
     let alias_path = delivered_path(&alias);
     assert_eq!(alias["lease_id"], first["lease_id"]);
@@ -1655,11 +1670,11 @@ fn generated_github_lease_end_to_end() {
 
     // Fresh generated approvals default raw. Both local aliases stay attached to
     // one durable version and every known get view is rewritten on refresh.
-    let raw = json_get(&env, &["--new-lease", "GH_TOKEN", "Read acme/web directly"]);
+    let raw = json_get(&env, &["--new-lease", "--repositories", "acme/web", "--permissions", "contents=read", "GH_TOKEN", "Read acme/web directly"]);
     assert_eq!(raw["mode"], "raw");
     let raw_id = raw["lease_id"].as_str().unwrap().to_owned();
     let raw_path = delivered_path(&raw);
-    let raw_alias = json_get(&env, &["GITHUB_TOKEN", "Use the same direct credential"]);
+    let raw_alias = json_get(&env, &["--repositories", "acme/web", "--permissions", "contents=read", "GITHUB_TOKEN", "Use the same direct credential"]);
     let raw_alias_path = delivered_path(&raw_alias);
     assert_eq!(raw_alias["lease_id"], raw["lease_id"]);
     assert_eq!(raw_alias["credential_version"], raw["credential_version"]);
@@ -1694,7 +1709,7 @@ curl --noproxy '*' -fsS -o /dev/null -H "X-Key: $GH_TOKEN" "$1"
 test "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H "X-Key: $GITHUB_TOKEN" "$2")" = 403
 printf 'raw-child-ok\n'"#;
     let output = exec_env.run_env(&[
-        "exec", "--wait", "30", "GH_TOKEN,GITHUB_TOKEN", "--",
+        "exec", "--wait", "30", "--repositories", "acme/web", "--permissions", "contents=read", "GH_TOKEN,GITHUB_TOKEN", "--",
         "/bin/sh", "-c", raw_child, "asm-fixture",
         &approved_url, &outside_url, "literal;$(not-a-command)",
     ], None, &[
@@ -1711,7 +1726,7 @@ printf 'raw-child-ok\n'"#;
     // Identity conflicts are rejected before either app is contacted; custom
     // destinations intentionally permit two distinct app identities.
     let conflict = exec_env.run(&[
-        "exec", "GH_TOKEN=release-bot/GH_TOKEN,GITHUB_TOKEN=review-bot/GH_TOKEN",
+        "exec", "--repositories", "acme/web", "--permissions", "contents=read", "GH_TOKEN=release-bot/GH_TOKEN,GITHUB_TOKEN=review-bot/GH_TOKEN",
         "--", "/bin/sh", "-c", "printf should-not-launch",
     ], None);
     assert_eq!(conflict.code, asm_proto::error::EXIT_INVALID);
@@ -1726,7 +1741,7 @@ curl --noproxy '*' -fsS -o /dev/null -H "X-Key: $BOT_A_TOKEN" "$1"
 curl --noproxy '*' -fsS -o /dev/null -H "X-Key: $BOT_B_TOKEN" "$1"
 printf 'two-apps-ok\n'"#;
     let output = exec_env.run_env(&[
-        "exec", "--wait", "30",
+        "exec", "--wait", "30", "--repositories", "acme/web", "--permissions", "contents=read",
         "BOT_A_TOKEN=release-bot/GH_TOKEN,BOT_B_TOKEN=review-bot/GH_TOKEN",
         "--", "/bin/sh", "-c", custom_child, "asm-fixture", &approved_url,
     ], None, &[("GH_TOKEN", "inherited-gh"), ("GITHUB_TOKEN", "inherited-github")]);
@@ -1750,7 +1765,7 @@ test -z "${all_proxy+x}"
 curl --noproxy '' -fsS -o /dev/null -H "X-Key: $GH_TOKEN" "$1"
 printf 'sentinel-child-ok\n'"#;
     let output = exec_env.run_env(&[
-        "exec", "--sentinel", "--hosts", "127.0.0.1", "--wait", "30",
+        "exec", "--sentinel", "--hosts", "127.0.0.1", "--wait", "30", "--repositories", "acme/web", "--permissions", "contents=read",
         "GITHUB_TOKEN", "--", "/bin/sh", "-c", sentinel_child,
         "asm-fixture", &approved_url,
     ], None, &[
@@ -1766,7 +1781,7 @@ printf 'sentinel-child-ok\n'"#;
     // Ending authorization, unlike provider expiry, permanently ends exact-lease
     // renewal and revokes its still-valid GitHub token.
     let short = json_get(&env, &[
-        "--new-lease", "--sentinel", "--hosts", "127.0.0.1",
+        "--new-lease", "--sentinel", "--hosts", "127.0.0.1", "--repositories", "acme/web", "--permissions", "contents=read",
         "release-bot/GH_TOKEN", "short-generated-lease",
     ]);
     let short_id = short["lease_id"].as_str().unwrap();
@@ -1801,7 +1816,7 @@ printf 'sentinel-child-ok\n'"#;
         client_secret: String::new(), master_password: String::new(),
     }).unwrap();
     let output = exec_env.run(&[
-        "exec", "--wait", "30", "GH_TOKEN,OTHER_SECRET", "--", "/bin/sh", "-c",
+        "exec", "--wait", "30", "--repositories", "acme/web", "--permissions", "contents=read", "GH_TOKEN,OTHER_SECRET", "--", "/bin/sh", "-c",
         r#"set -eu; test "$GH_TOKEN" = "$GITHUB_TOKEN"; test -n "$HTTPS_PROXY"; case "$OTHER_SECRET" in asm_*) ;; *) exit 82 ;; esac; printf 'all-acquired-ok\n'"#,
     ], None);
     assert_eq!(output.code, 0, "multi-secret exec failed: {}", output.stderr);
@@ -1870,6 +1885,18 @@ printf 'structured-child-ok\n'"#;
     drop(details);
     assert!(!exec_env.secrets.exists());
     assert!(approver.errors.lock().unwrap().is_empty(), "an approval failed");
+    let approvals = approver.count();
+    let split = exec_env.run(&[
+        "exec", "--repositories", "acme/web,other-org/platform", "GH_TOKEN", "--", "/bin/sh", "-c", "printf should-not-launch",
+    ], None);
+    assert_ne!(split.code, 0);
+    assert!(split.stdout.is_empty() && split.stderr.to_ascii_lowercase().contains("split"), "{}", split.stderr);
+    assert_eq!(approver.count(), approvals, "mixed installations must fail before approval");
+    let org = json_get(&env, &["--repositories", "other-org/platform", "GH_TOKEN", "Inspect platform metadata"]);
+    assert_eq!(org["generator_name"], "release-bot");
+    assert_eq!(org["generation"]["grant"]["scope"]["installation_id"], 93);
+    assert_eq!(org["generation"]["grant"]["scope"]["permissions"], json!({"metadata":"read"}));
+
     let review_count = review.count();
     let release_count = release.count();
     assert_eq!(review.state.lock().unwrap().repository_checks, review_count);

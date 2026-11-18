@@ -5,13 +5,16 @@ use crate::error::{CliError, RERUN_TO_PICK_UP};
 use crate::files::{FileBinding, SecretsDir};
 use crate::state::{self, HostState};
 use asm_proto::error::ErrorCode;
-use asm_proto::generators::{GenerationRequest, GithubPermission, GithubScopeRequest};
+use asm_proto::generators::{
+    GITHUB_TOKEN_ALIAS, GITHUB_TOKEN_NAME, GenerationRequest, GithubPermission, GithubScopeRequest,
+    SourceKind,
+};
 use asm_proto::wire::{
     GetResult, LeaseMode, LeaseStatus, LeasesResponse, MAX_POLL_WAIT_SECS, RequestBody,
     RequestResult, RequestState, RequestStatus, SecretsResponse, WriteResult,
 };
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -318,6 +321,48 @@ struct JsonGet<'a> {
 }
 
 #[derive(clap::Args)]
+pub(crate) struct GithubScopeArgs {
+    /// Explicit GitHub owner/repo names; repeat or separate with commas.
+    #[arg(long, value_name = "OWNER/REPO", value_delimiter = ',')]
+    repositories: Vec<String>,
+    /// GitHub permissions KEY=read|write|admin; repeat or separate with commas. Defaults to metadata=read.
+    #[arg(long, value_name = "KEY=LEVEL", value_delimiter = ',')]
+    permissions: Vec<String>,
+}
+
+pub(crate) fn github_repositories_required() -> CliError {
+    CliError::invalid("generated GitHub credentials require --repositories OWNER/REPO")
+}
+
+impl GithubScopeArgs {
+    pub(crate) fn into_generation(self) -> Result<Option<GenerationRequest>, CliError> {
+        if self.repositories.is_empty() {
+            return if self.permissions.is_empty() { Ok(None) } else { Err(github_repositories_required()) };
+        }
+        let mut permissions = BTreeMap::new();
+        for item in self.permissions {
+            let invalid = || CliError::invalid("permissions must be KEY=read|write|admin");
+            let (key, level) = item.trim().split_once('=').ok_or_else(invalid)?;
+            let level = match level {
+                "read" => GithubPermission::Read,
+                "write" => GithubPermission::Write,
+                "admin" => GithubPermission::Admin,
+                _ => return Err(invalid()),
+            };
+            if permissions.insert(key.to_owned(), level).is_some() {
+                return Err(CliError::invalid("duplicate permission key"));
+            }
+        }
+        let mut request = GenerationRequest::GithubApp(GithubScopeRequest {
+            repositories: Some(self.repositories),
+            permissions: Some(permissions),
+        });
+        request.canonicalize()?;
+        Ok(Some(request))
+    }
+}
+
+#[derive(clap::Args)]
 pub struct GetArgs {
     /// Ask for raw values (the operator may choose sentinel delivery instead).
     #[arg(long, conflicts_with = "sentinel")]
@@ -334,12 +379,8 @@ pub struct GetArgs {
     pub json: bool,
     #[arg(long)]
     pub no_reaper: bool,
-    /// Requested GitHub owner/repository names.
-    #[arg(long, alias = "github-repositories", value_delimiter = ',')]
-    pub repositories: Vec<String>,
-    /// Requested GitHub permission KEY=read|write|admin; repeat for multiple keys.
-    #[arg(long = "permission", alias = "github-permission", value_delimiter = ',')]
-    pub permissions: Vec<String>,
+    #[command(flatten)]
+    github_scope: GithubScopeArgs,
     /// Renew exactly this host-owned generated lease, without rebinding.
     #[arg(long, conflicts_with = "new_lease")]
     pub lease: Option<String>,
@@ -355,39 +396,14 @@ pub struct GetArgs {
     pub reason: String,
 }
 
-fn generation_request(a: &GetArgs) -> Result<Option<GenerationRequest>, CliError> {
-    if a.repositories.is_empty() && a.permissions.is_empty() {
-        return Ok(None);
-    }
-    let mut permissions = std::collections::BTreeMap::new();
-    for item in &a.permissions {
-        let (key, value) = item.split_once('=').ok_or_else(|| CliError::invalid("permissions must be KEY=read|write|admin"))?;
-        let level = match value {
-            "read" => GithubPermission::Read,
-            "write" => GithubPermission::Write,
-            "admin" => GithubPermission::Admin,
-            _ => return Err(CliError::invalid("permissions must be KEY=read|write|admin")),
-        };
-        if permissions.insert(key.to_owned(), level).is_some() {
-            return Err(CliError::invalid("duplicate permission key"));
-        }
-    }
-    let mut request = GenerationRequest::GithubApp(GithubScopeRequest {
-        repositories: (!a.repositories.is_empty()).then(|| a.repositories.clone()),
-        permissions: (!a.permissions.is_empty()).then_some(permissions),
-    });
-    request.canonicalize()?;
-    Ok(Some(request))
-}
-
 pub fn get(a: GetArgs) -> Result<(), CliError> {
     let reason = asm_proto::rules::validate_reason(&a.reason)?;
     let hosts = parse_hosts(&a.hosts)?;
-    let generation = generation_request(&a)?;
+    let generation = a.github_scope.into_generation()?;
     let generated_flags = generation.is_some() || a.lease.is_some() || a.refresh || a.new_lease;
     let s = Session::open()?;
     let dir = s.secrets_dir()?;
-    crate::bindings::require_capabilities(&s.api, generated_flags, a.sentinel || a.lease.is_some())?;
+    crate::bindings::require_capabilities(&s.api, generated_flags, a.sentinel || a.lease.is_some(), false)?;
     let owned = s.sync_leases()?;
     let mut refresh_from_version = None;
     let (binding, request_name, generated, fields) = if let Some(id) = &a.lease {
@@ -429,10 +445,9 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
         // their colliding bare alias was omitted from the public generated row.
         let generated_spelling = matches!(
             binding.source.as_str(),
-            asm_proto::generators::GITHUB_TOKEN_NAME | asm_proto::generators::GITHUB_TOKEN_ALIAS
+            GITHUB_TOKEN_NAME | GITHUB_TOKEN_ALIAS
         ) && entries.iter().any(|entry| {
-            entry.source_kind == asm_proto::generators::SourceKind::Generator
-                && !entry.generators.is_empty()
+            entry.source_kind == SourceKind::Generator && !entry.generators.is_empty()
         });
         match resolved {
             Ok(resolved) => {
@@ -452,7 +467,15 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
     if generated_flags && !generated {
         return Err(CliError::invalid("generation options require a generated secret"));
     }
-    crate::bindings::require_capabilities(&s.api, generated, fields.is_some() || a.sentinel || (generated && binding.source.ends_with("GITHUB_TOKEN")))?;
+    if generated && a.lease.is_none() && generation.is_none() {
+        return Err(github_repositories_required());
+    }
+    crate::bindings::require_capabilities(
+        &s.api,
+        generated,
+        fields.is_some() || a.sentinel || (generated && binding.source.ends_with(GITHUB_TOKEN_ALIAS)),
+        generation.is_some(),
+    )?;
     let mut body = RequestBody::Get {
         name: request_name,
         raw: a.raw,
@@ -611,6 +634,42 @@ pub fn add(wait: Option<u64>, name: String) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use asm_proto::wire::ResultFile;
+    use clap::{Parser, error::ErrorKind};
+
+    fn parse_get(options: &[&str]) -> Result<GetArgs, clap::Error> {
+        let args = ["asm", "get"].into_iter().chain(options.iter().copied()).chain([GITHUB_TOKEN_NAME, "Read GitHub"]);
+        let crate::Command::Get(get) = crate::Cli::try_parse_from(args)?.command else { unreachable!() };
+        Ok(get)
+    }
+
+    #[test]
+    fn github_scope_rejects_invalid_repositories_and_permissions() {
+        for options in [
+            vec!["--repositories", "repo"],
+            vec!["--repositories", "acme/repo", "--permissions", "contents"],
+            vec!["--repositories", "acme/repo", "--permissions", "contents=none"],
+            vec!["--repositories", "acme/repo", "--permissions", "contents=read,contents=read"],
+            vec!["--repositories", "acme/repo", "--permissions", "metadata=write"],
+        ] {
+            let get = parse_get(&options).unwrap();
+            assert!(get.github_scope.into_generation().is_err(), "{options:?}");
+        }
+    }
+
+    #[test]
+    fn obsolete_github_flags_are_not_accepted_by_get_or_exec() {
+        for flag in ["--permission", "--github-permission", "--github-repositories"] {
+            let value = if flag == "--github-repositories" { "acme/web" } else { "contents=read" };
+            let Err(error) = parse_get(&[flag, value]) else {
+                panic!("get accepted {flag}");
+            };
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+            let Err(error) = crate::Cli::try_parse_from(["asm", "exec", flag, value, GITHUB_TOKEN_NAME, "--", "gh"]) else {
+                panic!("exec accepted {flag}");
+            };
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        }
+    }
 
     #[test]
     fn get_block_format() {

@@ -97,7 +97,6 @@ pub(crate) use asm_proto::wire::RequestedMode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GeneratorTarget {
     pub requested_name: String,
-    pub output_name: String,
     pub pinned_generator_id: Option<String>,
     pub candidates: Vec<GenerationChoice>,
     pub requested_generation: Option<GenerationRequest>,
@@ -555,19 +554,23 @@ impl Core {
 
     /// Push a pending request unless an equal one of the same host exists (re-attach).
     pub(crate) fn push_pending(&self, p: Pending, same: impl Fn(&Pending) -> bool) -> RequestState {
-        let state = {
-            let mut b = lock(&self.book);
-            if let Some(existing) = b.pending.iter().find(|q| q.host_id == p.host_id && same(q)) {
-                return existing.state();
-            }
-            self.log(activity::requested(&p));
-            let s = p.state();
-            b.pending.push(p);
-            s
-        };
-        self.bump();
-        self.notify(TOPIC_REQUESTS);
+        let (state, inserted) = self.attach_pending(p, |current, _| same(current));
+        if inserted {
+            self.bump();
+            self.notify(TOPIC_REQUESTS);
+        }
         state
+    }
+
+    pub(crate) fn attach_pending(&self, p: Pending, same: impl Fn(&Pending, &Pending) -> bool) -> (RequestState, bool) {
+        let mut b = lock(&self.book);
+        if let Some(existing) = b.pending.iter().find(|q| q.host_id == p.host_id && same(q, &p)) {
+            return (existing.state(), false);
+        }
+        self.log(activity::requested(&p));
+        let state = p.state();
+        b.pending.push(p);
+        (state, true)
     }
 
     fn create_get(
@@ -604,11 +607,11 @@ impl Core {
         };
         match resolved {
             super::catalog::CatalogMatch::Generated(super::catalog::CatalogGeneratedTarget {
-                requested_name, output_name, pinned_generator_id, candidates,
+                requested_name, pinned_generator_id, candidates,
             }) => {
                 body.validate_get_capabilities(SourceKind::Generator)?;
                 let target = GeneratorTarget {
-                    requested_name, output_name, pinned_generator_id, candidates,
+                    requested_name, pinned_generator_id, candidates,
                     requested_generation: generation.clone(),
                 };
                 let wanted_fields = select_fields(&["value".to_string()], fields.as_deref())?;
@@ -1624,6 +1627,7 @@ fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi
                     }).collect(), target.requested_generation.clone().map(Into::into)),
             };
             ffi::RequestDetail::Get {
+                is_generated: matches!(g.target, GetTarget::Generated(_)),
                 name, vault_id, vault_name, kind: kind.into(), fields: g.wanted_fields,
                 reason: g.reason, raw_requested: g.mode == RequestedMode::Raw
                     || (g.mode == RequestedMode::Default && matches!(g.target, GetTarget::Generated(_))),

@@ -40,7 +40,21 @@ fn grant() -> GithubGrant {
 }
 
 fn config() -> GithubAppConfig {
-    GithubAppConfig { client_id: "Iv1.test-client".into(), installation_id: 7, ceiling: grant() }
+    GithubAppConfig { client_id: "Iv1.test-client".into(), installations: vec![grant()] }
+}
+
+fn second_grant() -> GithubGrant {
+    GithubGrant {
+        installation_id: 19,
+        repositories: vec![GithubRepository { id: 88, full_name: "other/site".into() }],
+        permissions: BTreeMap::from([("metadata".into(), GithubPermission::Read)]),
+    }
+}
+
+fn multi_config() -> GithubAppConfig {
+    let mut config = config();
+    config.installations.push(second_grant());
+    config
 }
 
 fn token_response(token: &str) -> Value {
@@ -80,7 +94,10 @@ impl Step {
         Self { method, path: path.into(), status, body: body.to_string(), headers: vec![], delay: Duration::ZERO }
     }
     fn mint(body: Value) -> Self {
-        Self::new("POST", "/app/installations/7/access_tokens", 201, body)
+        Self::mint_for(7, body)
+    }
+    fn mint_for(id: u64, body: Value) -> Self {
+        Self::new("POST", &format!("/app/installations/{id}/access_tokens"), 201, body)
     }
     fn page(page: u64, body: Value) -> Self {
         Self::new("GET", &format!("/installation/repositories?per_page=100&page={page}"), 200, body)
@@ -200,7 +217,11 @@ impl Server {
     }
 
     fn generator(&self) -> GithubAppGenerator {
-        GithubAppGenerator::with_client_for_tests(&config(), &keys().0,
+        self.generator_with(&config())
+    }
+
+    fn generator_with(&self, config: &GithubAppConfig) -> GithubAppGenerator {
+        GithubAppGenerator::with_client_for_tests(config, &keys().0,
             GithubAppGenerator::client_builder().build().unwrap(), self.url.clone()).unwrap()
     }
 
@@ -245,6 +266,113 @@ fn generator_issue_verifies_rs256_and_exact_narrowed_body() {
 }
 
 #[test]
+fn generator_issues_each_grant_only_against_its_configured_installation() {
+    let mut second_response = token_response("other-token");
+    second_response["repositories"] = json!([{"id":88, "full_name":"other/site"}]);
+    second_response["permissions"] = json!({"metadata":"read"});
+    let server = Server::start(vec![
+        Step::mint(token_response("first-token")),
+        Step::mint_for(19, second_response),
+    ]);
+    let client = server.generator_with(&multi_config());
+    let mut crossed = grant();
+    crossed.installation_id = 19;
+    assert!(client.issue(&crossed).is_err());
+    crossed.repositories = second_grant().repositories;
+    assert!(client.issue(&crossed).is_err(), "the other installation has no contents permission");
+    assert_eq!(client.issue(&grant()).unwrap().token, "first-token");
+    assert_eq!(client.issue(&second_grant()).unwrap().token, "other-token");
+    let requests = server.finish();
+    requests.iter().for_each(assert_jwt);
+    assert_eq!(requests[0].body["repository_ids"], json!([42]));
+    assert_eq!(requests[1].body, json!({"repository_ids":[88],"permissions":{"metadata":"read"}}));
+}
+
+#[test]
+fn generator_lists_paginated_app_installations_without_minting_or_forwarding_credentials() {
+    let mut first = Step::new("GET", "/app/installations?per_page=100&page=1", 200,
+        json!([{"id":19,"account":{"login":"other"}}]));
+    first.headers.push(("Link", "<http://127.0.0.1:1/steal-jwt>; rel=\"next\"".into()));
+    let server = Server::start(vec![first,
+        Step::new("GET", "/app/installations?per_page=100&page=2", 200,
+            json!([{"id":7,"account":{"login":"acme"}}])),
+    ]);
+    let draft = GithubAppConfig { installations: Vec::new(), ..config() };
+    let client = GithubAppGenerator::construct(draft, &keys().0,
+        GithubAppGenerator::client_builder().build().unwrap(), server.url.clone()).unwrap();
+    assert_eq!(client.list_installations().unwrap(), [
+        GithubInstallationAccount { installation_id: 7, account: "acme".into() },
+        GithubInstallationAccount { installation_id: 19, account: "other".into() },
+    ]);
+    server.finish().iter().for_each(assert_jwt);
+}
+
+#[test]
+fn generator_installation_listing_rejects_duplicate_ids_across_pages() {
+    let accounts = json!([{"id":7,"account":{"login":"acme"}}]);
+    let mut first = Step::new("GET", "/app/installations?per_page=100&page=1", 200, accounts.clone());
+    first.headers.push(("Link", "</app/installations?page=2>; rel=\"next\"".into()));
+    let server = Server::start(vec![first,
+        Step::new("GET", "/app/installations?per_page=100&page=2", 200, accounts),
+    ]);
+    let error = server.generator().list_installations().unwrap_err();
+    assert!(error.message.contains("invalid installation listing"));
+    assert_eq!(server.finish().len(), 2);
+}
+
+fn installation_verification(id: u64, account: &str, repositories: Value) -> [Step; 4] {
+    let mut response = installation();
+    response["id"] = json!(id);
+    response["account"]["login"] = json!(account);
+    [
+        Step::new("GET", &format!("/app/installations/{id}"), 200, response),
+        Step::mint_for(id, discovery_token()),
+        Step::page(1, listing(repositories.as_array().unwrap().len() as u64, repositories)),
+        Step::revoke(204),
+    ]
+}
+
+#[test]
+fn generator_verifies_every_configured_installation_with_its_own_discovery_token() {
+    let first = installation_verification(7, "acme", json!([{"id":42,"full_name":"Acme/Web"}]));
+    let mut second = installation_verification(19, "other", json!([{"id":88,"full_name":"other/site"}]));
+    let mut token = discovery_token();
+    token["token"] = json!("second-discovery-private");
+    second[1] = Step::mint_for(19, token);
+    let server = Server::start(first.into_iter().chain(second).collect());
+    assert!(server.generator_with(&multi_config()).verify_installations().unwrap().is_none());
+    let requests = server.finish();
+    for (four, token) in requests.chunks_exact(4).zip(["discovery-private", "second-discovery-private"]) {
+        assert_jwt(&four[0]);
+        assert_jwt(&four[1]);
+        assert_eq!(four[1].body, json!({"permissions":{"metadata":"read"}}));
+        assert_eq!(four[2].headers["authorization"], format!("Bearer {token}"));
+        assert_eq!(four[3].headers["authorization"], format!("Bearer {token}"));
+    }
+}
+
+#[test]
+fn generator_rejects_unverified_repository_identity_or_permission_in_any_ceiling() {
+    for (repositories, permission, expected) in [
+        (json!([{"id":77,"full_name":"other/site"}]), None, "repository ID 88"),
+        (json!([{"id":88,"full_name":"other/renamed"}]), None, "repository ID 88"),
+        (json!([{"id":88,"full_name":"other/site"}]), Some(GithubPermission::Admin), "permission contents:admin"),
+    ] {
+        let mut config = multi_config();
+        if let Some(permission) = permission {
+            config.installations[1].permissions.insert("contents".into(), permission);
+        }
+        let first = installation_verification(7, "acme", json!([{"id":42,"full_name":"acme/web"}]));
+        let second = installation_verification(19, "other", repositories);
+        let server = Server::start(first.into_iter().chain(second).collect());
+        let error = server.generator_with(&config).verify_installations().unwrap_err();
+        assert!(error.message.contains(expected));
+        assert!(error.message.contains("installation 19"));
+        assert_eq!(server.finish().len(), 8, "invalid selections must still revoke discovery tokens");
+    }
+}
+
+#[test]
 fn generator_connect_discovers_with_metadata_only_then_revokes() {
     let mut page1 = Step::page(1, listing(2, json!([{"id":43,"full_name":"acme/api"}])));
     // Must never follow an arbitrary provider-supplied URL.
@@ -255,11 +383,7 @@ fn generator_connect_discovers_with_metadata_only_then_revokes() {
         Step::page(2, listing(2, json!([{"id":42,"full_name":"Acme/Web"}]))),
         Step::revoke(204),
     ]);
-    let mut draft = config();
-    draft.ceiling.repositories.clear();
-    let generator = GithubAppGenerator::with_client_for_tests(&draft, &keys().0,
-        GithubAppGenerator::client_builder().build().unwrap(), server.url.clone()).unwrap();
-    let discovered = generator.connect().unwrap();
+    let discovered = server.generator().connect(7).unwrap();
     assert_eq!(discovered.account_login, "acme");
     assert_eq!(discovered.repositories.iter().map(|repo| repo.id).collect::<Vec<_>>(), [42,43]);
     assert_eq!(discovered.repositories[0].full_name, "Acme/Web");
@@ -284,7 +408,7 @@ fn generator_connect_refuses_wrong_suspended_or_unverifiable_installation() {
     let mut malformed_permissions = installation(); malformed_permissions["permissions"] = json!({"contents":"none"});
     for response in [wrong_id, suspended, missing_suspension, missing_permissions, malformed_permissions] {
         let server = Server::start(vec![Step::new("GET", "/app/installations/7", 200, response)]);
-        assert!(server.generator().connect().is_err());
+        assert!(server.generator().connect(7).is_err());
         assert_eq!(server.finish().len(), 1, "never create discovery tokens for an unverified installation");
     }
 }
@@ -298,7 +422,7 @@ fn generator_discovery_refuses_broader_missing_or_invalid_permission_evidence() 
             None => { token.as_object_mut().unwrap().remove("permissions"); }
         }
         let server = Server::start(vec![Step::new("GET", "/app/installations/7", 200, installation()), Step::mint(token), Step::revoke(204)]);
-        let error = server.generator().connect().unwrap_err();
+        let error = server.generator().connect(7).unwrap_err();
         assert!(error.message.contains("metadata-only"));
         let requests = server.finish();
         assert_eq!(requests.len(), 3);
@@ -310,7 +434,7 @@ fn generator_discovery_refuses_broader_missing_or_invalid_permission_evidence() 
 fn generator_discovery_always_cleans_up_and_surfaces_sanitized_failure_warning() {
     let server = Server::start(vec![Step::new("GET", "/app/installations/7", 200, installation()),
         Step::mint(discovery_token()), Step::page(1, listing(0,json!([]))), Step::revoke(500)]);
-    let warning = server.generator().connect().unwrap().warning.unwrap();
+    let warning = server.generator().connect(7).unwrap().warning.unwrap();
     assert!(warning.contains("HTTP 500"));
     assert!(warning.contains("token provider expiry:"));
     assert!(!warning.contains("discovery-private"));
@@ -318,7 +442,7 @@ fn generator_discovery_always_cleans_up_and_surfaces_sanitized_failure_warning()
 
     let server = Server::start(vec![Step::new("GET", "/app/installations/7", 200, installation()),
         Step::mint(discovery_token()), Step::page(1, json!({"private-token":"must-not-leak"})), Step::revoke(403)]);
-    let error = server.generator().connect().unwrap_err();
+    let error = server.generator().connect(7).unwrap_err();
     assert!(error.message.contains(LISTING_CHANGED));
     assert!(error.message.contains("HTTP 403"));
     assert!(!error.message.contains("must-not-leak"));
@@ -575,7 +699,7 @@ fn generator_partial_scope_evidence_is_enumerated_under_the_new_token() {
     let mut approved = grant();
     approved.repositories.push(GithubRepository { id: 43, full_name: "acme/api".into() });
     let mut configured = config();
-    configured.ceiling = approved.clone();
+    configured.installations[0] = approved.clone();
     let server = Server::start(vec![
         Step::mint(token_response("partial-private")),
         Step::page(1, listing(2, json!([{"id":43,"full_name":"acme/api"}]))),
@@ -600,7 +724,7 @@ fn generator_discovery_invalid_expiry_still_revokes_obtained_token() {
             Step::new("GET", "/app/installations/7", 200, installation()),
             Step::mint(response), Step::revoke(204),
         ]);
-        let error = server.generator().connect().unwrap_err();
+        let error = server.generator().connect(7).unwrap_err();
         assert_eq!(error.message, "GitHub repository discovery failed (invalid token expiry)");
         assert!(!error.message.contains("discovery-private"));
         assert_eq!(server.finish().last().unwrap().headers["authorization"], "Bearer discovery-private");

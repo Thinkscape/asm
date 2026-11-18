@@ -93,12 +93,11 @@ struct GetDetail: Equatable, Sendable {
     /// Offered but not pre-filled.
     var suggestedHosts: [HostPatternCheckItem]
     var defaultDurationSecs: UInt64?
+    var isGenerated: Bool
     var generatorChoices: [GeneratorApprovalChoiceItem] = []
     var requestedGeneration: GenerationRequestItem?
     var sentinelRequired: Bool = false
     var hasSubstitutableFields: Bool = true
-
-    var isGenerated: Bool { !generatorChoices.isEmpty || requestedGeneration != nil }
 }
 
 struct PendingItem: Identifiable, Equatable, Sendable {
@@ -198,6 +197,12 @@ struct GithubRepositoryItem: Identifiable, Hashable, Sendable {
 struct GithubScopeRequestItem: Equatable, Sendable {
     var repositories: [String]?
     var permissions: [GithubPermissionItem]?
+
+    var effectivePermissions: [GithubPermissionItem] {
+        let requested = permissions ?? []
+        if requested.contains(where: { $0.name == "metadata" }) { return requested }
+        return requested + [.init(name: "metadata", level: .read)]
+    }
 }
 
 enum GenerationRequestItem: Equatable, Sendable {
@@ -208,21 +213,31 @@ enum GenerationRequestItem: Equatable, Sendable {
     }
 }
 
-struct GithubGrantItem: Equatable, Sendable {
+struct GithubGrantItem: Identifiable, Equatable, Sendable {
+    static let repositoryLimit = 500
+
+    var id: UInt64 { installationID }
     var installationID: UInt64
     var repositories: [GithubRepositoryItem]
     var permissions: [GithubPermissionItem]
 
-    func unmetClaims(_ request: GithubScopeRequestItem?) -> [String] {
-        guard let request else { return [] }
-        let names = Set(repositories.map { $0.fullName.lowercased() })
-        var issues = (request.repositories ?? []).filter { !names.contains($0.lowercased()) }
-            .map { "Repository not selected: \($0)" }
-        let levels = Dictionary(permissions.map { ($0.name, $0.level) }, uniquingKeysWith: { a, _ in a })
-        for permission in request.permissions ?? [] where levels[permission.name].map({ $0 >= permission.level }) != true {
-            issues.append("Permission not selected: \(permission.name): \(permission.level.rawValue)")
+    // Saved grants carry canonical repository names, not the account from discovery.
+    // Only describe an owner when those names agree.
+    var repositoryOwner: String? {
+        guard let first = repositories.first?.fullName.prefix(while: { $0 != "/" }),
+              !first.isEmpty else { return nil }
+        let owner = first.lowercased()
+        guard repositories.allSatisfy({ $0.fullName.prefix(while: { $0 != "/" }).lowercased() == owner }) else {
+            return nil
         }
-        return issues
+        return String(first)
+    }
+
+    func exactlyMatches(_ request: GithubScopeRequestItem) -> Bool {
+        guard let requested = request.repositories, !requested.isEmpty,
+              Set(requested.map { $0.lowercased() }) == Set(repositories.map { $0.fullName.lowercased() })
+        else { return false }
+        return Set(request.effectivePermissions) == Set(permissions)
     }
 }
 
@@ -244,7 +259,12 @@ struct GenerationChoiceItem: Identifiable, Equatable, Sendable {
 }
 
 struct GeneratorApprovalChoiceItem: Identifiable, Equatable, Sendable {
-    var id: String { choice.id }
+    struct ID: Hashable, Sendable {
+        var generatorID: String
+        var installationID: UInt64
+    }
+
+    var id: ID { ID(generatorID: choice.id, installationID: choice.ceiling.github.installationID) }
     var choice: GenerationChoiceItem
     var suggestedHosts: [HostPatternCheckItem]
     var scopeIssues: [String]
@@ -258,8 +278,7 @@ struct GenerationSelectionItem: Equatable, Sendable {
 
 struct GithubAppConfigItem: Equatable, Sendable {
     var clientID: String
-    var installationID: UInt64
-    var ceiling: GithubGrantItem
+    var installations: [GithubGrantItem]
 }
 
 enum GeneratorConfigItem: Equatable, Sendable {
@@ -294,10 +313,23 @@ struct GithubInstallationItem: Equatable, Sendable {
     var warning: String?
 }
 
+struct GithubInstallationAccountItem: Identifiable, Equatable, Sendable {
+    var id: UInt64 { installationID }
+    var installationID: UInt64
+    var account: String
+}
+
 /// Repository IDs, not editable display names, are the authority in a selected scope.
 struct GithubClaimsSelection: Equatable {
     var repositoryIDs: Set<UInt64> = []
     var permissions: [String: GithubPermissionLevel] = ["metadata": .read]
+
+    init() {}
+
+    init(ceiling: GithubGrantItem) {
+        repositoryIDs = Set(ceiling.repositories.map(\.id))
+        permissions = Dictionary(uniqueKeysWithValues: ceiling.permissions.map { ($0.name, $0.level) })
+    }
 
     subscript(repository id: UInt64) -> Bool {
         get { repositoryIDs.contains(id) }
@@ -316,20 +348,8 @@ struct GithubClaimsSelection: Equatable {
             }
         )
     }
-
-    static func requested(_ request: GithubScopeRequestItem?, within ceiling: GithubGrantItem) -> Self {
-        let names = Set((request?.repositories ?? []).map { $0.lowercased() })
-        var selection = Self()
-        selection.repositoryIDs = Set(ceiling.repositories.filter { names.contains($0.fullName.lowercased()) }.map(\.id))
-        for permission in request?.permissions ?? [] {
-            if let maximum = ceiling.permissions.first(where: { $0.name == permission.name }),
-               maximum.allowedLevels.contains(permission.level) {
-                selection.permissions[permission.name] = permission.level
-            }
-        }
-        return selection
-    }
 }
+
 enum VaultKind: String, Equatable, Sendable {
     case bitwarden, envFile, keychain
 

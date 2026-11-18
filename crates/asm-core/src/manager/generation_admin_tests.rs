@@ -39,9 +39,10 @@ impl Keys {
         Ok(())
     }
 
-    fn save(&self, core: &Core, draft: ffi::GeneratorDraft) -> Result<ffi::GeneratorInfo> {
-        core.save_generator_with(draft,
-            |id| self.get(id), |id, pem| self.put(id, pem), |id| self.delete(id))
+    fn save(&self, fixture: &Fixture, draft: ffi::GeneratorDraft) -> Result<ffi::GeneratorInfo> {
+        fixture.core.save_generator_with_github(draft,
+            |id| self.get(id), |id, pem| self.put(id, pem), |id| self.delete(id),
+            |config, pem| fixture.github_client(config, pem))
     }
 }
 
@@ -91,12 +92,12 @@ fn generation_admin_failed_edit_restores_key_and_preserves_live_authority() {
     let old_client = before.client().unwrap();
     let mut draft = edit(&f, "app-a");
     draft.config = GeneratorConfig::GithubApp(GithubAppConfig {
-        client_id: "replacement-client".into(), installation_id: 7, ceiling: Fixture::grant(),
+        client_id: "replacement-client".into(), installations: vec![Fixture::grant()],
     }).into();
     draft.private_key_pem = replacement_pem().to_string();
     reject_generator_persistence(&f);
 
-    assert!(keys.save(&f.core, draft).is_err());
+    assert!(keys.save(&f, draft).is_err());
 
     assert_eq!(lock(&keys.written).as_slice(), ["app-a", "app-a"]);
     assert!(keys.get("app-a").unwrap().as_deref() == Some(crate::generator::github::test_pem()));
@@ -134,17 +135,18 @@ fn generation_admin_failed_key_restoration_disables_generator_and_evicts_materia
     let restoration_attempts = AtomicUsize::new(0);
     reject_generator_persistence(&f);
 
-    let saved = f.core.save_generator_with(draft, |id| keys.get(id), |id, pem| {
+    let saved = f.core.save_generator_with_github(draft, |id| keys.get(id), |id, pem| {
         if pem == crate::generator::github::test_pem() {
             restoration_attempts.fetch_add(1, Ordering::SeqCst);
             return Err(CoreError::internal("isolated credential restoration failure"));
         }
         keys.put(id, pem)
-    }, |id| keys.delete(id));
+    }, |id| keys.delete(id), |config, pem| f.github_client(config, pem));
     assert!(saved.is_err());
 
     assert_eq!(restoration_attempts.load(Ordering::SeqCst), 1);
-    assert!(keys.get("app-a").unwrap().as_deref() == Some(replacement_pem()));
+    assert!(keys.get("app-a").unwrap().is_none());
+    assert_eq!(lock(&keys.deleted).as_slice(), ["app-a"]);
     assert_eq!(f.core.store.get_generator("app-a").unwrap().unwrap(), before);
     let live = f.core.generators.get("app-a").unwrap();
     assert_eq!(live.record, before);
@@ -179,7 +181,7 @@ fn generation_admin_display_rename_preserves_client_revision_and_lease() {
     let mut draft = edit(&f, "app-a");
     draft.name = "renamed-bot".into();
 
-    let saved = keys.save(&f.core, draft).unwrap();
+    let saved = keys.save(&f, draft).unwrap();
 
     assert_eq!(saved.name, "renamed-bot");
     assert_eq!(saved.revision, 1);
@@ -225,28 +227,21 @@ fn generation_admin_pending_edits_refresh_offered_revisions_without_adding_sourc
     let f = Fixture::new();
     f.install("app-b", "review-bot", 2);
     let keys = Keys::installed(&["app-a", "app-b"]);
-    let mut body = f.body("GH_TOKEN");
-    if let RequestBody::Get { generation, .. } = &mut body {
-        *generation = Some(GenerationRequest::GithubApp(GithubScopeRequest {
-            repositories: Some(vec!["acme/repo1".into()]),
-            permissions: Some([("contents".into(), GithubPermission::Write)].into_iter().collect()),
-        }));
-    }
-    let group = f.request(body).unwrap();
+    let group = f.request(f.body("GH_TOKEN")).unwrap();
     let pinned = f.request(f.body("release-bot/GITHUB_TOKEN")).unwrap();
     let initial = pending_choices(&f, &group.request_id);
     assert_eq!(initial.iter().map(|c| c.choice.generator_id.as_str()).collect::<Vec<_>>(), ["app-a", "app-b"]);
-    assert!(!initial[0].scope_issues.is_empty());
+    assert!(initial[0].scope_issues.is_empty());
     f.install("app-c", "later-bot", 3);
     let mut ceiling = Fixture::grant();
     ceiling.permissions.insert("contents".into(), GithubPermission::Write);
     let mut draft = edit(&f, "app-a");
     draft.name = "edited-bot".into();
     draft.config = GeneratorConfig::GithubApp(GithubAppConfig {
-        client_id: "edited-client".into(), installation_id: 7, ceiling: ceiling.clone(),
+        client_id: "edited-client".into(), installations: vec![ceiling],
     }).into();
 
-    let saved = keys.save(&f.core, draft).unwrap();
+    let saved = keys.save(&f, draft).unwrap();
 
     assert_eq!(saved.revision, 2);
     assert!(lock(&keys.written).is_empty());
@@ -254,24 +249,78 @@ fn generation_admin_pending_edits_refresh_offered_revisions_without_adding_sourc
     assert_eq!(choices.iter().map(|c| c.choice.generator_id.as_str()).collect::<Vec<_>>(), ["app-a", "app-b"]);
     assert_eq!(choices[0].choice.name, "edited-bot");
     assert_eq!(choices[0].choice.revision, 2);
-    assert_eq!(choices[0].choice.ceiling, ffi::GenerationGrant::from(GenerationGrant::GithubApp(ceiling)));
+    assert_eq!(choices[0].choice.ceiling, ffi::GenerationGrant::from(GenerationGrant::GithubApp(Fixture::grant())));
     assert!(choices[0].choice.available);
     assert!(choices[0].scope_issues.is_empty());
     assert_eq!(choices[1].choice.revision, 1);
-    assert!(!choices[1].scope_issues.is_empty());
+    assert!(choices[1].scope_issues.is_empty());
     let pinned_choices = pending_choices(&f, &pinned.request_id);
     assert_eq!(pinned_choices.len(), 1);
     assert_eq!(pinned_choices[0].choice.generator_id, "app-a");
     assert_eq!(pinned_choices[0].choice.revision, 2);
+    assert_eq!(f.approve(&group.request_id, "app-a", LeaseMode::Raw, 43_200).unwrap_err().code, ErrorCode::Invalid);
     assert_eq!(f.approve(&group.request_id, "app-c", LeaseMode::Raw, 43_200).unwrap_err().code, ErrorCode::Invalid);
     assert_eq!(f.issued(), 0);
     assert_eq!(f.core.request_state(&f.host.id, &group.request_id).unwrap().status, RequestStatus::Pending);
 
-    // A still-offered local provider can satisfy a deliberate narrower approval.
+    // The operator can choose between matching installations on different generators.
     f.approve(&group.request_id, "app-b", LeaseMode::Raw, 43_200).unwrap();
     let approved = get(f.core.request_state(&f.host.id, &group.request_id).unwrap());
     assert_eq!(approved.generation.unwrap().generator_id, "app-b");
     assert_eq!(f.issued(), 1);
+}
+
+#[test]
+fn generation_admin_removing_one_installation_ends_its_pending_request() {
+    let f = Fixture::new();
+    let mut removed = Fixture::grant();
+    removed.installation_id = 8;
+    removed.repositories = vec![GithubRepository { id: 3, full_name: "acme/repo3".into() }];
+    f.install_with_ceilings("app-b", "review-bot", 2, vec![Fixture::grant(), removed.clone()]);
+    let mut body = f.body("review-bot/GH_TOKEN");
+    if let RequestBody::Get { generation: Some(GenerationRequest::GithubApp(scope)), .. } = &mut body {
+        scope.repositories = Some(vec!["acme/repo3".into()]);
+    }
+    let pending = f.request(body).unwrap();
+    let choices = pending_choices(&f, &pending.request_id);
+    assert_eq!(choices.len(), 1);
+    assert_eq!(choices[0].choice.ceiling, ffi::GenerationGrant::from(GenerationGrant::GithubApp(removed.clone())));
+    let keys = Keys::installed(&["app-b"]);
+    let mut draft = edit(&f, "app-b");
+    draft.config = GeneratorConfig::GithubApp(GithubAppConfig {
+        client_id: "client-app-b".into(), installations: vec![Fixture::grant()],
+    }).into();
+    assert_eq!(keys.save(&f, draft).unwrap().revision, 2);
+
+    let denied = f.core.request_state(&f.host.id, &pending.request_id).unwrap();
+    assert_eq!(denied.status, RequestStatus::Denied);
+    assert!(f.approve_github(&pending.request_id, "app-b", 1, removed, LeaseMode::Raw, 43_200).is_err());
+    assert_eq!(f.issued(), 0);
+}
+
+#[test]
+fn generation_admin_pending_repository_names_cannot_rebind_to_different_ids() {
+    let f = Fixture::new();
+    let mut previous = Fixture::grant();
+    previous.repositories[0].id = 2;
+    f.install_with_ceilings("app-b", "review-bot", 2, vec![previous.clone()]);
+    let body = f.body("review-bot/GH_TOKEN");
+    let pending = f.request(body.clone()).unwrap();
+    assert_eq!(pending_choices(&f, &pending.request_id)[0].choice.ceiling,
+        ffi::GenerationGrant::from(GenerationGrant::GithubApp(previous)));
+    let keys = Keys::installed(&["app-b"]);
+    let mut draft = edit(&f, "app-b");
+    draft.config = GeneratorConfig::GithubApp(GithubAppConfig {
+        client_id: "client-app-b".into(), installations: vec![Fixture::grant()],
+    }).into();
+    assert_eq!(keys.save(&f, draft).unwrap().revision, 2);
+
+    assert_eq!(f.core.request_state(&f.host.id, &pending.request_id).unwrap().status, RequestStatus::Denied);
+    let next = f.request(body).unwrap();
+    assert_ne!(next.request_id, pending.request_id);
+    assert_eq!(pending_choices(&f, &next.request_id)[0].choice.ceiling,
+        ffi::GenerationGrant::from(GenerationGrant::GithubApp(Fixture::grant())));
+    assert_eq!(f.issued(), 0);
 }
 
 #[test]
@@ -320,13 +369,13 @@ fn generation_admin_failed_new_save_deletes_only_the_new_credential() {
     let draft = ffi::GeneratorDraft {
         id: None, name: "new-bot".into(),
         config: GeneratorConfig::GithubApp(GithubAppConfig {
-            client_id: "new-client".into(), installation_id: 7, ceiling: Fixture::grant(),
+            client_id: "new-client".into(), installations: vec![Fixture::grant()],
         }).into(),
         private_key_pem: replacement_pem().to_string(),
     };
     reject_generator_persistence(&f);
 
-    assert!(keys.save(&f.core, draft).is_err());
+    assert!(keys.save(&f, draft).is_err());
 
     let written = lock(&keys.written).clone();
     assert_eq!(written.len(), 1);
@@ -341,4 +390,43 @@ fn generation_admin_failed_new_save_deletes_only_the_new_credential() {
     assert_eq!(f.core.store.list_generators().unwrap(), vec![before.record]);
     assert!(f.core.store.list_leases().unwrap().is_empty());
     assert_eq!(f.issued(), 0);
+}
+
+#[test]
+fn generation_admin_invalid_github_key_is_never_written() {
+    let f = Fixture::new();
+    let mut draft = edit(&f, "app-a");
+    draft.private_key_pem = "not a PEM key".into();
+    assert!(f.core.save_generator_with(draft, |_| Ok(None),
+        |_, _| panic!("invalid private key must not be stored"),
+        |_| panic!("invalid private key must not require rollback")).is_err());
+    assert_eq!(f.core.list_generators()[0].revision, 1);
+}
+
+#[test]
+fn generation_admin_save_verifies_each_installation_before_changing_authority() {
+    let f = Fixture::new();
+    let keys = Keys::installed(&["app-a"]);
+    let before = f.core.store.get_generator("app-a").unwrap().unwrap();
+    let mut draft = edit(&f, "app-a");
+    draft.private_key_pem = replacement_pem().to_string();
+    let mut second = Fixture::grant();
+    second.installation_id = 8;
+    // The ID is visible in installation 8, but the submitted name is not verified for that ID.
+    second.repositories = vec![GithubRepository { id: 3, full_name: "acme/forged".into() }];
+    let config = |second| GeneratorConfig::GithubApp(GithubAppConfig {
+        client_id: "client-app-a".into(), installations: vec![Fixture::grant(), second],
+    }).into();
+    draft.config = config(second.clone());
+
+    let error = keys.save(&f, draft.clone()).unwrap_err();
+    assert!(error.message.contains("installation 8"));
+    assert!(lock(&keys.written).is_empty());
+    assert_eq!(f.core.store.get_generator("app-a").unwrap(), Some(before));
+
+    second.repositories[0].full_name = "acme/repo3".into();
+    draft.config = config(second);
+    assert_eq!(keys.save(&f, draft).unwrap().revision, 2);
+    assert_eq!(lock(&keys.written).as_slice(), ["app-a"]);
+    assert_eq!(f.issued(), 0, "save verification does not mint a lease credential");
 }

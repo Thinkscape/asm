@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use asm_proto::crypto::new_uuid_v4;
 use asm_proto::generators::{
     CREDENTIAL_REFRESH_MARGIN_SECS, GenerationGrant, GenerationRequest, GenerationSelection,
-    GithubGrant, SourceKind,
+    GITHUB_TOKEN_ALIAS, GITHUB_TOKEN_NAME, GithubGrant, GithubRepository, GithubScopeRequest, SourceKind,
 };
 use asm_proto::rules::{new_sentinel, normalize_host_patterns};
 use asm_proto::time::fmt_unix;
@@ -94,8 +94,8 @@ fn github(grant: &GenerationGrant) -> &GithubGrant {
 
 fn canonical_name(name: &str) -> Option<String> {
     let (prefix, leaf) = name.rsplit_once('/').map_or((None, name), |(p, l)| (Some(p), l));
-    if !matches!(leaf, "GH_TOKEN" | "GITHUB_TOKEN") { return None; }
-    Some(prefix.map_or_else(|| "GH_TOKEN".into(), |p| format!("{p}/GH_TOKEN")))
+    if !matches!(leaf, GITHUB_TOKEN_NAME | GITHUB_TOKEN_ALIAS) { return None; }
+    Some(prefix.map_or_else(|| GITHUB_TOKEN_NAME.into(), |p| format!("{p}/{GITHUB_TOKEN_NAME}")))
 }
 
 fn hosts_cover(lease: &LeaseRecord, requested: &[String]) -> bool {
@@ -111,9 +111,40 @@ fn accepts_mode(requested: RequestedMode, mode: LeaseMode) -> bool {
     }
 }
 
-fn request_compatible(lease: &LeaseRecord, requested: Option<&GenerationRequest>) -> bool {
-    requested.is_none() || requested == lease.requested_generation.as_ref()
-        || lease.generation.as_ref().is_some_and(|grant| requested.is_some_and(|r| grant.covers_request(r).unwrap_or(false)))
+fn explicit_github_scope(request: Option<&GenerationRequest>) -> Result<&GithubScopeRequest> {
+    match request {
+        Some(GenerationRequest::GithubApp(scope)) if scope.repositories.as_ref().is_some_and(|names| !names.is_empty()) => Ok(scope),
+        _ => Err(CoreError::invalid("generated GitHub credentials require an explicit --repositories list of owner/repo names")),
+    }
+}
+
+fn configured_github_repository<'a>(ceiling: &'a GithubGrant, name: &str) -> Option<&'a GithubRepository> {
+    let mut matches = ceiling.repositories.iter().filter(|repo| repo.full_name.trim().eq_ignore_ascii_case(name));
+    let repo = matches.next()?;
+    matches.next().is_none().then_some(repo)
+}
+
+/// Resolve against one installation only. Request syntax has already been canonicalized.
+fn resolve_github_grant(scope: &GithubScopeRequest, ceiling: &GithubGrant) -> Option<GithubGrant> {
+    let permissions = scope.permissions.as_ref()?;
+    if !permissions.iter().all(|(name, level)| ceiling.permissions.get(name).is_some_and(|max| level <= max)) {
+        return None;
+    }
+    let names = scope.repositories.as_ref()?;
+    let mut repositories = Vec::with_capacity(names.len());
+    for name in names {
+        repositories.push(configured_github_repository(ceiling, name)?.clone());
+    }
+    repositories.sort_unstable_by_key(|repo| repo.id);
+    Some(GithubGrant { installation_id: ceiling.installation_id, repositories, permissions: permissions.clone() })
+}
+
+fn same_generated_get(left: &GeneratorTarget, right: &GeneratorTarget) -> bool {
+    // New choices cannot create parallel approval for a request whose
+    // previously offered choice may already be in flight.
+    left.pinned_generator_id == right.pinned_generator_id
+        && (left.pinned_generator_id.is_some() || left.requested_name == right.requested_name)
+        && left.requested_generation == right.requested_generation
 }
 
 impl Core {
@@ -133,7 +164,7 @@ impl Core {
             })));
     }
 
-    fn authorized_generator(&self, lease: &LeaseRecord, now: i64) -> Result<GeneratorEntry> {
+    fn authorized_generator(&self, lease: &LeaseRecord, now: i64) -> Result<Arc<GithubAppGenerator>> {
         if lock(&self.generation).shutting_down {
             return Err(CoreError::vault_unavailable("manager is shutting down"));
         }
@@ -142,41 +173,61 @@ impl Core {
         }
         self.store.get_host(&lease.host_id)?.filter(|h| h.revoked_at.is_none())
             .ok_or_else(|| CoreError::unauthorized("host was revoked"))?;
-        let entry = self.generators.get(&lease.vault_id)
-            .ok_or_else(|| CoreError::vault_unavailable("generator was removed"))?;
-        if Some(entry.record.revision) != lease.generator_revision {
-            return Err(CoreError::vault_unavailable("generator authorization changed"));
-        }
-        let GeneratorConfig::GithubApp(config) = &entry.record.config;
         let grant = lease.generation.as_ref().ok_or_else(|| CoreError::vault_unavailable("generated lease has no grant"))?;
-        if !github(grant).is_subset_of(&config.ceiling)? {
-            return Err(CoreError::vault_unavailable("generator authorization changed"));
-        }
-        entry.client()?;
-        Ok(entry)
+        self.generators.with_entry(&lease.vault_id, |entry| {
+            if Some(entry.record.revision) != lease.generator_revision || !entry.record.config.accepts_grant(grant)? {
+                return Err(CoreError::vault_unavailable("generator authorization changed"));
+            }
+            entry.client()
+        }).ok_or_else(|| CoreError::vault_unavailable("generator was removed"))?
+    }
+
+    fn issue_for_lease(&self, lease: &LeaseRecord, client: &GithubAppGenerator) -> Result<GeneratedCredential> {
+        let grant = lease.generation.as_ref()
+            .ok_or_else(|| CoreError::vault_unavailable("generated lease has no grant"))?;
+        client.issue(github(grant)).map_err(|e| {
+            self.generator_event("generation_failed", lease, Some(&e.message));
+            CoreError::vault_unavailable(e.message)
+        })
     }
 
     pub(crate) fn create_generated_get(
-        &self, host: &HostRecord, agent: &str, address: &str, target: GeneratorTarget,
+        &self, host: &HostRecord, agent: &str, address: &str, mut target: GeneratorTarget,
         mode: RequestedMode, wanted_fields: Vec<String>, requested: Vec<String>, reason: String,
         new_lease: bool, refresh: bool, refresh_from_version: Option<u64>,
     ) -> Result<RequestState> {
+        // Serialize the reuse decision and pending insertion with approval commit.
+        let authority = lock(&self.authorization);
         if lock(&self.generation).shutting_down {
             return Err(CoreError::vault_unavailable("manager is shutting down"));
+        }
+        explicit_github_scope(target.requested_generation.as_ref())?;
+        self.reconcile_generator_target(&mut target, false);
+        if target.candidates.is_empty() {
+            return Err(CoreError::invalid(
+                "no single configured GitHub App installation covers the requested repositories and permissions; \
+                 check the owner/repo names and generator access, split the repositories by installation, or lower --permissions",
+            ));
         }
         if !new_lease {
             let latest = self.store.leases_of_host(&host.id)?.into_iter()
                 .filter(|l| l.source_kind == SourceKind::Generator && l.agent == agent
                     && accepts_mode(mode, l.mode)
                     && l.name == target.requested_name
-                    && target.pinned_generator_id.as_ref().is_none_or(|id| id == &l.vault_id))
+                    && target.pinned_generator_id.as_ref().is_none_or(|id| id == &l.vault_id)
+                    // History only selects the latest lease to check; it cannot authorize reuse.
+                    && (l.requested_generation == target.requested_generation
+                        || target.candidates.iter().any(|choice| choice.generator_id == l.vault_id
+                            && Some(&choice.ceiling) == l.generation.as_ref())))
                 .max_by_key(|l| l.approval_order.unwrap_or(0));
             if let Some(lease) = latest {
-                let now = self.generation_now();
-                if lease.is_active(now) && hosts_cover(&lease, &requested)
+                let scope_matches = target.candidates.iter().any(|choice| choice.generator_id == lease.vault_id
+                    && Some(choice.revision) == lease.generator_revision
+                    && Some(&choice.ceiling) == lease.generation.as_ref());
+                if lease.is_active(self.generation_now()) && hosts_cover(&lease, &requested)
                     && wanted_fields.iter().all(|f| lease.fields.iter().any(|lf| &lf.field == f))
-                    && request_compatible(&lease, target.requested_generation.as_ref())
-                    && self.generators.get(&lease.vault_id).is_some_and(|g| Some(g.record.revision) == lease.generator_revision) {
+                    && scope_matches {
+                    drop(authority);
                     let result = self.materialize_generated(&lease.id, refresh, refresh_from_version)?;
                     return self.generated_shortcut(host, result);
                 }
@@ -185,11 +236,18 @@ impl Core {
         let (initial, suggestions) = host_candidates(&requested, &[], &["api.github.com".into()]);
         let detail = GetDetail { target: GetTarget::Generated(target), mode, wanted_fields,
             requested_hosts: requested, reason, initial, suggestions };
-        let p = self.new_pending(host, agent, address, Detail::Get(detail.clone()));
-        Ok(self.push_pending(p, |q| q.agent == agent && matches!(&q.detail, Detail::Get(g)
-            if matches!((&g.target, &detail.target), (GetTarget::Generated(a), GetTarget::Generated(b)) if a == b)
-                && g.mode == detail.mode && g.wanted_fields == detail.wanted_fields
-                && g.requested_hosts == detail.requested_hosts && g.reason == detail.reason)))
+        let p = self.new_pending(host, agent, address, Detail::Get(detail));
+        let (state, inserted) = self.attach_pending(p, |q, p| q.agent == agent
+            && matches!((&q.detail, &p.detail), (Detail::Get(g), Detail::Get(detail))
+                if matches!((&g.target, &detail.target), (GetTarget::Generated(a), GetTarget::Generated(b)) if same_generated_get(a, b))
+                    && g.mode == detail.mode && g.wanted_fields == detail.wanted_fields
+                    && g.requested_hosts == detail.requested_hosts && g.reason == detail.reason));
+        drop(authority);
+        if inserted {
+            self.bump();
+            self.notify(TOPIC_REQUESTS);
+        }
+        Ok(state)
     }
 
     pub(crate) fn generated_pinned_get(
@@ -203,8 +261,9 @@ impl Core {
             return Err(CoreError::invalid("--lease requires a generated lease"));
         }
         let requested_name = canonical_name(name).ok_or_else(|| CoreError::invalid("name does not match this lease"))?;
-        let current_name = self.generators.get(&lease.vault_id).map(|g| format!("{}/GH_TOKEN", g.record.name));
-        if requested_name != lease.name && current_name.as_deref() != Some(&requested_name) {
+        if requested_name != lease.name && self.generators.with_entry(&lease.vault_id, |entry| {
+            requested_name.rsplit_once('/') == Some((entry.record.name.as_str(), GITHUB_TOKEN_NAME))
+        }) != Some(true) {
             return Err(CoreError::invalid("name does not match this lease"));
         }
         if !lease.is_active(self.generation_now()) {
@@ -212,9 +271,24 @@ impl Core {
                 status: RequestStatus::Denied, deny_reason: Some("lease ended; request a new lease without --lease".into()),
                 result: None, expires_at: None, pending_lifetime_secs: 0 });
         }
+        let scope_matches = match (lease.generation.as_ref(), generation) {
+            (Some(GenerationGrant::GithubApp(grant)), Some(request)) => {
+                let scope = explicit_github_scope(Some(request))?;
+                self.generators.with_entry(&lease.vault_id, |entry| {
+                    let GeneratorConfig::GithubApp(config) = &entry.record.config;
+                    let Some(ceiling) = config.ceiling(grant.installation_id) else { return false; };
+                    scope.permissions.as_ref() == Some(&grant.permissions)
+                        && scope.repositories.as_ref().is_some_and(|names| names.len() == grant.repositories.len()
+                            && names.iter().all(|name| configured_github_repository(ceiling, name).is_some_and(|repo|
+                                grant.repositories.binary_search_by_key(&repo.id, |approved| approved.id).is_ok())))
+                }) == Some(true)
+            }
+            (_, None) => true,
+            (None, Some(_)) => false,
+        };
         if !accepts_mode(mode, lease.mode) || !hosts_cover(&lease, requested)
             || fields.is_some_and(|fs| fs.iter().any(|f| !lease.fields.iter().any(|lf| &lf.field == f)))
-            || !request_compatible(&lease, generation) {
+            || !scope_matches {
             return Err(CoreError::invalid("request does not fit this lease"));
         }
         let result = self.materialize_generated(id, refresh, refresh_from_version)?;
@@ -297,12 +371,11 @@ impl Core {
         let (lease, client, force) = {
             let authority = lock(&self.authorization);
             let lease = self.store.get_lease(id)?.ok_or_else(|| CoreError::not_found("no such lease"))?;
-            let entry = self.authorized_generator(&lease, self.generation_now())?;
             let now = self.generation_now();
+            let client = self.authorized_generator(&lease, now)?;
             let force = refresh && lease.credential_version <= observed;
-            let mut generation = lock(&self.generation);
-            if let Some(cached) = generation.cached.get_mut(id) {
-                cached.prune(now);
+            let generation = lock(&self.generation);
+            if let Some(cached) = generation.cached.get(id) {
                 if !force && cached.fresh(now) {
                     drop(generation);
                     if lease.mode == LeaseMode::Sentinel {
@@ -315,23 +388,32 @@ impl Core {
                     }
                     return self.validate_generated_delivery(id, lease.credential_version);
                 }
-                if !force && cached.current.expires_at > now && cached.retired.len() >= 2 {
+            }
+            if !force {
+                let live_tokens = if let Some(cached) = generation.cached.get(id) {
+                    std::iter::once(&cached.current).chain(&cached.retired).filter(|c| c.expires_at > now).count()
+                } else {
+                    generation.retired_only.get(id).map_or(0, |r| r.tokens.iter().filter(|c| c.expires_at > now).count())
+                };
+                if live_tokens >= 3 {
                     return Err(CoreError::rate_limited("too many live generated credentials; wait for an earlier token to expire"));
                 }
             }
-            (lease, entry.client()?, force)
+            (lease, client, force)
         };
-        let credential = Arc::new(client.issue(github(lease.generation.as_ref().ok_or_else(|| CoreError::vault_unavailable("generated lease has no grant"))?))
-            .map_err(|e| { self.generator_event("generation_failed", &lease, Some(&e.message)); CoreError::vault_unavailable(e.message) })?);
+        let credential = Arc::new(self.issue_for_lease(&lease, &client)?);
         let mut revoke = Vec::new();
+        let mut installed = false;
         let outcome = (|| {
             let authority = lock(&self.authorization);
             let mut current = self.store.get_lease(id)?.ok_or_else(|| CoreError::not_found("no such lease"))?;
-            self.authorized_generator(&current, self.generation_now())?;
-            if current.generation != lease.generation || current.credential_version != lease.credential_version {
+            let now = self.generation_now();
+            let live = self.authorized_generator(&current, now)?;
+            if !Arc::ptr_eq(&live, &client)
+                || current.generation != lease.generation || current.credential_version != lease.credential_version {
                 return Err(CoreError::vault_unavailable("generator authorization changed during issuance"));
             }
-            if credential.expires_at <= self.generation_now() {
+            if credential.expires_at <= now {
                 return Err(CoreError::vault_unavailable("GitHub returned an expired credential"));
             }
             let version = self.store.update_generated_credential(id, lease.credential_version, credential.expires_at)?;
@@ -341,7 +423,6 @@ impl Core {
             let mut retired = Vec::new();
             if let Some(previous) = generation.retired_only.remove(id) {
                 if force {
-                    let now = (generation.clock)();
                     revoke.extend(previous.tokens.into_iter().filter(|c| c.expires_at > now)
                         .map(|credential| Revocation { lease_id: id.into(), generator_id: lease.vault_id.clone(),
                             credential, client: previous.client.clone() }));
@@ -351,15 +432,16 @@ impl Core {
             }
             if let Some(previous) = generation.cached.remove(id) {
                 if force {
-                    revoke.extend(std::iter::once(previous.current).chain(previous.retired).filter(|c| c.expires_at > self.generation_now_unlocked(&generation))
+                    revoke.extend(std::iter::once(previous.current).chain(previous.retired).filter(|c| c.expires_at > now)
                         .map(|c| Revocation { lease_id: id.into(), generator_id: lease.vault_id.clone(), credential: c, client: previous.client.clone() }));
                 } else {
                     retired.extend(previous.retired);
-                    if previous.current.expires_at > (generation.clock)() { retired.push(previous.current); }
-                    retired.retain(|c| c.expires_at > (generation.clock)());
+                    if previous.current.expires_at > now { retired.push(previous.current); }
                 }
             }
+            retired.retain(|c| c.expires_at > now);
             generation.cached.insert(id.into(), CachedLease { current: credential.clone(), version, retired, client: client.clone() });
+            installed = true;
             drop(generation);
             self.lease_wake.notify_one();
             let published = if current.mode == LeaseMode::Sentinel {
@@ -378,23 +460,21 @@ impl Core {
         })();
         self.notify_proxy_changed();
         self.notify(TOPIC_LEASES);
-        if outcome.is_err() {
-            let installed = lock(&self.generation).cached.get(id).is_some_and(|c| Arc::ptr_eq(&c.current, &credential));
-            if !installed { revoke.push(Revocation { lease_id: id.into(), generator_id: lease.vault_id.clone(), credential, client }); }
+        if outcome.is_err() && !installed {
+            revoke.push(Revocation { lease_id: id.into(), generator_id: lease.vault_id.clone(), credential, client });
         }
         self.revoke_tokens(revoke, None);
         outcome
     }
-
-    fn generation_now_unlocked(&self, generation: &GenerationState) -> i64 { (generation.clock)() }
 
     pub(crate) fn approve_generated_get(
         &self, pending: &Pending, detail: &GetDetail, target: &GeneratorTarget, mode: LeaseMode,
         duration: Option<u64>, hosts: Vec<String>, selection: Option<GenerationSelection>,
     ) -> Result<GetResult, Fail> {
         if duration == Some(0) { return Err(CoreError::invalid("generated leases must have a positive duration").into()); }
-        let mut selection = selection.ok_or_else(|| CoreError::invalid("choose a GitHub App and grant"))?;
-        selection.grant.canonicalize()?;
+        let GenerationSelection { generator_id, generator_revision, mut grant } =
+            selection.ok_or_else(|| CoreError::invalid("choose a GitHub App installation and grant"))?;
+        grant.canonicalize()?;
         let hosts = if mode == LeaseMode::Raw { Vec::new() } else {
             let hosts = normalize_host_patterns(&hosts)?;
             if hosts.is_empty() { return Err(CoreError::invalid("choose at least one host, or Any host").into()); }
@@ -402,68 +482,68 @@ impl Core {
         };
         let (lease, client) = {
             let _authority = lock(&self.authorization);
-            self.check_pending_generation(pending, &selection)?;
-            let offered = target.candidates.iter().find(|c| c.generator_id == selection.generator_id
-                && c.revision == selection.generator_revision).ok_or_else(|| CoreError::invalid("choose one of the offered GitHub Apps"))?;
-            let entry = self.generators.get(&selection.generator_id).ok_or_else(|| CoreError::invalid("generator was removed"))?;
-            let GeneratorConfig::GithubApp(config) = &entry.record.config;
-            if entry.record.revision != selection.generator_revision || !offered.available
-                || !github(&selection.grant).is_subset_of(&config.ceiling)? {
-                return Err(CoreError::invalid("grant does not fit the selected GitHub App").into());
-            }
+            let (vault_name, client, grant) = self.check_pending_generation(pending, &generator_id, generator_revision, &grant, |entry, offered| {
+                // Approval supplies IDs; only the reconciled choice supplies verified display names.
+                Ok((entry.record.name.clone(), entry.client()?, offered.clone()))
+            })?;
             let now = self.generation_now();
             let order = self.store.reserve_generator_approval_order()?;
             let lease = LeaseRecord { id: new_uuid_v4(), host_id: pending.host_id.clone().unwrap_or_default(),
-                vault_id: entry.record.id.clone(), vault_name: entry.record.name.clone(), secret_key: "token".into(),
+                vault_id: generator_id.clone(), vault_name, secret_key: "token".into(),
                 name: canonical_name(&target.requested_name).ok_or_else(|| CoreError::invalid("invalid generated name"))?,
                 mode, fields: detail.wanted_fields.iter().map(|field| LeaseField { field: field.clone(),
                     sentinel: (mode == LeaseMode::Sentinel).then(new_sentinel), path: target.requested_name.clone() }).collect(),
                 hosts: hosts.clone(), reason: detail.reason.clone(), agent: pending.agent.clone(), created_at: now,
                 expires_at: duration.map(|d| now.saturating_add(d.min(i64::MAX as u64) as i64)), revoked_at: None,
-                source_kind: SourceKind::Generator, generation: Some(selection.grant.clone()),
-                generator_revision: Some(selection.generator_revision), credential_expires_at: None,
+                source_kind: SourceKind::Generator, generation: Some(grant),
+                generator_revision: Some(generator_revision), credential_expires_at: None,
                 approval_order: Some(order), credential_version: 1, requested_generation: target.requested_generation.clone() };
-            (lease, entry.client()?)
+            (lease, client)
         };
-        let credential = Arc::new(client.issue(github(&selection.grant)).map_err(|e| {
-            self.generator_event("generation_failed", &lease, Some(&e.message));
-            Fail::Keep(CoreError::vault_unavailable(e.message))
-        })?);
+        let credential = Arc::new(self.issue_for_lease(&lease, &client).map_err(Fail::Keep)?);
         let mut lease = lease;
         lease.credential_expires_at = Some(credential.expires_at);
+        let mut revoked = Vec::new();
+        let mut installed = false;
         let outcome = (|| -> Result<GetResult> {
             let authority = lock(&self.authorization);
-            self.check_pending_generation(pending, &selection)?;
-            if !lease.is_active(self.generation_now()) || credential.expires_at <= self.generation_now() {
+            let grant = lease.generation.as_ref().ok_or_else(|| CoreError::internal("generated lease has no grant"))?;
+            let live = self.check_pending_generation(pending, &generator_id, generator_revision, grant, |entry, _| entry.client())?;
+            let now = self.generation_now();
+            if !lease.is_active(now) || credential.expires_at <= now {
                 return Err(CoreError::vault_unavailable("approval expired during token generation"));
             }
-            self.authorized_generator(&lease, self.generation_now())?;
+            if !Arc::ptr_eq(&live, &client) {
+                return Err(CoreError::vault_unavailable("generator authorization changed during issuance"));
+            }
             self.store.insert_lease(&lease)?;
             lock(&self.generation).cached.insert(lease.id.clone(), CachedLease {
                 current: credential.clone(), version: 1, retired: Vec::new(), client: client.clone() });
-            if mode == LeaseMode::Sentinel && let Err(e) = self.publish_proxy_locked(&authority) {
-                let _ = self.store.revoke_lease(&lease.id, self.generation_now());
-                lock(&self.generation).cached.remove(&lease.id);
-                let mut state = lock(&self.proxy_state);
-                state.entries.remove(&lease.id);
-                state.suspended.remove(&lease.id);
-                state.dirty = true;
-                drop(state);
+            installed = true;
+            let deliver = (|| {
+                if mode == LeaseMode::Sentinel { self.publish_proxy_locked(&authority)?; }
+                let result = self.with_generated_delivery(&lease.id, 1, true, Self::generated_metadata)?;
+                let mut book = lock(&self.book);
+                let index = book.pending.iter().position(|p| p.id == pending.id && p.resolving)
+                    .ok_or_else(|| CoreError::vault_unavailable("request was cancelled during token generation"))?;
+                book.pending.remove(index);
+                let mut state = pending.ended_state(RequestStatus::Approved);
+                state.result = Some(RequestResult::Get(result.clone()));
+                book.done.insert(pending.id.clone(), Done { host_id: lease.host_id.clone(), state,
+                    at: self.generation_now(), generated: Some(GeneratedDelivery { lease_id: lease.id.clone(), credential_version: 1, consumed: false }) });
+                drop(book);
+                lock(&self.last_active).insert(lease.id.clone());
+                self.lease_wake.notify_one();
+                Ok(result)
+            })();
+            if deliver.is_err() {
+                if let Err(error) = self.store.revoke_lease(&lease.id, self.generation_now()) {
+                    log::error!("failed approval rollback: {}", error.message);
+                }
+                revoked.extend(self.evict_generated_locked(&lease, &authority));
                 let _ = self.publish_proxy_locked(&authority);
-                return Err(e);
             }
-            let result = self.with_generated_delivery(&lease.id, 1, true, Self::generated_metadata)?;
-            let mut book = lock(&self.book);
-            let index = book.pending.iter().position(|p| p.id == pending.id && p.resolving)
-                .ok_or_else(|| CoreError::vault_unavailable("request was cancelled during token generation"))?;
-            book.pending.remove(index);
-            let mut state = pending.ended_state(RequestStatus::Approved);
-            state.result = Some(RequestResult::Get(result.clone()));
-            book.done.insert(pending.id.clone(), Done { host_id: lease.host_id.clone(), state,
-                at: self.generation_now(), generated: Some(GeneratedDelivery { lease_id: lease.id.clone(), credential_version: 1, consumed: false }) });
-            drop(book);
-            lock(&self.last_active).insert(lease.id.clone());
-            Ok(result)
+            deliver
         })();
         self.notify_proxy_changed();
         self.notify(TOPIC_LEASES);
@@ -476,49 +556,38 @@ impl Core {
                 Ok(result)
             }
             Err(e) => {
-                let mut revoked = Vec::new();
-                {
-                    let authority = lock(&self.authorization);
-                    if self.store.get_lease(&lease.id).ok().flatten().is_some() {
-                        if let Err(error) = self.store.revoke_lease(&lease.id, self.generation_now()) {
-                            log::error!("failed approval rollback: {}", error.message);
-                        }
-                        revoked.extend(self.evict_generated_locked(&lease, &authority));
-                        let _ = self.publish_proxy_locked(&authority);
-                    }
-                }
-                if !revoked.iter().any(|r| Arc::ptr_eq(&r.credential, &credential)) {
+                if !installed {
                     revoked.push(Revocation { lease_id: lease.id, generator_id: lease.vault_id, credential, client });
                 }
-                self.notify_proxy_changed();
                 self.revoke_tokens(revoked, None);
                 Err(Fail::Keep(e))
             }
         }
     }
 
-    fn check_pending_generation(&self, pending: &Pending, selection: &GenerationSelection) -> Result<()> {
+    fn check_pending_generation<T>(
+        &self, pending: &Pending, generator_id: &str, revision: u64, grant: &GenerationGrant,
+        use_entry: impl FnOnce(&GeneratorEntry, &GenerationGrant) -> Result<T>,
+    ) -> Result<T> {
         let now = self.generation_now();
         if lock(&self.generation).shutting_down { return Err(CoreError::vault_unavailable("manager is shutting down")); }
+        self.store.get_host(pending.host_id.as_deref().unwrap_or_default())?.filter(|h| h.revoked_at.is_none())
+            .ok_or_else(|| CoreError::unauthorized("host was revoked"))?;
         let book = lock(&self.book);
         let current = book.pending.iter().find(|p| p.id == pending.id && p.host_id == pending.host_id
             && p.resolving && p.expires > now).ok_or_else(|| CoreError::vault_unavailable("request ended during token generation"))?;
         let Detail::Get(GetDetail { target: GetTarget::Generated(target), .. }) = &current.detail else {
             return Err(CoreError::invalid("request no longer offers this generator"));
         };
-        if !target.candidates.iter().any(|c| c.generator_id == selection.generator_id && c.revision == selection.generator_revision) {
-            return Err(CoreError::invalid("request no longer offers this generator"));
-        }
-        drop(book);
-        self.store.get_host(pending.host_id.as_deref().unwrap_or_default())?.filter(|h| h.revoked_at.is_none())
-            .ok_or_else(|| CoreError::unauthorized("host was revoked"))?;
-        let entry = self.generators.get(&selection.generator_id).ok_or_else(|| CoreError::invalid("generator was removed"))?;
-        let GeneratorConfig::GithubApp(config) = &entry.record.config;
-        if entry.record.revision != selection.generator_revision
-            || !github(&selection.grant).is_subset_of(&config.ceiling)? {
-            return Err(CoreError::invalid("generator authorization changed"));
-        }
-        Ok(())
+        let offered = target.candidates.iter().find(|choice|
+            choice.generator_id == generator_id && choice.revision == revision && &choice.ceiling == grant)
+            .ok_or_else(|| CoreError::invalid("approval must match an offered GitHub installation and its exact requested repositories and permissions"))?;
+        self.generators.with_entry(generator_id, |entry| {
+            if entry.record.revision != revision || !entry.record.config.accepts_grant(grant)? {
+                return Err(CoreError::invalid("generator authorization changed"));
+            }
+            use_entry(entry, &offered.ceiling)
+        }).ok_or_else(|| CoreError::invalid("generator was removed"))?
     }
 
     fn complete_generated_pending(&self, pending: &Pending, result: &GetResult) {
@@ -638,13 +707,25 @@ impl Core {
     }
 
     pub fn github_connect(&self, draft: ffi::GeneratorDraft) -> Result<ffi::GithubInstallation> {
-        let config: GeneratorConfig = draft.config.try_into()?;
-        let GeneratorConfig::GithubApp(config) = config;
-        let pem = if draft.private_key_pem.is_empty() {
-            creds::get(draft.id.as_deref().ok_or_else(|| CoreError::invalid("choose a private key PEM file"))?,
-                creds::GITHUB_PRIVATE_KEY)?.ok_or_else(|| CoreError::invalid("choose a private key PEM file"))?
-        } else { draft.private_key_pem };
-        Ok(GithubAppGenerator::new(&config, &pem)?.connect()?.into())
+        let ffi::GeneratorConfig::GithubApp { config } = draft.config;
+        let [ceiling] = config.installations.as_slice() else {
+            return Err(CoreError::invalid("choose exactly one GitHub installation to connect"));
+        };
+        let pem = Self::github_draft_pem(draft.id.as_deref(), draft.private_key_pem)?;
+        Ok(GithubAppGenerator::for_discovery(config.client_id, &pem)?.connect(ceiling.installation_id)?.into())
+    }
+
+    pub fn github_list_installations(&self, draft: ffi::GeneratorDraft) -> Result<Vec<ffi::GithubInstallationAccount>> {
+        let ffi::GeneratorConfig::GithubApp { config } = draft.config;
+        let pem = Self::github_draft_pem(draft.id.as_deref(), draft.private_key_pem)?;
+        Ok(GithubAppGenerator::for_discovery(config.client_id, &pem)?.list_installations()?.into_iter().map(Into::into).collect())
+    }
+
+    fn github_draft_pem(id: Option<&str>, pem: String) -> Result<String> {
+        if !pem.is_empty() { return Ok(pem); }
+        let missing = || CoreError::invalid("choose a private key PEM file");
+        creds::get(id.ok_or_else(missing)?, creds::GITHUB_PRIVATE_KEY)?
+            .filter(|pem| !pem.is_empty()).ok_or_else(missing)
     }
 
     pub fn save_generator(&self, draft: ffi::GeneratorDraft) -> Result<ffi::GeneratorInfo> {
@@ -660,37 +741,67 @@ impl Core {
         put_key: impl Fn(&str, &str) -> Result<()>,
         delete_key: impl Fn(&str) -> Result<()>,
     ) -> Result<ffi::GeneratorInfo> {
+        self.save_generator_with_github(draft, get_key, put_key, delete_key, GithubAppGenerator::new)
+    }
+
+    fn save_generator_with_github(
+        &self, draft: ffi::GeneratorDraft,
+        get_key: impl Fn(&str) -> Result<Option<String>>,
+        put_key: impl Fn(&str, &str) -> Result<()>,
+        delete_key: impl Fn(&str) -> Result<()>,
+        build_github: impl FnOnce(&crate::generator::GithubAppConfig, &str) -> Result<GithubAppGenerator>,
+    ) -> Result<ffi::GeneratorInfo> {
         let name = draft.name.trim().to_string();
         crate::generator::validate_name(&name)?;
         let mut config: GeneratorConfig = draft.config.try_into()?;
-        let GeneratorConfig::GithubApp(github) = &mut config;
-        github.ceiling.canonicalize()?;
+        config.canonicalize()?;
         config.validate()?;
+        let previous = match draft.id.as_deref() {
+            Some(id) => Some(self.store.get_generator(id)?.ok_or_else(|| CoreError::not_found("no such generator"))?),
+            None => None,
+        };
+        let id = previous.as_ref().map(|r| r.id.clone()).unwrap_or_else(new_uuid_v4);
+        let replacement = (!draft.private_key_pem.is_empty()).then_some(draft.private_key_pem.as_str());
+        let reuse = replacement.is_none() && previous.as_ref().is_some_and(|old| old.config == config)
+            && self.generators.with_entry(&id, |entry| entry.generator.is_some()) == Some(true);
+        let mut github_warning = None;
+        let mut verified_key = None;
+        let verified_client = if reuse {
+            None
+        } else {
+            // Verify this exact draft without holding the authorization mutex.
+            if replacement.is_none() && previous.is_some() {
+                verified_key = get_key(&id)?;
+            }
+            let pem = replacement.or(verified_key.as_deref()).filter(|pem| !pem.is_empty())
+                .ok_or_else(|| CoreError::invalid("choose a private key PEM file"))?;
+            let GeneratorConfig::GithubApp(github) = &config;
+            let client = build_github(github, pem)?;
+            github_warning = client.verify_installations()?;
+            Some(Arc::new(client))
+        };
         let mut tokens = Vec::new();
         let (entry, ended) = {
             let authority = lock(&self.authorization);
             if lock(&self.generation).shutting_down {
                 return Err(CoreError::vault_unavailable("manager is shutting down"));
             }
-            let previous = match draft.id.as_deref() {
-                Some(id) => Some(self.store.get_generator(id)?.ok_or_else(|| CoreError::not_found("no such generator"))?),
-                None => None,
-            };
-            let id = previous.as_ref().map(|r| r.id.clone()).unwrap_or_else(new_uuid_v4);
+            if let Some(previous) = &previous
+                && self.store.get_generator(&previous.id)?.as_ref() != Some(previous) {
+                return Err(CoreError::invalid("generator changed while saving; reopen the editor and try again"));
+            }
             let old_pem = get_key(&id)?;
-            let key_changed = !draft.private_key_pem.is_empty()
-                && old_pem.as_deref() != Some(draft.private_key_pem.as_str());
-            let pem = if draft.private_key_pem.is_empty() {
-                old_pem.as_deref().ok_or_else(|| CoreError::invalid("choose a private key PEM file"))?
-            } else { &draft.private_key_pem };
-            let authority_changed = previous.as_ref().is_some_and(|r| r.config != config) || key_changed;
-            let reusable = (!authority_changed).then(|| self.generators.get(&id).and_then(|e| e.generator)).flatten();
-            let client = match reusable {
+            if verified_key.is_some() && verified_key != old_pem {
+                return Err(CoreError::invalid("generator credentials changed while saving; reopen the editor and try again"));
+            }
+            let key_changed = replacement.is_some_and(|new| old_pem.as_deref() != Some(new));
+            let pem = replacement.or(old_pem.as_deref()).filter(|s| !s.is_empty())
+                .ok_or_else(|| CoreError::invalid("choose a private key PEM file"))?;
+            let authority_changed = previous.as_ref().is_some_and(|r| !r.config.same_authority(&config)) || key_changed;
+            let client = match verified_client {
                 Some(client) => client,
-                None => {
-                    let GeneratorConfig::GithubApp(github) = &config;
-                    Arc::new(GithubAppGenerator::new(github, pem)?)
-                }
+                None => self.generators.with_entry(&id, |entry| entry.generator.clone()).flatten()
+                    .ok_or_else(|| CoreError::invalid("generator changed while saving; reopen the editor and try again"))?,
             };
             let revision = match previous.as_ref() {
                 Some(r) if authority_changed => r.revision.checked_add(1)
@@ -698,8 +809,11 @@ impl Core {
                 Some(r) => r.revision,
                 None => 1,
             };
-            let position = previous.as_ref().map(|r| r.position).unwrap_or(
-                self.store.list_generators()?.iter().map(|r| r.position).max().unwrap_or(0).saturating_add(1));
+            let position = match &previous {
+                Some(previous) => previous.position,
+                None => self.store.list_generators()?.iter().map(|r| r.position).max().unwrap_or(0).saturating_add(1),
+            };
+            let affected_leases = if authority_changed && previous.is_some() { self.generator_leases(&id)? } else { Vec::new() };
             let record = GeneratorRecord { id: id.clone(), name, config, revision, position };
             if key_changed || previous.is_none() {
                 put_key(&id, pem)?;
@@ -712,9 +826,12 @@ impl Core {
                     }
                 } else { Ok(()) };
                 if rollback.is_err() && previous.is_some() {
+                    // Do not leave an unrestored replacement under the previous verified identity.
+                    if old_pem.is_some() && delete_key(&id).is_err() {
+                        log::error!("could not remove unrestored generator credentials from the keychain");
+                    }
                     self.generators.mark_unavailable(&id, "private key rollback failed; reconnect this generator");
-                    for lease in self.store.list_leases()?.into_iter().filter(|l|
-                        l.source_kind == SourceKind::Generator && l.vault_id == id) {
+                    for lease in affected_leases {
                         tokens.extend(self.evict_generated_locked(&lease, &authority));
                     }
                     let _ = self.refresh_generator_candidates_locked(&authority);
@@ -724,18 +841,13 @@ impl Core {
                 self.sync_proxy(false);
                 self.notify(TOPIC_GENERATORS);
                 self.notify(TOPIC_REQUESTS);
+                self.notify(TOPIC_LEASES);
                 return Err(error);
             }
             let entry = GeneratorEntry { record, generator: Some(client), unavailable_reason: None };
             self.generators.insert(entry.clone());
-            if authority_changed {
-                for lease in self.store.list_leases()?.into_iter().filter(|l|
-                    l.source_kind == SourceKind::Generator && l.vault_id == id) {
-                    if lease.is_active(self.generation_now()) && self.store.revoke_lease(&lease.id, self.generation_now())? {
-                        self.log_lease_revoked(&lease, "generator authorization changed");
-                    }
-                    tokens.extend(self.evict_generated_locked(&lease, &authority));
-                }
+            for lease in affected_leases {
+                tokens.extend(self.end_generator_lease_locked(&lease, "generator authorization changed", &authority));
             }
             let ended = self.refresh_generator_candidates_locked(&authority);
             self.log(Event::new(Category::Generators, if previous.is_some() { "edited" } else { "created" },
@@ -763,7 +875,16 @@ impl Core {
         }
         qualified.sort();
         qualified.dedup();
-        let warning = (!qualified.is_empty()).then(|| format!("Secret name collision; use qualified choices: {}", qualified.join(", ")));
+        let mut warning = github_warning;
+        if !qualified.is_empty() {
+            let collision = format!("Secret name collision; use qualified choices: {}", qualified.join(", "));
+            if let Some(warning) = &mut warning {
+                warning.push_str("; ");
+                warning.push_str(&collision);
+            } else {
+                warning = Some(collision);
+            }
+        }
         Ok(self.generator_info(&entry, warning))
     }
 
@@ -776,14 +897,11 @@ impl Core {
         let ended = {
             let authority = lock(&self.authorization);
             let record = self.store.get_generator(id)?.ok_or_else(|| CoreError::not_found("no such generator"))?;
+            let affected_leases = self.generator_leases(id)?;
             self.store.delete_generator(id)?;
             self.generators.remove(id);
-            for lease in self.store.list_leases()?.into_iter().filter(|l|
-                l.source_kind == SourceKind::Generator && l.vault_id == id) {
-                if lease.is_active(self.generation_now()) && self.store.revoke_lease(&lease.id, self.generation_now())? {
-                    self.log_lease_revoked(&lease, "generator removed");
-                }
-                tokens.extend(self.evict_generated_locked(&lease, &authority));
+            for lease in affected_leases {
+                tokens.extend(self.end_generator_lease_locked(&lease, "generator removed", &authority));
             }
             let ended = self.refresh_generator_candidates_locked(&authority);
             self.log(Event::new(Category::Generators, "removed", format!("generator {} removed", record.name))
@@ -800,20 +918,53 @@ impl Core {
         Ok(())
     }
 
+    fn generator_leases(&self, id: &str) -> Result<Vec<LeaseRecord>> {
+        Ok(self.store.list_leases()?.into_iter()
+            .filter(|l| l.source_kind == SourceKind::Generator && l.vault_id == id).collect())
+    }
+
+    fn end_generator_lease_locked(&self, lease: &LeaseRecord, reason: &str, authority: &MutexGuard<'_, ()>) -> Vec<Revocation> {
+        let now = self.generation_now();
+        if lease.is_active(now) {
+            match self.store.revoke_lease(&lease.id, now) {
+                Ok(true) => self.log_lease_revoked(lease, reason),
+                Ok(false) => {},
+                Err(e) => log::error!("ending generated lease: {}", e.message),
+            }
+        }
+        // The removed generator or old revision cannot deliver even if the durable update failed.
+        self.evict_generated_locked(lease, authority)
+    }
+
+    fn reconcile_generator_target(&self, target: &mut GeneratorTarget, keep_offered_grant: bool) {
+        let Ok(scope) = explicit_github_scope(target.requested_generation.as_ref()) else {
+            target.candidates.clear();
+            return;
+        };
+        target.candidates.retain_mut(|candidate| {
+            self.generators.with_entry(&candidate.generator_id, |entry| {
+                let GeneratorConfig::GithubApp(config) = &entry.record.config;
+                let offered = github(&candidate.ceiling);
+                let Some(resolved) = config.ceiling(offered.installation_id)
+                    .and_then(|ceiling| resolve_github_grant(scope, ceiling))
+                else { return false; };
+                // Never reinterpret a pending owner/repo name as a different repository ID.
+                if keep_offered_grant && &resolved != offered { return false; }
+                candidate.name.clone_from(&entry.record.name);
+                candidate.revision = entry.record.revision;
+                candidate.ceiling = GenerationGrant::GithubApp(resolved);
+                candidate.available = entry.generator.is_some();
+                candidate.unavailable_reason.clone_from(&entry.unavailable_reason);
+                true
+            }).unwrap_or(false)
+        });
+    }
+
     fn refresh_generator_candidates_locked(&self, _authority: &MutexGuard<'_, ()>) -> Vec<Pending> {
         let mut book = lock(&self.book);
         for pending in &mut book.pending {
             let Detail::Get(GetDetail { target: GetTarget::Generated(target), .. }) = &mut pending.detail else { continue; };
-            target.candidates.retain_mut(|candidate| {
-                let Some(entry) = self.generators.get(&candidate.generator_id) else { return false; };
-                let GeneratorConfig::GithubApp(config) = &entry.record.config;
-                candidate.name = entry.record.name;
-                candidate.revision = entry.record.revision;
-                candidate.ceiling = GenerationGrant::GithubApp(config.ceiling.clone());
-                candidate.available = entry.generator.is_some();
-                candidate.unavailable_reason = entry.unavailable_reason;
-                true
-            });
+            self.reconcile_generator_target(target, true);
         }
         let (ended, keep) = std::mem::take(&mut book.pending).into_iter().partition(|p|
             matches!(&p.detail, Detail::Get(GetDetail { target: GetTarget::Generated(target), .. }) if target.candidates.is_empty()));
@@ -825,6 +976,10 @@ impl Core {
     /// Callers inject a real local HTTP client; no provider operation is simulated.
     pub fn install_generator_client(&self, record: GeneratorRecord, client: Arc<GithubAppGenerator>) -> Result<()> {
         record.config.validate()?;
+        let GeneratorConfig::GithubApp(config) = &record.config;
+        if !client.matches_config(config) {
+            return Err(CoreError::invalid("generator client does not match the configured GitHub App"));
+        }
         let authority = lock(&self.authorization);
         if lock(&self.generation).shutting_down { return Err(CoreError::vault_unavailable("manager is shutting down")); }
         if self.store.get_generator(&record.id)?.is_some() {

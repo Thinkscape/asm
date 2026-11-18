@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
-use asm_proto::generators::{GithubGrant, GithubPermission, GithubRepository};
+use asm_proto::generators::{GenerationGrant, GithubGrant, GithubPermission, GithubRepository};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
@@ -28,37 +28,63 @@ pub enum GeneratorConfig {
     GithubApp(GithubAppConfig),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct GithubAppConfig {
     pub client_id: String,
-    pub installation_id: u64,
-    pub ceiling: GithubGrant,
+    pub installations: Vec<GithubGrant>,
+}
+
+impl PartialEq for GithubAppConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.client_id == other.client_id && self.installations == other.installations
+            && self.installations.iter().flat_map(|grant| &grant.repositories)
+                .eq(other.installations.iter().flat_map(|grant| &grant.repositories))
+    }
 }
 
 impl GithubAppConfig {
-    /// Connection drafts may have no repositories yet. Saving requires validate().
-    pub fn validate_connection(&self) -> Result<()> {
-        if self.client_id.is_empty()
-            || self.client_id.chars().any(|c| c.is_whitespace() || c.is_control())
+    pub(crate) fn validate_client_id(client_id: &str) -> Result<()> {
+        if client_id.is_empty()
+            || client_id.chars().any(|c| c.is_whitespace() || c.is_control())
         {
             return Err(CoreError::invalid("GitHub client ID is required without whitespace"));
         }
-        if self.installation_id == 0 || self.ceiling.installation_id != self.installation_id {
-            return Err(CoreError::invalid("GitHub installation IDs must be positive and match"));
+        Ok(())
+    }
+
+    fn validate_installations(&self) -> Result<()> {
+        if self.installations.is_empty() {
+            return Err(CoreError::invalid("select at least one GitHub installation"));
+        }
+        if self.installations.windows(2).any(|pair| pair[0].installation_id >= pair[1].installation_id) {
+            return Err(CoreError::invalid("GitHub installation IDs must be sorted and unique"));
         }
         Ok(())
     }
 
     pub fn canonicalize(&mut self) -> Result<()> {
-        self.validate_connection()?;
-        self.ceiling.canonicalize()?;
+        Self::validate_client_id(&self.client_id)?;
+        self.installations.sort_unstable_by_key(|grant| grant.installation_id);
+        self.validate_installations()?;
+        for grant in &mut self.installations {
+            grant.canonicalize()?;
+        }
         Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
-        self.validate_connection()?;
-        self.ceiling.validate()?;
+        Self::validate_client_id(&self.client_id)?;
+        self.validate_installations()?;
+        for grant in &self.installations {
+            grant.validate()?;
+        }
         Ok(())
+    }
+
+    /// A canonical configuration has one ceiling per installation, sorted by ID.
+    pub fn ceiling(&self, installation_id: u64) -> Option<&GithubGrant> {
+        self.installations.binary_search_by_key(&installation_id, |grant| grant.installation_id)
+            .ok().map(|index| &self.installations[index])
     }
 }
 
@@ -73,6 +99,26 @@ impl GeneratorConfig {
         match self {
             Self::GithubApp(config) => config.canonicalize(),
         }
+    }
+
+    pub fn ceilings(&self) -> impl Iterator<Item = GenerationGrant> + '_ {
+        let Self::GithubApp(config) = self;
+        config.installations.iter().cloned().map(GenerationGrant::GithubApp)
+    }
+
+    /// Check the exact installation's ceiling without copying any grants.
+    pub fn accepts_grant(&self, grant: &GenerationGrant) -> Result<bool> {
+        let (Self::GithubApp(config), GenerationGrant::GithubApp(grant)) = (self, grant);
+        match config.ceiling(grant.installation_id) {
+            Some(ceiling) => Ok(grant.is_subset_of(ceiling)?),
+            None => Ok(false),
+        }
+    }
+
+    /// Repository display names do not change the authority of an issued grant.
+    pub fn same_authority(&self, other: &Self) -> bool {
+        let (Self::GithubApp(left), Self::GithubApp(right)) = (self, other);
+        left.client_id == right.client_id && left.installations == right.installations
     }
 
     pub fn metadata(&self) -> SecretMeta {
@@ -108,6 +154,12 @@ impl fmt::Debug for GeneratedCredential {
             .field("expires_at", &self.expires_at)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubInstallationAccount {
+    pub installation_id: u64,
+    pub account: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,8 +261,14 @@ impl GeneratorRegistry {
     }
 
     pub fn get(&self, id: &str) -> Option<GeneratorEntry> {
+        self.with_entry(id, GeneratorEntry::clone)
+    }
+
+    /// Read an entry without copying its config. The callback runs under the
+    /// registry's read lock and must not call into the registry or store.
+    pub(crate) fn with_entry<T>(&self, id: &str, f: impl FnOnce(&GeneratorEntry) -> T) -> Option<T> {
         self.entries.read().unwrap_or_else(|p| p.into_inner())
-            .iter().find(|entry| entry.record.id == id).cloned()
+            .iter().find(|entry| entry.record.id == id).map(f)
     }
 
     pub fn entries(&self) -> Vec<GeneratorEntry> {
@@ -250,12 +308,12 @@ mod tests {
         GeneratorRecord {
             id: "generator-1".into(), name: "release-bot".into(), revision: 1, position: 0,
             config: GeneratorConfig::GithubApp(GithubAppConfig {
-                client_id: "Iv1.test".into(), installation_id: 7,
-                ceiling: GithubGrant {
+                client_id: "Iv1.test".into(),
+                installations: vec![GithubGrant {
                     installation_id: 7,
                     repositories: vec![GithubRepository { id: 42, full_name: "acme/web".into() }],
                     permissions: BTreeMap::from([("metadata".into(), GithubPermission::Read)]),
-                },
+                }],
             }),
         }
     }
@@ -295,13 +353,37 @@ mod tests {
     }
 
     #[test]
-    fn connection_draft_is_not_a_saved_configuration() {
+    fn github_config_canonicalizes_installations_and_rejects_duplicates() {
         let GeneratorConfig::GithubApp(mut config) = record().config;
-        config.ceiling.repositories.clear();
-        assert!(config.validate_connection().is_ok());
+        let mut other = config.installations[0].clone();
+        other.installation_id = 9;
+        other.repositories[0].id = 43;
+        config.installations.insert(0, other.clone());
+        config.canonicalize().unwrap();
+        assert_eq!(config.ceiling(9), Some(&other));
+        assert_eq!(config.ceiling(7).unwrap().repositories[0].id, 42);
+        assert!(config.ceiling(8).is_none());
+        assert!(config.validate().is_ok());
+        let provider = GeneratorConfig::GithubApp(config.clone());
+        let mut crossed = other.clone();
+        crossed.repositories[0].id = 42;
+        assert!(!provider.accepts_grant(&GenerationGrant::GithubApp(crossed)).unwrap());
+        assert!(provider.accepts_grant(&GenerationGrant::GithubApp(other.clone())).unwrap());
+
+        config.installations.push(other);
+        assert!(config.canonicalize().unwrap_err().message.contains("unique"));
+        config.installations.clear();
         assert!(config.validate().is_err());
-        config.ceiling.installation_id = 8;
-        assert!(config.validate_connection().is_err());
+    }
+
+    #[test]
+    fn invalid_git_hub_config_cannot_be_saved() {
+        let GeneratorConfig::GithubApp(mut config) = record().config;
+        config.installations[0].repositories.clear();
+        assert!(config.validate().is_err());
+        for id in ["", "a b", "a\nb"] {
+            assert!(GithubAppConfig::validate_client_id(id).is_err());
+        }
         for name in ["", "bad/name", "bad\nname"] {
             assert!(validate_name(name).is_err());
         }

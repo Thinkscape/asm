@@ -8,7 +8,7 @@ use std::time::Duration;
 use asm_proto::ApiError;
 use asm_proto::generators::{GenerationSelection, SourceKind};
 use asm_proto::wire::{
-    CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_SECRET_FIELDS_V1,
+    CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_SECRET_FIELDS_V1,
     HealthResponse, LeaseBrief, LeaseInfo, LeasesResponse, MANAGER_NAME, MAX_POLL_WAIT_SECS,
     PairPollQuery, PairRequest, PairResponse, ProxyInfo, RequestBody, RequestState, RequestStatus,
     RevealRequest, SecretsResponse, WaitQuery,
@@ -155,6 +155,7 @@ async fn health() -> Json<HealthResponse> {
         version: asm_proto::VERSION.to_string(),
         capabilities: vec![
             CAPABILITY_GENERATED_CREDENTIALS_V1.into(),
+            CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1.into(),
             CAPABILITY_SECRET_FIELDS_V1.into(),
         ],
     })

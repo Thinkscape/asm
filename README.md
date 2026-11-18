@@ -170,7 +170,7 @@ The app lives in the menu bar (key icon) and has no Dock icon.
 On the Mac:
 
 1. Open **Agents Secrets Manager** and choose **Settings…** from the menu bar item.
-2. In **Vaults**, add a static source, or in **Generators**, connect a GitHub App using its client ID, installation ID and RSA private key, then choose explicit repository and permission ceilings.
+2. In **Vaults**, add a static source, or in **Generators**, connect a GitHub App using its client ID and RSA private key. Add each installation by account or ID, verify it, then set its repository and permission limits.
 3. In **Proxy**, add hostname hints that agent machines can reach (for example a Tailscale name). `asm proxy-info` offers these to clients.
 
 On the agent machine:
@@ -183,12 +183,14 @@ asm pair my-mac.tailnet.ts.net
 
 asm doctor
 asm list --json
-asm exec GH_TOKEN -- gh pr list --repo acme/web
-# Approve the app, repository/permission grant, delivery mode and lease duration.
+asm exec --repositories acme/web --permissions pull_requests=read GH_TOKEN -- gh pr list --repo acme/web
+# ASM uses the repo to select an installation; gh uses --repo to select the PR list.
 # Both GH_TOKEN and GITHUB_TOKEN are injected with the same value; no token files.
 
-asm exec --sentinel --hosts api.github.com GITHUB_TOKEN -- gh api repos/acme/web
+asm exec --repositories acme/web --sentinel --hosts api.github.com GITHUB_TOKEN -- gh api repos/acme/web
 ```
+
+For GitHub, `get` and `exec` require `--repositories OWNER/REPO[,OWNER/REPO...]` unless `get --lease ID` pins an existing grant. Permissions default to `metadata=read`; request additional access with `--permissions contents=read,pull_requests=write`. A previously approved broader raw token is not returned for a narrower request. All requested repos must belong to one configured installation: split cross-installation work into separate invocations, each receiving its own `GH_TOKEN`. Raw GitHub tokens need no proxy.
 
 To pair without a popup (scripts, containers), use **Hosts and Agents → Pairing codes → Generate…** in the app. It shows a ready-to-run command:
 
@@ -252,7 +254,7 @@ Commands:
 |`asm pair <MANAGER> [PAIRING_CODE]`|`--force`: pair again although the current pairing still works|`MANAGER` is `<hostname>[:port]`. `PAIRING_CODE` (`asm-…`) is the unattended code; it is also read from `$ASM_PAIRING_CODE`. Without a code the CLI prints `verification code: 123 456` and waits for approval. Prints `paired: <host id>`, or `already paired with …` (exit 0) when the manager still accepts this machine's pairing. See [Pairing the same machine again](#pairing-the-same-machine-again).|
 |`asm list`|`--json`: print the manager's JSON answer|One name per line. Names are vault-prefixed (`work/GITHUB_TOKEN`) when two vaults share a name.|
 |`asm get <BINDING> <REASON>`|`--raw` / `--sentinel`, `--hosts`, `--wait`, `--json`, `--no-reaper`; generated grant and lease options in `asm get --help`|Prints paths and nonsecret lease/grant/version metadata. `[DEST=]SOURCE[::FIELD]` selects fields and local file views. Static raw requests always need approval.|
-|`asm exec <BINDINGS> -- <COMMAND> [ARG...]`|`--raw` / `--sentinel`, `--hosts`, `--reason`, `--wait`|Sequential acquisitions share one wait deadline; any failure prevents launch. Discovery, proxy preparation and child runtime are outside that budget. No token files, reaper or in-process renewal.|
+|`asm exec <BINDINGS> -- <COMMAND> [ARG...]`|`--raw` / `--sentinel`, `--hosts`, `--repositories`, `--permissions`, `--reason`, `--wait`|Sequential acquisitions share one wait deadline; any failure prevents launch. Discovery, proxy preparation and child runtime are outside that budget. No token files, reaper or in-process renewal.|
 |`asm update <NAME>`|`--field <FIELD>`: field to change (default: `password` for logins, the only field otherwise)<br>`--wait <WAIT>`|Reads the new value from stdin. Prints `updated <name> in <vault>`. Raw leases on that secret are revoked.|
 |`asm add <NAME>`|`--wait <WAIT>`|Reads the value from stdin. The operator picks the vault. Prints `added <name> to <vault>; run asm get to use it`.|
 |`asm proxy-info`|`--json`|Proxy URLs (`http://` and `socks5h://` per hostname hint, the first reachable one marked `(recommended)`), CA certificate and CA bundle paths. Refreshes the CA files.|
@@ -295,7 +297,8 @@ Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets
 - **Settings window**:
   - **Vaults**: Bitwarden/Vaultwarden (server, API key, exposed collections, personal vault; master password held in memory only), `.env` files (every key is exposed), the macOS login keychain (generic and internet passwords, secure notes).
     The table sizes **Name** to the longest vault name (150pt minimum), keeps **Kind**, **Status** and **Secrets** compact, and gives **Details** the remaining width for the Bitwarden server URL or `.env` file path.
-  - **Generators**: use **+** to choose a generator type (currently **GitHub App**). Configurations expose fixed `GH_TOKEN` / `GITHUB_TOKEN` aliases, installation discovery, explicit repository/permission ceilings and availability. Multiple apps share the logical output; approvals select one app.
+  - **Generators**: configure a GitHub App's client ID and private key once. Add each installation by account or ID and choose its allowed repositories and permissions. Adding an installation in ASM does not install the app on GitHub. Existing single-installation generators retain their original limits. Agents request `GH_TOKEN` / `GITHUB_TOKEN`; if multiple apps cover the requested scope the operator can choose, or the agent can qualify the source (`release-bot/GH_TOKEN`).
+    GitHub repositories appear in name order in Settings and approvals. In **Edit Limits**, **Select all** and **Deselect all** change only the current installation’s draft; approvals remain read-only. For installations with more than 500 repositories, select up to 500 individually.
   - **Hosts and Agents**: paired machines (OS, addresses, agents seen, active leases), renaming and revocation; pairing codes.
   - **Leases**: active and ended grants with host, source, mode, fields and hosts; generated details show the selected app, approved repositories/permissions, authorization deadline and provider-token deadline.
   - **Proxy**: status (running, starting, not running with the cause and since when, not responding), failed starts, health and CA expiry; network access (whether the proxy and the API listen for other machines, and what the macOS Firewall does to iron-proxy and the app); listener address and port; hostname hints; advanced ports, request body limit and plain-HTTP substitution (off by default); the CA certificate; the proxy log. The sidebar marks **Proxy** while it is down or blocked by the firewall.

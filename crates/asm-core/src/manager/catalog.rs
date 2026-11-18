@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use asm_proto::generators::{GenerationChoice, GenerationGrant, SourceKind};
+use asm_proto::generators::{GITHUB_TOKEN_ALIAS, GITHUB_TOKEN_NAME, GenerationChoice, SourceKind};
 use asm_proto::names::resolve_catalog_name;
 use asm_proto::wire::{GeneratorOption, SecretEntry, SecretKind};
 
@@ -11,7 +11,7 @@ use crate::error::{CoreError, Result};
 use crate::vault::names::{NamedSecret, VaultListing, compute_names};
 use crate::vault::VaultStatus;
 
-const GITHUB_NAMES: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
+const GITHUB_NAMES: [&str; 2] = [GITHUB_TOKEN_NAME, GITHUB_TOKEN_ALIAS];
 
 #[derive(Debug, Clone)]
 pub(crate) struct GeneratedOutput {
@@ -24,7 +24,6 @@ pub(crate) struct GeneratedOutput {
 #[derive(Debug, Clone)]
 pub(crate) struct CatalogGeneratedTarget {
     pub requested_name: String,
-    pub output_name: String,
     pub pinned_generator_id: Option<String>,
     pub candidates: Vec<GenerationChoice>,
 }
@@ -68,13 +67,13 @@ impl SecretCatalog {
         }).cloned().collect();
         Ok(CatalogMatch::Generated(CatalogGeneratedTarget {
             requested_name: resolved.canonical_key,
-            output_name: output.canonical_name.clone(),
             pinned_generator_id: resolved.pinned_generator_id,
             candidates,
         }))
     }
 
-    pub fn resolve_generated(&self, query: &str) -> Result<Option<CatalogGeneratedTarget>> {
+    #[cfg(test)]
+    fn resolve_generated(&self, query: &str) -> Result<Option<CatalogGeneratedTarget>> {
         match self.resolve(query) {
             Ok(CatalogMatch::Generated(target)) => Ok(Some(target)),
             Ok(CatalogMatch::Vault(_)) => Ok(None),
@@ -85,16 +84,18 @@ impl SecretCatalog {
 }
 
 fn generated_row(name: String, aliases: Vec<String>, choices: &[GenerationChoice]) -> SecretEntry {
+    let mut seen = BTreeSet::new();
+    let generators: Vec<_> = choices.iter().filter(|c| seen.insert(c.generator_id.as_str()))
+        .map(|c| GeneratorOption { generator_id: c.generator_id.clone(), name: c.name.clone(), available: c.available })
+        .collect();
     SecretEntry {
         name,
-        vault: if choices.len() == 1 { choices[0].name.clone() } else { "GitHub Apps".into() },
+        vault: if generators.len() == 1 { generators[0].name.clone() } else { "GitHub Apps".into() },
         kind: SecretKind::Single,
         fields: vec!["value".into()],
         lease: None,
         source_kind: SourceKind::Generator,
-        generators: choices.iter().map(|c| GeneratorOption {
-            generator_id: c.generator_id.clone(), name: c.name.clone(), available: c.available,
-        }).collect(),
+        generators,
         aliases,
     }
 }
@@ -128,15 +129,15 @@ fn build_catalog(listings: &[VaultListing], choices: Vec<GenerationChoice>, warn
         };
         base_names.insert(output.canonical_name.clone());
         base_names.extend(output.aliases.iter().cloned());
-        let bare: Vec<_> = std::iter::once(output.canonical_name.as_str())
+        let mut bare = std::iter::once(output.canonical_name.as_str())
             .chain(output.aliases.iter().map(String::as_str))
-            .filter(|name| !output.static_collisions.iter().any(|c| c == name))
-            .collect();
-        if let Some(name) = bare.first() {
-            wire_entries.push(generated_row((*name).into(), bare.iter().skip(1).map(|s| (*s).into()).collect(), &output.choices));
+            .filter(|name| !output.static_collisions.iter().any(|c| c == name));
+        if let Some(name) = bare.next() {
+            wire_entries.push(generated_row(name.into(), bare.map(str::to_owned).collect(), &output.choices));
         }
         if !output.static_collisions.is_empty() {
-            for choice in &output.choices {
+            let mut seen = BTreeSet::new();
+            for choice in output.choices.iter().filter(|c| seen.insert(c.generator_id.as_str())) {
                 wire_entries.push(generated_row(
                     format!("{}/{}", choice.name, output.canonical_name),
                     output.aliases.iter().map(|alias| format!("{}/{alias}", choice.name)).collect(),
@@ -159,14 +160,14 @@ impl Core {
                 VaultStatus::Error(e) => warnings.push(format!("{}: {e}", v.name)),
             }
         }
-        let choices = self.generators.entries().into_iter().map(|entry| {
-            let crate::generator::GeneratorConfig::GithubApp(config) = &entry.record.config;
-            GenerationChoice {
+        let mut choices = Vec::new();
+        for entry in self.generators.entries() {
+            choices.extend(entry.record.config.ceilings().map(|ceiling| GenerationChoice {
                 generator_id: entry.record.id.clone(), name: entry.record.name.clone(), revision: entry.record.revision,
-                ceiling: GenerationGrant::GithubApp(config.ceiling.clone()),
+                ceiling,
                 available: entry.generator.is_some(), unavailable_reason: entry.unavailable_reason.clone(),
-            }
-        }).collect();
+            }));
+        }
         warnings.sort();
         warnings.dedup();
         Ok(build_catalog(&listings, choices, warnings))
@@ -176,7 +177,7 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asm_proto::generators::{GithubGrant, GithubPermission, GithubRepository};
+    use asm_proto::generators::{GenerationGrant, GithubGrant, GithubPermission, GithubRepository};
     use crate::vault::SecretMeta;
 
     fn listing(names: &[&str]) -> Vec<VaultListing> {
@@ -199,6 +200,21 @@ mod tests {
         let pinned = c.resolve_generated("review-bot/GITHUB_TOKEN").unwrap().unwrap();
         assert_eq!(pinned.requested_name, "review-bot/GH_TOKEN");
         assert_eq!(pinned.candidates[0].generator_id, "id-review-bot");
+    }
+    #[test]
+    fn catalog_advertises_an_app_once_but_routes_all_its_installations() {
+        let first = choice("bot");
+        let mut second = first.clone();
+        let GenerationGrant::GithubApp(installation) = &mut second.ceiling;
+        installation.installation_id = 20;
+        let catalog = build_catalog(&listing(&["GH_TOKEN", "GITHUB_TOKEN"]), vec![first, second], vec![]);
+        let generated: Vec<_> = catalog.wire_entries.iter().filter(|entry| entry.source_kind == SourceKind::Generator).collect();
+        assert_eq!(generated.len(), 1);
+        assert_eq!(generated[0].generators.len(), 1);
+        assert_eq!(generated[0].vault, "bot");
+        let pinned = catalog.resolve_generated("bot/GITHUB_TOKEN").unwrap().unwrap();
+        assert_eq!(pinned.pinned_generator_id.as_deref(), Some("id-bot"));
+        assert_eq!(pinned.candidates.len(), 2);
     }
     #[test]
     fn catalog_collision_changes_only_colliding_static_spelling() {

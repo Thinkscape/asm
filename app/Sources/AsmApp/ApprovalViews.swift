@@ -692,9 +692,8 @@ private struct DenySplitButton: View {
     }
 }
 
-/// Approves a `get`: the primary segment allows in the current mode, the chevron
-/// ("Approval mode") only switches the mode. Proxied: accent fill, Return approves.
-/// Real value: orange fill, never bound to Return.
+/// Approves a `get`: the primary segment allows in the current mode; the chevron
+/// only switches the mode. Only a static proxied get is a Return action.
 private struct AllowSplitButton: View {
     @Binding var mode: ValueMode
     /// The primary segment; the chevron always works.
@@ -716,6 +715,7 @@ private struct AllowSplitButton: View {
             }
             .buttonStyle(SegmentButtonStyle())
             .keyboardShortcut(isDefault ? .defaultAction : nil)
+            .onKeyPress(.return) { isDefault ? .ignored : .handled }
             .disabled(!enabled)
             SegmentDivider(style: realValue ? AnyShapeStyle(.black.opacity(0.25)) : AnyShapeStyle(.white.opacity(0.45)))
             SplitChevron(label: "Approval mode") {
@@ -1145,13 +1145,25 @@ private struct HostEntry: Identifiable, Equatable {
     var id: String { pattern }
 }
 
+private struct ApprovalGeneratorIdentity: Equatable {
+    let id: GeneratorApprovalChoiceItem.ID
+    let revision: UInt64
+
+    init(_ choice: GeneratorApprovalChoiceItem) {
+        id = choice.id
+        revision = choice.choice.revision
+    }
+
+    func matches(_ choice: GeneratorApprovalChoiceItem) -> Bool {
+        choice.id == id && choice.choice.revision == revision && choice.choice.available
+    }
+}
+
 private struct GetApprovalGuard: Equatable {
     var mode: ValueMode
-    var generatorID: String?
-    var revision: UInt64?
-    var claims: GithubClaimsSelection
-    var unmetAcknowledged: Bool
-    var unmetClaims: [String]
+    var generator: ApprovalGeneratorIdentity?
+    var selection: GenerationSelectionItem?
+    var request: GithubScopeRequestItem?
 }
 
 private struct GetApproval: View {
@@ -1168,10 +1180,7 @@ private struct GetApproval: View {
     @State private var hostError: String?
     @State private var editingReason = false
     @State private var mode: ValueMode
-    @State private var selectedGeneratorID: String?
-    @State private var selectedRevision: UInt64?
-    @State private var claims: GithubClaimsSelection
-    @State private var unmetAcknowledged = false
+    @State private var selectedGenerator: ApprovalGeneratorIdentity?
     @State private var armedGuard: GetApprovalGuard?
     @FocusState private var hostFieldFocused: Bool
 
@@ -1188,43 +1197,40 @@ private struct GetApproval: View {
         _hosts = State(initialValue: detail.initialHosts.map { HostEntry(pattern: $0.normalized, broad: $0.broad) })
         _duration = State(initialValue: detail.defaultDurationSecs ?? 0)
         _mode = State(initialValue: detail.rawRequested && !detail.sentinelRequired ? .realValue : .proxied)
-        // Total candidates matter: one ready app among several must never become a default identity.
+        // A ready installation among several candidates must never become the default identity.
         let sole = detail.generatorChoices.count == 1 ? detail.generatorChoices.first : nil
         let initial = sole.flatMap { $0.choice.available && $0.scopeIssues.isEmpty ? $0 : nil }
-        _selectedGeneratorID = State(initialValue: initial?.id)
-        _selectedRevision = State(initialValue: initial?.choice.revision)
-        _claims = State(initialValue: initial.map {
-            GithubClaimsSelection.requested(detail.requestedGeneration?.github, within: $0.choice.ceiling.github)
-        } ?? GithubClaimsSelection())
+        _selectedGenerator = State(initialValue: initial.map(ApprovalGeneratorIdentity.init))
     }
 
     private var generated: Bool { detail.isGenerated }
     private var durationSecs: UInt64? { duration == 0 ? nil : duration }
     private var selected: GeneratorApprovalChoiceItem? {
-        detail.generatorChoices.first {
-            $0.id == selectedGeneratorID && $0.choice.revision == selectedRevision && $0.choice.available
+        guard let selectedGenerator else { return nil }
+        return detail.generatorChoices.first {
+            selectedGenerator.matches($0) && (detail.vaultID == nil || $0.choice.id == detail.vaultID)
         }
     }
-    private var selectedGrant: GithubGrantItem? { selected.map { claims.grant(within: $0.choice.ceiling.github) } }
-    private var unmetClaims: [String] { selectedGrant?.unmetClaims(detail.requestedGeneration?.github) ?? [] }
-    private var selection: GenerationSelectionItem? {
-        guard let selected, let selectedGrant else { return nil }
-        return GenerationSelectionItem(generatorID: selected.id, generatorRevision: selected.choice.revision, grant: .githubApp(selectedGrant))
-    }
+
     private var guardValue: GetApprovalGuard {
-        GetApprovalGuard(mode: mode, generatorID: selectedGeneratorID, revision: selectedRevision,
-                         claims: claims, unmetAcknowledged: unmetAcknowledged, unmetClaims: unmetClaims)
-    }
-    private var armed: Bool { context.armed && armedGuard == guardValue }
-    private var canAllow: Bool {
-        guard armed, !(detail.sentinelRequired && mode == .realValue) else { return false }
-        if generated {
-            guard let selectedGrant, !selectedGrant.repositories.isEmpty,
-                  selectedGrant.repositories.count <= 500,
-                  selectedGrant.permissions.contains(where: { $0.name == "metadata" && $0.level == .read }),
-                  unmetClaims.isEmpty || unmetAcknowledged else { return false }
+        let request = detail.requestedGeneration?.github
+        let selection = selected.flatMap { option -> GenerationSelectionItem? in
+            let grant = option.choice.ceiling.github
+            guard let request, option.scopeIssues.isEmpty,
+                  grant.repositories.count <= GithubGrantItem.repositoryLimit,
+                  grant.permissions.contains(where: { $0.name == "metadata" && $0.level == .read }),
+                  grant.exactlyMatches(request) else { return nil }
+            return GenerationSelectionItem(generatorID: option.choice.id, generatorRevision: option.choice.revision,
+                                           grant: .githubApp(grant))
         }
-        return mode == .realValue || !detail.hasSubstitutableFields || anyHost || !hosts.isEmpty
+        return GetApprovalGuard(mode: mode, generator: selectedGenerator, selection: selection, request: request)
+    }
+
+    private func canAllow(_ approval: GetApprovalGuard) -> Bool {
+        guard context.armed, armedGuard == approval,
+              !(detail.sentinelRequired && approval.mode == .realValue) else { return false }
+        if generated && approval.selection == nil { return false }
+        return approval.mode == .realValue || !detail.hasSubstitutableFields || anyHost || !hosts.isEmpty
     }
     // Generated claims and app pickers never authorize through Return, even while their menus own focus.
     private var allowIsDefault: Bool { !generated && mode == .proxied && !hostFieldFocused && !editingReason }
@@ -1252,6 +1258,7 @@ private struct GetApproval: View {
     }
 
     var body: some View {
+        let expectedGuard = guardValue
         ApprovalScaffold(
             error: context.error,
             footnote: generated ? Text("Access is authorized to this paired host. Agent labels identify the requester but are not a security boundary.") : nil,
@@ -1263,9 +1270,8 @@ private struct GetApproval: View {
             if generated {
                 GeneratorApprovalSection(
                     choices: detail.generatorChoices, pinnedID: detail.vaultID,
-                    selected: selected, selectedID: selectedGeneratorID, claims: $claims,
-                    request: detail.requestedGeneration?.github, unmetClaims: unmetClaims,
-                    unmetAcknowledged: $unmetAcknowledged, select: { id in selectGenerator(id) }
+                    selected: selected, grant: expectedGuard.selection?.grant.github, request: expectedGuard.request,
+                    select: { id in selectGenerator(id) }
                 )
             }
             if mode == .proxied {
@@ -1309,57 +1315,46 @@ private struct GetApproval: View {
             ApprovalActions(cannedReasons: ["host selection too open", "provide a better reason"],
                             armed: context.armed, escapeDenies: !hostFieldFocused,
                             editingReason: $editingReason, deny: context.deny) {
-                AllowSplitButton(mode: $mode, enabled: canAllow, isDefault: allowIsDefault,
+                AllowSplitButton(mode: $mode, enabled: canAllow(expectedGuard), isDefault: allowIsDefault,
                                  sentinelRequired: detail.sentinelRequired, allow: allow)
             }
             ValueModeCaption(mode: mode, generated: generated, plainOnly: !detail.hasSubstitutableFields)
         }
-        .task(id: guardValue) {
+        .task(id: expectedGuard) {
+            guard !Task.isCancelled else { return }
             armedGuard = nil
-            let expected = guardValue
             try? await Task.sleep(for: .seconds(1))
-            if !Task.isCancelled { armedGuard = expected }
+            if !Task.isCancelled { armedGuard = expectedGuard }
         }
         .onChange(of: mode) { _, newMode in
             if newMode == .realValue { editingHost = false; newHost = ""; hostError = nil }
         }
-        .onChange(of: claims) { _, _ in unmetAcknowledged = false }
-        .onChange(of: unmetClaims) { _, _ in unmetAcknowledged = false }
         .onChange(of: detail.generatorChoices) { _, updated in
-            guard let id = selectedGeneratorID else { return }
-            if !updated.contains(where: { $0.id == id && $0.choice.revision == selectedRevision && $0.choice.available }) {
-                selectedGeneratorID = nil
-                selectedRevision = nil
-                claims = GithubClaimsSelection()
-                unmetAcknowledged = false
+            guard let selectedGenerator else { return }
+            if !updated.contains(where: selectedGenerator.matches) {
+                selectGenerator(nil)
             }
         }
-        .onChange(of: detail.requestedGeneration) { _, _ in unmetAcknowledged = false }
         .onChange(of: detail.sentinelRequired) { _, required in if required { mode = .proxied } }
     }
 
-    private func selectGenerator(_ id: String?) {
-        if id == nil {
-            selectedGeneratorID = nil
-            selectedRevision = nil
-            claims = GithubClaimsSelection()
-            unmetAcknowledged = false
+    private func selectGenerator(_ id: GeneratorApprovalChoiceItem.ID?) {
+        guard let id else {
+            selectedGenerator = nil
             return
         }
         guard let candidate = detail.generatorChoices.first(where: { $0.id == id && $0.choice.available }),
-              detail.vaultID == nil || candidate.id == detail.vaultID else { return }
-        selectedGeneratorID = candidate.id
-        selectedRevision = candidate.choice.revision
-        claims = .requested(detail.requestedGeneration?.github, within: candidate.choice.ceiling.github)
-        unmetAcknowledged = false
+              detail.vaultID == nil || candidate.choice.id == detail.vaultID else { return }
+        selectedGenerator = ApprovalGeneratorIdentity(candidate)
     }
 
     private func allow() {
-        guard canAllow else { return }
+        let approval = guardValue
+        guard canAllow(approval) else { return }
         context.resolve(.approveGet(
-            raw: mode == .realValue, durationSecs: durationSecs,
-            hosts: mode == .realValue || !detail.hasSubstitutableFields ? [] : (anyHost ? ["*"] : hosts.map(\.pattern)),
-            generation: selection
+            raw: approval.mode == .realValue, durationSecs: durationSecs,
+            hosts: approval.mode == .realValue || !detail.hasSubstitutableFields ? [] : (anyHost ? ["*"] : hosts.map(\.pattern)),
+            generation: generated ? approval.selection : nil
         ))
     }
 
@@ -1385,60 +1380,86 @@ private struct GeneratorApprovalSection: View {
     let choices: [GeneratorApprovalChoiceItem]
     let pinnedID: String?
     let selected: GeneratorApprovalChoiceItem?
-    let selectedID: String?
-    @Binding var claims: GithubClaimsSelection
+    let grant: GithubGrantItem?
     let request: GithubScopeRequestItem?
-    let unmetClaims: [String]
-    @Binding var unmetAcknowledged: Bool
-    let select: @MainActor @Sendable (String?) -> Void
+    let select: @MainActor @Sendable (GeneratorApprovalChoiceItem.ID?) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionLabel("GitHub App")
-            if let pinnedID, let pinned = choices.first(where: { $0.id == pinnedID }) {
-                Text("\(pinned.choice.name) · installation \(pinned.choice.ceiling.github.installationID)")
-                    .font(.headline)
-                if selected == nil {
-                    Button("Select this app") { select(pinnedID) }.disabled(!pinned.choice.available)
+            GithubApprovalInstallationPicker(choices: choices, pinnedID: pinnedID, selectedID: selected?.id, select: select)
+            if let grant {
+                if let owner = grant.repositoryOwner {
+                    LabeledContent("Repository owner", value: owner)
                 }
-            } else {
-                Picker("GitHub App", selection: Binding(get: { selectedID }, set: { value in select(value) })) {
-                    Text("Choose an app…").tag(Optional<String>.none)
-                    ForEach(choices) { option in
-                        Text("\(option.choice.name) · \(option.choice.ceiling.github.installationID)\(option.choice.available ? "" : " (unavailable)")")
-                            .tag(Optional(option.id)).disabled(!option.choice.available)
-                    }
-                }
-            }
-            ForEach(choices) { option in
-                if !option.choice.available {
-                    Text("\(option.choice.name): \(option.choice.unavailableReason ?? "Unavailable")")
-                        .font(.callout)
-                }
-            }
-            if let selected {
-                if !selected.scopeIssues.isEmpty {
-                    Text("This app cannot satisfy all requested scope. You may deliberately approve different or narrower claims.")
-                        .font(.callout)
-                    ForEach(selected.scopeIssues, id: \.self) { issue in Text(issue).font(.caption) }
-                }
-                LabeledContent("Selected installation", value: String(selected.choice.ceiling.github.installationID))
-                Text("Claims to approve").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
-                GithubClaimsEditor(ceiling: selected.choice.ceiling.github, selection: $claims)
-                RequestedGithubClaims(request: request)
-                if !unmetClaims.isEmpty {
-                    Text("Unmet requested claims").font(.subheadline.weight(.semibold))
-                        .accessibilityAddTraits(.isHeader)
-                    ForEach(unmetClaims, id: \.self) { issue in Text(issue).font(.callout) }
-                    Toggle("Approve the selected claims instead of the unmet requested claims", isOn: $unmetAcknowledged)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            } else {
-                Text("Select a GitHub App before choosing its claims. No permissions are combined across apps.")
+                LabeledContent("Selected installation ID", value: String(grant.installationID))
+                Text("Scope to approve").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+                GithubScopeSummary(grant: grant)
+                Text("A GitHub token is issued for exactly the requested scope, from one installation.")
                     .font(.callout).foregroundStyle(.secondary)
+            } else {
+                if let selected {
+                    if selected.scopeIssues.isEmpty {
+                        Text("This installation cannot be approved for the exact requested scope.").font(.callout)
+                    } else {
+                        ForEach(selected.scopeIssues, id: \.self) { issue in Text(issue).font(.callout) }
+                    }
+                } else {
+                    Text("Choose one installation. All requested repositories and permissions must be available in that installation.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
                 RequestedGithubClaims(request: request)
             }
         }
+    }
+}
+
+private struct GithubApprovalInstallationPicker: View {
+    let choices: [GeneratorApprovalChoiceItem]
+    let pinnedID: String?
+    let selectedID: GeneratorApprovalChoiceItem.ID?
+    let select: @MainActor @Sendable (GeneratorApprovalChoiceItem.ID?) -> Void
+
+    var body: some View {
+        let choices = pinnedID.map { id in self.choices.filter { $0.choice.id == id } } ?? self.choices
+        VStack(alignment: .leading, spacing: 6) {
+            SectionLabel("GitHub App")
+            if pinnedID != nil, choices.count == 1, let pinned = choices.first {
+                label(pinned).font(.headline)
+                if selectedID == nil {
+                    Button("Select this installation") { select(pinned.id) }
+                        .disabled(!pinned.choice.available)
+                }
+            } else if !choices.isEmpty {
+                Picker("GitHub App installation", selection: Binding(get: { selectedID }, set: { select($0) })) {
+                    Text("Choose an installation…").tag(Optional<GeneratorApprovalChoiceItem.ID>.none)
+                    ForEach(choices) { option in
+                        label(option).tag(Optional(option.id)).disabled(!option.choice.available)
+                    }
+                }
+            } else {
+                Text("No GitHub App installations match this request.").font(.callout)
+            }
+            ForEach(choices) { option in
+                if !option.choice.available {
+                    let reason = option.choice.unavailableReason ?? String(localized: "Unavailable")
+                    Text("\(identityLabel(option)): \(reason)").font(.callout)
+                }
+            }
+        }
+    }
+
+    private func label(_ option: GeneratorApprovalChoiceItem) -> Text {
+        let title = identityLabel(option)
+        return option.choice.available ? title : Text("\(title) (unavailable)")
+    }
+
+    private func identityLabel(_ option: GeneratorApprovalChoiceItem) -> Text {
+        let name = option.choice.name
+        let grant = option.choice.ceiling.github
+        if let owner = grant.repositoryOwner {
+            return Text("\(name) · \(owner) · installation \(String(grant.installationID))")
+        }
+        return Text("\(name) · installation \(String(grant.installationID))")
     }
 }
 
@@ -1448,14 +1469,14 @@ private struct RequestedGithubClaims: View {
     var body: some View {
         if let request {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Requested claims").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
-                if let repositories = request.repositories {
+                Text("Requested GitHub scope").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+                if let repositories = request.repositories, !repositories.isEmpty {
                     Text("Repositories: \(repositories.formatted())").font(.callout)
+                } else {
+                    Text("No repositories were requested. An explicit repository list is required.").font(.callout)
                 }
-                if let permissions = request.permissions {
-                    ForEach(permissions) { permission in
-                        Text("\(permission.scopeLabel): \(permission.level.rawValue)").font(.callout)
-                    }
+                ForEach(request.effectivePermissions) { permission in
+                    Text("\(permission.scopeLabel): \(permission.level.rawValue)").font(.callout)
                 }
             }
         }
