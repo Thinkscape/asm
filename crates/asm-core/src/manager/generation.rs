@@ -588,7 +588,6 @@ impl Core {
         let (lease, client, recall) = {
             let authority = lock(&self.authorization);
             let lease = self.store.get_lease(id)?.ok_or_else(|| CoreError::not_found("no such lease"))?;
-            let client = self.authorized_generator(&lease, self.generation_now())?;
             let now = self.generation_now();
             let client = self.authorized_generator(&lease, now)?;
             let force = refresh && lease.credential_version <= observed;
@@ -848,8 +847,6 @@ impl Core {
     ) -> Result<(GeneratorEntry, Option<GcloudAccessGrant>)> {
         let now = self.generation_now();
         if lock(&self.generation).shutting_down { return Err(CoreError::vault_unavailable("manager is shutting down")); }
-        self.store.get_host(pending.host_id.as_deref().unwrap_or_default())?.filter(|h| h.revoked_at.is_none())
-            .ok_or_else(|| CoreError::unauthorized("host was revoked"))?;
         let book = lock(&self.book);
         let current = book.pending.iter().find(|p| p.id == pending.id && p.host_id == pending.host_id
             && p.resolving && p.expires == pending.expires && p.expires > now)
@@ -1148,16 +1145,6 @@ impl Core {
         get_key: impl Fn(&str, &str) -> Result<Option<String>>,
         put_key: impl Fn(&str, &str, &str) -> Result<()>,
         delete_key: impl Fn(&str, &str) -> Result<()>,
-        build_github: impl FnOnce(&crate::generator::GithubAppConfig, &str) -> Result<GithubAppGenerator>,
-    ) -> Result<ffi::GeneratorInfo> {
-        self.save_generator_with_github(draft, get_key, put_key, delete_key, GithubAppGenerator::new)
-    }
-
-    fn save_generator_with_github(
-        &self, draft: ffi::GeneratorDraft,
-        get_key: impl Fn(&str) -> Result<Option<String>>,
-        put_key: impl Fn(&str, &str) -> Result<()>,
-        delete_key: impl Fn(&str) -> Result<()>,
         build_github: impl FnOnce(&crate::generator::GithubAppConfig, &str) -> Result<GithubAppGenerator>,
     ) -> Result<ffi::GeneratorInfo> {
         let name = draft.name.trim().to_string();

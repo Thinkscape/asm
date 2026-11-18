@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use asm_proto::generators::{GITHUB_TOKEN_ALIAS, GITHUB_TOKEN_NAME, GenerationChoice, SourceKind};
+use asm_proto::generators::{GenerationChoice, GenerationGrant, SourceKind};
 use asm_proto::names::resolve_catalog_name;
 use asm_proto::wire::{GeneratorOption, SecretEntry, SecretKind};
 
@@ -25,6 +25,7 @@ pub(crate) struct GeneratedOutput {
 #[derive(Debug, Clone)]
 pub(crate) struct CatalogGeneratedTarget {
     pub requested_name: String,
+    pub output_name: String,
     pub pinned_generator_id: Option<String>,
     pub candidates: Vec<GenerationChoice>,
 }

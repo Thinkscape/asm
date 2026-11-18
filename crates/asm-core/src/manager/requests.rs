@@ -100,6 +100,7 @@ pub(crate) use asm_proto::wire::RequestedMode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GeneratorTarget {
     pub requested_name: String,
+    pub output_name: String,
     pub pinned_generator_id: Option<String>,
     pub candidates: Vec<GenerationChoice>,
     pub requested_generation: Option<GenerationRequest>,
@@ -623,14 +624,14 @@ impl Core {
         };
         match resolved {
             super::catalog::CatalogMatch::Generated(super::catalog::CatalogGeneratedTarget {
-                requested_name, pinned_generator_id, candidates,
+                requested_name, output_name, pinned_generator_id, candidates,
             }) => {
                 body.validate_get_capabilities(SourceKind::Generator)?;
                 if generation.as_ref().is_some_and(|request| request.output_name() != output_name) {
                     return Err(CoreError::invalid("requested scope provider does not match the generated output"));
                 }
                 let target = GeneratorTarget {
-                    requested_name, pinned_generator_id, candidates,
+                    requested_name, output_name, pinned_generator_id, candidates,
                     requested_generation: generation.clone(),
                     operator_selected_grant: body.supports_operator_selected_grant(),
                     operator_selected_gcloud_project: body.supports_operator_selected_project(),

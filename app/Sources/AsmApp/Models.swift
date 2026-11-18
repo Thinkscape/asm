@@ -374,14 +374,7 @@ struct GithubGrantItem: Identifiable, Equatable, Sendable {
                 issues.append(String(localized: "Additional permission: \(permission.name): \(permission.level.rawValue)"))
             }
         }
-        return String(first)
-    }
-
-    func exactlyMatches(_ request: GithubScopeRequestItem) -> Bool {
-        guard let requested = request.repositories, !requested.isEmpty,
-              Set(requested.map { $0.lowercased() }) == Set(repositories.map { $0.fullName.lowercased() })
-        else { return false }
-        return Set(request.effectivePermissions) == Set(permissions)
+        return issues
     }
 }
 

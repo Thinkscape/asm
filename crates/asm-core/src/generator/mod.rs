@@ -319,26 +319,6 @@ impl GeneratorConfig {
         }
     }
 
-    pub fn ceilings(&self) -> impl Iterator<Item = GenerationGrant> + '_ {
-        let Self::GithubApp(config) = self;
-        config.installations.iter().cloned().map(GenerationGrant::GithubApp)
-    }
-
-    /// Check the exact installation's ceiling without copying any grants.
-    pub fn accepts_grant(&self, grant: &GenerationGrant) -> Result<bool> {
-        let (Self::GithubApp(config), GenerationGrant::GithubApp(grant)) = (self, grant);
-        match config.ceiling(grant.installation_id) {
-            Some(ceiling) => Ok(grant.is_subset_of(ceiling)?),
-            None => Ok(false),
-        }
-    }
-
-    /// Repository display names do not change the authority of an issued grant.
-    pub fn same_authority(&self, other: &Self) -> bool {
-        let (Self::GithubApp(left), Self::GithubApp(right)) = (self, other);
-        left.client_id == right.client_id && left.installations == right.installations
-    }
-
     pub fn metadata(&self) -> SecretMeta {
         SecretMeta {
             key: OUTPUT_KEY.into(),

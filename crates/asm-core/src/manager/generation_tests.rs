@@ -477,11 +477,6 @@ esac
     fn approve_gcloud(&self, id: &str) -> Result<()> {
         self.core.resolve_request(id, gcloud_approval(Self::gcloud_grant()))
     }
-    fn github_client(&self, config: &GithubAppConfig, pem: &str) -> Result<GithubAppGenerator> {
-        GithubAppGenerator::with_client_for_tests(config, pem,
-            reqwest::blocking::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap(),
-            self.provider.url.clone())
-    }
     fn at(&self, elapsed: i64) { self.clock.store(self.start + elapsed, Ordering::SeqCst); }
     fn body(&self, name: &str) -> RequestBody {
         let generation = match name.rsplit('/').next().and_then(canonical_generated_output) {
