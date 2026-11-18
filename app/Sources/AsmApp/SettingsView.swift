@@ -142,6 +142,15 @@ private struct SettingsDetail: View {
             }
         }
         .navigationTitle(pane.title)
+        .toolbar {
+            // Reserve toolbar space even on panes with no actions, so macOS keeps
+            // the unified title bar and its window-control and sidebar insets.
+            if #available(macOS 26, *) {
+                ToolbarSpacer(.flexible)
+            } else {
+                ToolbarItem { Spacer(minLength: 0) }
+            }
+        }
     }
 }
 

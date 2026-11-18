@@ -147,6 +147,7 @@ struct AsmApp: App {
             SettingsView(model: appDelegate.model)
         }
         .defaultSize(width: 920, height: 600)
+        .windowToolbarStyle(.unified)
         .commands { ActivityLogCommands() }
 
         Window("Activity Log", id: "activity") {
