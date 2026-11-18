@@ -382,7 +382,7 @@ private struct PendingSection: View {
                     } label: {
                         PendingRow(kind: item.kind, host: item.hostLabel, hostname: item.hostname, summary: item.summary, createdAt: item.createdAt)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(HoverRowButtonStyle())
                 }
             }
         }
@@ -407,9 +407,7 @@ private struct PendingRow: View {
             Spacer(minLength: 4)
             Text(createdAt, style: .relative).font(.caption).foregroundStyle(.secondary).monospacedDigit()
         }
-        .padding(.vertical, 3)
         .padding(.horizontal, 4)
-        .contentShape(Rectangle())
     }
 
     private var hostLine: String {
