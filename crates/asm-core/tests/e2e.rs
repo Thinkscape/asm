@@ -1065,10 +1065,13 @@ impl LocalHttp {
             while !stopping.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // On Darwin accepted sockets inherit O_NONBLOCK. Only accept() is polled;
+                        // the HTTP parser must wait for headers and body bytes up to its timeout.
+                        stream.set_nonblocking(false).unwrap();
                         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                         stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
                         let response = read_local_request(&stream)
-                            .map_err(|_| "local HTTP request could not be read".to_string())
+                            .map_err(|e| format!("local HTTP request could not be read: {e}"))
                             .and_then(&reply);
                         let (status, value) = response.unwrap_or_else(|error| {
                             failures.lock().unwrap().push(error);
@@ -1135,6 +1138,28 @@ fn read_local_request(stream: &TcpStream) -> std::io::Result<LocalRequest> {
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
     Ok(LocalRequest { method, target, headers, body })
+}
+
+#[test]
+fn local_http_waits_for_the_complete_request_body() {
+    let server = LocalHttp::start(|request| {
+        assert_eq!(request.body, b"test");
+        Ok((200, json!("received")))
+    });
+    let mut client = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    client.write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nte").unwrap();
+
+    // No response is valid while two declared body bytes are still outstanding.
+    client.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    let mut byte = [0; 1];
+    assert!(matches!(client.peek(&mut byte), Err(e) if matches!(e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)), "fixture answered an incomplete request");
+    client.write_all(b"st").unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    server.assert_clean();
 }
 
 struct IssuedToken {
