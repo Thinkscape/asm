@@ -1,9 +1,10 @@
 //! The set of configured vaults and their live providers.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use super::bitwarden::BitwardenVault;
+use super::bitwarden::{BitwardenVault, forget_session};
 use super::env::EnvFileVault;
 use super::keychain::KeychainVault;
 use super::names::VaultListing;
@@ -11,6 +12,7 @@ use super::{
     AddTarget, BitwardenSecrets, SecretMeta, VaultConfig, VaultProvider, VaultStatus, creds,
 };
 use crate::error::{CoreError, Result};
+use crate::manager::resume::ResumeStore;
 use crate::paths::DataDirs;
 
 #[derive(Clone)]
@@ -19,6 +21,11 @@ pub struct VaultEntry {
     pub name: String,
     pub config: VaultConfig,
     pub provider: Arc<dyn VaultProvider>,
+}
+
+pub(crate) struct BitwardenSession {
+    pub provider: Arc<dyn VaultProvider>,
+    pub revision: Option<u64>,
 }
 
 /// A vault that cannot be built (e.g. its credentials are missing from the keychain):
@@ -56,16 +63,21 @@ impl Registry {
         Self::default()
     }
 
-    /// Build a provider from config; Bitwarden reads its client secret from `creds`. A
-    /// Bitwarden vault starts `Locked` (the master password is never stored) and needs
-    /// `unlock`; one that fails to start is still returned, with status `Error(<message>)`,
-    /// and its `sync()` retries. May block while `bw` logs in.
+    pub(crate) fn build_provider_resumable(
+        dirs: &DataDirs,
+        id: &str,
+        config: &VaultConfig,
+        resume: Arc<ResumeStore>,
+    ) -> Result<Arc<dyn VaultProvider>> {
+        Self::build_provider_with(dirs, id, config, Some(resume), creds::get)
+    }
+
     pub fn build_provider(
         dirs: &DataDirs,
         id: &str,
         config: &VaultConfig,
     ) -> Result<Arc<dyn VaultProvider>> {
-        Self::build_provider_with(dirs, id, config, creds::get)
+        Self::build_provider_with(dirs, id, config, None, creds::get)
     }
 
     /// `build_provider` with the credential lookup `(vault_id, kind)` injected.
@@ -73,21 +85,28 @@ impl Registry {
         dirs: &DataDirs,
         id: &str,
         config: &VaultConfig,
+        resume: Option<Arc<ResumeStore>>,
         stored: impl FnOnce(&str, &str) -> Result<Option<String>>,
     ) -> Result<Arc<dyn VaultProvider>> {
         Ok(match config {
             VaultConfig::EnvFile { path } => Arc::new(EnvFileVault::new(PathBuf::from(path))),
             VaultConfig::Keychain => Arc::new(KeychainVault::new()),
             VaultConfig::Bitwarden(cfg) => match stored(id, creds::CLIENT_SECRET)? {
-                Some(client_secret) => Arc::new(BitwardenVault::start_or_error(
+                Some(client_secret) => Arc::new(BitwardenVault::start_with_resume(
                     dirs,
                     id,
                     cfg.clone(),
                     BitwardenSecrets { client_secret },
+                    resume,
                 )),
-                None => Arc::new(UnavailableVault(
-                    "client secret missing from the keychain; edit the vault".into(),
-                )),
+                None => {
+                    if let Some(resume) = &resume {
+                        forget_session(resume, id)?;
+                    }
+                    Arc::new(UnavailableVault(
+                        "client secret missing from the keychain; edit the vault".into(),
+                    ))
+                }
             },
         })
     }
@@ -121,15 +140,17 @@ impl Registry {
         }
     }
 
-    /// Remove an entry and shut its provider down.
-    pub fn remove(&self, id: &str) -> Option<VaultEntry> {
+    /// Remove an entry, explicitly retiring its provider.
+    pub fn remove(&self, id: &str) -> Result<Option<VaultEntry>> {
         let removed = {
             let mut entries = self.write();
-            let i = entries.iter().position(|x| x.id == id)?;
+            let Some(i) = entries.iter().position(|x| x.id == id) else {
+                return Ok(None);
+            };
             entries.remove(i)
         };
-        removed.provider.shutdown();
-        Some(removed)
+        removed.provider.discard()?;
+        Ok(Some(removed))
     }
 
     pub fn get(&self, id: &str) -> Option<VaultEntry> {
@@ -140,25 +161,33 @@ impl Registry {
         self.read().clone()
     }
 
-    /// List every vault whose status is Ready; errors per vault go to `warnings` ("<vault>: <msg>").
-    pub fn listings(&self) -> (Vec<VaultListing>, Vec<String>) {
+    pub(crate) fn bitwarden_sessions(&self) -> HashMap<String, BitwardenSession> {
+        self.read()
+            .iter()
+            .filter(|entry| matches!(entry.config, VaultConfig::Bitwarden(_)))
+            .map(|entry| {
+                (
+                    entry.id.clone(),
+                    BitwardenSession {
+                        provider: entry.provider.clone(),
+                        revision: entry.provider.bitwarden_session_revision(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// List discoverable secret names. Provider diagnostics stay in the manager.
+    pub(crate) fn listings(&self) -> Vec<VaultListing> {
         let mut listings = Vec::new();
-        let mut warnings = Vec::new();
         for e in self.all() {
-            match e.provider.status() {
-                VaultStatus::Ready => match e.provider.list() {
-                    Ok(secrets) => listings.push(VaultListing {
-                        vault_id: e.id,
-                        vault_name: e.name,
-                        secrets,
-                    }),
-                    Err(err) => warnings.push(format!("{}: {}", e.name, err.message)),
-                },
-                VaultStatus::Locked => warnings.push(format!("{}: vault is locked", e.name)),
-                VaultStatus::Error(m) => warnings.push(format!("{}: {m}", e.name)),
+            if e.provider.status() == VaultStatus::Ready
+                && let Ok(secrets) = e.provider.list()
+            {
+                listings.push(VaultListing { vault_id: e.id, vault_name: e.name, secrets });
             }
         }
-        (listings, warnings)
+        listings
     }
 
     pub fn shutdown_all(&self) {
@@ -204,10 +233,9 @@ mod tests {
         broken.name = "gone".into();
         r.insert(broken);
 
-        let (ls, warnings) = r.listings();
+        let ls = r.listings();
         assert_eq!(ls.len(), 2);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].starts_with("gone: "));
+        assert!(matches!(r.get("c").unwrap().provider.status(), VaultStatus::Error(_)));
         let names = super::super::names::compute_names(&ls);
         let d: Vec<&str> = names.iter().map(|n| n.display.as_str()).collect();
         assert_eq!(
@@ -219,10 +247,9 @@ mod tests {
         r.insert(env_entry(dir.path(), "b", "personal", "ONLY=1\n"));
         assert_eq!(r.all().len(), 3);
         assert_eq!(r.get("b").unwrap().name, "personal");
-        assert!(r.remove("c").is_some());
-        assert!(r.remove("c").is_none());
-        let (ls, warnings) = r.listings();
-        assert!(warnings.is_empty());
+        assert!(r.remove("c").unwrap().is_some());
+        assert!(r.remove("c").unwrap().is_none());
+        let ls = r.listings();
         let d: Vec<String> = super::super::names::compute_names(&ls)
             .into_iter()
             .map(|n| n.display)
@@ -248,17 +275,17 @@ mod tests {
         };
 
         let cfg = VaultConfig::Bitwarden(fake_bw::config(&fake_bw::install(tmp.path())));
-        let p = Registry::build_provider_with(&dirs, "bw1", &cfg, stored).unwrap();
+        let p = Registry::build_provider_with(&dirs, "bw1", &cfg, None, stored).unwrap();
         assert_eq!(p.status(), VaultStatus::Locked);
         p.sync().unwrap();
         assert_eq!(p.status(), VaultStatus::Locked);
         p.shutdown();
 
         let cfg = VaultConfig::Bitwarden(fake_bw::config("/nonexistent/bw"));
-        let p = Registry::build_provider_with(&dirs, "bw2", &cfg, stored).unwrap();
+        let p = Registry::build_provider_with(&dirs, "bw2", &cfg, None, stored).unwrap();
         assert!(matches!(p.status(), VaultStatus::Error(_)));
 
-        let p = Registry::build_provider_with(&dirs, "bw3", &cfg, |_, _| Ok(None)).unwrap();
+        let p = Registry::build_provider_with(&dirs, "bw3", &cfg, None, |_, _| Ok(None)).unwrap();
         assert!(matches!(p.status(), VaultStatus::Error(_)));
         assert_eq!(
             p.unlock("x").unwrap_err().code,

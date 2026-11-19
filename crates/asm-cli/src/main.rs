@@ -2,6 +2,7 @@
 
 mod api;
 mod bindings;
+mod delivery;
 mod error;
 mod exec;
 mod files;
@@ -43,7 +44,7 @@ enum Command {
     },
     /// List the secrets you can request.
     List {
-        /// Print the manager's JSON answer.
+        /// Print the secret catalog as JSON.
         #[arg(long)]
         json: bool,
     },

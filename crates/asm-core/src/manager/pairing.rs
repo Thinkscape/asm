@@ -9,7 +9,8 @@ use asm_proto::pairing::{
 };
 use asm_proto::rules::validate_agent_text;
 use asm_proto::time::fmt_unix;
-use asm_proto::wire::{HostInfo, PairProof, PairRequest, PairResponse, RevealRequest};
+use asm_proto::wire::{HostInfo, PairProof, PairRequest, PairResponse, RequestStatus, RevealRequest};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::activity::{self, Category, Event};
@@ -19,8 +20,7 @@ use super::{Core, TOPIC_HOSTS, TOPIC_REQUESTS, lock, now};
 use crate::error::{CoreError, Result};
 use crate::store::{CodeUse, HostRecord, Store};
 
-/// At most this many open pairing attempts per remote address, and in total.
-const MAX_PER_ADDRESS: usize = 1;
+/// At most one open attempt per observed address, and this many overall.
 const MAX_TOTAL: usize = 5;
 
 /// Longest friendly host name, in Unicode scalar values.
@@ -42,7 +42,7 @@ pub(crate) fn host_name(raw: &str, hostname: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum PairState {
     AwaitingReveal,
     Pending,
@@ -52,7 +52,7 @@ pub(crate) enum PairState {
 }
 
 /// The existing host a pairing request relates to.
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Repair {
     pub host_id: String,
     /// The host's friendly name.
@@ -82,7 +82,7 @@ impl Repair {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct PairAttempt {
     pub id: String,
     poll_hash: [u8; 32],
@@ -115,22 +115,21 @@ fn check_poll(a: &PairAttempt, poll_token: &str) -> Result<()> {
 }
 
 /// `POST /pair` without a code: register the client's commitment and answer a server nonce.
-pub(crate) fn start_attempt(
-    book: &mut Book,
+fn start_attempt(
+    book: &Book,
     commit_hex: &str,
     info: HostInfo,
     ip: &str,
     t: i64,
-) -> Result<PairResponse> {
+) -> Result<(PairAttempt, PairResponse)> {
     let commit: [u8; 32] = hex_decode_array(commit_hex)
         .ok_or_else(|| CoreError::invalid("client_commit must be 64 hex digits"))?;
-    let open: Vec<&PairAttempt> = book.pairs.values().filter(|a| a.open()).collect();
-    if open.iter().filter(|a| a.ip == ip).count() >= MAX_PER_ADDRESS {
+    if book.pairs.values().any(|a| a.open() && a.ip == ip) {
         return Err(CoreError::rate_limited(
             "a pairing request from this address is already pending",
         ));
     }
-    if open.len() >= MAX_TOTAL {
+    if book.pairs.values().filter(|a| a.open()).count() >= MAX_TOTAL {
         return Err(CoreError::rate_limited(
             "too many pairing requests are pending",
         ));
@@ -138,51 +137,44 @@ pub(crate) fn start_attempt(
     let id = new_uuid_v4();
     let poll_token = new_token();
     let server_nonce = new_nonce();
-    book.pairs.insert(
-        id.clone(),
-        PairAttempt {
-            id: id.clone(),
-            poll_hash: sha256(poll_token.as_bytes()),
-            commit,
-            server_nonce,
-            info,
-            ip: ip.to_string(),
-            expires: t + REVEAL_SECS,
-            state: PairState::AwaitingReveal,
-            ended: None,
-            machine_hint: None,
-            repair: None,
-        },
-    );
-    Ok(PairResponse::AwaitingReveal {
+    let attempt = PairAttempt {
+        id: id.clone(),
+        poll_hash: sha256(poll_token.as_bytes()),
+        commit,
+        server_nonce,
+        info,
+        ip: ip.to_string(),
+        expires: t + REVEAL_SECS,
+        state: PairState::AwaitingReveal,
+        ended: None,
+        machine_hint: None,
+        repair: None,
+    };
+    Ok((attempt, PairResponse::AwaitingReveal {
         pair_id: id,
         poll_token,
         server_nonce: asm_proto::crypto::hex_encode(&server_nonce),
-    })
+    }))
+}
+
+enum Reveal {
+    AlreadyRevealed,
+    CommitmentMismatch,
+    Revealed(Pending),
 }
 
 /// `POST /pair/{id}/reveal`: check the commitment, derive the code and queue the popup.
-pub(crate) fn reveal_attempt(
-    book: &mut Book,
+fn reveal_attempt(
+    a: &PairAttempt,
     cert_sha256: &[u8; 32],
-    pair_id: &str,
     req: &RevealRequest,
     t: i64,
     lifetime: i64,
-) -> Result<PairResponse> {
-    let a = book
-        .pairs
-        .get(pair_id)
-        .ok_or_else(|| CoreError::not_found("no such pairing request"))?;
+) -> Result<Reveal> {
     check_poll(a, &req.poll_token)?;
     match a.state {
         PairState::AwaitingReveal => {}
-        PairState::Pending => {
-            return Ok(PairResponse::Pending {
-                deny_reason: None,
-                expires_at: Some(fmt_unix(a.expires)),
-            });
-        }
+        PairState::Pending => return Ok(Reveal::AlreadyRevealed),
         _ => {
             return Err(CoreError::invalid(
                 "this pairing request is no longer waiting for a reveal",
@@ -192,16 +184,10 @@ pub(crate) fn reveal_attempt(
     let nonce: [u8; NONCE_LEN] = hex_decode_array(&req.client_nonce)
         .ok_or_else(|| CoreError::invalid("client_nonce must be 32 hex digits"))?;
     if !verify_commit(&a.commit, &nonce) {
-        book.pairs.remove(pair_id);
-        return Err(CoreError::invalid(
-            "client_nonce does not match the commitment",
-        ));
+        return Ok(Reveal::CommitmentMismatch);
     }
     let code = format_pairing_code(pairing_code(cert_sha256, &nonce, &a.server_nonce));
-    let a = book.pairs.get_mut(pair_id).expect("checked above");
-    a.state = PairState::Pending;
-    a.expires = t + lifetime;
-    let pending = Pending {
+    Ok(Reveal::Revealed(Pending {
         id: a.id.clone(),
         created: t,
         expires: t + lifetime,
@@ -219,19 +205,15 @@ pub(crate) fn reveal_attempt(
             machine_hint: a.machine_hint.clone(),
             repair: a.repair.clone(),
         },
-    };
-    book.pending.push(pending);
-    Ok(PairResponse::Pending {
-        deny_reason: None,
-        expires_at: Some(fmt_unix(t + lifetime)),
-    })
+    }))
 }
 
 /// `GET /pair/{id}`: the attempt's state; `approved` (with the token) is returned once.
-pub(crate) fn poll_attempt(
+fn poll_attempt(
     book: &mut Book,
     pair_id: &str,
     poll_token: &str,
+    before_delivery: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<PairResponse> {
     let a = book
         .pairs
@@ -248,12 +230,10 @@ pub(crate) fn poll_attempt(
         },
         PairState::Expired => PairResponse::Expired { deny_reason: None },
         PairState::Approved { host_id, token } => {
-            let r = PairResponse::Approved {
-                host_id: host_id.clone(),
-                token: token.clone(),
-            };
-            book.pairs.remove(pair_id);
-            r
+            before_delivery(host_id, token)?;
+            let attempt = book.pairs.remove(pair_id).expect("same locked attempt");
+            let PairState::Approved { host_id, token } = attempt.state else { unreachable!() };
+            PairResponse::Approved { host_id, token }
         }
     })
 }
@@ -373,16 +353,13 @@ impl Core {
         if let Some(code) = req.pairing_code.as_deref().filter(|c| !c.trim().is_empty()) {
             let hostname = req.host_info.hostname.clone();
             let info = serde_json::to_value(&req.host_info).unwrap_or_default();
-            let paired = pair_with_code(
-                &self.store,
-                &self.cert.sha256,
-                code,
-                req.host_info,
-                req.machine_hint.clone(),
-                proven.as_ref().map(|(h, hash)| (h.id.as_str(), hash)),
-                ip,
-                t,
-            )?;
+            let paired = {
+                let _authority = lock(&self.authorization);
+                pair_with_code(
+                    &self.store, &self.cert.sha256, code, req.host_info, req.machine_hint.clone(),
+                    proven.as_ref().map(|(h, hash)| (h.id.as_str(), hash)), ip, t,
+                )?
+            };
             match paired {
                 CodePairing::Paired {
                     host_id,
@@ -462,17 +439,14 @@ impl Core {
             Some((h, hash)) => Some(Repair::new(h, Some(*hash))),
             None => hint_matches.first().map(|h| Repair::new(h, None)),
         };
-        self.expire_requests(t);
+        self.expire_requests(t)?;
         let r = {
-            let mut b = lock(&self.book);
-            let r = start_attempt(&mut b, &req.client_commit, req.host_info, ip, t)?;
-            if let PairResponse::AwaitingReveal { pair_id, .. } = &r
-                && let Some(a) = b.pairs.get_mut(pair_id)
-            {
-                a.machine_hint = req.machine_hint;
-                a.repair = repair;
-            }
-            r
+            let mut book = lock(&self.book);
+            let (mut attempt, response) = start_attempt(&book, &req.client_commit, req.host_info, ip, t)?;
+            attempt.machine_hint = req.machine_hint;
+            attempt.repair = repair;
+            self.save_pair_locked(&mut book, attempt, None, None)?;
+            response
         };
         self.bump();
         Ok(r)
@@ -481,32 +455,49 @@ impl Core {
     /// `POST /pair/{id}/reveal`.
     pub fn pair_reveal(&self, pair_id: &str, req: RevealRequest) -> Result<PairResponse> {
         let t = now();
-        self.expire_requests(t);
+        self.expire_requests(t)?;
         let lifetime = self.settings().request_lifetime_secs.max(1) as i64;
-        let (r, popup) = {
-            let mut b = lock(&self.book);
-            let awaiting = b
-                .pairs
-                .get(pair_id)
-                .is_some_and(|a| matches!(a.state, PairState::AwaitingReveal));
-            let r = reveal_attempt(&mut b, &self.cert.sha256, pair_id, &req, t, lifetime)?;
-            let popup = awaiting
-                .then(|| b.pending.iter().find(|p| p.id == pair_id).cloned())
-                .flatten();
-            (r, popup)
+        let response = {
+            let mut book = lock(&self.book);
+            let attempt = book.pairs.get(pair_id)
+                .ok_or_else(|| CoreError::not_found("no such pairing request"))?;
+            match reveal_attempt(attempt, &self.cert.sha256, &req, t, lifetime)? {
+                Reveal::AlreadyRevealed => return Ok(PairResponse::Pending {
+                    deny_reason: None, expires_at: Some(fmt_unix(attempt.expires)),
+                }),
+                Reveal::CommitmentMismatch => {
+                    self.delete_book_row(pair_id)?;
+                    book.pairs.remove(pair_id);
+                    return Err(CoreError::invalid("client_nonce does not match the commitment"));
+                }
+                Reveal::Revealed(pending) => {
+                    let mut attempt = attempt.clone();
+                    attempt.state = PairState::Pending;
+                    attempt.expires = pending.expires;
+                    let response = PairResponse::Pending {
+                        deny_reason: None, expires_at: Some(fmt_unix(pending.expires)),
+                    };
+                    let event = activity::requested(&pending);
+                    self.save_pair_locked(&mut book, attempt, Some(pending), None)?;
+                    self.log(event);
+                    response
+                }
+            }
         };
-        if let Some(p) = popup {
-            self.log(activity::requested(&p));
-        }
         self.bump();
         self.notify(TOPIC_REQUESTS);
-        Ok(r)
+        Ok(response)
     }
 
     /// `GET /pair/{id}` (one check; the API layer long-polls).
     pub fn pair_poll(&self, pair_id: &str, poll_token: &str) -> Result<PairResponse> {
-        self.expire_requests(now());
-        poll_attempt(&mut lock(&self.book), pair_id, poll_token)
+        self.expire_requests(now())?;
+        let _authority = lock(&self.authorization);
+        poll_attempt(&mut lock(&self.book), pair_id, poll_token, |host_id, token| {
+            self.store.host_by_proof(host_id, &sha256(token.as_bytes()))?
+                .ok_or_else(|| CoreError::not_found("no such pairing request"))?;
+            self.delete_book_row(pair_id)
+        })
     }
 
     /// Operator approved a pairing popup and hand the token to the poller:
@@ -544,90 +535,68 @@ impl Core {
             revoked_at: None,
             machine_hint: machine_hint.clone(),
         };
-        // The old host's current name (it may have been renamed since the request).
-        let old_name = |r: &Repair| -> Result<String> {
-            Ok(self
-                .store
-                .get_host(&r.host_id)?
-                .map_or_else(|| r.host_name.clone(), |h| h.label().to_string()))
-        };
-        match repair {
-            Some(
-                r @ Repair {
-                    proof: Some(old_hash),
-                    ..
-                },
-            ) => {
-                host.id = r.host_id.clone();
-                if !self.store.rotate_host_token(&host, old_hash, &token_hash)? {
+        let rotated_proof = repair.as_ref().and_then(|r| r.proof.as_ref());
+        let replacing = repair.as_ref().filter(|r| replace && r.proof.is_none());
+        if let Some(previous) = repair.as_ref().filter(|r| r.proof.is_some() || replace) {
+            // Use the current name, not the one that was shown when the popup opened.
+            host.name = self.store.get_host(&previous.host_id)?
+                .map_or_else(|| previous.host_name.clone(), |h| h.label().to_string());
+            if rotated_proof.is_some() {
+                host.id.clone_from(&previous.host_id);
+            }
+        } else {
+            host.name = host_name(name, &info.hostname)?;
+        }
+        if let Some(previous) = replacing {
+            // A forgeable hint never carries leases or tokens over.
+            match self.revoke_host(&previous.host_id) {
+                Ok(()) => {}
+                Err(e) if e.code == asm_proto::ErrorCode::NotFound => {}
+                Err(e) => return Err(Fail::Keep(e)),
+            }
+        }
+
+        let approved = {
+            let _authority = lock(&self.authorization);
+            let mut book = lock(&self.book);
+            let mut pending = book.pending.iter().find(|q| q.id == p.id && q.resolving && q.expires > now())
+                .cloned().ok_or_else(|| CoreError::not_found("this pairing request is no longer pending"))?;
+            pending.host_id = Some(host.id.clone());
+            pending.host_label.clone_from(&host.name);
+            let history = pending.history(RequestStatus::Approved, None, t);
+            let mut attempt = book.pairs.get(&p.id).filter(|a| matches!(a.state, PairState::Pending))
+                .cloned().ok_or_else(|| CoreError::internal("pairing request is missing its attempt"))?;
+            attempt.state = PairState::Approved { host_id: host.id.clone(), token };
+            attempt.ended = Some(t);
+            let row = self.seal_pair(&attempt, None)?;
+            if let Some(old_hash) = rotated_proof {
+                if !self.store.rotate_host_token_with_request(&host, old_hash, &token_hash, &row, &history)? {
                     return Err(Fail::Keep(CoreError::invalid(format!(
-                        "{} was revoked or paired again since this request; deny it and run asm pair again",
-                        r.host_name
+                        "{} was revoked or paired again since this request; deny it and run asm pair again", host.name
                     ))));
                 }
-                host.name = old_name(r)?;
-                self.log(
-                    Event::new(
-                        Category::Pairing,
-                        "repaired",
-                        format!(
-                            "{} paired again from {address}; its old token no longer works",
-                            host.name
-                        ),
-                    )
-                    .host(Some(&host.id))
-                    .detail(json!({
-                        "request_id": p.id,
-                        "address": address,
-                        "host_info": serde_json::to_value(info).unwrap_or_default(),
-                    })),
-                );
+            } else {
+                self.store.insert_host_with_request(&host, &token_hash, &row, &history)?;
             }
-            Some(r) if replace => {
-                host.name = old_name(r)?;
-                // Revoke first: a forgeable hint never carries leases or tokens over.
-                match self.revoke_host(&r.host_id) {
-                    Ok(()) => {}
-                    Err(e) if e.code == asm_proto::ErrorCode::NotFound => {}
-                    Err(e) => return Err(Fail::Keep(e)),
-                }
-                self.store.insert_host(&host, &token_hash)?;
-                self.log(
-                    Event::new(
-                        Category::Pairing,
-                        "replaced",
-                        format!(
-                            "{} paired from {address}, replacing the earlier host of that name (same machine hint); the earlier host and its leases were revoked",
-                            host.name
-                        ),
-                    )
-                    .host(Some(&host.id))
-                    .detail(json!({
-                        "request_id": p.id,
-                        "replaced_host_id": r.host_id,
-                        "address": address,
-                        "host_info": serde_json::to_value(info).unwrap_or_default(),
-                    })),
-                );
-            }
-            _ => {
-                host.name = host_name(name, &info.hostname).map_err(Fail::Keep)?;
-                self.store.insert_host(&host, &token_hash)?;
-            }
+            Self::remove_pending_locked(&mut book, &p.id);
+            book.pairs.insert(p.id.clone(), attempt);
+            activity::approved(&pending, None, t)
+        };
+        if rotated_proof.is_some() {
+            self.log(Event::new(Category::Pairing, "repaired",
+                format!("{} paired again from {address}; its old token no longer works", host.name))
+                .host(Some(&host.id)).detail(json!({
+                    "request_id": p.id, "address": address, "host_info": info,
+                })));
+        } else if let Some(previous) = replacing {
+            self.log(Event::new(Category::Pairing, "replaced",
+                format!("{} paired from {address}, replacing the earlier host of that name (same machine hint); the earlier host and its leases were revoked", host.name))
+                .host(Some(&host.id)).detail(json!({
+                    "request_id": p.id, "replaced_host_id": previous.host_id, "address": address, "host_info": info,
+                })));
         }
-        let mut b = lock(&self.book);
-        // History of this request names the host.
-        if let Some(q) = b.pending.iter_mut().find(|q| q.id == p.id) {
-            q.host_id = Some(host.id.clone());
-            q.host_label = host.name.clone();
-        }
-        if let Some(a) = b.pairs.get_mut(&p.id) {
-            a.state = PairState::Approved {
-                host_id: host.id.clone(),
-                token,
-            };
-        }
-        drop(b);
+        self.log(approved);
+        self.notify_request_ended();
         self.notify(TOPIC_HOSTS);
         Ok(())
     }
@@ -659,6 +628,35 @@ mod tests {
         t: i64,
     ) -> Result<CodePairing> {
         super::pair_with_code(store, cert, code, info, None, None, ip, t)
+    }
+
+    fn start_attempt(book: &mut Book, commit: &str, info: HostInfo, ip: &str, t: i64) -> Result<PairResponse> {
+        let (attempt, response) = super::start_attempt(book, commit, info, ip, t)?;
+        book.pairs.insert(attempt.id.clone(), attempt);
+        Ok(response)
+    }
+
+    fn reveal_attempt(
+        book: &mut Book, cert: &[u8; 32], id: &str, req: &RevealRequest, t: i64, lifetime: i64,
+    ) -> Result<()> {
+        let a = book.pairs.get_mut(id).unwrap();
+        match super::reveal_attempt(a, cert, req, t, lifetime)? {
+            Reveal::AlreadyRevealed => Ok(()),
+            Reveal::CommitmentMismatch => {
+                book.pairs.remove(id);
+                Err(CoreError::invalid("client_nonce does not match the commitment"))
+            }
+            Reveal::Revealed(pending) => {
+                a.state = PairState::Pending;
+                a.expires = pending.expires;
+                book.pending.push(pending);
+                Ok(())
+            }
+        }
+    }
+
+    fn poll_attempt(book: &mut Book, id: &str, token: &str) -> Result<PairResponse> {
+        super::poll_attempt(book, id, token, |_, _| Ok(()))
     }
 
     #[test]

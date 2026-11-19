@@ -13,8 +13,8 @@ use asm_proto::generators::{
 use asm_proto::names::{canonical_generated_output, generated_output};
 use asm_proto::wire::{
     CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1,
-    GetResult, LeaseMode, LeaseStatus, LeasesResponse, MAX_POLL_WAIT_SECS, RequestBody,
-    RequestResult, RequestState, RequestStatus, SecretsResponse, WriteResult,
+    GetResult, LeaseInfo, LeaseMode, LeaseStatus, LeasesResponse, MAX_POLL_WAIT_SECS, RequestBody,
+    RequestResult, RequestState, RequestStatus, RequestedMode, SecretsResponse, WriteResult,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -77,19 +77,15 @@ pub fn list(json: bool) -> Result<(), CliError> {
     let s = Session::open()?;
     s.warn_secrets();
     s.sync_leases()?;
-    let body = s.api.get_bytes("/secrets")?;
-    let parsed: SecretsResponse = serde_json::from_slice(&body)
-        .map_err(|e| CliError::failure(format!("unexpected answer from the manager: {e}")))?;
-    for w in &parsed.warnings {
-        eprintln!("warning: {w}");
-    }
+    let catalog: SecretsResponse = s.api.get("/secrets")?;
     let mut out = std::io::stdout().lock();
     if json {
-        let _ = out.write_all(&body);
+        // Project through the public schema instead of echoing legacy status fields.
+        let _ = serde_json::to_writer(&mut out, &catalog);
         let _ = out.write_all(b"\n");
     } else {
         let mut printed = HashSet::new();
-        for secret in &parsed.secrets {
+        for secret in &catalog.secrets {
             for name in std::iter::once(&secret.name).chain(secret.aliases.iter()) {
                 if printed.insert(name) {
                     let _ = writeln!(out, "{name}");
@@ -267,7 +263,7 @@ fn submit(
 }
 
 pub(crate) fn submit_get(
-    api: &Api, body: &RequestBody, deadline: Option<Instant>, pinned: Option<&GenerationSelection>,
+    api: &Api, body: &RequestBody, deadline: Option<Instant>, pinned: Option<&LeaseInfo>,
     capabilities: crate::bindings::GetCapabilities,
 ) -> Result<GetResult, CliError> {
     let (result, was_pending) = submit(api, body, deadline)?;
@@ -278,6 +274,10 @@ pub(crate) fn submit_get(
     let RequestBody::Get { fields, generation, sentinel, lease_id, .. } = body else {
         return Err(CliError::failure("invalid get request"));
     };
+    // Older managers can approve a sentinel even when the request asks for raw.
+    if lease_id.is_none() && generation.is_some() && result.mode != LeaseMode::Raw {
+        return Err(CliError::failure("the manager returned sentinel delivery for a new generated credential; ask for raw approval or upgrade the manager"));
+    }
     let actual: HashSet<&str> = result.files.iter().map(|f| f.field.as_str()).collect();
     if !asm_proto::crypto::is_uuid(&result.lease_id)
         || result.files.is_empty()
@@ -285,8 +285,16 @@ pub(crate) fn submit_get(
         || fields.as_ref().is_some_and(|wanted| wanted.len() != actual.len() || wanted.iter().any(|f| !actual.contains(f.as_str())))
         || lease_id.as_ref().is_some_and(|id| id != &result.lease_id)
         || lease_id.is_some() != pinned.is_some()
+        || pinned.is_some_and(|lease| result.mode != lease.mode
+            || result.hosts != lease.hosts || result.expires_at != lease.expires_at
+            || (fields.is_none() && (actual.len() != lease.fields.len()
+                || lease.fields.iter().any(|field| !actual.contains(field.as_str())))))
         || (*sentinel && result.mode != LeaseMode::Sentinel)
-        || (result.mode == LeaseMode::Raw && result.files.iter().any(|f| f.substituted))
+        || (result.mode == LeaseMode::Raw && result.files.iter().any(|f| f.substituted == Some(true)))
+        || (result.generation.is_some() && match result.mode {
+            LeaseMode::Raw => !result.hosts.is_empty(),
+            LeaseMode::Sentinel => result.files.iter().any(|f| f.substituted == Some(false)),
+        })
     {
         return Err(CliError::failure("the manager sent an inconsistent get result"));
     }
@@ -299,7 +307,7 @@ pub(crate) fn submit_get(
         return Err(CliError::failure("the manager sent invalid generated credential metadata"));
     }
     if let Some(pinned) = pinned {
-        if result.generation.as_ref() != Some(pinned) {
+        if result.generation.is_none() || result.generation != pinned.generation {
             return Err(CliError::failure("the manager changed the pinned generated credential grant"));
         }
         if result.operator_selected_grant {
@@ -358,6 +366,7 @@ struct JsonFile<'a> {
     field: &'a str,
     relative_path: &'a str,
     path: &'a PathBuf,
+    delivery: crate::delivery::Delivery,
 }
 
 #[derive(Serialize)]
@@ -469,12 +478,13 @@ impl GenerationArgs {
 
 #[derive(clap::Args)]
 pub struct GetArgs {
-    /// Ask for raw values (the operator may choose sentinel delivery instead).
+    /// Ask for raw values (for static secrets, the operator may choose sentinel delivery instead).
     #[arg(long, conflicts_with = "sentinel")]
     pub raw: bool,
-    /// Forbid disclosure of raw substitutable values.
+    /// Require sentinel delivery for static secrets or an exact existing sentinel lease.
     #[arg(long, conflicts_with = "raw")]
     pub sentinel: bool,
+    /// Proxy destination restrictions (not supported for new generated credentials).
     #[arg(long, value_delimiter = ',')]
     pub hosts: Vec<String>,
     /// Overall operator/acquisition wait, in seconds.
@@ -507,6 +517,7 @@ pub struct GetArgs {
 pub fn get(a: GetArgs) -> Result<(), CliError> {
     let reason = asm_proto::rules::validate_reason(&a.reason)?;
     let hosts = parse_hosts(&a.hosts)?;
+    let mode = RequestedMode::from_flags(a.raw, a.sentinel)?;
     let selectors = a.generation_args.into_selectors(a.gcloud_scopes)?;
     let mut capability = selectors.capability();
     let generation = selectors.github.or(selectors.google);
@@ -529,7 +540,7 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
         if selection.validate().is_err() || !selection.grant.is_issued() {
             return Err(CliError::failure("the manager sent invalid generated credential metadata"));
         }
-        pinned = Some(selection);
+        pinned = Some(lease);
         let managed = matches!(&selection.grant, GenerationGrant::GcloudAccess(_));
         if managed {
             capability = Some(CAPABILITY_GCLOUD_ACCESS_V1);
@@ -544,7 +555,9 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
                 return Err(CliError::invalid(message));
             }
         }
-        if lease.status != LeaseStatus::Active {
+        if lease.status != LeaseStatus::Active || lease.expires_at.as_deref()
+            .is_some_and(|t| asm_proto::time::parse_unix(t).is_none_or(|t| t <= unix_now()))
+        {
             return Err(CliError::denied(Some("lease ended; request a new lease without --lease")));
         }
         if (a.raw && lease.mode != LeaseMode::Raw) || (a.sentinel && lease.mode != LeaseMode::Sentinel) {
@@ -593,6 +606,14 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
     if generated_flags && !generated {
         return Err(CliError::invalid("generation options require a generated secret"));
     }
+    let mode = match pinned {
+        Some(lease) => match lease.mode {
+            LeaseMode::Raw => RequestedMode::Raw,
+            LeaseMode::Sentinel => RequestedMode::Sentinel,
+        },
+        None if generated => mode.for_new_generated(&hosts)?,
+        None => mode,
+    };
     if let Some(request) = &generation {
         if output != Some(request.output_name()) {
             let message = match request {
@@ -615,12 +636,12 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
         fields.is_some() || a.sentinel || (generated && binding.source.ends_with(GITHUB_TOKEN_ALIAS)),
         capability,
     )?;
-    let generation = generation.or_else(|| replay_managed_claims(pinned));
+    let generation = generation.or_else(|| replay_managed_claims(pinned.and_then(|lease| lease.generation.as_ref())));
     let client_capabilities = capabilities.client_capabilities(generation.as_ref(), pinned.is_some());
     let mut body = RequestBody::Get {
         name: request_name,
-        raw: a.raw,
-        sentinel: a.sentinel,
+        raw: mode == RequestedMode::Raw,
+        sentinel: mode == RequestedMode::Sentinel,
         fields,
         generation,
         refresh: a.refresh,
@@ -641,6 +662,12 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
     }).collect::<Vec<_>>();
     let stored = if generated || binding.destination.is_some() { dir.store_bindings(&result, &views)? } else { dir.store(&result)? };
     crate::reaper::ensure_running(dir);
+    for file in &stored {
+        file.delivery.report(&file.relative_path);
+    }
+    if stored.iter().any(|file| file.delivery != crate::delivery::Delivery::Raw) {
+        crate::delivery::proxy_hint();
+    }
     let mut out = std::io::stdout().lock();
     if a.json {
         let j = JsonGet {
@@ -658,6 +685,7 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
                     field: &f.field,
                     relative_path: &f.relative_path,
                     path: &f.path,
+                    delivery: f.delivery,
                 })
                 .collect(),
         };
@@ -889,7 +917,7 @@ mod tests {
                 field: "value".into(),
                 relative_path: "T".into(),
                 content: "x".into(),
-                substituted: false,
+                substituted: Some(false),
             }],
         };
         let p = vec![PathBuf::from("/run/user/1000/asm/secrets/GITHUB_TOKEN")];

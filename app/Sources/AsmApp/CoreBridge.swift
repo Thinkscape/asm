@@ -851,7 +851,7 @@ private extension GenerationChoiceItem {
 private extension GeneratorApprovalChoiceItem {
     init(_ choice: GeneratorApprovalChoice) {
         self.init(choice: GenerationChoiceItem(choice.choice),
-                  suggestedHosts: choice.suggestedHosts.map(HostPatternCheckItem.init), scopeIssues: choice.scopeIssues,
+                  scopeIssues: choice.scopeIssues,
                   scopeCatalog: choice.scopeCatalog.map(GcloudScopeOptionItem.init),
                   defaultProjectID: choice.defaultProjectId,
                   gcloudReady: choice.gcloudReady.map(GcloudAccessGrantItem.init))

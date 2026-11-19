@@ -320,7 +320,7 @@ fn generation_admin_removal_denies_empty_offers_without_rebinding_new_sources() 
     let ended = f.core.request_state(&f.host.id, &pinned.request_id).unwrap();
     assert_eq!(ended.status, RequestStatus::Denied);
     assert!(ended.result.is_none());
-    assert!(ended.deny_reason.unwrap().contains("no offered generators remain"));
+    assert_eq!(ended.deny_reason.as_deref(), Some(crate::error::REQUEST_UNAVAILABLE));
     assert!(!f.core.snapshot().pending.iter().any(|p| p.id == pinned.request_id));
     assert!(keys.get("app-a").unwrap().is_none());
     assert!(f.core.store.get_generator("app-a").unwrap().is_none());
@@ -333,7 +333,7 @@ fn generation_admin_removal_denies_empty_offers_without_rebinding_new_sources() 
     let ended = f.core.request_state(&f.host.id, &group.request_id).unwrap();
     assert_eq!(ended.status, RequestStatus::Denied);
     assert!(ended.result.is_none());
-    assert!(ended.deny_reason.unwrap().contains("no offered generators remain"));
+    assert_eq!(ended.deny_reason.as_deref(), Some(crate::error::REQUEST_UNAVAILABLE));
     assert!(f.core.snapshot().pending.is_empty());
     assert!(f.approve(&group.request_id, "app-c", LeaseMode::Raw, 43_200).is_err());
     assert_eq!(f.core.list_generators().iter().map(|g| g.id.as_str()).collect::<Vec<_>>(), ["app-c"]);

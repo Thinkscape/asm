@@ -17,7 +17,7 @@ Coding agents need API keys and passwords. asm provides operator-approved access
 - a **patched [iron-proxy](https://github.com/paradigmxyz/iron-proxy)**, run by the manager, puts the real value into requests on the way out;
 - an **agent skill** ([`skill/asm/SKILL.md`](skill/asm/SKILL.md)) teaches agents the workflow.
 
-Static secrets default to **sentinel** delivery (`asm_` + 40 random characters): the proxy substitutes the real value only on approved HTTPS hosts. Generated tokens default to raw delivery, with optional `--sentinel`. `asm exec` injects approved values directly into a child environment without token files.
+Static secrets default to **sentinel** delivery (`asm_` + 40 random characters): the proxy substitutes the real value only on approved HTTPS hosts. New GitHub App and Google Cloud token grants are **raw only**. `asm exec` injects them directly into the child environment without token files or ASM proxy setup.
 
 ## Security model
 
@@ -77,6 +77,8 @@ Default ports (changeable in the app): manager API `7411`, proxy `7412`, iron-pr
 ## Install
 
 Release assets are on [GitHub Releases](https://github.com/Thinkscape/asm/releases/latest). Every release has a `SHA256SUMS` file.
+
+You can upgrade the manager before paired CLIs. Versions v0.3.0–v0.5.0 can still discover generators; their legacy `available` field means the generator is listed, not that its provider is unlocked or ready. Upgrade the CLI for per-field delivery receipts and raw-only generated-token checks before submitting a request.
 
 ### CLI with Homebrew (macOS, Linux)
 
@@ -187,8 +189,6 @@ asm list --json
 asm exec --repositories acme/web --permissions pull_requests=read GH_TOKEN -- gh pr list --repo acme/web
 # ASM uses the repo to select an installation; gh uses --repo to select the PR list.
 # Both GH_TOKEN and GITHUB_TOKEN are injected with the same value; no token files.
-
-asm exec --repositories acme/web --sentinel --hosts api.github.com GITHUB_TOKEN -- gh api repos/acme/web
 ```
 
 For GitHub, `get` and `exec` require `--repositories OWNER/REPO[,OWNER/REPO...]` unless `get --lease ID` pins an existing grant. Permissions default to `metadata=read`; request additional access with `--permissions contents=read,pull_requests=write`. The popup marks what the agent requested. The operator can remove or add repositories and change permission levels within **one configured installation’s limits**. Installations cannot be combined in one token. A narrower request does not silently receive a previously approved broader raw token. Raw GitHub tokens need no proxy.
@@ -204,7 +204,7 @@ asm exec --project my-staging-project --permissions compute=read \
 
 The first `--project` describes the requested grant; the argument after `--` tells the consumer which resources to query. The supported claims are `storage=read`, `storage=create`, `compute=read`, `run=read`, `logs=read`, and `bigquery=metadata-read`. Use a comma-separated list for a combination; arbitrary IAM role names, OAuth scopes, and wildcard claims are not accepted for a connection. A role on the **project** is not a restriction to one bucket or resource.
 
-The Google popup preselects the requested project and marks the requested access in each service’s permission menu. Storage read and create can be granted independently or together. With a compatible client, the operator can check another active project visible to the signed-in connection. This **switches** the grant to that project; it does not add a second project or rewrite the command after `--`. If the list cannot be loaded, the requested project remains available. Changing the project or permissions requires reviewing the new selection. Pinned renewals keep the approved grant.
+The Google popup preselects the requested project and marks the requested access in each service’s permission menu. Storage read and create can be granted independently or together. With a compatible client, the operator can check another active project visible to the signed-in connection. This **switches** the grant to that project; it does not add a second project or rewrite the command after `--`. If the list cannot be loaded, the requested project remains available. As on GitHub, **Generate token** approves the current selection directly. Pinned renewals keep the approved grant.
 
 **First use:** expand **IAM changes on approval** to see the proposed keyless service account, its project-level roles, and who can mint tokens. **Generate token** authorizes those durable changes and the lease. **Deny** makes no changes and delivers nothing. The administrator needs sufficient Google permissions. If setup succeeds but issuance fails, the cloud resources may remain; ASM reports the failure rather than substituting another credential. Later approvals for the same profile do not recreate it.
 
@@ -245,8 +245,14 @@ Raw token expiry removes file material but retains local alias reservations unti
 ends. Repeat get to refresh file views; exec never updates them or renews a running child.
 Routine renewal leaves old copies usable until natural expiry. Explicit `--refresh` rotates
 the token; ASM can revoke known GitHub predecessors, not Google tokens. `--lease ID` pins an existing generated grant;
-`--new-lease` requests a fresh decision. After restart, generated grants remain but require
-explicit acquisition to mint token material again.
+`--new-lease` requests a fresh decision.
+
+**Restart is not revocation.** On relaunch, the manager restores unexpired generated tokens, their versions, approved sentinel mappings, and pending request IDs. It does not issue a new token, renew a deadline, or deny a pending request just because the process stopped. The API and proxy are unreachable while the manager is down. Explicit revocation, provider expiry, and changes to the configured authority still apply.
+Previously issued generated sentinel leases keep their original mode, hosts and deadline. To use one explicitly, pin its lease ID. An unpinned request cannot reuse it; a new generated grant is always raw.
+
+Restart records are encrypted in the manager database with a per-database key held in the Mac’s login Keychain. The database alone cannot recover the credentials. Interrupted operations that may already have written to an external provider must be reviewed; the manager does not automatically repeat those writes.
+
+The first upgrade from a memory-only manager cannot recover credentials or pending requests the old process never saved. Let current work finish before quitting that version. Bitwarden restores a verified session key, never the master password; a rejected or unavailable key requires unlocking the vault again.
 
 Bindings use `[DEST=]SOURCE[::FIELD]`: for example
 `asm get 'GOOGLE_USER=Vaultwarden/google::username' 'Sign in'`.
@@ -276,9 +282,9 @@ Commands:
 |Command|Options|Notes|
 |---|---|---|
 |`asm pair <MANAGER> [PAIRING_CODE]`|`--force`: pair again although the current pairing still works|`MANAGER` is `<hostname>[:port]`. `PAIRING_CODE` (`asm-…`) is the unattended code; it is also read from `$ASM_PAIRING_CODE`. Without a code the CLI prints `verification code: 123 456` and waits for approval. Prints `paired: <host id>`, or `already paired with …` (exit 0) when the manager still accepts this machine's pairing. See [Pairing the same machine again](#pairing-the-same-machine-again).|
-|`asm list`|`--json`: print the manager's JSON answer|One name per line. Names are vault-prefixed (`work/GITHUB_TOKEN`) when two vaults share a name.|
-|`asm get <BINDING> <REASON>`|`--raw` / `--sentinel`, `--hosts`, `--wait`, `--json`, `--no-reaper`; generated grant and lease options in `asm get --help`|Prints paths and nonsecret lease/grant/version metadata. `[DEST=]SOURCE[::FIELD]` selects fields and local file views. Static raw requests always need approval.|
-|`asm exec <BINDINGS> -- <COMMAND> [ARG...]`|`--raw` / `--sentinel`, `--hosts`, `--repositories`, `--permissions`, `--reason`, `--wait`|Sequential acquisitions share one wait deadline; any failure prevents launch. Discovery, proxy preparation and child runtime are outside that budget. No token files, reaper or in-process renewal.|
+|`asm list`|`--json`: print structured catalog entries|One name per line. Names are vault-prefixed (`work/GITHUB_TOKEN`) when two vaults share a name. Provider lock state and diagnostics stay in the manager.|
+|`asm get <BINDING> <REASON>`|`--raw` / `--sentinel`, `--hosts`, `--wait`, `--json`, `--no-reaper`; generated grant and lease options in `asm get --help`|Prints paths and nonsecret lease/grant/version metadata. The receipt on stderr identifies each file as a real value or a sentinel; JSON includes `files[].delivery`. `[DEST=]SOURCE[::FIELD]` selects fields and local file views. Static raw requests always need approval.|
+|`asm exec <BINDINGS> -- <COMMAND> [ARG...]`|`--raw` / `--sentinel`, `--hosts`, `--repositories`, `--permissions`, `--reason`, `--wait`|Reports delivery per environment variable on stderr before launch. For sentinels it configures the child’s proxy and CA automatically; for file-based clients use `eval "$(asm proxy-env)"`. Sequential acquisitions share one wait deadline; any failure prevents launch. No token files, reaper or in-process renewal.|
 |`asm update <NAME>`|`--field <FIELD>`: field to change (default: `password` for logins, the only field otherwise)<br>`--wait <WAIT>`|Reads the new value from stdin. Prints `updated <name> in <vault>`. Raw leases on that secret are revoked.|
 |`asm add <NAME>`|`--wait <WAIT>`|Reads the value from stdin. The operator picks the vault. Prints `added <name> to <vault>; run asm get to use it`.|
 |`asm proxy-info`|`--json`|Proxy URLs (`http://` and `socks5h://` per hostname hint, the first reachable one marked `(recommended)`), CA certificate and CA bundle paths. Refreshes the CA files.|
@@ -295,7 +301,7 @@ Exit codes:
 |Code|Meaning|
 |---|---|
 |0|ok|
-|1|connection or other failure, vault unavailable, rate limited, request lost (manager restarted)|
+|1|connection or other failure, credential unavailable, rate limited, or unknown request|
 |2|invalid input|
 |3|denied (`denied: <reason>` on stderr) or expired|
 |4|still pending when `--wait` elapsed; run the same command again to keep waiting|
@@ -317,7 +323,7 @@ Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets
 ## The manager app
 
 - **Menu bar**: pending requests (click one to open its approval popup), recent decisions, locked vaults to unlock, **Settings…**, **Show Log…** and **Quit**. While the proxy is down (or running but not answering its health check for over 10 s) the icon gets a red dot and the panel a red banner with the cause, **Restart** and **Details…**. While the macOS Firewall blocks the proxy (or the manager API) and it listens for other machines, the icon gets the same red dot and the panel an orange banner with **Firewall Settings**, **How to Fix…** and **Details…**.
-- **Approval popup**: generated-token permission requests are visible in screenshots and screen sharing; they show request metadata, not token values. Pairing and secret-value dialogs still request capture protection. The popup shows the requester, reason, delivery mode, and lease duration. Proxy delivery adds destination-host controls. **Deny** can send a reason to the requester.
+- **Approval popup**: generated-token requests show the requester, reason, scope, and lease duration; **Generate token** releases the real value. There is no proxy option or host selector. Static vault requests still offer delivery and proxy-host controls. Generated-token popups can be captured in screenshots; pairing and secret-value dialogs request capture protection.
 - **Settings window**:
   - **Vaults**: Bitwarden/Vaultwarden (server, API key, exposed collections, personal vault; master password held in memory only), `.env` files (every key is exposed), the macOS login keychain (generic and internet passwords, secure notes).
     The table sizes **Name** to the longest vault name (150pt minimum), keeps **Kind**, **Status** and **Secrets** compact, and gives **Details** the remaining width for the Bitwarden server URL or `.env` file path.

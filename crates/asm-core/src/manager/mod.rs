@@ -34,6 +34,7 @@ pub(crate) mod gcloud_profiles;
 pub mod netinfo;
 pub mod pairing;
 pub mod requests;
+pub(crate) mod resume;
 
 pub use requests::Book;
 
@@ -61,12 +62,15 @@ pub const ALREADY_RUNNING: &str =
     "another Agents Secrets Manager is already running with this data directory";
 
 /// Options for `Manager::start_with` (not exported over FFI).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct StartOptions {
     /// Root for proxy value files; default `std::env::temp_dir()`.
     pub values_root: Option<PathBuf>,
     /// Settings written before start, as `(key, JSON value)` (see `settings` key constants).
     pub settings: Vec<(String, serde_json::Value)>,
+    /// Rust-only isolated test custody. Production uses this database's Keychain key.
+    #[doc(hidden)]
+    pub resume_key: Option<[u8; 32]>,
 }
 
 /// Current wall-clock time in Unix seconds.
@@ -121,6 +125,7 @@ pub struct Core {
     pub dirs: DataDirs,
     pub bin_dir: PathBuf,
     pub store: Arc<Store>,
+    pub(crate) resume: Arc<resume::ResumeStore>,
     pub registry: Registry,
     pub generators: crate::generator::GeneratorRegistry,
     /// Generation authority linearization; never held during provider calls.
@@ -279,11 +284,25 @@ impl Core {
         observer: Arc<dyn ManagerObserver>,
         options: StartOptions,
     ) -> Result<Arc<Self>> {
+        Self::start_with_generators(data_dir, bin_dir, observer, options, |registry, records, runner| {
+            registry.load(records, runner);
+            Ok(())
+        })
+    }
+
+    fn start_with_generators(
+        data_dir: PathBuf, bin_dir: PathBuf, observer: Arc<dyn ManagerObserver>, options: StartOptions,
+        load: impl FnOnce(
+            &crate::generator::GeneratorRegistry, Vec<crate::store::GeneratorRecord>,
+            &crate::generator::gcloud_cli::GcloudRunner,
+        ) -> Result<()>,
+    ) -> Result<Arc<Self>> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dirs = DataDirs::create(&data_dir, options.values_root.as_deref())?;
         let instance_lock = lock_data_dir(&dirs.data)?;
         let gcloud = gcloud::GcloudSetup::new(dirs.gcloud.clone())?;
         let store = Arc::new(Store::open(&dirs.db())?);
+        let resume = Arc::new(resume::ResumeStore::open(store.clone(), options.resume_key)?);
         let activity = activity::ActivityLog::start(store.clone(), observer.clone());
         Settings::seed(&store, &options.settings)?;
         let settings = Settings::load(&store)?;
@@ -299,6 +318,7 @@ impl Core {
                 .iter()
                 .map(|v| {
                     let dirs = &dirs;
+                    let resume = resume.clone();
                     let cfg = effective_config(&settings, &v.config);
                     s.spawn(move || {
                         if matches!(cfg, VaultConfig::Bitwarden(_))
@@ -306,7 +326,7 @@ impl Core {
                         {
                             log::warn!("vault {}: {}", v.name, e.message);
                         }
-                        Registry::build_provider(dirs, &v.id, &cfg)
+                        Registry::build_provider_resumable(dirs, &v.id, &cfg, resume)
                     })
                 })
                 .collect();
@@ -334,23 +354,17 @@ impl Core {
             }
         }
         let generators = crate::generator::GeneratorRegistry::new();
-        generators.load(store.list_generators()?, &gcloud.runner);
+        load(&generators, store.list_generators()?, &gcloud.runner)?;
 
         // Proxy entries of active sentinel leases.
         let t = now();
         let active = store.active_leases(t)?;
         let sentinel: Vec<&LeaseRecord> = active
             .iter()
-            .filter(|l| l.mode == LeaseMode::Sentinel)
+            .filter(|l| l.mode == LeaseMode::Sentinel && l.source_kind == SourceKind::Vault)
             .collect();
         let mut proxy_state = ProxyState::default();
         build_entries(&registry, &sentinel, &mut proxy_state);
-        for lease in &active {
-            if lease.source_kind == SourceKind::Generator {
-                proxy_state.suspended.insert(lease.id.clone(),
-                    "credential unavailable; run asm get to generate a token".into());
-            }
-        }
 
         let obs = observer.clone();
         let on_change: Arc<dyn Fn() + Send + Sync> =
@@ -369,11 +383,10 @@ impl Core {
                 sink(e)
             })
         };
-        let proxy = ProxySupervisor::start(
+        let proxy = ProxySupervisor::prepare(
             bin_dir.clone(),
             dirs.clone(),
             settings.proxy.clone(),
-            proxy_state.flatten(),
             on_change,
             on_event,
         )?;
@@ -389,6 +402,7 @@ impl Core {
             dirs,
             bin_dir,
             store,
+            resume,
             registry,
             generators,
             authorization: Mutex::new(()),
@@ -415,6 +429,26 @@ impl Core {
             firewall: Mutex::new(firewall::FirewallCheck::default()),
             firewall_wake,
         });
+        // Restore and validate authority before opening either listener.
+        let recovered = (|| -> Result<()> {
+            core.restore_generated()?;
+            core.restore_request_book(now())?;
+            let t = now();
+            let active = core.store.active_leases(t)?;
+            let entries = {
+                let mut state = lock(&core.proxy_state);
+                let ids: HashSet<&str> = active.iter().map(|lease| lease.id.as_str()).collect();
+                state.entries.retain(|id, _| ids.contains(id.as_str()));
+                Self::project_generated_entries(&mut state, &active, &lock(&core.generation), t);
+                state.dirty = false;
+                state.flatten()
+            };
+            core.proxy.activate(entries)
+        })();
+        if let Err(error) = recovered {
+            core.shutdown();
+            return Err(error);
+        }
         {
             let suspended = lock(&core.proxy_state).suspended.clone();
             for l in &sentinel {
@@ -625,7 +659,7 @@ impl Core {
         retry_suspended: bool,
         mutate: impl FnOnce(&mut ProxyState),
     ) -> Result<()> {
-        let (snapshot, todo) = {
+        let (snapshot, todo, bw_before) = {
             let _authority = lock(&self.authorization);
             let active = self.store.active_leases(self.generation_now())?;
             let mut state = lock(&self.proxy_state);
@@ -637,18 +671,40 @@ impl Core {
                 .filter(|l| (!state.entries.contains_key(&l.id) && !state.suspended.contains_key(&l.id))
                     || (retry_suspended && state.suspended.contains_key(&l.id)))
                 .cloned().collect();
-            (active, todo)
+            (active, todo, self.registry.bitwarden_sessions())
         };
         let mut read = ProxyState::default();
         build_entries(&self.registry, &todo.iter().collect::<Vec<_>>(), &mut read);
         let result = {
             let authority = lock(&self.authorization);
             let active = self.store.active_leases(self.generation_now())?;
+            let bw_after = self.registry.bitwarden_sessions();
             let mut state = lock(&self.proxy_state);
             for lease in &active {
-                if lease.source_kind != SourceKind::Vault
+                if lease.source_kind != SourceKind::Vault || lease.mode != LeaseMode::Sentinel
+                    || !lease.fields.iter().any(|f| f.sentinel.is_some())
                     || !snapshot.iter().any(|old| old.id == lease.id && old.revoked_at == lease.revoked_at) {
                     continue;
+                }
+                let before = bw_before.get(&lease.vault_id);
+                let after = bw_after.get(&lease.vault_id);
+                if before.is_some() || after.is_some() {
+                    if after.and_then(|s| s.revision).is_none() {
+                        let removed = state.entries.remove(&lease.id).is_some();
+                        state.dirty |= removed;
+                        if removed || !state.suspended.contains_key(&lease.id) {
+                            let why = read.suspended.remove(&lease.id)
+                                .unwrap_or_else(|| "Bitwarden vault is unavailable".into());
+                            state.suspended.insert(lease.id.clone(), why);
+                        }
+                        continue;
+                    }
+                    if !before.zip(after).is_some_and(|(old, current)| {
+                        old.revision == current.revision && Arc::ptr_eq(&old.provider, &current.provider)
+                    }) {
+                        // A superseded helper must not restore results read outside authorization.
+                        continue;
+                    }
                 }
                 if let Some(entries) = read.entries.remove(&lease.id) {
                     state.dirty = true;
@@ -675,17 +731,8 @@ impl Core {
         }
     }
 
-    /// Caller owns generation authorization. No observer callback is invoked here.
-    pub(crate) fn publish_proxy_locked(&self, _guard: &MutexGuard<'_, ()>) -> Result<()> {
-        let t = self.generation_now();
-        let active = self.store.active_leases(t)?;
-        let mut state = lock(&self.proxy_state);
-        let ids: HashSet<&str> = active.iter().map(|l| l.id.as_str()).collect();
-        let before = state.entries.len();
-        state.entries.retain(|id, _| ids.contains(id.as_str()));
-        state.dirty |= state.entries.len() != before;
-        state.suspended.retain(|id, _| ids.contains(id.as_str()));
-        let generation = lock(&self.generation);
+    fn project_generated_entries(state: &mut ProxyState, active: &[LeaseRecord], generation: &generation::GenerationState, t: i64) {
+
         for lease in active.iter().filter(|l| l.source_kind == SourceKind::Generator) {
             match generation.cached.get(&lease.id).filter(|c|
                 c.version == lease.credential_version && c.current.expires_at > t) {
@@ -713,6 +760,20 @@ impl Core {
                 }
             }
         }
+    }
+
+    /// Caller owns generation authorization. No observer callback is invoked here.
+    pub(crate) fn publish_proxy_locked(&self, _guard: &MutexGuard<'_, ()>) -> Result<()> {
+        let t = self.generation_now();
+        let active = self.store.active_leases(t)?;
+        let mut state = lock(&self.proxy_state);
+        let ids: HashSet<&str> = active.iter().map(|l| l.id.as_str()).collect();
+        let before = state.entries.len();
+        state.entries.retain(|id, _| ids.contains(id.as_str()));
+        state.dirty |= state.entries.len() != before;
+        state.suspended.retain(|id, _| ids.contains(id.as_str()));
+        let generation = lock(&self.generation);
+        Self::project_generated_entries(&mut state, &active, &generation, t);
         drop(generation);
         if !state.dirty { return Ok(()); }
         let result = self.proxy.apply_deferred(state.flatten());
@@ -777,7 +838,9 @@ impl Core {
     /// availability changes, and drop ended leases from the proxy.
     pub fn sweep(&self) {
         let t = now();
-        self.expire_requests(t);
+        if let Err(error) = self.expire_requests(t) {
+            log::error!("expiring request records: {}", error.message);
+        }
         self.sweep_generated_at(self.generation_now());
         self.sweep_gcloud_setup(t);
         let _ = self.store.prune_history(t - HISTORY_SECS);
@@ -836,13 +899,19 @@ impl Core {
         }
         self.proxy.shutdown();
         self.registry.shutdown_all();
-        self.finish_generation_shutdown();
         if let Some(rt) = lock(&self.rt).take() {
             rt.shutdown_background();
         }
         self.activity.stop();
-        // Another manager may use the data directory from now on.
-        lock(&self.instance_lock).take();
+        if let Err(error) = self.resume.close() {
+            log::error!("closing restart storage: {}", error.message);
+        }
+        // Release explicitly: a concurrently forked child can temporarily hold a copy of the
+        // same open file description until exec, even when the descriptor is close-on-exec.
+        if let Some(file) = lock(&self.instance_lock).take()
+            && let Err(error) = file.unlock() {
+            log::error!("unlocking manager data directory: {error}");
+        }
     }
 }
 

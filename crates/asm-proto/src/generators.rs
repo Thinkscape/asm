@@ -283,6 +283,7 @@ pub enum GenerationGrant {
     GcloudAccess(GcloudAccessGrant),
 }
 
+/// An operator's approval candidate, not a public wire type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationChoice {
     pub generator_id: String,

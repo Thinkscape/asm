@@ -109,7 +109,7 @@ impl Core {
             return Err(CoreError::invalid("explicit local confirmation is required to delete a Google service account"));
         }
         let uid = target.account_unique_id.as_str();
-        let (account, pending, entry, client, flight, tokens, cutover) = {
+        let (account, pending, entry, client, flight, tokens, cutover, request_cleanup) = {
             let authority = lock(&self.authorization);
             self.check_gcloud_delete_shutdown()?;
             let account = self.store.gcloud_managed_account(target.profile_id)?.ok_or_else(stale_confirmation)?;
@@ -127,10 +127,17 @@ impl Core {
             let pending = self.store.begin_gcloud_account_deletion(&account, target.generator_revision)?;
             self.gcloud_profiles.invalidate_deleted_profile_plans(&account.key);
             let mut tokens = Vec::new();
-            {
-                let mut book = lock(&self.book);
-                book.done.retain(|_, done| !done.generated.as_ref().is_some_and(|delivery| actual.contains(delivery.lease_id.as_str())));
-            }
+            let mut request_cleanup = Ok(());
+            lock(&self.book).done.retain(|id, done| {
+                if done.generated.as_ref().is_some_and(|d| actual.contains(d.lease_id.as_str())) {
+                    if let Err(error) = self.delete_book_row(id) {
+                        request_cleanup = Err(error);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
             for lease in &account.leases {
                 tokens.extend(self.evict_generated_locked(lease, &authority));
             }
@@ -144,16 +151,17 @@ impl Core {
             } else {
                 Ok(())
             };
-            (account, pending, entry, client, flight, tokens, cutover)
+            (account, pending, entry, client, flight, tokens, cutover, request_cleanup)
         };
 
         self.log_gcloud_account_retirement("gcloud_account_deletion_started", "Google service account retirement recorded; local leases removed", &account, &target, None);
-        self.revoke_tokens(tokens, None);
+        self.revoke_tokens(tokens);
         self.notify_proxy_changed();
         self.notify(TOPIC_LEASES);
         self.bump();
         self.notify(TOPIC_REQUESTS);
         self.notify(TOPIC_GCLOUD_ACCOUNTS);
+        request_cleanup?;
 
         let gate = || {
             let _authority = lock(&self.authorization);

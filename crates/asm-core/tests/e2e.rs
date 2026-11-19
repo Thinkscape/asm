@@ -119,10 +119,10 @@ impl AutoApprover {
                     vault_id: vault_id.clone(),
                     collection_id: None,
                 },
-                RequestDetail::Add { targets, .. } => Decision::ApproveWrite {
-                    vault_id: targets[0].vault_id.clone(),
-                    collection_id: None,
-                },
+                RequestDetail::Add { targets, .. } => {
+                    let Some(target) = targets.first() else { continue };
+                    Decision::ApproveWrite { vault_id: target.vault_id.clone(), collection_id: None }
+                }
             };
             let deny = matches!(decision, Decision::Deny { .. });
             if m.resolve_request(p.id.clone(), decision).is_ok() && !deny {
@@ -354,6 +354,7 @@ fn headless_end_to_end() {
         busy: Mutex::new(()),
     });
     let options = StartOptions {
+        resume_key: Some([17; 32]),
         values_root: Some(values_root),
         settings: vec![
             (keys::API_BIND.into(), json!("127.0.0.1")),
@@ -1331,6 +1332,8 @@ impl GeneratedApprover {
             let generation = if generator_choices.is_empty() {
                 None
             } else {
+                assert!(!sentinel_required, "new generated requests cannot require a sentinel");
+                assert!(requested_hosts.is_empty(), "generated requests cannot carry proxy hosts");
                 let selected = generator_choices.iter()
                     .find(|candidate| candidate.choice.name == "review-bot")
                     .or_else(|| (generator_choices.len() == 1).then(|| &generator_choices[0]))
@@ -1368,9 +1371,7 @@ impl GeneratedApprover {
                     grant,
                 }.into())
             };
-            let mode = if *sentinel_required {
-                asm_core::ffi::LeaseMode::Sentinel
-            } else if generation.is_some() || *raw_requested {
+            let mode = if generation.is_some() || *raw_requested {
                 asm_core::ffi::LeaseMode::Raw
             } else {
                 asm_core::ffi::LeaseMode::Sentinel
@@ -1432,6 +1433,24 @@ fn json_get(env: &Env, arguments: &[&str]) -> serde_json::Value {
 fn delivered_path(result: &serde_json::Value) -> PathBuf {
     assert_eq!(result["files"].as_array().unwrap().len(), 1);
     PathBuf::from(result["files"][0]["path"].as_str().unwrap())
+}
+
+fn assert_generated_sentinel_rejected(output: Out) {
+    assert_eq!(output.code, asm_proto::error::EXIT_INVALID, "{}", output.stderr);
+    assert!(output.stderr.contains("generated credentials require raw delivery; remove --sentinel"),
+        "{}", output.stderr);
+    assert!(output.stdout.is_empty(), "rejected request must not deliver a credential");
+}
+
+fn assert_generated_leases_are_raw(manager: &Manager) {
+    let leases = manager.list_leases();
+    let proxy = manager.core().proxy_state.lock().unwrap();
+    for lease in leases.iter().filter(|lease| lease.generation.is_some()) {
+        assert_eq!(lease.mode, asm_core::ffi::LeaseMode::Raw);
+        assert!(lease.hosts.is_empty());
+        assert!(proxy.entries.get(&lease.lease_id).is_none_or(Vec::is_empty),
+            "generated lease must not publish a proxy entry");
+    }
 }
 
 fn wait_until(description: &str, mut ready: impl FnMut() -> bool) {
@@ -1506,6 +1525,7 @@ fn generated_manager(tmp: &Path, ports: &[u16], bin_dir: PathBuf) -> (Arc<Genera
     let manager = Manager::start_with(
         tmp.join("data"), bin_dir, Arc::new(GeneratedObserver(approver.clone())),
         StartOptions {
+            resume_key: Some([18; 32]),
             values_root: Some(tmp.join("values")),
             settings: vec![
                 (keys::API_BIND.into(), json!("127.0.0.1")), (keys::API_PORT.into(), json!(0)),
@@ -1555,8 +1575,8 @@ fn generated_github_lease_end_to_end() {
     let approved_url = upstream.url("/repos/acme/web");
     let outside_url = upstream.url("/repos/acme/private");
     let ports = free_ports(5);
-    let (approver, _shutdown) = generated_manager(tmp.path(), &ports, bin_dir);
-    let manager = _shutdown.0.clone();
+    let (approver, shutdown) = generated_manager(tmp.path(), &ports, bin_dir);
+    let manager = shutdown.0.clone();
     release.install(&manager, "00000000-0000-4000-8000-000000000041", "release-bot");
     review.install(&manager, "00000000-0000-4000-8000-000000000084", "review-bot");
     wait_healthy(&manager);
@@ -1581,14 +1601,29 @@ fn generated_github_lease_end_to_end() {
         .all(|candidate| candidate.get("ceiling").is_none()));
     assert_eq!(release.count() + review.count(), 0, "listing never mints");
 
+    let child_marker = tmp.path().join("sentinel-child-started");
+    assert_generated_sentinel_rejected(env.run(&[
+        "get", "--sentinel", "--hosts", "127.0.0.1", "--no-reaper", "--wait", "30",
+        "--repositories", "acme/web", "--permissions", "contents=read",
+        "GH_TOKEN", "Try an explicitly requested sentinel",
+    ], None));
+    assert_generated_sentinel_rejected(env.run(&[
+        "exec", "--sentinel", "--wait", "30", "--repositories", "acme/web", "--permissions", "contents=read",
+        "GITHUB_TOKEN", "--", "/bin/sh", "-c", r#": > "$1""#, "asm-fixture", child_marker.to_str().unwrap(),
+    ], None));
+    assert!(!child_marker.exists(), "rejected sentinel exec must not launch the child");
+    assert_eq!(release.count() + review.count(), 0, "rejected sentinel requests never mint");
+    assert_eq!(approver.count(), 0);
+    assert!(manager.list_leases().is_empty(), "rejected sentinel requests create no lease");
+
     // One chooser offers both apps; the approval deliberately narrows review's
     // write/two-repository ceiling to one repository with read permission.
     let first = json_get(&env, &[
-        "--sentinel", "--hosts", "127.0.0.1",
         "--repositories", "ACME/web", "--permissions", "contents=read",
-        "GH_TOKEN", "Read acme/web through the proxy",
+        "GH_TOKEN", "Read acme/web directly",
     ]);
-    assert_eq!(first["mode"], "sentinel");
+    assert_eq!(first["mode"], "raw");
+    assert_eq!(first["files"][0]["delivery"], "raw");
     assert_eq!(first["generator_name"], "review-bot");
     assert_eq!(first["credential_version"], 1);
     assert_eq!(first["generation"]["grant"]["scope"]["repositories"], json!([
@@ -1623,106 +1658,58 @@ fn generated_github_lease_end_to_end() {
             else { panic!("requested GitHub scope expected") };
         assert_eq!(scope.repositories.as_deref(), Some(["acme/web".to_owned()].as_slice()));
     }
-    let sentinel_path = delivered_path(&first);
-    let sentinel = std::fs::read_to_string(&sentinel_path).unwrap();
-    assert!(is_sentinel(&sentinel));
-    let (status, _) = via_proxy(ports[0], &approved_url, &sentinel);
-    assert_eq!(status, 200);
-    assert!(upstream_seen.lock().unwrap().last()
-        .is_some_and(|(token, _)| *token == review.token(0)));
-    let (status, _) = via_proxy(ports[0], &outside_url, &sentinel);
-    assert_eq!(status, 403, "an unapproved repository is not accessible");
+    let raw_path = delivered_path(&first);
+    let token = std::fs::read_to_string(&raw_path).unwrap();
+    assert_eq!(token, review.token(0));
+    let direct = reqwest::blocking::Client::builder().no_proxy()
+        .timeout(Duration::from_secs(5)).build().unwrap();
+    let get_status = |url: &str, token: &str| {
+        direct.get(url).header("X-Key", token).send().unwrap().status().as_u16()
+    };
+    assert_eq!(get_status(&approved_url, &token), 200);
+    assert_eq!(get_status(&outside_url, &token), 403, "an unapproved repository is not accessible");
+    assert_generated_leases_are_raw(&manager);
 
     // Alias reuse is one grant/version, not a second issuance or approval.
     let alias = json_get(&env, &[
-        "--sentinel", "--repositories", "acme/web", "--permissions", "contents=read", "GITHUB_TOKEN", "Continue reading acme/web",
+        "--repositories", "acme/web", "--permissions", "contents=read", "GITHUB_TOKEN", "Continue reading acme/web",
     ]);
     let alias_path = delivered_path(&alias);
     assert_eq!(alias["lease_id"], first["lease_id"]);
     assert_eq!(alias["credential_version"], 1);
-    assert_eq!(std::fs::read_to_string(&alias_path).unwrap(), sentinel);
-    assert_ne!(alias_path, sentinel_path);
+    assert_eq!(std::fs::read_to_string(&alias_path).unwrap(), token);
+    assert_ne!(alias_path, raw_path);
     assert_eq!(review.count(), 1);
 
-    // A real refresh changes the upstream credential while preserving sentinel,
-    // immutable grant, lease id and authorization deadline. Only this replacement
-    // has a short provider deadline so the production expiry wake can be observed.
+    // Refresh rewrites every local alias view without changing the grant or
+    // authorization deadline. Give this replacement a short provider lifetime.
     review.state.lock().unwrap().next_lifetime = 8;
     let refreshed = json_get(&env, &[
-        "--lease", &lease_id, "--refresh", "--sentinel",
+        "--lease", &lease_id, "--refresh",
         "GITHUB_TOKEN", "Rotate the approved installation token",
     ]);
     assert_eq!(refreshed["lease_id"], first["lease_id"]);
     assert_eq!(refreshed["expires_at"], deadline);
     assert_eq!(refreshed["generation"], first["generation"]);
     assert_eq!(refreshed["credential_version"], 2);
-    assert_eq!(std::fs::read_to_string(&sentinel_path).unwrap(), sentinel);
-    assert_eq!(std::fs::read_to_string(&alias_path).unwrap(), sentinel);
+    assert_eq!(std::fs::read_to_string(&raw_path).unwrap(), review.token(1));
+    assert_eq!(std::fs::read_to_string(&alias_path).unwrap(), review.token(1));
     assert!(review.was_revoked(&review.token(0)), "explicit refresh revokes its predecessor");
-    let (status, _) = via_proxy(ports[0], &approved_url, &sentinel);
-    assert_eq!(status, 200);
-    assert!(upstream_seen.lock().unwrap().last()
-        .is_some_and(|(token, _)| *token == review.token(1)));
-    wait_until("provider-expired sentinel suspension", || {
+    assert_eq!(get_status(&approved_url, &token), 403, "revoked predecessor cannot access the resource");
+    wait_until("provider-expired credential suspension", || {
         manager.list_leases().iter().any(|lease| lease.lease_id == lease_id && lease.suspended)
     });
-    wait_until("expired credential removal at the proxy", || {
-        let before = upstream_seen.lock().unwrap().len();
-        via_proxy(ports[0], &approved_url, &sentinel).0 == 403
-            && upstream_seen.lock().unwrap().len() == before
-    });
-    let before = upstream_seen.lock().unwrap().len();
-    let (status, _) = via_proxy(ports[0], &approved_url, &sentinel);
-    assert_eq!(status, 403);
-    assert_eq!(upstream_seen.lock().unwrap().len(), before, "expired token never forwarded");
+    assert_eq!(get_status(&approved_url, &review.token(1)), 403, "the provider enforces token expiry");
     assert_eq!(review.count(), 2, "sweeping/listing does not renew credentials");
-    assert!(sentinel_path.exists(), "provider expiry does not end a sentinel lease file");
     let resumed = json_get(&env, &[
         "--lease", &lease_id, "GH_TOKEN", "Resume the same approved grant",
     ]);
     assert_eq!(resumed["credential_version"], 3);
     assert_eq!(resumed["expires_at"], deadline);
-    assert_eq!(std::fs::read_to_string(&sentinel_path).unwrap(), sentinel);
+    assert_eq!(resumed["generation"], first["generation"]);
+    assert_eq!(std::fs::read_to_string(delivered_path(&resumed)).unwrap(), review.token(2));
     assert_eq!(approver.count(), 1, "renewal needs no new operator decision");
-    let (status, _) = via_proxy(ports[0], &approved_url, &sentinel);
-    assert_eq!(status, 200);
-    assert!(upstream_seen.lock().unwrap().last()
-        .is_some_and(|(token, _)| *token == review.token(2)));
-    manager.revoke_lease(lease_id.clone()).unwrap();
-    let before = upstream_seen.lock().unwrap().len();
-    assert_eq!(via_proxy(ports[0], &approved_url, &sentinel).0, 403);
-    assert_eq!(upstream_seen.lock().unwrap().len(), before);
-    assert!(review.was_revoked(&review.token(2)));
-    let ended = env.run(&[
-        "get", "--no-reaper", "--lease", &lease_id, "GITHUB_TOKEN", "Do not rebind",
-    ], None);
-    assert_eq!(ended.code, 3, "ended --lease must be terminal: {}", ended.stderr);
-    assert_eq!(review.count(), 3, "revoked lease cannot mint");
-
-    // Fresh generated approvals default raw. Both local aliases stay attached to
-    // one durable version and every known get view is rewritten on refresh.
-    let raw = json_get(&env, &["--new-lease", "--repositories", "acme/web", "--permissions", "contents=read", "GH_TOKEN", "Read acme/web directly"]);
-    assert_eq!(raw["mode"], "raw");
-    let raw_id = raw["lease_id"].as_str().unwrap().to_owned();
-    let raw_path = delivered_path(&raw);
-    let raw_alias = json_get(&env, &["--repositories", "acme/web", "--permissions", "contents=read", "GITHUB_TOKEN", "Use the same direct credential"]);
-    let raw_alias_path = delivered_path(&raw_alias);
-    assert_eq!(raw_alias["lease_id"], raw["lease_id"]);
-    assert_eq!(raw_alias["credential_version"], raw["credential_version"]);
-    assert_eq!(std::fs::read_to_string(&raw_path).unwrap(), review.token(3));
-    assert_eq!(std::fs::read_to_string(&raw_alias_path).unwrap(), review.token(3));
-    let raw_rotated = json_get(&env, &[
-        "--lease", &raw_id, "--refresh", "GITHUB_TOKEN", "Rotate both local alias views",
-    ]);
-    assert_eq!(raw_rotated["credential_version"], 2);
-    assert_eq!(raw_rotated["expires_at"], raw["expires_at"]);
-    assert_eq!(std::fs::read_to_string(&raw_path).unwrap(), review.token(4));
-    assert_eq!(std::fs::read_to_string(&raw_alias_path).unwrap(), review.token(4));
-    assert!(review.was_revoked(&review.token(3)));
-    let direct = reqwest::blocking::Client::builder().no_proxy()
-        .timeout(Duration::from_secs(5)).build().unwrap();
-    assert_eq!(direct.get(&approved_url).header("X-Key", review.token(3))
-        .send().unwrap().status().as_u16(), 403, "revoked raw predecessor cannot access the resource");
+    assert_eq!(get_status(&approved_url, &review.token(2)), 200);
 
     let exec_env = Env {
         cli, config: env.config.clone(), secrets: tmp.path().join("exec-must-not-write"),
@@ -1735,6 +1722,8 @@ test "$GH_TOKEN" = "$GITHUB_TOKEN"
 test "$GH_TOKEN" != stale-gh
 test "$GITHUB_TOKEN" != stale-github
 test "$HTTP_PROXY" = caller-network
+test "$https_proxy" = caller-lowercase-proxy
+test "$SSL_CERT_FILE" = caller-ca
 test "$3" = 'literal;$(not-a-command)'
 curl --noproxy '*' -fsS -o /dev/null -H "X-Key: $GH_TOKEN" "$1"
 test "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H "X-Key: $GITHUB_TOKEN" "$2")" = 403
@@ -1746,9 +1735,14 @@ printf 'raw-child-ok\n'"#;
     ], None, &[
         ("GH_TOKEN", "stale-gh"), ("GITHUB_TOKEN", "stale-github"),
         ("HTTP_PROXY", "caller-network"),
+        ("https_proxy", "caller-lowercase-proxy"), ("SSL_CERT_FILE", "caller-ca"),
     ]);
     assert_eq!(output.code, 0, "raw exec failed: {}", output.stderr);
     assert_eq!(output.stdout, "raw-child-ok\n");
+    assert_eq!(upstream_seen.lock().unwrap().as_slice().last_chunk::<2>().unwrap(), &[
+        (review.token(2), "/repos/acme/web".to_owned()),
+        (review.token(2), "/repos/acme/private".to_owned()),
+    ], "the child used the exact cached raw token");
     assert_eq!(review.count(), minted, "both aliases acquire one cached credential");
     assert_eq!(approver.count(), approvals);
     assert_eq!(file_snapshot(&env.secrets), saved_files);
@@ -1782,53 +1776,28 @@ printf 'two-apps-ok\n'"#;
     assert_eq!(review.count(), minted + 1);
     assert!(!exec_env.secrets.exists());
 
-    // The actual exec sentinel path obtains its proxy/CA environment itself,
-    // replaces lowercase overrides, and forwards only the selected app's token.
-    let sentinel_child = r#"set -eu
-test "$GH_TOKEN" = "$GITHUB_TOKEN"
-case "$GH_TOKEN" in asm_*) ;; *) exit 81 ;; esac
-test -n "$HTTP_PROXY"
-test -n "$HTTPS_PROXY"
-test -r "$SSL_CERT_FILE"
-test -z "${http_proxy+x}"
-test -z "${https_proxy+x}"
-test -z "${all_proxy+x}"
-curl --noproxy '' -fsS -o /dev/null -H "X-Key: $GH_TOKEN" "$1"
-printf 'sentinel-child-ok\n'"#;
-    let output = exec_env.run_env(&[
-        "exec", "--sentinel", "--hosts", "127.0.0.1", "--wait", "30", "--repositories", "acme/web", "--permissions", "contents=read",
-        "GITHUB_TOKEN", "--", "/bin/sh", "-c", sentinel_child,
-        "asm-fixture", &approved_url,
-    ], None, &[
-        ("http_proxy", "http://127.0.0.1:1"),
-        ("https_proxy", "http://127.0.0.1:1"),
-        ("all_proxy", "http://127.0.0.1:1"),
-    ]);
-    assert_eq!(output.code, 0, "sentinel exec failed: {}", output.stderr);
-    assert_eq!(output.stdout, "sentinel-child-ok\n");
-    assert_eq!(file_snapshot(&env.secrets), saved_files, "exec never synchronizes get files");
-    assert!(!exec_env.secrets.exists());
+    manager.revoke_lease(lease_id.clone()).unwrap();
+    assert!(review.was_revoked(&review.token(2)));
+    assert_eq!(get_status(&approved_url, &review.token(2)), 403);
+    let ended = env.run(&[
+        "get", "--no-reaper", "--lease", &lease_id, "GITHUB_TOKEN", "Do not rebind",
+    ], None);
+    assert_eq!(ended.code, 3, "ended --lease must be terminal: {}", ended.stderr);
+    assert_eq!(review.count(), minted + 1, "revoked lease cannot mint");
 
     // Ending authorization, unlike provider expiry, permanently ends exact-lease
     // renewal and revokes its still-valid GitHub token.
     let short = json_get(&env, &[
-        "--new-lease", "--sentinel", "--hosts", "127.0.0.1", "--repositories", "acme/web", "--permissions", "contents=read",
+        "--new-lease", "--repositories", "acme/web", "--permissions", "contents=read",
         "release-bot/GH_TOKEN", "short-generated-lease",
     ]);
     let short_id = short["lease_id"].as_str().unwrap();
-    let short_sentinel = std::fs::read_to_string(delivered_path(&short)).unwrap();
-    assert_eq!(via_proxy(ports[0], &approved_url, &short_sentinel).0, 200);
+    let short_token = std::fs::read_to_string(delivered_path(&short)).unwrap();
+    assert_eq!(short_token, release.token(1));
     wait_until("generated authorization expiry", || manager.list_leases().iter()
         .any(|lease| lease.lease_id == short_id && lease.status == asm_core::ffi::LeaseStatus::Expired));
-    wait_until("expired authorization removal at the proxy", || {
-        let before = upstream_seen.lock().unwrap().len();
-        via_proxy(ports[0], &approved_url, &short_sentinel).0 == 403
-            && upstream_seen.lock().unwrap().len() == before
-    });
-    let before = upstream_seen.lock().unwrap().len();
-    assert_eq!(via_proxy(ports[0], &approved_url, &short_sentinel).0, 403);
-    assert_eq!(upstream_seen.lock().unwrap().len(), before);
-    wait_until("expired lease provider revocation", || release.was_revoked(&release.token(1)));
+    wait_until("expired lease provider revocation", || release.was_revoked(&short_token));
+    assert_eq!(get_status(&approved_url, &short_token), 403);
     let minted = release.count();
     let output = env.run(&[
         "get", "--no-reaper", "--lease", short_id,
@@ -1847,11 +1816,15 @@ printf 'sentinel-child-ok\n'"#;
         client_secret: String::new(), master_password: String::new(),
     }).unwrap();
     let output = exec_env.run(&[
-        "exec", "--wait", "30", "--repositories", "acme/web", "--permissions", "contents=read", "GH_TOKEN,OTHER_SECRET", "--", "/bin/sh", "-c",
-        r#"set -eu; test "$GH_TOKEN" = "$GITHUB_TOKEN"; test -n "$HTTPS_PROXY"; case "$OTHER_SECRET" in asm_*) ;; *) exit 82 ;; esac; printf 'all-acquired-ok\n'"#,
+        "exec", "--hosts", "127.0.0.2", "--wait", "30", "--repositories", "acme/web", "--permissions", "contents=read",
+        "GH_TOKEN,OTHER_SECRET", "--", "/bin/sh", "-c",
+        r#"set -eu; test "$GH_TOKEN" = "$GITHUB_TOKEN"; case "$GH_TOKEN" in fixture.*.installation-token) ;; *) exit 81 ;; esac; test -n "$HTTPS_PROXY"; case "$OTHER_SECRET" in asm_*) ;; *) exit 82 ;; esac; printf 'all-acquired-ok\n'"#,
     ], None);
     assert_eq!(output.code, 0, "multi-secret exec failed: {}", output.stderr);
     assert_eq!(output.stdout, "all-acquired-ok\n");
+    let static_lease = manager.list_leases().into_iter().find(|lease| lease.name == "OTHER_SECRET").unwrap();
+    assert_eq!(static_lease.mode, asm_core::ffi::LeaseMode::Sentinel);
+    assert_eq!(static_lease.hosts, ["127.0.0.2"]);
     assert!(!exec_env.secrets.exists());
 
     // Shipped structured-field examples run through the real manager/CLI.
@@ -1936,12 +1909,10 @@ printf 'structured-child-ok\n'"#;
     let release_count = release.count();
     assert_eq!(review.state.lock().unwrap().repository_checks, review_count);
     assert_eq!(release.state.lock().unwrap().repository_checks, release_count);
-    review.http.assert_clean();
-    release.http.assert_clean();
     upstream.assert_clean();
 
-    // Configuration, SQLite and audit surfaces contain metadata only. Private
-    // proxy material is intentionally excluded: it is the sentinel data plane.
+    assert_generated_leases_are_raw(&manager);
+    // Configuration, SQLite and audit surfaces contain metadata only.
     for path in [
         tmp.path().join("data/asm.db"),
         tmp.path().join("data/asm.db-wal"),
@@ -1959,10 +1930,13 @@ printf 'structured-child-ok\n'"#;
         let display = format!("{} {:?}", activity.summary, activity.detail);
         assert!(!display.contains("installation-token") && !display.contains("BEGIN RSA PRIVATE KEY"));
     }
-    drop(_shutdown);
-    assert!(release.was_revoked(&release.token(0)), "shutdown revokes live raw credentials");
-    assert!(review.was_revoked(&review.token(review.count() - 1)),
-        "shutdown revokes the final sentinel credential");
+    let prior_release_revokes = release.state.lock().unwrap().revoked.clone();
+    let prior_review_revokes = review.state.lock().unwrap().revoked.clone();
+    drop(shutdown);
+    assert_eq!(release.state.lock().unwrap().revoked, prior_release_revokes, "shutdown must not revoke release credentials");
+    assert_eq!(review.state.lock().unwrap().revoked, prior_review_revokes, "shutdown must not revoke review credentials");
+    review.http.assert_clean();
+    release.http.assert_clean();
 }
 
 #[path = "e2e/gcloud.rs"]

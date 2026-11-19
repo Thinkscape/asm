@@ -56,12 +56,23 @@ impl Core {
         let (status, secret_count, note) = match self.registry.get(&rec.id) {
             Some(v) => {
                 let status = v.provider.status();
-                let count = if status == VaultStatus::Ready {
-                    v.provider.list().ok().map(|l| l.len() as u32)
-                } else {
-                    None
+                let listed_count = (status == VaultStatus::Ready)
+                    .then(|| v.provider.list().map(|secrets| secrets.len() as u32));
+                let mut note = v.provider.note();
+                let count = match listed_count {
+                    Some(Ok(count)) => Some(count),
+                    Some(Err(error)) => {
+                        let note = note.get_or_insert_with(String::new);
+                        if !note.is_empty() {
+                            note.push('\n');
+                        }
+                        note.push_str("Could not list secrets: ");
+                        note.push_str(&error.message);
+                        None
+                    }
+                    None => None,
                 };
-                (status.into(), count, v.provider.note())
+                (status.into(), count, note)
             }
             None => {
                 let msg = lock(&self.vault_errors)
@@ -95,7 +106,7 @@ impl Core {
     /// Build (or rebuild) the provider of a stored vault and register it.
     fn start_vault(&self, rec: &VaultRecord) {
         let cfg = effective_config(&self.settings(), &rec.config);
-        match Registry::build_provider(&self.dirs, &rec.id, &cfg) {
+        match Registry::build_provider_resumable(&self.dirs, &rec.id, &cfg, self.resume.clone()) {
             Ok(provider) => {
                 lock(&self.vault_errors).remove(&rec.id);
                 self.registry.insert(VaultEntry {
@@ -106,9 +117,7 @@ impl Core {
                 });
             }
             Err(e) => {
-                if let Some(old) = self.registry.remove(&rec.id) {
-                    drop(old);
-                }
+                let _ = self.registry.remove(&rec.id);
                 lock(&self.vault_errors).insert(rec.id.clone(), e.message);
             }
         }
@@ -194,6 +203,39 @@ impl Core {
             config,
             position,
         };
+        if let (Some(VaultConfig::Bitwarden(old)), VaultConfig::Bitwarden(new)) =
+            (current.as_ref().map(|c| &c.config), &rec.config)
+        {
+            let changed_login = !draft.client_secret.is_empty()
+                || old.server_url != new.server_url
+                || old.email != new.email
+                || old.client_id != new.client_id;
+            if changed_login || !old.same_connection(new) {
+                let retired = self.registry.remove(&id);
+                let leases = self.store.active_leases(now())?;
+                self.sync_proxy_with(false, |state| {
+                    for lease in leases.iter().filter(|l| {
+                        l.source_kind == SourceKind::Vault && l.vault_id == id
+                            && l.mode == LeaseMode::Sentinel
+                            && l.fields.iter().any(|f| f.sentinel.is_some())
+                    }) {
+                        state.dirty |= state.entries.remove(&lease.id).is_some();
+                        state.suspended.insert(lease.id.clone(), "Bitwarden connection changed".into());
+                    }
+                });
+                if retired?.is_none() {
+                    bitwarden::forget_session(&self.resume, &id)?;
+                }
+                if changed_login {
+                    // The SDK's own cached API login must not survive credential replacement.
+                    match std::fs::remove_dir_all(self.dirs.bw_vault(&id)) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+        }
         self.store.upsert_vault(&rec)?;
         if matches!(rec.config, VaultConfig::Bitwarden(_)) && !draft.client_secret.is_empty() {
             if let Err(e) = creds::set(&id, creds::CLIENT_SECRET, &draft.client_secret) {
@@ -351,7 +393,10 @@ impl Core {
             .into_iter()
             .find(|v| v.id == id)
             .ok_or_else(|| CoreError::not_found("no such vault"))?;
-        self.registry.remove(id);
+        let removed = self.registry.remove(id)?;
+        if removed.is_none() && matches!(rec.config, VaultConfig::Bitwarden(_)) {
+            bitwarden::forget_session(&self.resume, id)?;
+        }
         lock(&self.vault_errors).remove(id);
         self.store.delete_vault(id)?;
         if matches!(rec.config, VaultConfig::Bitwarden(_)) {
@@ -650,12 +695,12 @@ impl Core {
             self.log(Event::new(Category::Pairing, "revoked", format!("host {} revoked", host.label()))
                 .host(Some(host_id)).detail(serde_json::json!({ "hostname": host.info.hostname, "address": host.address })));
         }
-        self.cancel_host_requests(host_id);
+        let cancelled = self.cancel_host_requests(host_id);
         self.sync_proxy(false);
-        self.revoke_tokens(tokens, None);
+        self.revoke_tokens(tokens);
         self.notify(TOPIC_HOSTS);
         self.notify(TOPIC_LEASES);
-        Ok(())
+        cancelled
     }
 
     /// Set a host's friendly name (rules of [`super::pairing::host_name`]; empty = its
@@ -836,7 +881,7 @@ impl Core {
             } else { Vec::new() }
         };
         self.sync_proxy(false);
-        self.revoke_tokens(tokens, None);
+        self.revoke_tokens(tokens);
         self.notify(TOPIC_LEASES);
         Ok(())
     }

@@ -304,8 +304,8 @@ fn get_result(content: &str) -> Value {
 
 fn get_result_expiring(content: &str, expires_at: &str) -> Value {
     json!({"lease_id":LEASE,"mode":"sentinel","hosts":["api.example.com"],"expires_at":expires_at,
-        "files":[{"field":"username","relative_path":"work/GitHub.username","content":"octocat"},
-                 {"field":"password","relative_path":"work/GitHub.password","content":content}]})
+        "files":[{"field":"username","relative_path":"work/GitHub.username","content":"octocat","substituted":false},
+                 {"field":"password","relative_path":"work/GitHub.password","content":content,"substituted":true}]})
 }
 
 fn requests_handler(outcome: &'static str) -> Arc<Handler> {
@@ -453,9 +453,15 @@ fn get_writes_files_and_prints_block() {
             .as_ref()
     );
     assert!(j["files"][1].get("content").is_none());
+    assert_eq!(j["files"][0]["delivery"], "raw");
+    assert_eq!(j["files"][1]["delivery"], "sentinel");
+    let receipt = text(&out.stderr);
+    assert!(receipt.contains("work/GitHub.password: sentinel"));
+    assert!(receipt.contains("eval \"$(asm proxy-env)\"") && receipt.contains("asm exec --sentinel"));
+    assert!(!receipt.contains("octocat") && !receipt.contains("asm_0123456789"));
     let out = asm(&e, &["list"], "");
     assert_eq!(text(&out.stdout), "work/GitHub\n");
-    assert!(text(&out.stderr).contains("warning: other: locked"));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
     assert!(
         !e.secrets.join("work").exists(),
         "inactive lease files removed"
@@ -704,7 +710,7 @@ fn reaper_lock_admits_one_instance() {
 fn generator_catalog() -> Value {
     json!({"secrets":[
         {"name":"GH_TOKEN","aliases":["GITHUB_TOKEN"],"source_kind":"generator","vault":"GitHub App","kind":"single","fields":["value"],"lease":null,
-         "generators":[{"generator_id":"app-a","name":"release-bot","available":true},{"generator_id":"app-b","name":"review-bot","available":true}]},
+         "generators":[{"generator_id":"app-a","name":"release-bot"},{"generator_id":"app-b","name":"review-bot"}]},
         {"name":"OTHER_SECRET","vault":"work","kind":"single","fields":["actual_field"],"lease":null},
         {"name":"Vaultwarden/google","vault":"Vaultwarden","kind":"login","fields":["username","password"],"lease":null},
         {"name":"A=b","vault":"work","kind":"single","fields":["value"],"lease":null},
@@ -712,7 +718,7 @@ fn generator_catalog() -> Value {
         {"name":"item\\name","vault":"work","kind":"single","fields":["value"],"lease":null},
         {"name":"work/item,with,commas","vault":"work","kind":"single","fields":["field"],"lease":null},
         {"name":"work/item::literal","vault":"work","kind":"single","fields":["value"],"lease":null}
-    ],"warnings":[]})
+    ]})
 }
 
 /// Stateful manager fixture: no Keychain, provider, or credential-file dependency.
@@ -760,6 +766,13 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
             }
             ("GET", "/v1/secrets") => {
                 let mut catalog = generator_catalog();
+                if scenario == "legacy-catalog-status" {
+                    catalog["warnings"] = json!(["other: vault is locked"]);
+                    catalog["secrets"][0]["generators"][0]["available"] = json!(true);
+                    catalog["secrets"][0]["generators"][1]["available"] = json!(false);
+                    catalog["secrets"][0]["generators"][1]["unavailable_reason"] =
+                        json!("private credential diagnostic");
+                }
                 if scenario == "mixed-providers" || managed_google {
                     let name = if scenario == "managed-google-collision" {
                         "gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN"
@@ -768,7 +781,7 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                     };
                     catalog["secrets"].as_array_mut().unwrap().push(json!({
                         "name":name,"source_kind":"generator","vault":"gcloud-dev","kind":"single","fields":["value"],"lease":null,
-                        "generators":[{"generator_id":"gcp","name":"gcloud-dev","available":true}]
+                        "generators":[{"generator_id":"gcp","name":"gcloud-dev"}]
                     }));
                 }
                 if scenario == "managed-google-collision" {
@@ -799,7 +812,7 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                             }));
                         }
                     }
-                    catalog = json!({"secrets":secrets,"warnings":[]});
+                    catalog = json!({"secrets":secrets});
                 }
                 if scenario == "no-catalog" {
                     return (
@@ -864,6 +877,11 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                     name,
                     "GH_TOKEN" | "GITHUB_TOKEN" | "release-bot/GH_TOKEN" | "review-bot/GH_TOKEN"
                 ));
+                if generated {
+                    assert_eq!(body["raw"], true);
+                    assert_eq!(body["sentinel"], false);
+                    assert_eq!(body["hosts"], json!([]));
+                }
                 let review = name.starts_with("review-bot/");
                 let id = if generated {
                     if gcloud {
@@ -913,7 +931,9 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                             },
                     )
                 };
-                let mode = if body["sentinel"] == true || (scenario == "sentinel" && !generated) {
+                let unexpectedly_sentinel = generated && matches!(scenario,
+                    "legacy-generated-sentinel" | "managed-google-legacy-sentinel");
+                let mode = if body["sentinel"] == true || (scenario == "sentinel" && !generated) || unexpectedly_sentinel {
                     "sentinel"
                 } else {
                     "raw"
@@ -1008,7 +1028,8 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                     let value = if scenario == "nul" {"fixture\0secret".to_owned()} else if scenario == "raw-prefix" {"asm_raw_not_a_sentinel".to_owned()} else if generated {
                         format!("fixture-{}-v{version}", if gcloud {"gcloud"} else if review {"review"} else {"release"})
                     } else if field == "username" {"octocat".to_owned()} else if field == "password" {"fixture-password".to_owned()} else {"fixture-other".to_owned()};
-                    let substituted = mode == "sentinel" && field != "username";
+                    let substituted = (mode == "sentinel" && field != "username")
+                        || (generated && scenario == "legacy-generated-raw-substituted");
                     json!({"field":field,"relative_path":if generated {output.to_owned()} else if name == "Vaultwarden/google" {format!("{name}.{field}")} else {name.replace('\\', "_")},
                         "content":if substituted {format!("asm_fixture_{field}")} else {value},"substituted":substituted})
                 }).collect::<Vec<_>>();
@@ -1086,6 +1107,109 @@ fn posted(f: &Fake) -> Vec<Value> {
         .filter(|(m, p, _)| m == "POST" && p == "/v1/requests")
         .map(|(_, _, b)| b.clone())
         .collect()
+}
+
+#[test]
+fn generated_get_and_exec_reject_sentinel_and_generated_only_host_restrictions_before_posting() {
+    for (output, scope) in [
+        ("GITHUB_TOKEN", ["--repositories", GITHUB_REPOSITORY]),
+        (GCLOUD_NAME, ["--gcloud-scope", GCLOUD_LEGACY_SCOPE]),
+    ] {
+        let (f, e) = launcher_fixture("mixed-providers");
+        for (mode, error) in [
+            (&["--sentinel", "--hosts", "api.example.com"][..], "remove --sentinel"),
+            (&["--hosts", "api.example.com"][..], "remove --hosts"),
+        ] {
+            let mut get = vec!["get"];
+            get.extend_from_slice(mode);
+            get.extend(scope);
+            get.extend([output, "Read credential"]);
+            let out = asm(&e, &get, "");
+            assert_eq!(out.status.code(), Some(2), "{get:?}: {}", text(&out.stderr));
+            assert!(text(&out.stderr).contains(error));
+            assert!(out.stdout.is_empty());
+            assert!(!e.secrets.join(output).exists());
+
+            let mut exec = vec!["exec"];
+            exec.extend_from_slice(mode);
+            exec.extend(scope);
+            exec.extend([output, "--", "/bin/echo", "should not run"]);
+            let out = asm(&e, &exec, "");
+            assert_eq!(out.status.code(), Some(2), "{exec:?}: {}", text(&out.stderr));
+            assert!(text(&out.stderr).contains(error));
+            assert!(out.stdout.is_empty());
+        }
+
+        let mixed = format!("OTHER_SECRET,{output}");
+        let out = asm(&e, &[
+            "exec", "--sentinel", scope[0], scope[1], &mixed, "--", "/bin/echo", "should not run",
+        ], "");
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("remove --sentinel"));
+        assert!(out.stdout.is_empty());
+        assert!(posted(&f).is_empty(), "not even the first static constituent may be posted");
+    }
+}
+
+#[test]
+fn get_and_exec_refuse_a_legacy_manager_generated_sentinel_result() {
+    for (scenario, output, scope, error) in [
+        ("legacy-generated-sentinel", "GH_TOKEN", vec!["--repositories", GITHUB_REPOSITORY],
+            "sentinel delivery for a new generated credential"),
+        ("managed-google-legacy-sentinel", GCLOUD_NAME, vec!["--project", GCLOUD_PROJECT, "--permissions", "storage=read"],
+            "sentinel delivery for a new generated credential"),
+        ("legacy-generated-raw-substituted", "GH_TOKEN", vec!["--repositories", GITHUB_REPOSITORY],
+            "inconsistent get result"),
+    ] {
+        let (f, e) = launcher_fixture(scenario);
+        let mut get = vec!["get", "--json"];
+        get.extend_from_slice(&scope);
+        get.extend([output, "Read credential"]);
+        let out = asm(&e, &get, "");
+        assert_eq!(out.status.code(), Some(1), "{scenario}: {}", text(&out.stderr));
+        assert!(text(&out.stderr).contains(error));
+        assert!(out.stdout.is_empty());
+        assert!(!e.secrets.join(output).exists());
+        assert!(!e.secrets.join(".leases.json").exists());
+
+        let mut exec = vec!["exec"];
+        exec.extend_from_slice(&scope);
+        exec.extend([output, "--", "/bin/echo", "should not run"]);
+        let out = asm(&e, &exec, "");
+        assert_eq!(out.status.code(), Some(1), "{scenario}: {}", text(&out.stderr));
+        assert!(text(&out.stderr).contains(error));
+        assert!(out.stdout.is_empty());
+        assert!(!f.log.lock().unwrap().iter().any(|(_, p, _)| p == "/v1/proxy-info"));
+        assert_eq!(posted(&f).len(), 2);
+    }
+}
+
+#[test]
+fn legacy_catalog_readiness_is_not_printed_or_used_for_bindings() {
+    let (f, e) = launcher_fixture("legacy-catalog-status");
+    let plain = asm(&e, &["list"], "");
+    assert!(plain.status.success(), "{}", text(&plain.stderr));
+    assert!(plain.stderr.is_empty(), "{}", text(&plain.stderr));
+    assert!(text(&plain.stdout).starts_with("GH_TOKEN\nGITHUB_TOKEN\n"));
+
+    let json = asm(&e, &["list", "--json"], "");
+    assert!(json.status.success(), "{}", text(&json.stderr));
+    assert!(json.stderr.is_empty(), "{}", text(&json.stderr));
+    let catalog: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(catalog.get("warnings").is_none());
+    assert_eq!(catalog["secrets"][0]["generators"], json!([
+        {"generator_id":"app-a", "name":"release-bot"},
+        {"generator_id":"app-b", "name":"review-bot"}
+    ]));
+
+    let bound = asm(&e, &[
+        "get", "--repositories", GITHUB_REPOSITORY, "TOKEN=review-bot/GH_TOKEN", "Read acme/web",
+    ], "");
+    assert!(bound.status.success(), "{}", text(&bound.stderr));
+    let requests = posted(&f);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["name"], "review-bot/GH_TOKEN");
+    assert_eq!(std::fs::read_to_string(e.secrets.join("TOKEN")).unwrap(), "fixture-review-v1");
 }
 
 #[test]
@@ -1174,7 +1298,7 @@ fn get_sends_exact_google_scopes_and_uses_the_google_output_name() {
     let scope = "https://www.googleapis.com/auth/devstorage.read_only";
     let out = asm(
         &e,
-        &["get", "--json", "--raw", "--gcloud-scope", scope, "CLOUDSDK_AUTH_ACCESS_TOKEN", "Read demo storage"],
+        &["get", "--json", "--gcloud-scope", scope, "CLOUDSDK_AUTH_ACCESS_TOKEN", "Read demo storage"],
         "",
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -1687,16 +1811,14 @@ fn exec_sentinel_proxy_settings_are_automatic_and_plain_fields_skip_them() {
         &e,
         &[
             "exec",
-            "--repositories",
-            GITHUB_REPOSITORY,
-            "--sentinel",
             "--hosts",
-            "api.github.com",
-            "GH_TOKEN",
+            "api.example.com",
+            "--sentinel",
+            "OTHER_SECRET",
             "--",
             "/bin/sh",
             "-c",
-            "test \"$GH_TOKEN\" = asm_fixture_value && test \"$GITHUB_TOKEN\" = \"$GH_TOKEN\" && test -n \"$HTTPS_PROXY\" && test \"$HTTP_PROXY\" = \"$HTTPS_PROXY\" && test \"$ALL_PROXY\" = \"$HTTPS_PROXY\" && test -z \"$https_proxy$http_proxy$all_proxy$no_proxy$ssl_cert_file$requests_ca_bundle$curl_ca_bundle$git_ssl_cainfo$node_extra_ca_certs\" && test -f \"$SSL_CERT_FILE\" && printf proxy-ok",
+            "test \"$OTHER_SECRET\" = asm_fixture_actual_field && test -n \"$HTTPS_PROXY\" && test \"$HTTP_PROXY\" = \"$HTTPS_PROXY\" && test \"$ALL_PROXY\" = \"$HTTPS_PROXY\" && test -z \"$https_proxy$http_proxy$all_proxy$no_proxy$ssl_cert_file$requests_ca_bundle$curl_ca_bundle$git_ssl_cainfo$node_extra_ca_certs\" && test -f \"$SSL_CERT_FILE\" && printf proxy-ok",
         ],
         "",
         &[
@@ -1749,10 +1871,8 @@ fn exec_sentinel_proxy_settings_are_automatic_and_plain_fields_skip_them() {
         &e,
         &[
             "exec",
-            "--repositories",
-            GITHUB_REPOSITORY,
             "--sentinel",
-            "GH_TOKEN",
+            "OTHER_SECRET",
             "--",
             "/bin/sh",
             "-c",
@@ -1785,13 +1905,14 @@ fn github_scope_is_required_before_posting_new_requests() {
 #[test]
 fn static_github_spelling_does_not_turn_into_a_scope_request() {
     let (f, e) = launcher_fixture("alias-collision");
-    let get = asm(&e, &["get", "work/GH_TOKEN", "Read a static secret"], "");
+    let get = asm(&e, &["get", "--sentinel", "work/GH_TOKEN", "Read a static secret"], "");
     assert!(get.status.success(), "{}", text(&get.stderr));
+    assert_eq!(std::fs::read_to_string(e.secrets.join("work/GH_TOKEN")).unwrap(), "asm_fixture_value");
     let exec = asm(
         &e,
         &[
-            "exec", "TOKEN=work/GH_TOKEN", "--", "/bin/sh", "-c",
-            "test \"$TOKEN\" = fixture-other",
+            "exec", "--sentinel", "TOKEN=work/GH_TOKEN", "--", "/bin/sh", "-c",
+            "test \"$TOKEN\" = asm_fixture_value",
         ],
         "",
     );
@@ -1805,7 +1926,8 @@ fn static_github_spelling_does_not_turn_into_a_scope_request() {
     assert!(text(&ignored_scope.stderr).contains("generated GitHub"));
     let sent = posted(&f);
     assert_eq!(sent.len(), 2);
-    assert!(sent.iter().all(|body| body["name"] == "work/GH_TOKEN" && body["generation"].is_null()));
+    assert!(sent.iter().all(|body| body["name"] == "work/GH_TOKEN" && body["generation"].is_null()
+        && body["sentinel"] == true && body["raw"] == false));
 }
 
 #[test]
@@ -2108,6 +2230,81 @@ fn get_exact_lease_bypasses_catalog_and_refresh_can_be_auto_routed() {
 }
 
 #[test]
+fn get_exact_historical_generated_sentinel_preserves_original_authority() {
+    for scenario in ["same", "explicit", "older-manager", "mode", "hosts", "deadline", "field", "unsubstituted"] {
+        let grant = json!({"generator_id":"app-a","generator_revision":1,"grant":{"provider":"github_app","scope":{
+            "installation_id":1,"repositories":[{"id":7,"full_name":"acme/web"}],"permissions":{"metadata":"read"}}}});
+        let lease = json!({"lease_id":LEASE,"name":"old-name/GH_TOKEN","mode":"sentinel","hosts":["api.github.com"],
+            "expires_at":"2999-01-01T00:00:00Z","status":"active","fields":["value"],
+            "generation":grant,"credential_expires_at":"2999-01-01T00:00:00Z","credential_version":9});
+        let f = start(Arc::new(move |method, path, body| match (method, path) {
+            ("GET", "/v1/health") => (
+                200,
+                json!({"name":"asm-manager","version":"0.1.0","capabilities":["generated_credentials_v1","secret_fields_v1"]}),
+            ),
+            ("GET", "/v1/leases") => (200, json!({"leases":[lease]})),
+            ("POST", "/v1/requests") => {
+                assert_eq!(body["name"], "old-name/GITHUB_TOKEN");
+                assert_eq!(body["lease_id"], LEASE);
+                assert_eq!(body["refresh_from_version"], 9);
+                assert_eq!(body["raw"], false);
+                assert_eq!(body["sentinel"], true);
+                assert_eq!(body["hosts"], json!(["api.github.com"]));
+                let mut result = lease.clone();
+                result["credential_version"] = json!(10);
+                result["files"] = json!([{"field":"value","relative_path":"old-name/GH_TOKEN",
+                    "content":"asm_historical_sentinel","substituted":true}]);
+                match scenario {
+                    "older-manager" => { result["files"][0].as_object_mut().unwrap().remove("substituted"); }
+                    "mode" => {
+                        result["mode"] = json!("raw");
+                        result["hosts"] = json!([]);
+                        result["files"][0]["substituted"] = json!(false);
+                    }
+                    "hosts" => result["hosts"] = json!(["*"]),
+                    "deadline" => result["expires_at"] = json!("2999-02-01T00:00:00Z"),
+                    "field" => result["files"][0]["field"] = json!("other"),
+                    "unsubstituted" => result["files"][0]["substituted"] = json!(false),
+                    _ => {}
+                }
+                (200, json!({"request_id":REQ,"kind":"get","status":"approved","result":result}))
+            }
+            _ => (404, json!({"error":{"code":"not_found","message":"no current catalog"}})),
+        }));
+        let e = env();
+        write_host_json(&e, &f);
+        let name = "old-name/GITHUB_TOKEN";
+        let mut args = vec!["get", "--json", "--lease", LEASE, "--refresh", "--hosts", "api.github.com"];
+        if scenario == "explicit" {
+            args.push("--sentinel");
+        }
+        args.extend([name, "Continue using the existing lease"]);
+        let out = asm(&e, &args, "");
+        if matches!(scenario, "same" | "explicit" | "older-manager") {
+            assert!(out.status.success(), "{scenario}: {}", text(&out.stderr));
+            let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(result["mode"], "sentinel");
+            assert_eq!(result["hosts"], json!(["api.github.com"]));
+            assert_eq!(result["expires_at"], "2999-01-01T00:00:00Z");
+            let delivery = if scenario == "older-manager" { "unspecified_sentinel_field" } else { "sentinel" };
+            assert_eq!(result["files"][0]["delivery"], delivery);
+            assert!(text(&out.stderr).contains("--refresh --sentinel"));
+            assert_eq!(std::fs::read_to_string(e.secrets.join(name)).unwrap(), "asm_historical_sentinel");
+            let raw = asm(&e, &["get", "--raw", "--lease", LEASE, name, "Do not disclose raw"], "");
+            assert_eq!(raw.status.code(), Some(2), "{}", text(&raw.stderr));
+            assert!(text(&raw.stderr).contains("delivery mode conflicts"));
+        } else {
+            assert_eq!(out.status.code(), Some(1), "{scenario}: {}", text(&out.stderr));
+            assert!(text(&out.stderr).contains("inconsistent get result"));
+            assert!(out.stdout.is_empty());
+            assert!(!e.secrets.join(name).exists());
+        }
+        assert_eq!(posted(&f).len(), 1);
+        assert!(!f.log.lock().unwrap().iter().any(|(_, p, _)| p == "/v1/secrets"));
+    }
+}
+
+#[test]
 fn exec_preserves_explicit_standard_variable_and_raw_network_environment() {
     let (f, e) = launcher_fixture("raw");
     let cwd = std::env::current_dir().unwrap();
@@ -2145,14 +2342,15 @@ fn exec_preserves_explicit_standard_variable_and_raw_network_environment() {
 
 #[test]
 fn exec_mixed_delivery_uses_field_metadata_not_token_prefixes() {
-    let (_f, e) = launcher_fixture("sentinel");
+    let (f, e) = launcher_fixture("sentinel");
     let out = asm_env(
         &e,
         &[
             "exec",
             "--repositories",
             GITHUB_REPOSITORY,
-            "--raw",
+            "--hosts",
+            "api.example.com",
             "GH_TOKEN,OTHER_SECRET",
             "--",
             "/bin/sh",
@@ -2164,6 +2362,14 @@ fn exec_mixed_delivery_uses_field_metadata_not_token_prefixes() {
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(text(&out.stdout), "mixed-ok");
+    let receipt = text(&out.stderr);
+    assert!(receipt.contains("GH_TOKEN: raw") && receipt.contains("OTHER_SECRET: sentinel"));
+    assert!(!receipt.contains("fixture-release-v1") && !receipt.contains("asm_fixture_actual_field"));
+    let sent = posted(&f);
+    assert_eq!(sent[0]["raw"], true);
+    assert_eq!(sent[0]["hosts"], json!([]));
+    assert_eq!(sent[1]["raw"], false);
+    assert_eq!(sent[1]["hosts"], json!(["api.example.com"]));
     assert!(!e.secrets.exists());
 }
 

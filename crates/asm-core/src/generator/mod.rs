@@ -1,21 +1,21 @@
 //! Dynamic credential sources. Unlike vaults, generators issue one credential per
 //! approved lease and never participate in the static-secret value cache.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use asm_proto::generators::{
-    GCLOUD_TOKEN_NAME, GITHUB_TOKEN_NAME, GcloudAccessGrant, GcloudGrant, GcloudPermission,
+    GCLOUD_TOKEN_NAME, GITHUB_TOKEN_NAME, GcloudAccessGrant, GcloudGrant,
     GenerationGrant, GithubGrant, GithubPermission, GithubRepository, validate_gcloud_project_id,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 use crate::store::GeneratorRecord;
-use crate::vault::{SecretKind, SecretMeta, VaultStatus, creds};
+use crate::vault::{VaultStatus, creds};
 
 pub mod gcloud;
 pub(crate) mod gcloud_cli;
@@ -27,7 +27,6 @@ pub use github::GithubAppGenerator;
 
 pub const OUTPUT_KEY: &str = "token";
 pub const OUTPUT_FIELD: &str = "value";
-const GITHUB_API_HOST: &str = "api.github.com";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -168,16 +167,6 @@ impl GcloudConfig {
         }
         Ok(())
     }
-
-    fn uri_hosts(&self, scopes: &[String]) -> Vec<String> {
-        self.scope_catalog.iter()
-            .filter(|option| scopes.binary_search(&option.uri).is_ok())
-            .flat_map(|option| &option.services)
-            .map(|service| service.name.as_str())
-            .filter(|name| is_google_api_host(name))
-            .collect::<BTreeSet<_>>()
-            .into_iter().map(str::to_owned).collect()
-    }
 }
 
 fn validate_gcloud_login(sdk_path: &str, subject: &str, email: &str) -> Result<()> {
@@ -294,42 +283,6 @@ impl GeneratorConfig {
                     && left.account_email == right.account_email
             }
             _ => false,
-        }
-    }
-
-    /// Proxy destination suggestions only; these hosts do not restrict raw tokens.
-    pub fn uri_hosts(&self, grant: &GenerationGrant) -> Vec<String> {
-        match (self, grant) {
-            (Self::GithubApp(_), GenerationGrant::GithubApp(_)) => vec![GITHUB_API_HOST.into()],
-            (Self::Gcloud(config), GenerationGrant::Gcloud(grant))
-                if grant.service_account_unique_id == config.ceiling.service_account_unique_id =>
-            {
-                config.uri_hosts(&grant.scopes)
-            }
-            (Self::GcloudConnection(_), GenerationGrant::GcloudAccess(
-                GcloudAccessGrant::Requested { access } | GcloudAccessGrant::Issued { access, .. },
-            )) => access.permissions.iter().map(|permission| match permission {
-                GcloudPermission::StorageRead | GcloudPermission::StorageCreate => "storage.googleapis.com",
-                GcloudPermission::ComputeRead => "compute.googleapis.com",
-                GcloudPermission::RunRead => "run.googleapis.com",
-                GcloudPermission::LogsRead => "logging.googleapis.com",
-                GcloudPermission::BigqueryMetadataRead => "bigquery.googleapis.com",
-            }).collect::<BTreeSet<_>>().into_iter().map(str::to_owned).collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    pub fn metadata(&self) -> SecretMeta {
-        SecretMeta {
-            key: OUTPUT_KEY.into(),
-            name: self.output_name().into(),
-            kind: SecretKind::Single,
-            fields: vec![OUTPUT_FIELD.into()],
-            uri_hosts: match self {
-                Self::GithubApp(_) => vec![format!("https://{GITHUB_API_HOST}")],
-                Self::Gcloud(config) => config.uri_hosts(&config.ceiling.scopes),
-                Self::GcloudConnection(_) => Vec::new(),
-            },
         }
     }
 }
@@ -635,11 +588,11 @@ mod tests {
         assert_eq!(entry.record.name, "release-bot");
         assert!(matches!(entry.status(), VaultStatus::Error(_)));
         assert!(entry.client().is_err());
-        assert_eq!(entry.record.config.metadata().name, GITHUB_TOKEN_NAME);
+        assert_eq!(entry.record.config.output_name(), GITHUB_TOKEN_NAME);
         assert!(registry.remove("generator-1").is_some());
         let entry = registry.remove("generator-google").unwrap();
         assert!(entry.client().err().unwrap().message.contains("sign in again"));
-        assert_eq!(entry.record.config.metadata().name, GCLOUD_TOKEN_NAME);
+        assert_eq!(entry.record.config.output_name(), GCLOUD_TOKEN_NAME);
         assert!(registry.entries().is_empty());
     }
 
@@ -740,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn google_authority_excludes_catalog_labels_and_suggests_only_approved_api_hosts() {
+    fn google_authority_excludes_catalog_labels() {
         let original = google_record().config;
         let mut relabeled = original.clone();
         let GeneratorConfig::Gcloud(config) = &mut relabeled else { unreachable!() };
@@ -758,10 +711,8 @@ mod tests {
         assert!(!original.same_authority(&different_default));
         let approved = GenerationGrant::Gcloud(approved);
         assert!(original.accepts_grant(&approved).unwrap());
-        assert_eq!(original.uri_hosts(&approved), ["run.googleapis.com"]);
         let github = record().config.ceilings().next().unwrap();
         assert!(!original.accepts_grant(&github).unwrap());
-        assert!(original.uri_hosts(&github).is_empty());
         let GeneratorConfig::Gcloud(config) = &mut relabeled else { unreachable!() };
         config.ceiling.service_account_unique_id = "999999999999999999999".into();
         assert!(!original.same_authority(&relabeled));

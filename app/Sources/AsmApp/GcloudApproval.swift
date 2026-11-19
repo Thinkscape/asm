@@ -1,19 +1,17 @@
 import Observation
 import SwiftUI
 
-/// The exact pending get and delivery decision to which core binds a first-use IAM plan.
+/// The exact pending get and raw approval decision to which core binds a first-use IAM plan.
 struct GcloudSetupTarget: Equatable, Sendable {
     let requestID: String
     let requestExpiry: Date
     let requestedAccess: GcloudAccessRequestItem
     let access: GcloudAccessRequestItem
     let selection: GenerationSelectionItem
-    let raw: Bool
     let durationSecs: UInt64?
-    let hosts: [String]
 
     var decision: DecisionItem {
-        .approveGet(raw: raw, durationSecs: durationSecs, hosts: hosts, generation: selection)
+        .approveGet(raw: true, durationSecs: durationSecs, hosts: [], generation: selection)
     }
 
     @MainActor
@@ -27,7 +25,7 @@ struct GcloudSetupTarget: Equatable, Sendable {
               detail.operatorSelectedGrant || access.permissions == requestedAccess.permissions,
               selection.grant == .gcloudAccess(.requested(access: access)),
               detail.vaultID == nil || detail.vaultID == selection.generatorID,
-              !(detail.sentinelRequired && raw) else { return nil }
+              !detail.sentinelRequired else { return nil }
         return detail.generatorChoices.first {
             $0.choice.id == selection.generatorID && $0.choice.revision == selection.generatorRevision
                 && $0.choice.available && $0.choice.ceiling == .gcloudAccess(.requested(access: requestedAccess))

@@ -475,7 +475,7 @@ impl Core {
             if plan.expires <= self.generation_now() {
                 return Err(stale_plan());
             }
-            pending.resolving = true;
+            self.mark_request_resolving(pending)?;
             Ok((pending.clone(), entry.clone(), delivery))
         })?;
         let outcome = (|| {
@@ -505,7 +505,7 @@ impl Core {
         drop(flight);
         self.notify(TOPIC_GCLOUD_ACCOUNTS);
         if let Err(error) = &outcome {
-            self.keep_request_pending(request_id, error);
+            self.keep_request_pending(request_id, error)?;
         }
         outcome
     }

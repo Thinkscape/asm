@@ -164,7 +164,7 @@ private struct GeneratorListPane: View {
         } message: { generator in
             switch generator.config {
             case .githubApp:
-                Text("Its leases are invalidated and sentinels stop working. ASM attempts to revoke issued tokens; raw copies may remain usable until GitHub expiry if revocation fails.")
+                Text("This ends its leases. ASM attempts to revoke issued tokens; delivered copies may remain usable until GitHub expiry if revocation fails.")
             case .gcloud:
                 Text("This removes the saved sign-in from ASM and ends its leases. Google consent, the bound service account, and IAM grants are unchanged. Google access tokens cannot be individually revoked; issued copies remain usable until they expire.")
             case .gcloudConnection:

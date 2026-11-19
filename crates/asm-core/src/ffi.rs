@@ -462,7 +462,6 @@ impl TryFrom<GenerationSelection> for asm_proto::generators::GenerationSelection
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct GeneratorApprovalChoice {
     pub choice: GenerationChoice,
-    pub suggested_hosts: Vec<HostPatternCheck>,
     pub scope_issues: Vec<String>,
     /// Descriptive labels only; the exact approved ceiling lives in `choice`.
     pub scope_catalog: Vec<GcloudScopeOption>,

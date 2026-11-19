@@ -58,8 +58,18 @@ pub trait VaultProvider: Send + Sync {
     fn sync(&self) -> Result<()> {
         Ok(())
     }
-    /// Stop helper processes (Bitwarden `bw serve`). Called on remove and shutdown.
+    /// Stop helper processes without revoking resumable provider authority.
     fn shutdown(&self) {}
+    /// Explicitly retire the provider and discard any resumable authority.
+    fn discard(&self) -> Result<()> {
+        self.shutdown();
+        Ok(())
+    }
+    /// Current Bitwarden unlock generation, or None when no session is usable.
+    /// Must be a local state read: callers may hold manager locks.
+    fn bitwarden_session_revision(&self) -> Option<u64> {
+        None
+    }
     /// Unlock with the master password (Bitwarden). The password is used once and never
     /// stored; a wrong one returns an error whose message is meant for the operator.
     fn unlock(&self, _master_password: &str) -> Result<()> {
@@ -88,7 +98,7 @@ pub trait VaultProvider: Send + Sync {
 
 /// Persisted (non-secret) vault configuration, stored as JSON in the `vaults` table.
 /// The Bitwarden client secret lives in the keychain via `creds`; the master password is
-/// never stored (it only unlocks the running `bw serve`).
+/// never stored. Only a verified Bitwarden session key may be retained for restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VaultConfig {

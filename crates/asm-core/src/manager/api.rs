@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use asm_proto::ApiError;
+use asm_proto::{ApiError, ErrorCode};
 use asm_proto::generators::{GenerationSelection, SourceKind};
 use asm_proto::wire::{
     CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1,
@@ -39,6 +39,11 @@ impl From<CoreError> for ApiErr {
 
 impl IntoResponse for ApiErr {
     fn into_response(self) -> Response {
+        match self.0.code {
+            ErrorCode::Internal => log::error!("manager API: {}", self.0.message),
+            ErrorCode::VaultUnavailable => log::warn!("manager API: {}", self.0.message),
+            _ => {}
+        }
         let status = StatusCode::from_u16(self.0.code.http_status())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = ApiError::from(self.0).to_json();
@@ -100,7 +105,7 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Authenticate the calling host and record `last_seen`.
-async fn auth(core: &Arc<Core>, headers: &HeaderMap) -> ApiResult<HostRecord> {
+async fn auth(core: &Arc<Core>, headers: &HeaderMap) -> ApiResult<(HostRecord, [u8; 32])> {
     let Some(token) = bearer(headers) else {
         return Err(ApiErr(CoreError::unauthorized(
             "missing bearer token; run asm pair",
@@ -114,7 +119,7 @@ async fn auth(core: &Arc<Core>, headers: &HeaderMap) -> ApiResult<HostRecord> {
             .host_by_token(&hash)?
             .ok_or_else(|| CoreError::unauthorized("token rejected; run asm pair"))?;
         core.store.touch_host(&host.id, now())?;
-        Ok(host)
+        Ok((host, hash))
     })
     .await
 }
@@ -235,7 +240,7 @@ fn lease_brief(lease: &LeaseRecord) -> LeaseBrief {
 }
 
 async fn secrets(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<SecretsResponse>> {
-    let host = auth(&core, &headers).await?;
+    let (host, _) = auth(&core, &headers).await?;
     let r = blocking(move || {
         let mut catalog = core.secret_catalog()?;
         let t = now();
@@ -259,7 +264,7 @@ async fn secrets(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<Secr
                     .filter(|lease| lease.is_active(t)).map(lease_brief)
             };
         }
-        Ok(SecretsResponse { secrets: catalog.wire_entries, warnings: catalog.warnings })
+        Ok(SecretsResponse { secrets: catalog.wire_entries })
     }).await?;
     Ok(Json(r))
 }
@@ -270,7 +275,7 @@ async fn create_request(
     headers: HeaderMap,
     body: std::result::Result<Json<RequestBody>, JsonRejection>,
 ) -> ApiResult<Response> {
-    let host = auth(&core, &headers).await?;
+    let (host, _) = auth(&core, &headers).await?;
     let Json(body) = body.map_err(bad_json)?;
     let address = remote.ip().to_canonical().to_string();
     let state = blocking(move || core.create_request(&host, &address, body)).await?;
@@ -288,7 +293,7 @@ async fn get_request(
     Path(id): Path<String>,
     q: std::result::Result<Query<WaitQuery>, QueryRejection>,
 ) -> ApiResult<Json<RequestState>> {
-    let host = auth(&core, &headers).await?;
+    let (host, proof) = auth(&core, &headers).await?;
     let Query(q) = q.map_err(bad_query)?;
     // Check the pending state without consuming anything, then fetch once when terminal.
     let host_id = host.id.clone();
@@ -305,7 +310,7 @@ async fn get_request(
         |still_pending| !still_pending,
     )
     .await?;
-    let r = blocking(move || core.request_state(&host.id, &id)).await?;
+    let r = blocking(move || core.request_state_with_proof(&host.id, &id, Some(&proof))).await?;
     Ok(Json(r))
 }
 
@@ -314,14 +319,14 @@ async fn cancel_request(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<RequestState>> {
-    let host = auth(&core, &headers).await?;
+    let (host, proof) = auth(&core, &headers).await?;
     Ok(Json(
-        blocking(move || core.cancel_request(&host.id, &id)).await?,
+        blocking(move || core.cancel_request_with_proof(&host.id, &id, Some(&proof))).await?,
     ))
 }
 
 async fn leases(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<LeasesResponse>> {
-    let host = auth(&core, &headers).await?;
+    let (host, _) = auth(&core, &headers).await?;
     let r = blocking(move || {
         let t = now();
         let leases = core

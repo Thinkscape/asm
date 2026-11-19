@@ -1,7 +1,7 @@
 //! SQLite store (`<data>/asm.db`). Holds settings, source configs, hosts, pairing codes,
-//! resolved request history, lease metadata and the activity log. Never holds secret
-//! values: generated credentials keep only grant/version/expiry metadata, leases keep
-//! sentinels and file paths, and host tokens and pairing codes are stored as SHA-256.
+//! resolved request history, lease metadata and the activity log. Restart state
+//! containing secrets arrives as authenticated ciphertext; host tokens and pairing
+//! codes are stored as SHA-256 rather than plaintext.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 use crate::generator::GeneratorConfig;
+use crate::manager::resume::SealedResume;
 use crate::vault::VaultConfig;
 
 const SCHEMA: &str = "
@@ -125,6 +126,18 @@ CREATE TABLE IF NOT EXISTS secret_hosts(
     pattern    TEXT NOT NULL,
     PRIMARY KEY(vault_id, secret_key, pattern)
 );
+CREATE TABLE IF NOT EXISTS resume_identity(
+    singleton   INTEGER PRIMARY KEY CHECK(singleton = 1),
+    database_id BLOB NOT NULL CHECK(typeof(database_id) = 'blob' AND length(database_id) = 16),
+    key_check   BLOB NOT NULL CHECK(typeof(key_check) = 'blob' AND length(key_check) = 28),
+    writer_id   BLOB CHECK(writer_id IS NULL OR (typeof(writer_id) = 'blob' AND length(writer_id) = 16))
+);
+CREATE TABLE IF NOT EXISTS resume_entries(
+    namespace TEXT NOT NULL,
+    id        TEXT NOT NULL,
+    sealed    BLOB NOT NULL,
+    PRIMARY KEY(namespace, id)
+) WITHOUT ROWID;
 ";
 
 // The issued UID identifies the account even for legacy OAuth leases whose
@@ -557,6 +570,113 @@ impl Store {
 
     fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn claim_resume_writer<T>(
+        &self,
+        fresh_id: [u8; 16],
+        writer_id: &[u8; 16],
+        load: impl FnOnce(&[u8; 16], Vec<u8>) -> Result<T>,
+        create: impl FnOnce(&[u8; 16]) -> Result<(T, Vec<u8>)>,
+    ) -> Result<([u8; 16], T)> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(Vec<u8>, Vec<u8>)> = tx
+            .query_row(
+                "SELECT database_id, key_check FROM resume_identity WHERE singleton = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (id, key) = if let Some((id, verifier)) = existing {
+            let id = id
+                .try_into()
+                .map_err(|_| CoreError::internal("invalid restart database identity"))?;
+            let key = load(&id, verifier)?;
+            tx.execute(
+                "UPDATE resume_identity SET writer_id = ?1 WHERE singleton = 1",
+                [&writer_id[..]],
+            )?;
+            (id, key)
+        } else {
+            if tx.prepare("SELECT 1 FROM resume_entries LIMIT 1")?.exists([])? {
+                return Err(CoreError::internal("restart database identity is missing"));
+            }
+            // Persist the create-only key first, under a fresh random ID. If the
+            // process dies before commit, the DB is still empty; an unreferenced
+            // keychain item is safer than a committed DB whose key never existed.
+            let (key, verifier) = create(&fresh_id)?;
+            tx.execute(
+                "INSERT INTO resume_identity(singleton, database_id, key_check, writer_id)
+                 VALUES(1, ?1, ?2, ?3)",
+                params![&fresh_id[..], verifier, &writer_id[..]],
+            )?;
+            (fresh_id, key)
+        };
+        tx.commit()?;
+        Ok((id, key))
+    }
+
+    pub(crate) fn release_resume_writer(&self, id: &[u8; 16]) -> Result<()> {
+        self.db().execute(
+            "UPDATE resume_identity SET writer_id = NULL WHERE singleton = 1 AND writer_id = ?1",
+            [&id[..]],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn commit_resume(&self, rows: &[SealedResume]) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::apply_resume(&tx, rows)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Must be called inside a write transaction so a new writer cannot claim the
+    /// database between the fence and the caller's authority change.
+    fn apply_resume(conn: &Connection, rows: &[SealedResume]) -> Result<()> {
+        let Some(first) = rows.first() else {
+            return Ok(());
+        };
+        if rows.iter().any(|r| r.writer_id != first.writer_id)
+            || !conn
+                .prepare_cached("SELECT 1 FROM resume_identity WHERE singleton = 1 AND writer_id = ?1")?
+                .exists([&first.writer_id[..]])?
+        {
+            return Err(CoreError::internal("restart storage writer is no longer active"));
+        }
+        for row in rows {
+            let (namespace, id) = row.route();
+            if let Some(sealed) = &row.ciphertext {
+                conn.prepare_cached(
+                    "INSERT INTO resume_entries(namespace, id, sealed) VALUES(?1, ?2, ?3)
+                     ON CONFLICT(namespace, id) DO UPDATE SET sealed = excluded.sealed",
+                )?
+                .execute(params![namespace, id, sealed])?;
+            } else {
+                conn.prepare_cached("DELETE FROM resume_entries WHERE namespace = ?1 AND id = ?2")?
+                    .execute(params![namespace, id])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_resume(&self, namespace: &str, id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .db()
+            .prepare_cached("SELECT sealed FROM resume_entries WHERE namespace = ?1 AND id = ?2")?
+            .query_row(params![namespace, id], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub(crate) fn list_resume(&self, namespace: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let db = self.db();
+        let mut stmt = db.prepare_cached(
+            "SELECT id, sealed FROM resume_entries WHERE namespace = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([namespace], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     // ---- settings ----
@@ -1310,6 +1430,18 @@ impl Store {
         insert_host_row(&self.db(), h, token_hash)
     }
 
+    pub(crate) fn insert_host_with_request(
+        &self, host: &HostRecord, hash: &[u8; 32], row: &SealedResume, history: &HistoryRecord,
+    ) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        insert_host_row(&tx, host, hash)?;
+        Self::apply_resume(&tx, std::slice::from_ref(row))?;
+        Self::insert_history_with(&tx, history)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The active host `id` if its token hashes to `token_hash` (compared in constant time):
     /// a proof of an earlier pairing.
     pub fn host_by_proof(&self, id: &str, token_hash: &[u8; 32]) -> Result<Option<HostRecord>> {
@@ -1339,6 +1471,21 @@ impl Store {
         new_hash: &[u8; 32],
     ) -> Result<bool> {
         rotate_host_row(&self.db(), h, old_hash, new_hash)
+    }
+
+    pub(crate) fn rotate_host_token_with_request(
+        &self, host: &HostRecord, old_hash: &[u8; 32], new_hash: &[u8; 32],
+        row: &SealedResume, history: &HistoryRecord,
+    ) -> Result<bool> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if !rotate_host_row(&tx, host, old_hash, new_hash)? {
+            return Ok(false);
+        }
+        Self::apply_resume(&tx, std::slice::from_ref(row))?;
+        Self::insert_history_with(&tx, history)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Active hosts claiming `machine_hint`, most recently seen first.
@@ -1551,7 +1698,22 @@ impl Store {
     // ---- request history ----
 
     pub fn insert_history(&self, h: &HistoryRecord) -> Result<()> {
-        self.db().execute(
+        Self::insert_history_with(&self.db(), h)
+    }
+
+    pub(crate) fn commit_request_book(&self, row: &SealedResume, history: Option<&HistoryRecord>) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::apply_resume(&tx, std::slice::from_ref(row))?;
+        if let Some(history) = history {
+            Self::insert_history_with(&tx, history)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn insert_history_with(conn: &Connection, h: &HistoryRecord) -> Result<()> {
+        conn.execute(
             "INSERT OR REPLACE INTO requests(id, kind, host_id, host_label, summary, status, deny_reason, created_at, resolved_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -1600,8 +1762,27 @@ impl Store {
     // ---- leases ----
 
     pub fn insert_lease(&self, l: &LeaseRecord) -> Result<()> {
+        Self::insert_lease_with(&self.db(), l)
+    }
+
+    pub(crate) fn insert_lease_with_request(
+        &self,
+        lease: &LeaseRecord,
+        rows: &[SealedResume],
+        history: &HistoryRecord,
+    ) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::apply_resume(&tx, rows)?;
+        Self::insert_lease_with(&tx, lease)?;
+        Self::insert_history_with(&tx, history)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn insert_lease_with(conn: &Connection, l: &LeaseRecord) -> Result<()> {
         validate_lease_generation(l)?;
-        let inserted = self.db().execute(
+        let inserted = conn.execute(
             "INSERT INTO leases(id, host_id, vault_id, vault_name, secret_key, name, mode, fields, hosts,
                                 reason, agent, created_at, expires_at, revoked_at, source_kind, generation,
                                 generator_revision, credential_expires_at, approval_order, credential_version,
@@ -1772,6 +1953,16 @@ impl Store {
         expected_version: u64,
         credential_expires_at: i64,
     ) -> Result<u64> {
+        self.update_generated_credential_with_resume(id, expected_version, credential_expires_at, &[])
+    }
+
+    pub(crate) fn update_generated_credential_with_resume(
+        &self,
+        id: &str,
+        expected_version: u64,
+        credential_expires_at: i64,
+        rows: &[SealedResume],
+    ) -> Result<u64> {
         if credential_expires_at <= 0 {
             return Err(CoreError::invalid("credential expiry must be positive"));
         }
@@ -1805,6 +1996,7 @@ impl Store {
                AND revoked_at IS NULL",
             params![id, next_sql, credential_expires_at, sqlite_u64(expected_version, "credential version")?],
         )?;
+        Self::apply_resume(&tx, rows)?;
         tx.commit()?;
         Ok(next)
     }
@@ -2294,6 +2486,37 @@ mod tests {
         assert!(s.update_generated_credential(&lease.id, 3, 11_000).is_err());
         assert_eq!(s.get_lease(&lease.id).unwrap().unwrap().credential_version, 3);
         assert!(s.update_generated_credential("missing", 1, 11_000).is_err());
+    }
+
+    #[test]
+    fn generated_credential_version_and_sealed_token_change_together() {
+        use crate::manager::resume::ResumeStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        let s = Arc::new(Store::open(&path).unwrap());
+        let resume = ResumeStore::open(s.clone(), Some([44; 32])).unwrap();
+        let lease = generated_lease("generated");
+        s.insert_lease(&lease).unwrap();
+        resume.put("tokens", &lease.id, &"original").unwrap();
+        let stale_writer = resume.seal("tokens", &lease.id, &"stale writer").unwrap();
+        resume.close().unwrap();
+        let s = Arc::new(Store::open(&path).unwrap());
+        let reopened = ResumeStore::open(s.clone(), Some([44; 32])).unwrap();
+
+        assert!(s.update_generated_credential_with_resume(&lease.id, 1, 6_700, &[stale_writer]).is_err());
+        assert_eq!(s.get_lease(&lease.id).unwrap().unwrap().credential_version, 1);
+        assert_eq!(reopened.get::<String>("tokens", &lease.id).unwrap().as_deref(), Some("original"));
+        let next = reopened.seal("tokens", &lease.id, &"replacement").unwrap();
+        assert_eq!(
+            s.update_generated_credential_with_resume(&lease.id, 1, 6_700, &[next]).unwrap(),
+            2,
+        );
+        let stale_version = reopened.seal("tokens", &lease.id, &"stale version").unwrap();
+        assert!(s.update_generated_credential_with_resume(&lease.id, 1, 9_700, &[stale_version]).is_err());
+        assert_eq!(s.get_lease(&lease.id).unwrap().unwrap().credential_version, 2);
+        assert_eq!(reopened.get::<String>("tokens", &lease.id).unwrap().as_deref(), Some("replacement"));
     }
 
     #[test]

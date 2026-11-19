@@ -193,7 +193,15 @@ impl ProxySupervisor {
         on_change: Arc<dyn Fn() + Send + Sync>,
         on_event: EventSink,
     ) -> Result<Arc<Self>> {
-        validate_entries(&entries)?;
+        let sup = Self::prepare(bin_dir, dirs, cfg, on_change, on_event)?;
+        sup.activate(entries)?;
+        Ok(sup)
+    }
+
+    pub(crate) fn prepare(
+        bin_dir: PathBuf, dirs: DataDirs, cfg: ProxyConfig,
+        on_change: Arc<dyn Fn() + Send + Sync>, on_event: EventSink,
+    ) -> Result<Arc<Self>> {
         let binary = bin_dir.join("iron-proxy");
         let ca = ca::ensure(&binary, &dirs.proxy)?;
         let ca_expiry = std::fs::read_to_string(&ca.cert)
@@ -203,7 +211,7 @@ impl ProxySupervisor {
         // Dummy value file of the ended-sentinel entries of earlier versions.
         let _ = std::fs::remove_file(dirs.proxy.join("blocked.value"));
 
-        let sup = Arc::new(Self {
+        Ok(Arc::new(Self {
             logs: Arc::new(logs::LogSink::new(dirs.logs.join("proxy.log"))),
             binary,
             ca,
@@ -228,7 +236,12 @@ impl ProxySupervisor {
                 spawns: 0,
             }),
             dirs,
-        });
+        }))
+    }
+
+    pub(crate) fn activate(self: &Arc<Self>, entries: Vec<ProxyEntry>) -> Result<()> {
+        validate_entries(&entries)?;
+        let sup = self;
         {
             let _ops = lock(&sup.ops);
             sup.kill_orphans();
@@ -243,13 +256,13 @@ impl ProxySupervisor {
             }
             sup.prune_values();
         }
-        let weak = Arc::downgrade(&sup);
+        let weak = Arc::downgrade(sup);
         std::thread::Builder::new()
             .name("asm-proxy-monitor".into())
             .spawn(move || monitor(weak))
             .map_err(|e| CoreError::internal(format!("cannot start proxy monitor: {e}")))?;
         sup.notify();
-        Ok(sup)
+        Ok(())
     }
 
     /// Replace the full entry set: write/delete value files, rewrite the config, reload;

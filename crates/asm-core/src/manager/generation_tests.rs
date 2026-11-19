@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Condvar, mpsc};
+use std::time::{Duration, Instant};
 
 use asm_proto::generators::{GCLOUD_TOKEN_NAME, GcloudAccessGrant, GcloudAccessRequest, GcloudGrant,
     GcloudPermission, GcloudScopeRequest, GithubGrant, GithubPermission, GithubRepository, GithubScopeRequest};
@@ -25,6 +26,7 @@ const CONNECTION_ID: &str = "cloud-connection";
 const CONNECTION_ACCOUNT_ID: &str = "987654321";
 const OPERATOR_EMAIL: &str = "operator@example.test";
 const COMPUTE_SCOPE: &str = "https://www.googleapis.com/auth/compute.readonly";
+const RESUME_KEY: [u8; 32] = [7; 32];
 
 #[derive(Default)]
 struct ManagedIam {
@@ -51,7 +53,6 @@ struct ProviderState {
     clock: Arc<AtomicI64>, issued: AtomicUsize, status: AtomicU16,
     ttl: AtomicI64, revoked: Mutex<Vec<String>>, bodies: Mutex<Vec<Value>>,
     gate: Mutex<Option<Arc<Gate>>>, stop: AtomicBool,
-    revoke_delay_ms: AtomicI64, active_revocations: AtomicUsize, peak_revocations: AtomicUsize,
     google_calls: AtomicUsize, managed_iam: Mutex<ManagedIam>,
 }
 
@@ -73,8 +74,7 @@ impl Provider {
         let url = format!("http://{}/", listener.local_addr().unwrap()).parse().unwrap();
         let state = Arc::new(ProviderState { clock, issued: AtomicUsize::new(0), status: AtomicU16::new(201),
             ttl: AtomicI64::new(3600), revoked: Mutex::new(Vec::new()), bodies: Mutex::new(Vec::new()),
-            gate: Mutex::new(None), stop: AtomicBool::new(false), revoke_delay_ms: AtomicI64::new(0),
-            active_revocations: AtomicUsize::new(0), peak_revocations: AtomicUsize::new(0),
+            gate: Mutex::new(None), stop: AtomicBool::new(false),
             google_calls: AtomicUsize::new(0), managed_iam: Mutex::new(ManagedIam::default()) });
         let server = state.clone();
         let thread = std::thread::spawn(move || {
@@ -157,11 +157,6 @@ fn respond(mut stream: TcpStream, state: Arc<ProviderState>) {
             (204, String::new())
         } else {
             lock(&state.revoked).push(authorization);
-            let active = state.active_revocations.fetch_add(1, Ordering::SeqCst) + 1;
-            state.peak_revocations.fetch_max(active, Ordering::SeqCst);
-            let until = Instant::now() + Duration::from_millis(state.revoke_delay_ms.load(Ordering::SeqCst).max(0) as u64);
-            while Instant::now() < until && !state.stop.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(5)); }
-            state.active_revocations.fetch_sub(1, Ordering::SeqCst);
             (204, String::new())
         }
     } else if first == "POST /oauth2/v1/tokeninfo HTTP/1.1" {
@@ -342,6 +337,7 @@ impl Fixture {
         drop(listeners);
         let core = Core::start(data, bin, Arc::new(Quiet), StartOptions {
             values_root: Some(tmp.path().to_path_buf()),
+            resume_key: Some(RESUME_KEY),
             settings: vec![(crate::settings::API_BIND.into(), json!("127.0.0.1")),
                 (crate::settings::API_PORT.into(), json!(0)),
                 (crate::settings::PROXY_BIND.into(), json!("127.0.0.1")),
@@ -362,6 +358,49 @@ impl Fixture {
         let f = Self { core, provider, clock, host, start, _tmp: tmp };
         f.install("app-a", "release-bot", 1);
         f
+    }
+    fn restart(&mut self) {
+        self.restart_with_client(true);
+    }
+
+    fn restart_with_client(&mut self, available: bool) {
+        let data = self.core.dirs.data.clone();
+        let bin = self.core.bin_dir.clone();
+        self.core.shutdown();
+        let provider_url = self.provider.url.clone();
+        let root = self._tmp.path().to_path_buf();
+        self.core = Core::start_with_generators(data, bin, Arc::new(Quiet), StartOptions {
+            values_root: Some(root.clone()),
+            resume_key: Some(RESUME_KEY),
+            ..StartOptions::default()
+        }, |registry, records, _| {
+            for record in records {
+                let generator = if available {
+                    let client = match &record.config {
+                        GeneratorConfig::GithubApp(config) => GeneratorClient::GithubApp(
+                            GithubAppGenerator::with_client_for_tests(config, crate::generator::github::test_pem(),
+                                reqwest::blocking::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap(),
+                                provider_url.clone())?
+                        ),
+                        GeneratorConfig::Gcloud(config) => GeneratorClient::Gcloud(
+                            GcloudGenerator::with_endpoint_for_tests(config, GCLOUD_ADC_FIXTURE,
+                                &root.join("google-work"), provider_url.clone())?
+                        ),
+                        GeneratorConfig::GcloudConnection(config) => GeneratorClient::Gcloud(
+                            GcloudGenerator::connection_with_endpoint_for_tests(config, GCLOUD_ADC_FIXTURE,
+                                &root.join("managed-work"), provider_url.clone())?
+                        ),
+                    };
+                    Some(Arc::new(client))
+                } else {
+                    None
+                };
+                registry.insert(GeneratorEntry { record, generator, unavailable_reason: None });
+            }
+            Ok(())
+        }).unwrap();
+        let clock = self.clock.clone();
+        lock(&self.core.generation).clock = Arc::new(move || clock.load(Ordering::SeqCst));
     }
     fn grant() -> GithubGrant {
         GithubGrant { installation_id: 7, repositories: vec![GithubRepository { id: 1, full_name: "acme/repo1".into() }],
@@ -520,6 +559,38 @@ esac
         self.approve(&pending.request_id, "app-a", LeaseMode::Raw, 43_200).unwrap();
         get(self.core.request_state(&self.host.id, &pending.request_id).unwrap())
     }
+
+    /// Seed the prior-version sentinel representation without letting new decisions
+    /// authorize a generated sentinel. Use the provider-issued test credential.
+    fn grandfather_sentinel(&self, request_id: &str, host: &str) -> GetResult {
+        {
+            let authority = lock(&self.core.authorization);
+            let mut done = lock(&self.core.book).done[request_id].clone();
+            let id = &done.generated.as_ref().unwrap().lease_id;
+            let mut lease = self.core.store.get_lease(id).unwrap().unwrap();
+            lease.mode = LeaseMode::Sentinel;
+            lease.hosts = vec![host.into()];
+            for field in &mut lease.fields {
+                field.sentinel = Some(asm_proto::rules::new_sentinel());
+            }
+            let db = rusqlite::Connection::open(self.core.dirs.db()).unwrap();
+            db.execute("UPDATE leases SET mode = 'sentinel', fields = ?2, hosts = ?3 WHERE id = ?1",
+                rusqlite::params![id, serde_json::to_string(&lease.fields).unwrap(),
+                    serde_json::to_string(&lease.hosts).unwrap()]).unwrap();
+            let generation = lock(&self.core.generation);
+            let cached = &generation.cached[id];
+            self.core.resume.put(GENERATED_RESUME, id, &SavedCredentials {
+                authority: lease_authority(&lease).unwrap(), version: cached.version,
+                current: Some(SavedToken::new(cached.version, &cached.current)),
+                retired: cached.retired.iter().map(RetiredCredential::saved).collect(),
+            }).unwrap();
+            done.state.result = Some(RequestResult::Get(Core::generated_metadata(&lease, cached)));
+            drop(generation);
+            self.core.insert_done_locked(&mut lock(&self.core.book), request_id.into(), done, None).unwrap();
+            self.core.publish_proxy_locked(&authority).unwrap();
+        }
+        get(self.core.request_state(&self.host.id, request_id).unwrap())
+    }
     fn issued(&self) -> usize { self.provider.state.issued.load(Ordering::SeqCst) }
 }
 impl Drop for Fixture { fn drop(&mut self) { self.core.shutdown(); } }
@@ -570,6 +641,175 @@ fn managed_approval(grant: GcloudAccessGrant) -> ffi::Decision {
 fn generator_activity(f: &Fixture) -> Vec<ffi::ActivityEntry> {
     f.core.list_activity(ffi::ActivityQuery { categories: vec!["generators".into()], host_id: None,
         search: String::new(), before_id: None, limit: 100 })
+}
+
+// Exercise the manager's actual HTTPS and JSON projection; the provider fixture is local.
+fn wire_privacy_client(f: &Fixture) -> impl Fn(reqwest::Method, &str, Option<&RequestBody>) -> (u16, Value) {
+    let addr = f.core.api_addr().unwrap();
+    let cert = reqwest::Certificate::from_pem(f.core.cert.cert_pem.as_bytes()).unwrap();
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .tls_certs_only([cert])
+        .resolve("localhost", addr)
+        .timeout(Duration::from_secs(5))
+        .build().unwrap();
+    let token = f.host.id.clone();
+    move |method, route, body| {
+        let request = client.request(method, format!("https://localhost:{}/v1/{route}", addr.port()))
+            .bearer_auth(&token);
+        let response = match body {
+            Some(body) => request.json(body).send(),
+            None => request.send(),
+        }.unwrap();
+        (response.status().as_u16(), response.json().unwrap())
+    }
+}
+
+#[test]
+fn wire_privacy_vault_misses_add_targets_and_automatic_denial() {
+    use crate::vault::{AddTarget, SecretMeta, VaultConfig, VaultProvider, VaultStatus, registry::VaultEntry};
+    use reqwest::Method;
+
+    const VAULT: &str = "isolated-private-vault";
+    const DIAGNOSTIC: &str = "isolated-private-vault is locked; unlock it on this Mac";
+    struct Vault(AtomicBool);
+    impl VaultProvider for Vault {
+        fn status(&self) -> VaultStatus {
+            if self.0.load(Ordering::SeqCst) { VaultStatus::Locked } else { VaultStatus::Ready }
+        }
+        fn list(&self) -> Result<Vec<SecretMeta>> {
+            Ok(vec![SecretMeta { key: "KNOWN".into(), name: "KNOWN".into(),
+                kind: asm_proto::wire::SecretKind::Single, fields: vec!["value".into()], uri_hosts: vec![] }])
+        }
+        fn read(&self, _: &str) -> Result<Vec<(String, String)>> {
+            if self.0.load(Ordering::SeqCst) {
+                Err(CoreError::vault_unavailable(DIAGNOSTIC))
+            } else {
+                Ok(vec![("value".into(), "isolated-value".into())])
+            }
+        }
+        fn update(&self, _: &str, _: &str, _: &str) -> Result<()> {
+            self.read("KNOWN").map(|_| ())
+        }
+        fn add(&self, _: &str, _: &str, _: &AddTarget) -> Result<()> {
+            self.read("KNOWN").map(|_| ())
+        }
+    }
+
+    let f = Fixture::new();
+    let vault = Arc::new(Vault(AtomicBool::new(true)));
+    f.core.registry.insert(VaultEntry { id: VAULT.into(), name: VAULT.into(),
+        config: VaultConfig::EnvFile { path: "/unused".into() }, provider: vault.clone() });
+    let api = wire_privacy_client(&f);
+    let get = |name| f.body(name);
+    let update = |name| -> RequestBody {
+        serde_json::from_value(json!({"kind":"update","name":name,"value":"isolated-new-value"})).unwrap()
+    };
+    let misses = [get("UNKNOWN"), get("isolated-private-vault/UNKNOWN"), update("UNKNOWN"),
+        update("isolated-private-vault/UNKNOWN")];
+    let while_locked = misses.each_ref().map(|body| api(Method::POST, "requests", Some(body)));
+    for (status, error) in &while_locked {
+        assert_eq!(*status, 404);
+        assert_eq!(error["error"]["code"], "not_found");
+    }
+    let add = serde_json::from_value(json!({"kind":"add","name":"NEW","value":"isolated-new-value"})).unwrap();
+    let (status, request) = api(Method::POST, "requests", Some(&add));
+    assert_eq!(status, 202);
+    assert_eq!(request["status"], "pending");
+    let add_id = request["request_id"].as_str().unwrap();
+    let manager_targets = || match f.core.snapshot().pending.into_iter().find(|p| p.id == add_id).unwrap().detail {
+        ffi::RequestDetail::Add { targets, .. } => targets.into_iter().map(|t| t.vault_id).collect::<Vec<_>>(),
+        _ => panic!("expected pending add"),
+    };
+    assert!(manager_targets().is_empty());
+    assert!(f.core.resolve_request(add_id, ffi::Decision::ApproveWrite {
+        vault_id: VAULT.into(), collection_id: None,
+    }).is_err());
+
+    vault.0.store(false, Ordering::SeqCst);
+    assert_eq!(while_locked, misses.each_ref().map(|body| api(Method::POST, "requests", Some(body))));
+    assert_eq!(api(Method::POST, "requests", Some(&add)), (202, request.clone()));
+    assert_eq!(manager_targets(), [VAULT]);
+    f.core.resolve_request(add_id, ffi::Decision::ApproveWrite {
+        vault_id: VAULT.into(), collection_id: None,
+    }).unwrap();
+    assert_eq!(api(Method::GET, &format!("requests/{add_id}"), None).1["status"], "approved");
+
+    let (status, request) = api(Method::POST, "requests", Some(&get("KNOWN")));
+    assert_eq!(status, 202);
+    let get_id = request["request_id"].as_str().unwrap();
+    vault.0.store(true, Ordering::SeqCst);
+    let local_error = f.core.resolve_request(get_id, ffi::Decision::ApproveGet {
+        mode: ffi::LeaseMode::Raw, duration_secs: Some(60), hosts: vec![], generation: None,
+    }).unwrap_err();
+    assert!(local_error.message.contains(DIAGNOSTIC));
+    let route = format!("requests/{get_id}");
+    let (status, result) = api(Method::GET, &route, None);
+    assert_eq!(status, 200);
+    assert_eq!(result["status"], "denied");
+    assert_eq!(result["deny_reason"], "request could not be completed; check with the manager operator");
+    assert_eq!(api(Method::DELETE, &route, None), (status, result));
+    assert!(f.core.snapshot().recent.iter()
+        .any(|r| r.id == get_id && r.deny_reason.as_deref().is_some_and(|reason| reason.contains(DIAGNOSTIC))));
+}
+
+#[test]
+fn wire_privacy_generator_readiness_does_not_change_catalog_or_diagnose_pinned_failures() {
+    use reqwest::Method;
+
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct LegacyGeneratorOption {
+        generator_id: String,
+        name: String,
+        // v0.3–v0.5 require this boolean, without a default.
+        available: bool,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct LegacySecretEntry {
+        name: String,
+        #[serde(default)]
+        generators: Vec<LegacyGeneratorOption>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct LegacySecretsResponse {
+        secrets: Vec<LegacySecretEntry>,
+    }
+
+    let f = Fixture::new();
+    let first = f.first();
+    let api = wire_privacy_client(&f);
+    let health = api(Method::GET, "health", None);
+    let catalog = api(Method::GET, "secrets", None);
+    assert_eq!(catalog.0, 200);
+    let legacy: LegacySecretsResponse = serde_json::from_value(catalog.1.clone()).unwrap();
+    assert_eq!(legacy.secrets.len(), 1);
+    assert_eq!(legacy.secrets[0].name, "GH_TOKEN");
+    assert_eq!(legacy.secrets[0].generators, [LegacyGeneratorOption {
+        generator_id: "app-a".into(), name: "release-bot".into(), available: true,
+    }]);
+    assert_eq!(catalog.1["secrets"][0]["generators"], json!([
+        {"generator_id": "app-a", "name": "release-bot", "available": true}
+    ]));
+    let leases = api(Method::GET, "leases", None);
+    let wrong_scope = f.github_body(false, &["acme/unknown"], GithubPermission::Read);
+    let scope_error = api(Method::POST, "requests", Some(&wrong_scope));
+    assert_eq!(scope_error.0, 400);
+    assert!(scope_error.1["error"]["message"].as_str().unwrap().contains("check the owner/repo names"));
+
+    f.core.generators.mark_unavailable("app-a", "isolated release-bot credential was removed");
+    assert_eq!(api(Method::GET, "health", None), health);
+    assert_eq!(api(Method::GET, "secrets", None), catalog);
+    assert_eq!(api(Method::GET, "leases", None), leases);
+    assert_eq!(api(Method::POST, "requests", Some(&wrong_scope)), scope_error);
+    let (status, error) = api(Method::POST, "requests", Some(&conditional(&f, &first.lease_id, 1)));
+    assert_eq!(status, 503);
+    assert_eq!(error, json!({"error":{"code":"vault_unavailable",
+        "message":"request could not be completed; check with the manager operator"}}));
+    assert!(matches!(&f.core.list_generators()[0].status,
+        ffi::VaultStatus::Error { message } if message.contains("isolated release-bot credential was removed")));
+    assert_eq!(f.issued(), 1);
 }
 
 #[test]
@@ -706,21 +946,168 @@ fn generation_revoke_racing_renewal_never_reinstalls_token_or_proxy_entries() {
 }
 
 #[test]
-fn generation_restart_missing_cache_keeps_durable_version_and_original_grant() {
-    let f = Fixture::new();
-    let first = f.first();
-    // Restart's exact semantic seam: all nonpersistent material is gone, SQLite
-    // remains authoritative. No read/list/sweep is allowed to mint it back.
-    lock(&f.core.generation).cached.clear();
-    f.core.sweep_generated_at(f.start);
-    f.core.list_leases();
+fn generation_restart_preserves_raw_version_and_revoke_recalls_predecessors() {
+    let mut f = Fixture::new();
+    let pending = f.request(f.body("GH_TOKEN")).unwrap();
+    f.approve(&pending.request_id, "app-a", LeaseMode::Raw, 43_200).unwrap();
+    let first = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
+    f.at(3_000);
+    let second = get(f.request(f.body("GH_TOKEN")).unwrap());
+    assert_eq!(second.credential_version, Some(2));
+
+    f.restart();
+    assert_eq!(f.issued(), 2);
+    assert!(lock(&f.provider.state.revoked).is_empty(), "quit must not recall issued tokens");
+    assert!(f.core.request_state(&f.host.id, &pending.request_id).is_err(), "raw poll was already consumed");
+    let reused = get(f.request(f.body("GITHUB_TOKEN")).unwrap());
+    assert_eq!(reused.files, second.files);
+    assert_eq!(reused.credential_version, second.credential_version);
+    assert_eq!(reused.lease_id, first.lease_id);
+    assert_eq!(reused.generation, first.generation);
+    assert_eq!(reused.expires_at, first.expires_at);
+    assert_eq!(f.issued(), 2);
+
+    f.core.revoke_lease(&first.lease_id).unwrap();
+    let revoked = lock(&f.provider.state.revoked);
+    assert_eq!(revoked.len(), 2);
+    assert!(revoked.contains(&first.files[0].content));
+    assert!(revoked.contains(&second.files[0].content));
+}
+
+#[test]
+fn generation_restart_recovers_the_same_sentinel_before_serving() {
+    let mut f = Fixture::with_proxy(true);
+    let pending = f.request(f.body("GH_TOKEN")).unwrap();
+    f.approve(&pending.request_id, "app-a", LeaseMode::Raw, 43_200).unwrap();
+    let before = f.grandfather_sentinel(&pending.request_id, "api.github.com");
+    let path = f.core.dirs.values.join(format!("{}.0", before.lease_id));
+    let substituted = std::fs::read_to_string(path).unwrap();
+
+    f.restart();
+    let resumed_path = f.core.dirs.values.join(format!("{}.0", before.lease_id));
+    assert!(std::fs::read_to_string(resumed_path).unwrap() == substituted);
+    let after = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
+    assert_eq!(after.files, before.files);
+    assert_eq!(after.lease_id, before.lease_id);
+    assert_eq!(after.credential_version, before.credential_version);
+    assert_eq!(after.credential_expires_at, before.credential_expires_at);
+    assert_eq!(f.request(f.body("GH_TOKEN")).unwrap().status, RequestStatus::Pending,
+        "an unpinned request must not reuse the grandfathered sentinel");
+    let mut pinned = f.body("GH_TOKEN");
+    if let RequestBody::Get { lease_id, sentinel, hosts, .. } = &mut pinned {
+        *lease_id = Some(before.lease_id.clone());
+        *sentinel = true;
+        *hosts = vec!["api.github.com".into()];
+    }
+    let exact = get(f.request(pinned).unwrap());
+    assert_eq!(exact.files, before.files);
+    assert_eq!(exact.mode, LeaseMode::Sentinel);
     assert_eq!(f.issued(), 1);
-    assert_eq!(lock(&f.core.generation).next_expiry(f.start), None);
-    let next = get(f.request(f.body("GITHUB_TOKEN")).unwrap());
-    assert_eq!(next.credential_version, Some(2));
-    assert_eq!(next.lease_id, first.lease_id);
-    assert_eq!(next.generation, first.generation);
-    assert_eq!(next.expires_at, first.expires_at);
+    assert!(lock(&f.provider.state.revoked).is_empty());
+}
+
+#[test]
+fn generation_restart_recalls_live_predecessor_even_if_current_expired() {
+    let mut f = Fixture::new();
+    f.at(-1_000);
+    f.provider.state.ttl.store(1_400, Ordering::SeqCst);
+    let first = f.first();
+    f.at(-150);
+    f.provider.state.ttl.store(1_000, Ordering::SeqCst);
+    let second = get(f.request(f.body("GH_TOKEN")).unwrap());
+    assert_eq!(second.credential_version, Some(2));
+    // The provider adapter rejects an already-expired mint using real wall time.
+    // Simulate the shorter credential expiring while offline in the saved state.
+    {
+        let _authority = lock(&f.core.authorization);
+        let expiry = f.start - 50;
+        let mut saved = f.core.resume.get::<SavedCredentials<String>>(GENERATED_RESUME, &first.lease_id)
+            .unwrap().unwrap();
+        saved.current.as_mut().unwrap().expires_at = expiry;
+        let db = rusqlite::Connection::open(f.core.dirs.db()).unwrap();
+        db.execute("UPDATE leases SET credential_expires_at = ?2 WHERE id = ?1",
+            rusqlite::params![first.lease_id, expiry]).unwrap();
+        f.core.resume.put(GENERATED_RESUME, &first.lease_id, &saved).unwrap();
+    }
+
+    f.at(0);
+    f.restart();
+    assert!(f.core.check_generated_delivery(&first.lease_id, 2).is_err());
+    assert_eq!(f.issued(), 2);
+    f.core.revoke_lease(&first.lease_id).unwrap();
+    assert_eq!(*lock(&f.provider.state.revoked), [first.files[0].content.clone()]);
+}
+
+#[test]
+fn generation_restart_does_not_restore_a_revoked_hosts_tokens() {
+    let mut f = Fixture::new();
+    let first = f.first();
+    // Crash between the durable host removal and dependent lease cleanup.
+    assert!(f.core.store.revoke_host(&f.host.id, f.start).unwrap());
+    f.restart();
+    assert!(f.core.check_generated_delivery(&first.lease_id, 1).is_err());
+    assert!(lock(&f.core.generation).cached.is_empty());
+    assert_eq!(f.issued(), 1);
+}
+
+#[test]
+fn generation_restart_keeps_unconsumed_google_delivery_without_reminting() {
+    let mut f = Fixture::new();
+    f.install_gcloud();
+    let pending = f.request(f.body(GCLOUD_TOKEN_NAME)).unwrap();
+    f.approve_gcloud(&pending.request_id).unwrap();
+    f.restart();
+
+    let delivered = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
+    assert_eq!(delivered.credential_version, Some(1));
+    assert!(delivered.files[0].content.starts_with("isolated-child-"));
+    assert_eq!(f.issued(), 1);
+    f.restart();
+    assert!(f.core.request_state(&f.host.id, &pending.request_id).is_err());
+    let reused = get(f.request(f.body(GCLOUD_TOKEN_NAME)).unwrap());
+    assert!(reused.files == delivered.files);
+    assert_eq!(reused.credential_version, delivered.credential_version);
+    assert_eq!(f.issued(), 1);
+}
+
+#[test]
+fn generation_restart_retains_snapshot_if_client_is_temporarily_unavailable() {
+    let mut f = Fixture::new();
+    let first = f.first();
+    f.restart_with_client(false);
+    assert!(f.core.check_generated_delivery(&first.lease_id, 1).is_err());
+    assert!(lock(&f.core.generation).cached.is_empty());
+
+    f.restart();
+    let reused = get(f.request(f.body("GITHUB_TOKEN")).unwrap());
+    assert!(reused.files == first.files);
+    assert_eq!(reused.credential_version, Some(1));
+    assert_eq!(f.issued(), 1);
+}
+
+#[test]
+fn generation_failed_encrypted_refresh_commit_preserves_old_version_across_restart() {
+    let mut f = Fixture::new();
+    let first = f.first();
+    let db = rusqlite::Connection::open(f.core.dirs.db()).unwrap();
+    db.execute_batch(&format!(
+        "CREATE TRIGGER fail_token_resume BEFORE INSERT ON resume_entries
+         WHEN NEW.namespace = '{GENERATED_RESUME}'
+         BEGIN SELECT RAISE(ABORT, 'injected token custody failure'); END;"
+    )).unwrap();
+    f.at(3_000);
+    assert!(f.request(f.body("GH_TOKEN")).is_err());
+    assert_eq!(f.issued(), 2);
+    assert_eq!(lock(&f.provider.state.revoked).len(), 1);
+    db.execute_batch("DROP TRIGGER fail_token_resume").unwrap();
+    drop(db);
+
+    f.at(0);
+    f.restart();
+    let restored = get(f.request(f.body("GH_TOKEN")).unwrap());
+    assert!(restored.files == first.files);
+    assert_eq!(restored.credential_version, Some(1));
+    assert_eq!(f.issued(), 2);
 }
 
 #[test]
@@ -988,15 +1375,22 @@ fn generation_github_reattaches_pending_work_when_another_generator_appears_duri
 }
 
 #[test]
-fn generation_failed_initial_sentinel_publication_creates_no_active_grant() {
+fn generation_new_approvals_reject_sentinel_before_issuance() {
     let f = Fixture::new();
+    let mut sentinel = f.body("GH_TOKEN");
+    if let RequestBody::Get { sentinel, .. } = &mut sentinel { *sentinel = true; }
+    assert!(f.request(sentinel).is_err());
+    let mut with_hosts = f.body("GH_TOKEN");
+    if let RequestBody::Get { hosts, .. } = &mut with_hosts { hosts.push("api.github.com".into()); }
+    assert!(f.request(with_hosts).is_err());
     let pending = f.request(f.body("GH_TOKEN")).unwrap();
     assert!(f.approve(&pending.request_id, "app-a", LeaseMode::Sentinel, 43_200).is_err());
     assert!(f.core.store.active_leases(f.start).unwrap().is_empty());
     assert!(lock(&f.core.generation).cached.is_empty());
     assert!(lock(&f.core.proxy_state).entries.is_empty());
     assert_eq!(f.core.request_state(&f.host.id, &pending.request_id).unwrap().status, RequestStatus::Pending);
-    assert_eq!(lock(&f.provider.state.revoked).len(), 1);
+    assert_eq!(f.issued(), 0);
+    assert!(lock(&f.provider.state.revoked).is_empty());
 }
 
 #[test]
@@ -1130,8 +1524,8 @@ fn generation_shorter_replacement_expiry_does_not_revoke_a_live_predecessor() {
 fn generation_dirty_rotation_then_revoke_recovers_only_the_reduced_desired_set() {
     let f = Fixture::with_proxy(true);
     let pending = f.request(f.body("GH_TOKEN")).unwrap();
-    f.approve(&pending.request_id, "app-a", LeaseMode::Sentinel, 43_200).unwrap();
-    let first = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
+    f.approve(&pending.request_id, "app-a", LeaseMode::Raw, 43_200).unwrap();
+    let first = f.grandfather_sentinel(&pending.request_id, "api.github.com");
     let config = f.core.dirs.proxy.join("iron-proxy.yaml");
     let saved_config = config.with_extension("saved");
     std::fs::rename(&config, &saved_config).unwrap();
@@ -1142,7 +1536,12 @@ fn generation_dirty_rotation_then_revoke_recovers_only_the_reduced_desired_set()
     std::fs::rename(&f.core.dirs.values, &saved).unwrap();
     std::fs::write(&f.core.dirs.values, "force a value-directory write failure").unwrap();
     f.at(3_000);
-    assert!(f.request(f.body("GITHUB_TOKEN")).is_err());
+    let mut pinned = f.body("GITHUB_TOKEN");
+    if let RequestBody::Get { lease_id, sentinel, .. } = &mut pinned {
+        *lease_id = Some(first.lease_id.clone());
+        *sentinel = true;
+    }
+    assert!(f.request(pinned).is_err());
     assert!(lock(&f.core.proxy_state).dirty);
     let lease = f.core.store.get_lease(&first.lease_id).unwrap().unwrap();
     assert_eq!(lease.credential_version, 2);
@@ -1167,22 +1566,27 @@ fn generation_dirty_rotation_then_revoke_recovers_only_the_reduced_desired_set()
 }
 
 #[test]
-fn generation_shutdown_has_four_workers_and_one_shared_five_second_deadline() {
-    let f = Fixture::new();
-    for _ in 0..8 {
-        let mut body = f.body("GH_TOKEN");
-        if let RequestBody::Get { new_lease, .. } = &mut body { *new_lease = true; }
-        let pending = f.request(body).unwrap();
-        f.approve(&pending.request_id, "app-a", LeaseMode::Raw, 43_200).unwrap();
-    }
-    f.provider.state.revoke_delay_ms.store(10_000, Ordering::SeqCst);
-    let start = Instant::now();
-    f.core.shutdown();
-    assert!(start.elapsed() < Duration::from_secs(7), "shutdown must not serialize provider timeouts");
-    assert!(f.provider.state.peak_revocations.load(Ordering::SeqCst) <= 4);
-    assert!(lock(&f.provider.state.revoked).len() <= 4);
-    assert!(lock(&f.core.generation).cached.is_empty());
-    assert!(f.request(f.body("GH_TOKEN")).is_err());
+fn generation_late_refresh_after_restart_cannot_replace_delivered_credential() {
+    let mut f = Fixture::new();
+    let first = f.first();
+    let (gate, entered) = f.provider.block_next();
+    let old_core = f.core.clone();
+    let host = f.host.clone();
+    let refresh = conditional(&f, &first.lease_id, 1);
+    let worker = std::thread::spawn(move || old_core.create_request(&host, "127.0.0.1", refresh));
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    f.restart();
+    assert!(lock(&f.provider.state.revoked).is_empty());
+
+    gate.release();
+    assert!(worker.join().unwrap().is_err());
+    let reused = get(f.request(f.body("GH_TOKEN")).unwrap());
+    assert!(reused.files == first.files);
+    assert_eq!(reused.credential_version, Some(1));
+    assert_eq!(f.issued(), 2);
+    let revoked = lock(&f.provider.state.revoked);
+    assert_eq!(revoked.len(), 1, "only the unpublished late credential was recalled");
+    assert!(!revoked.contains(&first.files[0].content));
 }
 
 #[test]
@@ -1437,17 +1841,11 @@ fn google_account_delete_waits_for_sentinel_cutover_even_on_retry() {
     let f = Fixture::with_proxy(true);
     f.install_connection();
     let access = managed_access(&[GcloudPermission::StorageRead, GcloudPermission::ComputeRead]);
-    let mut body = managed_body(&f, access.clone());
-    if let RequestBody::Get { raw, .. } = &mut body { *raw = false; }
-    let pending = f.request(body).unwrap();
-    let mut decision = managed_approval(GcloudAccessGrant::Requested { access });
-    if let ffi::Decision::ApproveGet { mode, hosts, .. } = &mut decision {
-        *mode = ffi::LeaseMode::Sentinel;
-        *hosts = vec!["storage.googleapis.com".into()];
-    }
+    let pending = f.request(managed_body(&f, access.clone())).unwrap();
+    let decision = managed_approval(GcloudAccessGrant::Requested { access });
     let review = f.core.gcloud_profile_plan(pending.request_id.clone(), decision.clone()).unwrap();
     f.core.gcloud_approve_profile(&pending.request_id, &review.plan_id.unwrap(), decision).unwrap();
-    let sentinel = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
+    let sentinel = f.grandfather_sentinel(&pending.request_id, "storage.googleapis.com");
     assert!(f.core.proxy.status().running);
     let config = f.core.dirs.proxy.join("iron-proxy.yaml");
     let saved = config.with_extension("saved");

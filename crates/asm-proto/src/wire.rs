@@ -228,7 +228,7 @@ pub enum LeaseMode {
 }
 
 /// A request preference is distinct from the operator's final lease mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestedMode {
     #[default]
     Default,
@@ -246,16 +246,16 @@ impl RequestedMode {
         }
     }
 
-    /// Initial approval preference only; existing generated leases keep their mode.
-    pub fn default_mode(self, source: SourceKind) -> LeaseMode {
-        match self {
-            Self::Raw => LeaseMode::Raw,
-            Self::Sentinel => LeaseMode::Sentinel,
-            Self::Default => match source {
-                SourceKind::Vault => LeaseMode::Sentinel,
-                SourceKind::Generator => LeaseMode::Raw,
-            },
+    /// Resolve the delivery mode for an unpinned generated request.
+    /// An exact existing lease can keep its original mode and host restrictions.
+    pub fn for_new_generated(self, hosts: &[String]) -> Result<Self, ApiError> {
+        if self == Self::Sentinel {
+            return Err(ApiError::invalid("generated credentials require raw delivery; remove --sentinel"));
         }
+        if !hosts.is_empty() {
+            return Err(ApiError::invalid("generated credentials are raw and cannot be restricted to hosts; remove --hosts"));
+        }
+        Ok(Self::Raw)
     }
 }
 
@@ -300,20 +300,28 @@ pub struct SecretEntry {
     pub aliases: Vec<String>,
 }
 
-/// Public generator choice: ceilings remain in the manager's approval details.
+/// Public generator identity; readiness and ceilings stay in the manager.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratorOption {
     pub generator_id: String,
     pub name: String,
-    pub available: bool,
+    // A write-only compatibility marker. `false` omits the field on re-serialization.
+    #[serde(rename = "available", skip_deserializing, skip_serializing_if = "std::ops::Not::not")]
+    include_legacy_availability: bool,
+}
+
+impl GeneratorOption {
+    /// Advertise an addressable generator to HTTP clients. Legacy clients require
+    /// `available: true`; it does not report the provider's readiness.
+    pub fn listed(generator_id: String, name: String) -> Self {
+        Self { generator_id, name, include_legacy_availability: true }
+    }
 }
 
 /// `GET /secrets` response.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretsResponse {
     pub secrets: Vec<SecretEntry>,
-    #[serde(default)]
-    pub warnings: Vec<String>,
 }
 
 /// `POST /requests` body, tagged by `kind`.
@@ -322,8 +330,11 @@ pub struct SecretsResponse {
 pub enum RequestBody {
     Get {
         name: String,
+        /// Set for new generated requests for compatibility with older managers.
+        /// For static requests this is a preference, not a delivery guarantee.
         #[serde(default)]
         raw: bool,
+        /// Require sentinel delivery. Not permitted for new generated requests.
         #[serde(default)]
         sentinel: bool,
         /// None selects all current fields; Some is an exact authorization set.
@@ -342,6 +353,7 @@ pub enum RequestBody {
         refresh_from_version: Option<u64>,
         #[serde(default)]
         client_capabilities: Vec<String>,
+        /// Proxy destination restrictions, not applicable to new generated requests.
         #[serde(default)]
         hosts: Vec<String>,
         reason: String,
@@ -578,9 +590,9 @@ pub struct ResultFile {
     pub relative_path: String,
     /// Sentinel, raw value, or the plain username.
     pub content: String,
-    /// True only when the manager substituted this field with a sentinel.
-    #[serde(default)]
-    pub substituted: bool,
+    /// Absent on older managers; in sentinel mode this is not evidence of raw delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub substituted: Option<bool>,
 }
 
 /// Result of an approved `update` or `add`.
@@ -768,7 +780,6 @@ mod tests {
                 generators: vec![],
                 aliases: vec![],
             }],
-            warnings: vec![],
         };
         let v = to_value(&s).unwrap();
         assert_eq!(v["secrets"][0]["kind"], "login");
@@ -778,6 +789,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(l.leases[0].status, LeaseStatus::Revoked);
+    }
+
+    #[test]
+    fn catalog_decoding_drops_legacy_status_from_display() {
+        let public = json!({"secrets":[{
+            "name":"GH_TOKEN", "vault":"bot", "kind":"single", "fields":["value"], "lease":null,
+            "source_kind":"generator", "aliases":["GITHUB_TOKEN"],
+            "generators":[{"generator_id":"bot-id", "name":"bot"}]
+        }]});
+        for available in [true, false] {
+            let mut legacy = public.clone();
+            legacy["warnings"] = json!(["vault is locked"]);
+            legacy["secrets"][0]["generators"][0]["available"] = json!(available);
+            legacy["secrets"][0]["generators"][0]["unavailable_reason"] = json!("private diagnostics");
+
+            let decoded: SecretsResponse = serde_json::from_value(legacy).unwrap();
+            assert_eq!(to_value(&decoded).unwrap(), public);
+            assert_eq!(serde_json::from_value::<SecretsResponse>(public.clone()).unwrap(), decoded);
+        }
     }
 
     #[test]
@@ -851,7 +881,7 @@ mod tests {
         assert!(lease.fields.is_empty());
         assert_eq!((lease.generation, lease.credential_expires_at, lease.credential_version, lease.generator_name), (None, None, None, None));
         let result: GetResult = from_str(r#"{"lease_id":"l","mode":"sentinel","hosts":["*"],"expires_at":null,"files":[{"field":"value","relative_path":"X","content":"asm_fixture"}]}"#).unwrap();
-        assert!(!result.files[0].substituted);
+        assert_eq!(result.files[0].substituted, None);
         assert_eq!((result.generation.as_ref(), result.credential_expires_at.as_ref(), result.credential_version, result.generator_name.as_ref()), (None, None, None, None));
         result.validate().unwrap();
     }
@@ -926,6 +956,15 @@ mod tests {
     }
 
     #[test]
+    fn new_generated_modes_require_raw_without_host_restrictions() {
+        assert_eq!(RequestedMode::Default.for_new_generated(&[]).unwrap(), RequestedMode::Raw);
+        assert_eq!(RequestedMode::Raw.for_new_generated(&[]).unwrap(), RequestedMode::Raw);
+        assert!(RequestedMode::Sentinel.for_new_generated(&[]).unwrap_err().message.contains("--sentinel"));
+        assert!(RequestedMode::Default.for_new_generated(&["api.github.com".into()]).unwrap_err()
+            .message.contains("--hosts"));
+    }
+
+    #[test]
     fn capability_checks_are_targeted_and_do_not_break_legacy_static_requests() {
         let old = get_body(json!({}));
         assert!(!old.supports_operator_selected_grant());
@@ -935,7 +974,7 @@ mod tests {
             assert!(get_body(extra).validate_get_capabilities(SourceKind::Vault).is_err());
         }
         let capable = get_body(json!({
-            "sentinel":true,"fields":["value"],
+            "lease_id":"known","sentinel":true,"fields":["value"],
             "client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1,CAPABILITY_SECRET_FIELDS_V1,"future"]
         }));
         capable.validate_get_capabilities(SourceKind::Generator).unwrap();
@@ -1000,15 +1039,6 @@ mod tests {
             let other: RequestBody = serde_json::from_value(value.clone()).unwrap();
             assert!(!other.supports_operator_selected_project());
         }
-    }
-
-    #[test]
-    fn source_defaults_and_twelve_hour_duration_are_shared() {
-        assert_eq!(RequestedMode::from_flags(false, false).unwrap().default_mode(SourceKind::Vault), LeaseMode::Sentinel);
-        assert_eq!(RequestedMode::Default.default_mode(SourceKind::Generator), LeaseMode::Raw);
-        assert_eq!(RequestedMode::Sentinel.default_mode(SourceKind::Generator), LeaseMode::Sentinel);
-        assert_eq!(RequestedMode::Raw.default_mode(SourceKind::Vault), LeaseMode::Raw);
-        assert_eq!(LEASE_DURATIONS.iter().find(|(label, _)| *label == "12 h"), Some(&("12 h", Some(43_200))));
     }
 
     #[test]

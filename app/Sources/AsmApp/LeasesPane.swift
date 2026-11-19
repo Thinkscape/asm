@@ -172,7 +172,7 @@ struct LeasesPane: View {
         if googleCount > 0 {
             return Text("Ending these leases stops ASM delivery. Google access tokens cannot be individually revoked; copies remain usable until credential expiry. ASM attempts to revoke GitHub tokens, and static raw values cannot be recalled.")
         }
-        return Text("Their sentinels stop working at once. ASM attempts to revoke GitHub tokens, but raw copies may remain usable until provider expiry if revocation fails. Static raw values cannot be recalled.")
+        return Text("Ending these leases stops ASM delivery. ASM attempts to revoke GitHub tokens, but delivered copies may remain usable until provider expiry if revocation fails. Static raw values cannot be recalled.")
     }
 
     private func perform(_ ids: Set<String>) {

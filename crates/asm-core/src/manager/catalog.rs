@@ -9,7 +9,6 @@ use asm_proto::wire::{GeneratorOption, SecretEntry, SecretKind};
 use super::Core;
 use crate::error::{CoreError, Result};
 use crate::vault::names::{NamedSecret, VaultListing, compute_names};
-use crate::vault::VaultStatus;
 
 #[cfg(test)]
 use asm_proto::generators::GITHUB_TOKEN_NAMES;
@@ -40,7 +39,6 @@ pub(crate) struct SecretCatalog {
     pub static_entries: Vec<NamedSecret>,
     pub generated: Vec<GeneratedOutput>,
     pub wire_entries: Vec<SecretEntry>,
-    pub warnings: Vec<String>,
     generated_group_by_wire_row: Vec<Option<usize>>,
     base_names: BTreeSet<String>,
 }
@@ -101,7 +99,7 @@ impl SecretCatalog {
 fn generated_row(name: String, aliases: Vec<String>, choices: &[GenerationChoice]) -> SecretEntry {
     let mut seen = BTreeSet::new();
     let generators: Vec<_> = choices.iter().filter(|c| seen.insert(c.generator_id.as_str()))
-        .map(|c| GeneratorOption { generator_id: c.generator_id.clone(), name: c.name.clone(), available: c.available })
+        .map(|c| GeneratorOption::listed(c.generator_id.clone(), c.name.clone()))
         .collect();
     let source = if generators.len() == 1 {
         generators[0].name.as_str()
@@ -124,7 +122,7 @@ fn generated_row(name: String, aliases: Vec<String>, choices: &[GenerationChoice
 }
 
 /// The static name table is computed before overlaying generated output groups.
-fn build_catalog(listings: &[VaultListing], choices: Vec<GenerationChoice>, warnings: Vec<String>) -> SecretCatalog {
+fn build_catalog(listings: &[VaultListing], choices: Vec<GenerationChoice>) -> SecretCatalog {
     let mut static_entries = compute_names(listings);
     let mut base_names: BTreeSet<_> = listings.iter().flat_map(|l| l.secrets.iter().map(|s| s.name.clone())).collect();
     let mut generated: Vec<GeneratedOutput> = Vec::new();
@@ -177,19 +175,12 @@ fn build_catalog(listings: &[VaultListing], choices: Vec<GenerationChoice>, warn
             }
         }
     }
-    SecretCatalog { static_entries, generated, wire_entries, warnings, generated_group_by_wire_row, base_names }
+    SecretCatalog { static_entries, generated, wire_entries, generated_group_by_wire_row, base_names }
 }
 
 impl Core {
     pub(crate) fn secret_catalog(&self) -> Result<SecretCatalog> {
-        let (listings, mut warnings) = self.registry.listings();
-        for v in self.registry.all() {
-            match v.provider.status() {
-                VaultStatus::Ready => {},
-                VaultStatus::Locked => warnings.push(format!("{}: vault is locked", v.name)),
-                VaultStatus::Error(e) => warnings.push(format!("{}: {e}", v.name)),
-            }
-        }
+        let listings = self.registry.listings();
         let mut choices = Vec::new();
         for entry in self.generators.entries() {
             choices.extend(entry.record.config.ceilings().map(|ceiling| GenerationChoice {
@@ -198,9 +189,7 @@ impl Core {
                 available: entry.generator.is_some(), unavailable_reason: entry.unavailable_reason.clone(),
             }));
         }
-        warnings.sort();
-        warnings.dedup();
-        Ok(build_catalog(&listings, choices, warnings))
+        Ok(build_catalog(&listings, choices))
     }
 }
 
@@ -239,7 +228,7 @@ mod tests {
     }
     #[test]
     fn catalog_aliases_share_identity_and_pin_only_qualified_requests() {
-        let c = build_catalog(&listing(&["OTHER"]), vec![choice("release-bot"), choice("review-bot")], vec![]);
+        let c = build_catalog(&listing(&["OTHER"]), vec![choice("release-bot"), choice("review-bot")]);
         assert_eq!(c.wire_entries.len(), 2);
         let a = c.resolve_generated("GH_TOKEN").unwrap().unwrap();
         let b = c.resolve_generated("GITHUB_TOKEN").unwrap().unwrap();
@@ -255,7 +244,7 @@ mod tests {
         let mut second = first.clone();
         let GenerationGrant::GithubApp(installation) = &mut second.ceiling else { unreachable!() };
         installation.installation_id = 20;
-        let catalog = build_catalog(&listing(&["GH_TOKEN", "GITHUB_TOKEN"]), vec![first, second], vec![]);
+        let catalog = build_catalog(&listing(&["GH_TOKEN", "GITHUB_TOKEN"]), vec![first, second]);
         let generated: Vec<_> = catalog.wire_entries.iter().filter(|entry| entry.source_kind == SourceKind::Generator).collect();
         assert_eq!(generated.len(), 1);
         assert_eq!(generated[0].generators.len(), 1);
@@ -266,7 +255,7 @@ mod tests {
     }
     #[test]
     fn catalog_collision_changes_only_colliding_static_spelling() {
-        let c = build_catalog(&listing(&["GITHUB_TOKEN", "OTHER"]), vec![choice("bot")], vec![]);
+        let c = build_catalog(&listing(&["GITHUB_TOKEN", "OTHER"]), vec![choice("bot")]);
         assert_eq!(c.static_entries[0].display, "vault/GITHUB_TOKEN");
         assert_eq!(c.static_entries[1].display, "OTHER");
         assert!(!c.static_entries[1].prefixed);
@@ -275,17 +264,32 @@ mod tests {
         assert_eq!(c.resolve_generated("GH_TOKEN").unwrap().unwrap().requested_name, "GH_TOKEN");
     }
     #[test]
-    fn catalog_unavailable_choices_remain_visible_without_reserving_absent_aliases() {
-        let empty = build_catalog(&listing(&["OTHER"]), vec![], vec![]);
+    fn catalog_generator_readiness_stays_local_without_hiding_outputs() {
+        let empty = build_catalog(&listing(&["OTHER"]), vec![]);
         assert!(!empty.has_base_name("GH_TOKEN"));
-        let mut unavailable = choice("bot"); unavailable.available = false; unavailable.unavailable_reason = Some("key unavailable".into());
-        let c = build_catalog(&[], vec![unavailable], vec![]);
-        assert!(c.has_base_name("GITHUB_TOKEN"));
-        assert!(!c.wire_entries[0].generators[0].available);
+
+        let choices = vec![choice("bot"), gcloud_choice("cloud")];
+        let listings = listing(&["GH_TOKEN", GCLOUD_TOKEN_NAME]);
+        let ready = build_catalog(&listings, choices.clone());
+        let unavailable_choices = choices.into_iter().map(|mut choice| {
+            choice.available = false;
+            choice.unavailable_reason = Some("private credential diagnostic".into());
+            choice
+        }).collect();
+        let unavailable = build_catalog(&listings, unavailable_choices);
+
+        assert_eq!(ready.wire_entries, unavailable.wire_entries);
+        assert!(unavailable.has_base_name("GITHUB_TOKEN"));
+        for name in ["bot/GH_TOKEN", "cloud/CLOUDSDK_AUTH_ACCESS_TOKEN"] {
+            let target = unavailable.resolve_generated(name).unwrap().unwrap();
+            assert_eq!(target.candidates.len(), 1);
+            assert!(!target.candidates[0].available);
+            assert_eq!(target.candidates[0].unavailable_reason.as_deref(), Some("private credential diagnostic"));
+        }
     }
     #[test]
     fn catalog_both_collisions_require_source_qualification() {
-        let c = build_catalog(&listing(&["GH_TOKEN", "GITHUB_TOKEN", "OTHER"]), vec![choice("one"), choice("two")], vec![]);
+        let c = build_catalog(&listing(&["GH_TOKEN", "GITHUB_TOKEN", "OTHER"]), vec![choice("one"), choice("two")]);
         for &name in GITHUB_TOKEN_NAMES {
             assert!(matches!(c.resolve(name), Err(e) if e.code == asm_proto::ErrorCode::Ambiguous));
             assert!(matches!(c.resolve(&format!("vault/{name}")), Ok(CatalogMatch::Vault(_))));
@@ -299,7 +303,7 @@ mod tests {
 
     #[test]
     fn catalog_static_aliases_remain_independent_without_generators() {
-        let c = build_catalog(&listing(&["GH_TOKEN", "GITHUB_TOKEN"]), vec![], vec![]);
+        let c = build_catalog(&listing(&["GH_TOKEN", "GITHUB_TOKEN"]), vec![]);
         let CatalogMatch::Vault(a) = c.resolve("GH_TOKEN").unwrap() else { panic!("static origin lost") };
         let CatalogMatch::Vault(b) = c.resolve("GITHUB_TOKEN").unwrap() else { panic!("static origin lost") };
         assert_ne!(a.meta.key, b.meta.key);
@@ -309,7 +313,7 @@ mod tests {
 
     #[test]
     fn catalog_literal_source_prefix_has_its_own_static_identity() {
-        let c = build_catalog(&listing(&["vault/X", "X"]), vec![], vec![]);
+        let c = build_catalog(&listing(&["vault/X", "X"]), vec![]);
         let literal = resolve_catalog_name("vault/vault/X", &c.wire_entries).unwrap();
         let ordinary = resolve_catalog_name("vault/X", &c.wire_entries).unwrap();
         assert_ne!(literal.canonical_key, ordinary.canonical_key);
@@ -321,7 +325,7 @@ mod tests {
     fn catalog_resolves_bare_and_qualified_outputs_in_both_provider_orders() {
         let mut choices = vec![choice("gh-bot"), gcloud_choice("gcloud-dev")];
         for _ in 0..2 {
-            let catalog = build_catalog(&listing(&["OTHER"]), choices.clone(), vec![]);
+            let catalog = build_catalog(&listing(&["OTHER"]), choices.clone());
             for (bare, output, name) in [
                 ("GITHUB_TOKEN", "GH_TOKEN", "gh-bot"),
                 (GCLOUD_TOKEN_NAME, GCLOUD_TOKEN_NAME, "gcloud-dev"),
@@ -354,7 +358,7 @@ mod tests {
             choice("gh-second"), connection_choice("google-second"),
         ];
         for _ in 0..2 {
-            let catalog = build_catalog(&listing(&["GH_TOKEN", GCLOUD_TOKEN_NAME, "OTHER"]), choices.clone(), vec![]);
+            let catalog = build_catalog(&listing(&["GH_TOKEN", GCLOUD_TOKEN_NAME, "OTHER"]), choices.clone());
             for (output, expected, unrelated) in [
                 ("GH_TOKEN", ["gh-first", "gh-second"], "google-"),
                 (GCLOUD_TOKEN_NAME, ["google-first", "google-second"], "gh-"),

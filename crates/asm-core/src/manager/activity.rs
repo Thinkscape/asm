@@ -408,12 +408,7 @@ fn request_detail(p: &Pending) -> Map<String, Value> {
             d.insert("vault".into(), json!(u.secret.vault_name));
             d.insert("field".into(), json!(u.field));
         }
-        Detail::Add(a) => {
-            d.insert(
-                "targets".into(),
-                json!(a.targets.iter().map(|t| &t.vault_name).collect::<Vec<_>>()),
-            );
-        }
+        Detail::Add(_) => {}
     }
     d
 }

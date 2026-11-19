@@ -200,7 +200,7 @@ struct UnlockVaultSheet: View {
                 } header: {
                     Text("Unlock \(Text(verbatim: vault.name))")
                 } footer: {
-                    Text("Not stored; needed again after the app restarts.")
+                    Text("The master password is never stored. You’ll need it again if Bitwarden locks the vault or rejects its saved session.")
                 }
                 if let error {
                     Section {
@@ -362,7 +362,7 @@ private struct BitwardenSheet: View {
                 } header: {
                     Text("Personal API key")
                 } footer: {
-                    Text("The client id and secret are stored in the login keychain. The master password is never stored: it is only needed to Connect a new vault and to unlock a locked one, for example after the app restarts. Find the API key under Settings → Security → Keys in the Bitwarden web vault.")
+                    Text("The API client secret is kept in the login keychain. The master password is only used for Connect or Unlock and is never stored. A valid Bitwarden session can resume after an app restart. Find the API key under Settings → Security → Keys in the Bitwarden web vault.")
                 }
                 Section("Command-line tool") {
                     TextField("bw path", text: $config.bwPath, prompt: Text(verbatim: model.general.bwPath.isEmpty ? "/opt/homebrew/bin/bw" : model.general.bwPath))

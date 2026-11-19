@@ -169,10 +169,14 @@ private struct ApprovalBody: View {
         case let .pair(info, address, code, repair):
             PairApproval(context: context, info: info, observedAddress: address, code: code, repair: repair)
         case let .get(detail):
-            GetApproval(
-                context: context, detail: detail, durations: CoreBridge.leaseDurations,
-                model: model, gcloudSetup: gcloudSetup
-            )
+            if detail.isGenerated || detail.requestedGeneration != nil || !detail.generatorChoices.isEmpty {
+                GeneratedGetApproval(
+                    context: context, detail: detail, durations: CoreBridge.leaseDurations,
+                    model: model, gcloudSetup: gcloudSetup
+                )
+            } else {
+                StaticGetApproval(context: context, detail: detail, durations: CoreBridge.leaseDurations, model: model)
+            }
         case let .update(name, vaultID, vault, field, oldValue, newValue):
             UpdateApproval(
                 context: context, name: name, vaultID: vaultID, vaultName: vault,
@@ -389,7 +393,6 @@ private enum ValueMode: Hashable {
 /// Footnote under the action row: what the chosen mode gives the agent.
 private struct ValueModeCaption: View {
     let mode: ValueMode
-    var provider: ApprovalGenerationProvider?
     var plainOnly = false
 
     var body: some View {
@@ -401,10 +404,8 @@ private struct ValueModeCaption: View {
                      : "The agent gets a sentinel that works only through the proxy, over HTTPS, for the hosts above.")
                     .foregroundStyle(.secondary)
             case .realValue:
-                if provider == nil {
-                    Label("The agent receives the real value and keeps it. It cannot be taken back.",
-                          systemImage: "exclamationmark.triangle.fill")
-                }
+                Label("The agent receives the real value and keeps it. It cannot be taken back.",
+                      systemImage: "exclamationmark.triangle.fill")
             }
         }
         .font(.caption)
@@ -1166,6 +1167,144 @@ private struct HostEntry: Identifiable, Equatable {
     var id: String { pattern }
 }
 
+private struct StaticGetApproval: View {
+    let context: RequestContext
+    let detail: GetDetail
+    let durations: [LeaseDuration]
+    let model: AppModel
+
+    @State private var hosts: [HostEntry]
+    @State private var anyHost = false
+    @State private var duration: UInt64
+    @State private var editingHost = false
+    @State private var newHost = ""
+    @State private var hostError: String?
+    @State private var editingReason = false
+    @State private var mode: ValueMode
+    @State private var armedMode: ValueMode?
+    @FocusState private var hostFieldFocused: Bool
+
+    init(context: RequestContext, detail: GetDetail, durations: [LeaseDuration], model: AppModel) {
+        self.context = context
+        self.detail = detail
+        self.durations = durations
+        self.model = model
+        _hosts = State(initialValue: detail.initialHosts.map { HostEntry(pattern: $0.normalized, broad: $0.broad) })
+        _duration = State(initialValue: detail.defaultDurationSecs ?? 0)
+        _mode = State(initialValue: detail.rawRequested && !detail.sentinelRequired ? .realValue : .proxied)
+    }
+
+    private var suggestions: [HostEntry] {
+        let present = Set(hosts.map(\.pattern))
+        var seen = Set<String>()
+        let broad = Dictionary(detail.suggestedHosts.lazy.map { ($0.normalized, $0.broad) }, uniquingKeysWith: { a, _ in a })
+        return (detail.requestedHosts + detail.suggestedHosts.map(\.normalized))
+            .filter { $0 != "*" && !present.contains($0) && seen.insert($0).inserted }
+            .map { HostEntry(pattern: $0, broad: broad[$0] ?? false) }
+    }
+
+    private var approvedHosts: [String] {
+        guard mode == .proxied, detail.hasSubstitutableFields else { return [] }
+        return anyHost ? ["*"] : hosts.map(\.pattern)
+    }
+
+    private var approvedHostsLine: String {
+        if mode == .realValue { return String(localized: "none (real value)") }
+        if !detail.hasSubstitutableFields { return String(localized: "not required (plain fields)") }
+        return anyHost ? String(localized: "any host") : hosts.map(\.pattern).joined(separator: ", ")
+    }
+
+    private func canAllow(_ expected: ValueMode) -> Bool {
+        guard context.armed, armedMode == expected, mode == expected,
+              !model.isResolving(context.request.id),
+              !(detail.sentinelRequired && expected == .realValue) else { return false }
+        return expected == .realValue || !detail.hasSubstitutableFields || anyHost || !hosts.isEmpty
+    }
+
+    var body: some View {
+        let expectedMode = mode
+        let name = Text(verbatim: detail.name).fontWeight(.bold)
+        let subtitle = detail.rawRequested ? Text("wants the real value of \(name)") : Text("wants to use \(name)")
+        ApprovalScaffold(error: context.error, footnote: nil) {
+            ApprovalHeader(title: context.requesterTitle, subtitle: subtitle, queue: context.queue) { AppIconImage() }
+        } content: {
+            ReasonBlock(reason: detail.reason)
+            VStack(alignment: .leading, spacing: 14) {
+                if mode == .proxied {
+                    if detail.hasSubstitutableFields {
+                        HostsSection(
+                            hosts: $hosts, anyHost: $anyHost, editing: $editingHost,
+                            newHost: $newHost, error: $hostError, fieldFocused: $hostFieldFocused,
+                            suggestions: suggestions, add: add
+                        )
+                    } else {
+                        Text("Only plain fields are selected. Destination-host controls and proxy setup are not needed.")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+                GetDurationPicker(durations: durations, duration: $duration)
+                if detail.sentinelRequired {
+                    Text("The requester requires sentinel delivery. Real-value disclosure is disabled.")
+                        .font(.callout)
+                }
+            }
+        } details: {
+            InfoRow(label: "Vault", value: detail.vaultName)
+            InfoRow(label: "Fields", value: detail.fields.joined(separator: ", "))
+            InfoRow(label: "Requested hosts", value: detail.requestedHosts.joined(separator: ", "))
+            InfoRow(label: "Approved hosts", value: approvedHostsLine)
+            InfoRow(label: "Requested mode", value: detail.rawRequested ? String(localized: "real value") : String(localized: "proxied (sentinel)"))
+            RequestMetaRows(context: context)
+        } actions: {
+            ApprovalActions(cannedReasons: ["host selection too open", "provide a better reason"],
+                            armed: context.armed, escapeDenies: !hostFieldFocused,
+                            editingReason: $editingReason, deny: context.deny) {
+                AllowSplitButton(
+                    mode: $mode, enabled: canAllow(expectedMode),
+                    isDefault: mode == .proxied && !hostFieldFocused && !editingReason,
+                    sentinelRequired: detail.sentinelRequired
+                ) {
+                    guard canAllow(expectedMode) else { return }
+                    context.resolve(.approveGet(
+                        raw: expectedMode == .realValue, durationSecs: duration == 0 ? nil : duration,
+                        hosts: approvedHosts, generation: nil
+                    ))
+                }
+            }
+            ValueModeCaption(mode: mode, plainOnly: !detail.hasSubstitutableFields)
+        }
+        .task(id: expectedMode) {
+            guard !Task.isCancelled else { return }
+            armedMode = nil
+            try? await Task.sleep(for: .seconds(1))
+            if !Task.isCancelled { armedMode = expectedMode }
+        }
+        .onChange(of: mode) { _, newMode in
+            if newMode == .realValue { editingHost = false; newHost = ""; hostError = nil }
+        }
+        .onChange(of: detail.sentinelRequired) { _, required in
+            if required { mode = .proxied }
+        }
+    }
+
+    private func add(_ pattern: String) -> Bool {
+        switch model.checkHostPattern(pattern) {
+        case let .success(result):
+            hostError = nil
+            if result.normalized == "*" {
+                anyHost = true
+                editingHost = false
+            } else if !hosts.contains(where: { $0.pattern == result.normalized }) {
+                hosts.append(HostEntry(pattern: result.normalized, broad: result.broad))
+            }
+            return true
+        case let .failure(error):
+            hostError = error.message
+            return false
+        }
+    }
+}
+
 private enum ApprovalGenerationProvider: Equatable {
     case githubApp, gcloud, gcloudAccess
 
@@ -1256,14 +1395,10 @@ private struct GetApprovalClaims: Equatable {
 private struct GetApprovalGuard: Equatable {
     var reviewRevision: UInt64
     var requestID: String
-    var mode: ValueMode
     var generator: ApprovalGeneratorIdentity?
     var claims: GetApprovalClaims
     var selection: GenerationSelectionItem?
     var request: GenerationRequestItem?
-    var differencesAcknowledged: Bool
-    var scopeDifferences: [String]
-    var hosts: [String]
     var durationSecs: UInt64?
     var managedTarget: GcloudSetupTarget?
     var gcloudProfile: GcloudAccessGrantItem?
@@ -1293,29 +1428,21 @@ private struct GcloudProjectLookup {
     let list: GcloudApprovalProjectList
 }
 
-private struct GetApproval: View {
+private struct GeneratedGetApproval: View {
     let context: RequestContext
     let detail: GetDetail
     let durations: [LeaseDuration]
     let model: AppModel
     let gcloudSetup: GcloudApprovalSetup
 
-    @State private var hosts: [HostEntry]
-    @State private var anyHost = false
     @State private var duration: UInt64
-    @State private var editingHost = false
-    @State private var newHost = ""
-    @State private var hostError: String?
     @State private var editingReason = false
-    @State private var mode: ValueMode
     @State private var selectedGenerator: ApprovalGeneratorIdentity?
     @State private var claims: GetApprovalClaims
-    @State private var differencesAcknowledged = false
     @State private var reviewRevision: UInt64 = 0
     @State private var armedGuard: GetApprovalGuard?
     @State private var projectLookup: GcloudProjectLookup?
     @State private var projectRefresh: UInt64 = 0
-    @FocusState private var hostFieldFocused: Bool
 
     init(
         context: RequestContext,
@@ -1329,9 +1456,7 @@ private struct GetApproval: View {
         self.durations = durations
         self.model = model
         self.gcloudSetup = gcloudSetup
-        _hosts = State(initialValue: detail.initialHosts.map { HostEntry(pattern: $0.normalized, broad: $0.broad) })
         _duration = State(initialValue: detail.defaultDurationSecs ?? 0)
-        _mode = State(initialValue: detail.rawRequested && !detail.sentinelRequired ? .realValue : .proxied)
         let initial = Self.soleAvailableGenerator(in: detail)
         _selectedGenerator = State(initialValue: initial.map(ApprovalGeneratorIdentity.init))
         _claims = State(initialValue: initial.map {
@@ -1353,9 +1478,6 @@ private struct GetApproval: View {
         return true
     }
 
-    private var generated: Bool {
-        detail.isGenerated || detail.requestedGeneration != nil || !detail.generatorChoices.isEmpty
-    }
     private var durationSecs: UInt64? { duration == 0 ? nil : duration }
     private var selected: GeneratorApprovalChoiceItem? {
         guard let selectedGenerator else { return nil }
@@ -1371,7 +1493,7 @@ private struct GetApproval: View {
     }
     private var projectLookupKey: GcloudProjectLookupKey? {
         let presentation = model.approvalPresentation
-        guard detail.operatorSelectedGcloudProject, let original = managedAccess,
+        guard !detail.sentinelRequired, detail.operatorSelectedGcloudProject, let original = managedAccess,
               let selected, selected.choice.ceiling == .gcloudAccess(.requested(access: original)),
               gcloudSetup.isPresented(presentation) else { return nil }
         return GcloudProjectLookupKey(
@@ -1395,13 +1517,9 @@ private struct GetApproval: View {
         return project
     }
 
-    private func managedTarget(
-        for selected: GeneratorApprovalChoiceItem, projectID: String?, hosts: [String]
-    ) -> GcloudSetupTarget? {
-        guard let original = managedAccess, let projectID,
-              selected.choice.ceiling == .gcloudAccess(.requested(access: original)),
-              !(detail.sentinelRequired && mode == .realValue) else { return nil }
-        guard mode == .realValue || !detail.hasSubstitutableFields || !hosts.isEmpty else { return nil }
+    private func managedTarget(for selected: GeneratorApprovalChoiceItem, projectID: String?) -> GcloudSetupTarget? {
+        guard !detail.sentinelRequired, let original = managedAccess, let projectID,
+              selected.choice.ceiling == .gcloudAccess(.requested(access: original)) else { return nil }
         let access = detail.operatorSelectedGrant
             ? original.selecting(projectID: projectID, permissions: claims.gcloudPermissions)
             : GcloudAccessRequestItem(projectID: projectID, permissions: original.permissions)
@@ -1413,21 +1531,17 @@ private struct GetApproval: View {
                 generatorID: selected.choice.id, generatorRevision: selected.choice.revision,
                 grant: .gcloudAccess(.requested(access: access))
             ),
-            raw: mode == .realValue, durationSecs: durationSecs, hosts: hosts
+            durationSecs: durationSecs
         )
-    }
-    private var approvedHosts: [String] {
-        if mode == .realValue || !detail.hasSubstitutableFields { return [] }
-        return anyHost ? ["*"] : hosts.map(\.pattern)
     }
     private var guardValue: GetApprovalGuard {
         let request = detail.requestedGeneration
         let selected = self.selected
-        let hosts = generated ? approvedHosts : []
         let projectID = reviewedProjectID
-        let managedTarget = selected.flatMap { self.managedTarget(for: $0, projectID: projectID, hosts: hosts) }
+        let managedTarget = selected.flatMap { self.managedTarget(for: $0, projectID: projectID) }
         let ready = selected.flatMap { managedTarget?.readyGrant(in: $0) }
         let selection = selected.flatMap { generator -> GenerationSelectionItem? in
+            guard !detail.sentinelRequired else { return nil }
             if case .gcloudAccess = generator.choice.ceiling { return managedTarget?.selection }
             guard let grant = claims.grant(
                 within: generator.choice.ceiling, defaultProjectID: generator.defaultProjectID,
@@ -1440,110 +1554,42 @@ private struct GetApproval: View {
             }
             return GenerationSelectionItem(generatorID: generator.choice.id, generatorRevision: generator.choice.revision, grant: grant)
         }
-        var scopeDifferences = self.scopeDifferences(for: selection?.grant, from: request, within: selected?.choice.ceiling)
-        if let projectID, let original = managedAccess, projectID != original.projectID {
-            scopeDifferences.insert(
-                String(localized: "Project \(projectID) selected instead of requested \(original.projectID)."), at: 0
-            )
-        }
         return GetApprovalGuard(
             reviewRevision: reviewRevision,
             requestID: context.request.id,
-            mode: mode, generator: selectedGenerator, claims: claims, selection: selection, request: request,
-            differencesAcknowledged: differencesAcknowledged, scopeDifferences: scopeDifferences,
-            hosts: hosts, durationSecs: generated ? durationSecs : nil,
+            generator: selectedGenerator, claims: claims, selection: selection, request: request,
+            durationSecs: durationSecs,
             managedTarget: managedTarget, gcloudProfile: ready,
             planAuthorization: ready == nil ? managedTarget.flatMap { gcloudSetup.status(for: $0).authorization } : nil,
-            resolving: generated && model.isResolving(context.request.id),
+            resolving: model.isResolving(context.request.id),
             managedPresentation: provider == .gcloudAccess ? model.approvalPresentation : nil
         )
     }
 
-    private func scopeDifferences(
-        for grant: GenerationGrantItem?, from request: GenerationRequestItem?, within ceiling: GenerationGrantItem?
-    ) -> [String] {
-        switch (grant, request) {
-        case let (.githubApp(grant)?, .githubApp(scope)?):
-            let githubCeiling: GithubGrantItem? = if case let .githubApp(configured)? = ceiling { configured } else { nil }
-            return grant.unmetClaims(scope) + grant.addedClaims(scope, within: githubCeiling)
-        case let (.gcloud(grant)?, .gcloud(scope)?):
-            guard let requested = scope.scopes else { return [] }
-            let requestedSet = Set(requested)
-            let selectedSet = Set(grant.scopes)
-            return requested.filter { !selectedSet.contains($0) }.map { String(localized: "Scope not selected: \($0)") }
-                + grant.scopes.filter { !requestedSet.contains($0) }.map { String(localized: "Additional scope: \($0)") }
-        case let (.gcloudAccess(.requested(access))?, .gcloudAccess(original)?):
-            return access.unmetClaims(original) + access.addedClaims(original)
-        default:
-            return []
-        }
-    }
-
-    private func canAllow(_ approval: GetApprovalGuard) -> Bool {
+    private func canGenerate(_ approval: GetApprovalGuard) -> Bool {
         guard context.armed, armedGuard == approval, !approval.resolving,
-              !(detail.sentinelRequired && approval.mode == .realValue) else { return false }
-        if generated {
-            guard context.request.expiresAt > .now, let grant = approval.selection?.grant,
-                  approval.scopeDifferences.isEmpty || approval.differencesAcknowledged else { return false }
-            switch grant {
-            case let .githubApp(grant):
-                guard !grant.repositories.isEmpty, grant.repositories.count <= 500,
-                      grant.permissions.contains(where: { $0.name == "metadata" && $0.level == .read }) else { return false }
-            case let .gcloud(grant):
-                guard !grant.scopes.isEmpty else { return false }
-            case .gcloudAccess(.requested):
-                guard approval.managedTarget != nil,
-                      let presentation = approval.managedPresentation, gcloudSetup.isPresented(presentation) else { return false }
-                if approval.gcloudProfile == nil {
-                    guard let authorization = approval.planAuthorization, authorization.expiresAt > .now else { return false }
-                }
-            case .gcloudAccess:
-                return false
-            }
+              context.request.expiresAt > .now, let grant = approval.selection?.grant else { return false }
+        switch grant {
+        case let .githubApp(grant):
+            return !grant.repositories.isEmpty && grant.repositories.count <= 500
+                && grant.permissions.contains { $0.name == "metadata" && $0.level == .read }
+        case let .gcloud(grant):
+            return !grant.scopes.isEmpty
+        case .gcloudAccess(.requested):
+            guard approval.managedTarget != nil,
+                  let presentation = approval.managedPresentation, gcloudSetup.isPresented(presentation) else { return false }
+            if approval.gcloudProfile != nil { return true }
+            guard let authorization = approval.planAuthorization else { return false }
+            return authorization.expiresAt > .now
+        case .gcloudAccess:
+            return false
         }
-        return approval.mode == .realValue || !detail.hasSubstitutableFields || anyHost || !hosts.isEmpty
-    }
-    // Neither an explicit generation request nor an unscoped generated get can authorize through Return.
-    private var allowIsDefault: Bool { !generated && mode == .proxied && !hostFieldFocused && !editingReason }
-
-    private var sourceSuggestions: [HostPatternCheckItem] {
-        if provider == .gcloudAccess { return selected?.suggestedHosts.filter { !$0.broad } ?? [] }
-        guard provider == .gcloud else { return detail.suggestedHosts + (selected?.suggestedHosts ?? []) }
-        guard let selected else { return [] }
-        var catalogHosts = Set<String>()
-        for option in selected.scopeCatalog where claims.gcloudScopes.contains(option.uri) {
-            for service in option.services { catalogHosts.insert(service.name) }
-        }
-        // The manager normalizes these hosts. Restrict its ceiling-wide suggestions to selected scopes.
-        return selected.suggestedHosts.filter { !$0.broad && catalogHosts.contains($0.normalized) }
-    }
-
-    private var suggestions: [HostEntry] {
-        let present = Set(hosts.map(\.pattern))
-        var seen = Set<String>()
-        let sources = sourceSuggestions
-        let broad = Dictionary(sources.lazy.map { ($0.normalized, $0.broad) }, uniquingKeysWith: { a, _ in a })
-        let candidates = detail.requestedHosts + sources.map(\.normalized)
-        return candidates
-            .filter { $0 != "*" && !present.contains($0) && seen.insert($0).inserted }
-            .map { pattern in
-                HostEntry(pattern: pattern, broad: broad[pattern] ?? detail.suggestedHosts.contains {
-                    $0.normalized == pattern && $0.broad
-                })
-            }
     }
 
     private var subtitle: Text {
         let name = Text(verbatim: detail.name).fontWeight(.bold)
         if provider?.isGoogle == true { return Text("is requesting a Google Cloud token") }
-        if generated { return Text("requested a new \(name)") }
-        return detail.rawRequested ? Text("wants the real value of \(name)") : Text("wants to use \(name)")
-    }
-
-    private var approvedHostsLine: String {
-        if mode == .realValue { return String(localized: "none (real value)") }
-        if !detail.hasSubstitutableFields { return String(localized: "not required (plain fields)") }
-        return anyHost ? String(localized: "any host") : hosts.map(\.pattern).joined(separator: ", ")
+        return Text("requested a new \(name)")
     }
 
     var body: some View {
@@ -1562,17 +1608,20 @@ private struct GetApproval: View {
         let projectLookupKey = self.projectLookupKey
         ApprovalScaffold(
             error: context.resolutionError ?? setupStatus?.error ?? context.request.error,
-            footnote: generated ? Text("Access is authorized to this paired host. Agent labels identify the requester but are not a security boundary.") : nil,
-            contentHeight: generated ? max(160, min(340, (NSScreen.main?.visibleFrame.height ?? 800) - 460)) : nil
+            footnote: detail.sentinelRequired ? nil : Text("The paired host receives the raw token. Agent labels identify the requester but are not a security boundary."),
+            contentHeight: max(160, min(340, (NSScreen.main?.visibleFrame.height ?? 800) - 460))
         ) {
             ApprovalHeader(title: context.requesterTitle, subtitle: subtitle, queue: context.queue) { AppIconImage() }
         } content: {
             ReasonBlock(reason: detail.reason)
             VStack(alignment: .leading, spacing: 14) {
-                if generated {
+                if detail.sentinelRequired {
+                    Text("This request cannot accept a raw token. Deny it and ask the requester to retry with raw delivery.")
+                        .font(.callout)
+                } else {
                     GeneratorApprovalSection(
                         provider: provider, choices: detail.generatorChoices, pinnedID: detail.vaultID,
-                        selected: selected, claims: reviewBinding($claims, changingClaims: true),
+                        selected: selected, claims: reviewBinding($claims),
                         request: detail.requestedGeneration, operatorSelectedGrant: detail.operatorSelectedGrant,
                         approvedGrant: expectedGuard.selection?.grant,
                         projects: projectList, selectedProjectID: reviewedProjectID,
@@ -1580,35 +1629,7 @@ private struct GetApproval: View {
                         reloadProjects: { reloadProjects(from: projectLookupKey) },
                         select: { id in selectGenerator(id) }
                     )
-                    if !expectedGuard.scopeDifferences.isEmpty {
-                        GrantDifferencesReview(
-                            differences: expectedGuard.scopeDifferences, acknowledged: $differencesAcknowledged
-                        )
-                    }
-                }
-                if mode == .proxied {
-                    if detail.hasSubstitutableFields {
-                        HostsSection(
-                            hosts: reviewBinding($hosts), anyHost: reviewBinding($anyHost), editing: $editingHost,
-                            newHost: $newHost, error: $hostError, fieldFocused: $hostFieldFocused,
-                            suggestions: suggestions, suggestAnyHost: !generated || provider == .githubApp, add: add
-                        )
-                        if provider?.isGoogle == true {
-                            Text("These destinations only control where ASM substitutes the token. They do not restrict Google token access.")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    } else {
-                        Text("Only plain fields are selected. Destination-host controls and proxy setup are not needed.")
-                            .font(.callout).foregroundStyle(.secondary)
-                    }
-                }
-                GetDurationPicker(
-                    durations: durations, duration: reviewBinding($duration),
-                    delivery: generated ? reviewBinding($mode) : nil, sentinelRequired: detail.sentinelRequired
-                )
-                if detail.sentinelRequired {
-                    Text("The requester requires sentinel delivery. Real-value disclosure is disabled.")
-                        .font(.callout)
+                    GetDurationPicker(durations: durations, duration: reviewBinding($duration))
                 }
                 if provider == .gcloudAccess, !expectedGuard.resolving {
                     if case let .issued(_, uniqueID, email)? = expectedGuard.gcloudProfile {
@@ -1624,56 +1645,29 @@ private struct GetApproval: View {
             }
             .disabled(expectedGuard.resolving)
         } details: {
-            InfoRow(label: generated ? "Generator" : "Vault", value: selected?.choice.name ?? detail.vaultName)
-            if generated { InfoRow(label: "Output", value: detail.name) }
+            InfoRow(label: "Generator", value: selected?.choice.name ?? detail.vaultName)
+            InfoRow(label: "Output", value: detail.name)
             if case let .gcloud(grant)? = expectedGuard.selection?.grant, let projectID = grant.projectID {
                 InfoRow(label: "Issuance quota project", value: projectID)
             }
             InfoRow(label: "Fields", value: detail.fields.joined(separator: ", "))
-            InfoRow(label: "Requested hosts", value: detail.requestedHosts.joined(separator: ", "))
-            InfoRow(label: "Approved hosts", value: approvedHostsLine)
-            InfoRow(label: "Requested mode", value: detail.rawRequested ? String(localized: "real value") : String(localized: "proxied (sentinel)"))
             RequestMetaRows(context: context)
-            if generated { GeneratedCredentialNotes(provider: provider) }
+            GeneratedCredentialNotes(provider: provider)
         } actions: {
             // Keep durable changes next to the decision, outside the scrollable claim editor.
             if case let .prepared(authorization, plan)? = setupStatus {
                 GcloudInlineIAMPlan(plan: plan)
                     .id(authorization.id)
             }
-            ApprovalActions(cannedReasons: generated && mode == .realValue ? ["provide a better reason"]
-                            : ["host selection too open", "provide a better reason"],
-                            armed: context.armed, escapeDenies: !hostFieldFocused,
-                            editingReason: $editingReason, deny: deny) {
-                if generated {
-                    Button {
-                        allow(expectedGuard)
-                    } label: {
-                        if model.isGenerating(context.request.id) {
-                            HStack(spacing: 6) {
-                                ProgressView()
-                                    .progressViewStyle(.circular)
-                                    .controlSize(.small)
-                                    .tint(.white)
-                                    .accessibilityHidden(true)
-                                Text("Generating...")
-                            }
-                        } else {
-                            Text("Generate token")
-                        }
-                    }
-                    .buttonStyle(.panel)
-                    .onKeyPress(.return) { .handled }
-                    .disabled(!canAllow(expectedGuard))
-                } else {
-                    AllowSplitButton(mode: $mode, enabled: canAllow(expectedGuard),
-                                     isDefault: allowIsDefault, sentinelRequired: detail.sentinelRequired) {
-                        allow(expectedGuard)
-                    }
+            ApprovalActions(cannedReasons: ["provide a better reason"], armed: context.armed,
+                            escapeDenies: true, editingReason: $editingReason, deny: deny) {
+                GenerateTokenButton(
+                    generating: model.isGenerating(context.request.id), enabled: canGenerate(expectedGuard)
+                ) {
+                    generate(expectedGuard)
                 }
             }
             .disabled(expectedGuard.resolving)
-            ValueModeCaption(mode: mode, provider: provider, plainOnly: !detail.hasSubstitutableFields)
         }
         .task(id: projectLookupKey) {
             if let projectLookupKey { await lookupProjects(for: projectLookupKey) }
@@ -1689,10 +1683,6 @@ private struct GetApproval: View {
             try? await Task.sleep(for: .seconds(1))
             if !Task.isCancelled { armedGuard = expectedGuard }
         }
-        .onChange(of: mode) { _, newMode in
-            if newMode == .realValue { editingHost = false; newHost = ""; hostError = nil }
-        }
-        .onChange(of: expectedGuard.scopeDifferences) { _, _ in differencesAcknowledged = false }
         .onChange(of: detail.generatorChoices) { _, updated in
             if let selectedGenerator, updated.contains(where: selectedGenerator.matches) { return }
             setGenerator(Self.soleAvailableGenerator(in: detail))
@@ -1703,9 +1693,7 @@ private struct GetApproval: View {
             resetClaims()
             projectLookup = nil
         }
-        .onChange(of: detail.sentinelRequired) { _, required in
-            if required { reviewBinding($mode).wrappedValue = .proxied }
-        }
+        .onChange(of: detail.sentinelRequired) { _, _ in invalidateReview() }
     }
 
     private func lookupProjects(for key: GcloudProjectLookupKey) async {
@@ -1742,7 +1730,7 @@ private struct GetApproval: View {
     private func isCurrentProjectLookup(_ key: GcloudProjectLookupKey) -> Bool {
         guard !Task.isCancelled, key == projectLookupKey, let pending = model.shownRequest,
               pending.id == key.requestID, pending.expiresAt == key.requestExpiry,
-              case let .get(live) = pending.detail, live.operatorSelectedGcloudProject,
+              case let .get(live) = pending.detail, !live.sentinelRequired, live.operatorSelectedGcloudProject,
               case let .gcloudAccess(original)? = live.requestedGeneration,
               original == key.requestedAccess else { return false }
         return live.generatorChoices.contains {
@@ -1757,14 +1745,14 @@ private struct GetApproval: View {
         if let projectID, projectID != key.requestedAccess.projectID {
             guard case let .loaded(alternatives, _)? = projectList, alternatives.contains(projectID) else { return }
         }
-        invalidateReview(changingClaims: true)
+        invalidateReview()
         claims.gcloudProjectID = projectID
     }
 
     private func reloadProjects(from key: GcloudProjectLookupKey?) {
         guard let key, key.requestExpiry > .now, !model.isResolving(key.requestID),
               isCurrentProjectLookup(key) else { return }
-        invalidateReview(changingClaims: true)
+        invalidateReview()
         if claims.gcloudProjectID != key.requestedAccess.projectID { claims.gcloudProjectID = nil }
         projectLookup = nil
         projectRefresh &+= 1
@@ -1772,7 +1760,7 @@ private struct GetApproval: View {
 
     private func clearAlternateProject() {
         guard let project = claims.gcloudProjectID, project != managedAccess?.projectID else { return }
-        invalidateReview(changingClaims: true)
+        invalidateReview()
         claims.gcloudProjectID = nil
     }
 
@@ -1789,7 +1777,7 @@ private struct GetApproval: View {
     private func setGenerator(_ candidate: GeneratorApprovalChoiceItem?) {
         let identity = candidate.map(ApprovalGeneratorIdentity.init)
         guard identity != selectedGenerator else { return }
-        invalidateReview(changingClaims: true)
+        invalidateReview()
         selectedGenerator = identity
         projectLookup = nil
         claims = candidate.map { GetApprovalClaims(request: detail.requestedGeneration, within: $0.choice.ceiling) }
@@ -1797,49 +1785,38 @@ private struct GetApproval: View {
     }
 
     private func resetClaims() {
-        invalidateReview(changingClaims: true)
+        invalidateReview()
         claims = selected.map { GetApprovalClaims(request: detail.requestedGeneration, within: $0.choice.ceiling) }
             ?? GetApprovalClaims()
     }
 
-    private func invalidateReview(changingClaims: Bool = false) {
-        guard generated else { return }
+    private func invalidateReview() {
         // A->B->A must not resurrect an armed button or an already prepared IAM plan.
         reviewRevision &+= 1
         armedGuard = nil
-        if changingClaims { differencesAcknowledged = false }
         if provider == .gcloudAccess {
             gcloudSetup.cancelPreparation(forRequest: context.request.id, using: model)
         }
     }
 
-    private func reviewBinding<Value: Equatable>(
-        _ value: Binding<Value>, changingClaims: Bool = false
-    ) -> Binding<Value> {
+    private func reviewBinding<Value: Equatable>(_ value: Binding<Value>) -> Binding<Value> {
         Binding(get: { value.wrappedValue }, set: { updated in
             guard updated != value.wrappedValue else { return }
-            invalidateReview(changingClaims: changingClaims)
+            invalidateReview()
             value.wrappedValue = updated
         })
     }
 
-    private func allow(_ expected: GetApprovalGuard) {
+    private func generate(_ expected: GetApprovalGuard) {
         let approval = guardValue
-        guard approval == expected, canAllow(approval) else { return }
-        if provider == .gcloudAccess {
-            guard let target = approval.managedTarget, let current = model.shownRequest,
-                  current.id == approval.requestID, case let .get(liveDetail) = current.detail, liveDetail == detail else { return }
+        guard approval == expected, canGenerate(approval), let selection = approval.selection,
+              let current = model.shownRequest, current.id == approval.requestID,
+              case let .get(liveDetail) = current.detail, liveDetail == detail else { return }
+        if let target = approval.managedTarget {
             gcloudSetup.approve(target, authorization: approval.planAuthorization, ready: approval.gcloudProfile, using: model)
-            return
+        } else {
+            context.resolve(.approveGet(raw: true, durationSecs: approval.durationSecs, hosts: [], generation: selection))
         }
-        if generated {
-            guard let current = model.shownRequest, current.id == approval.requestID,
-                  case let .get(liveDetail) = current.detail, liveDetail == detail else { return }
-        }
-        context.resolve(.approveGet(
-            raw: mode == .realValue, durationSecs: durationSecs, hosts: approvedHosts,
-            generation: generated ? approval.selection : nil
-        ))
     }
 
     private func deny(_ reason: String) {
@@ -1850,31 +1827,37 @@ private struct GetApproval: View {
             context.deny(reason)
         }
     }
+}
 
-    private func add(_ pattern: String) -> Bool {
-        switch model.checkHostPattern(pattern) {
-        case let .success(result):
-            hostError = nil
-            if result.normalized == "*" {
-                reviewBinding($anyHost).wrappedValue = true
-                editingHost = false
-            } else if !hosts.contains(where: { $0.pattern == result.normalized }) {
-                invalidateReview()
-                hosts.append(HostEntry(pattern: result.normalized, broad: result.broad))
+private struct GenerateTokenButton: View {
+    let generating: Bool
+    let enabled: Bool
+    let generate: () -> Void
+
+    var body: some View {
+        Button(action: generate) {
+            if generating {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .controlSize(.small)
+                        .tint(.white)
+                        .accessibilityHidden(true)
+                    Text("Generating…")
+                }
+            } else {
+                Text("Generate token")
             }
-            return true
-        case let .failure(error):
-            hostError = error.message
-            return false
         }
+        .buttonStyle(.panel)
+        .onKeyPress(.return) { .handled }
+        .disabled(!enabled)
     }
 }
 
 private struct GetDurationPicker: View {
     let durations: [LeaseDuration]
     @Binding var duration: UInt64
-    var delivery: Binding<ValueMode>? = nil
-    var sentinelRequired = false
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
@@ -1884,15 +1867,6 @@ private struct GetDurationPicker: View {
             }
             .labelsHidden()
             Spacer(minLength: 0)
-            if let delivery {
-                SectionLabel("Delivery")
-                Picker("Delivery", selection: delivery) {
-                    Text("Proxy sentinel").tag(ValueMode.proxied)
-                    if !sentinelRequired { Text("Real token").tag(ValueMode.realValue) }
-                }
-                .labelsHidden()
-                .disabled(sentinelRequired)
-            }
         }
     }
 }
@@ -1981,22 +1955,6 @@ private struct GeneratorApprovalSection: View {
             case nil:
                 EmptyView()
             }
-        }
-    }
-}
-
-private struct GrantDifferencesReview: View {
-    let differences: [String]
-    @Binding var acknowledged: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            SectionLabel("Differences from the request").accessibilityAddTraits(.isHeader)
-            ForEach(differences, id: \.self) { difference in
-                Text(difference).font(.callout).fixedSize(horizontal: false, vertical: true)
-            }
-            Toggle("Approve this selection instead of the requested access", isOn: $acknowledged)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -2169,7 +2127,10 @@ private struct GeneratedCredentialNotes: View {
                 Text("GitHub tokens expire after one hour. Run asm get again to refresh within this lease. Renewal does not extend the authorization deadline.")
             case .gcloud:
                 Text("Run asm get again to refresh within this lease.")
-            case .gcloudAccess, nil:
+                Text(GcloudTokenWarning.text)
+            case .gcloudAccess:
+                Text(GcloudTokenWarning.text)
+            case nil:
                 EmptyView()
             }
         }
@@ -2273,7 +2234,6 @@ private struct HostsSection: View {
     @Binding var error: String?
     var fieldFocused: FocusState<Bool>.Binding
     let suggestions: [HostEntry]
-    let suggestAnyHost: Bool
     let add: (String) -> Bool
 
     private var filteredSuggestions: [HostEntry] {
@@ -2319,15 +2279,13 @@ private struct HostsSection: View {
                             .buttonStyle(SuggestionChipStyle(warning: suggestion.broad))
                             .help(suggestion.broad ? "Broad pattern: it matches many hosts." : "")
                         }
-                        if suggestAnyHost {
-                            Button {
-                                _ = add("*")
-                            } label: {
-                                Label("Any host", systemImage: "exclamationmark.triangle")
-                            }
-                            .buttonStyle(SuggestionChipStyle(warning: true))
-                            .help("Any host lets the agent obtain the real value.")
+                        Button {
+                            _ = add("*")
+                        } label: {
+                            Label("Any host", systemImage: "exclamationmark.triangle")
                         }
+                        .buttonStyle(SuggestionChipStyle(warning: true))
+                        .help("Any host lets the agent obtain the real value.")
                     }
                 }
                 if let error {
@@ -2602,7 +2560,8 @@ private struct AddApproval: View {
 
     private var target: AddTargetItem? { targets.first { $0.vaultID == vaultID } }
     private var canAllow: Bool {
-        context.armed && target != nil && !(target?.kind == .bitwarden && collectionID.isEmpty)
+        guard context.armed, let target else { return false }
+        return target.kind != .bitwarden || hasSelectedCollection(in: target)
     }
 
     var body: some View {
@@ -2642,6 +2601,7 @@ private struct AddApproval: View {
                     GridRow {
                         SectionLabel("Save to")
                         Picker("Save to", selection: $vaultID) {
+                            if target == nil { Text("Choose a vault…").tag("") }
                             ForEach(targets) { target in
                                 Text(verbatim: "\(target.vaultName) (\(target.kind.title))").tag(target.vaultID)
                             }
@@ -2653,6 +2613,9 @@ private struct AddApproval: View {
                         GridRow {
                             SectionLabel("Collection")
                             Picker("Collection", selection: $collectionID) {
+                                if !hasSelectedCollection(in: target) {
+                                    Text("Choose a collection…").tag("")
+                                }
                                 ForEach(target.collections) { collection in
                                     Text(verbatim: collection.name).tag(collection.id)
                                 }
@@ -2690,12 +2653,25 @@ private struct AddApproval: View {
             if vaultID.isEmpty, let first = targets.first { select(first.vaultID) }
         }
         .onChange(of: vaultID) { _, newValue in select(newValue) }
+        .onChange(of: targets) { _, _ in
+            guard let target else {
+                vaultID = ""
+                collectionID = ""
+                return
+            }
+            if !hasSelectedCollection(in: target) { collectionID = "" }
+        }
+    }
+
+    private func hasSelectedCollection(in target: AddTargetItem) -> Bool {
+        (collectionID == Self.personal && target.personalAllowed)
+            || target.collections.contains(where: { $0.id == collectionID })
     }
 
     private func select(_ id: String) {
         vaultID = id
         guard let target = targets.first(where: { $0.vaultID == id }) else { return }
-        if target.collections.contains(where: { $0.id == collectionID }) { return }
+        if hasSelectedCollection(in: target) { return }
         collectionID = target.collections.first?.id ?? (target.personalAllowed ? Self.personal : "")
     }
 }

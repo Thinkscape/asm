@@ -3,6 +3,8 @@
 
 use asm_proto::error::ErrorCode;
 
+pub(crate) const REQUEST_UNAVAILABLE: &str = "request could not be completed; check with the manager operator";
+
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{message}")]
 pub struct CoreError {
@@ -38,8 +40,7 @@ impl CoreError {
     pub fn rate_limited(m: impl Into<String>) -> Self {
         Self::new(ErrorCode::RateLimited, m)
     }
-    /// Internal failure; reported to API clients as `vault_unavailable`-free generic 500-ish.
-    /// Uses `Invalid` only if nothing better fits; prefer a specific constructor.
+    /// Internal failure; details are manager-local, and the API reports a generic 500.
     pub fn internal(m: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, m)
     }
@@ -67,7 +68,11 @@ impl From<asm_proto::ApiError> for CoreError {
 }
 impl From<CoreError> for asm_proto::ApiError {
     fn from(e: CoreError) -> Self {
-        Self::new(e.code, e.message)
+        let message = match e.code {
+            ErrorCode::VaultUnavailable | ErrorCode::Internal => REQUEST_UNAVAILABLE.to_owned(),
+            _ => e.message,
+        };
+        Self::new(e.code, message)
     }
 }
 

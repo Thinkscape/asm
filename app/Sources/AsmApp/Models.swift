@@ -289,18 +289,6 @@ struct GcloudAccessRequestItem: Equatable, Sendable {
     func selecting(projectID: String, permissions selection: Set<GcloudPermissionItem>) -> Self {
         Self(projectID: projectID, permissions: GcloudPermissionItem.allCases.filter(selection.contains))
     }
-
-    func unmetClaims(_ request: Self) -> [String] {
-        request.permissions.filter { !permissions.contains($0) }.map {
-            String(localized: "Permission not selected: \($0.claim)")
-        }
-    }
-
-    func addedClaims(_ request: Self) -> [String] {
-        permissions.filter { !request.permissions.contains($0) }.map {
-            String(localized: "Additional permission: \($0.claim)")
-        }
-    }
 }
 
 enum GenerationRequestItem: Equatable, Sendable {
@@ -332,49 +320,6 @@ struct GithubGrantItem: Identifiable, Equatable, Sendable {
         let match = GithubRequestedRepositories(requested, in: repositories)
         guard match.unavailable.isEmpty, match.matchedIDs.count == repositories.count else { return false }
         return Set(request.effectivePermissions) == Set(permissions)
-    }
-
-    func unmetClaims(_ request: GithubScopeRequestItem?) -> [String] {
-        guard let request else { return [] }
-        let match = GithubRequestedRepositories(request.repositories ?? [], in: repositories)
-        var issues = match.unavailable.map { repository in
-            repository.ambiguous
-                ? String(localized: "Requested repository name is ambiguous: \(repository.name)")
-                : String(localized: "Repository not selected: \(repository.name)")
-        }
-        let levels = Dictionary(permissions.map { ($0.name, $0.level) }, uniquingKeysWith: { first, _ in first })
-        for permission in request.permissions ?? [] where permission.name != "metadata" {
-            let level = levels[permission.name]
-            if let level, level < permission.level {
-                issues.append(String(localized: "\(permission.name): \(level.rawValue) selected instead of requested \(permission.level.rawValue)"))
-            } else if level == nil {
-                issues.append(String(localized: "Permission not selected: \(permission.name): \(permission.level.rawValue)"))
-            }
-        }
-        return issues
-    }
-
-    func addedClaims(_ request: GithubScopeRequestItem?, within ceiling: GithubGrantItem? = nil) -> [String] {
-        guard let request else { return [] }
-        let match = GithubRequestedRepositories(request.repositories ?? [], in: ceiling?.repositories ?? repositories)
-        var issues = repositories.filter { !match.matchedIDs.contains($0.id) }.map { repository in
-            if match.ambiguousIDs.contains(repository.id) {
-                return String(localized: "Additional repository: \(repository.fullName) · ID \(String(repository.id))")
-            }
-            return String(localized: "Additional repository: \(repository.fullName)")
-        }
-        // An explicit request with no permission flags asks only for mandatory metadata:read.
-        let levels = Dictionary((request.permissions ?? []).map { ($0.name, $0.level) }, uniquingKeysWith: { first, _ in first })
-        for permission in permissions where permission.name != "metadata" {
-            if let level = levels[permission.name] {
-                if level < permission.level {
-                    issues.append(String(localized: "\(permission.name): \(permission.level.rawValue) selected instead of requested \(level.rawValue)"))
-                }
-            } else {
-                issues.append(String(localized: "Additional permission: \(permission.name): \(permission.level.rawValue)"))
-            }
-        }
-        return issues
     }
 }
 
@@ -420,7 +365,6 @@ struct GeneratorApprovalChoiceItem: Identifiable, Equatable, Sendable {
         return ID(generatorID: choice.id, installationID: installationID)
     }
     var choice: GenerationChoiceItem
-    var suggestedHosts: [HostPatternCheckItem]
     var scopeIssues: [String]
     var scopeCatalog: [GcloudScopeOptionItem] = []
     var defaultProjectID: String? = nil

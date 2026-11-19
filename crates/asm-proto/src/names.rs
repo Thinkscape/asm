@@ -340,8 +340,8 @@ mod tests {
         SecretEntry {
             name: display.into(), vault: "GitHub Apps".into(), kind: crate::wire::SecretKind::Single,
             fields: vec!["value".into()], lease: None, source_kind: SourceKind::Generator,
-            generators: sources.iter().map(|(id, name)| crate::wire::GeneratorOption {
-                generator_id: (*id).into(), name: (*name).into(), available: true,
+            generators: sources.iter().map(|(id, name)| {
+                crate::wire::GeneratorOption::listed((*id).into(), (*name).into())
             }).collect(),
             aliases: aliases.iter().map(|s| (*s).into()).collect(),
         }
@@ -433,9 +433,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_qualified_source_precedes_literal_name_and_unavailable_is_addressable() {
-        let mut generated = generator_entry("GH_TOKEN", &["GITHUB_TOKEN"], &[("a", "bot")]);
-        generated.generators[0].available = false;
+    fn catalog_qualified_generator_precedes_literal_name() {
+        let generated = generator_entry("GH_TOKEN", &["GITHUB_TOKEN"], &[("a", "bot")]);
         let entries = [vault_entry("work", "bot/GH_TOKEN", "bot/GH_TOKEN"), generated];
         let found = resolve_catalog_name("bot/GH_TOKEN", &entries).unwrap();
         assert_eq!(found.entry_index, 1);

@@ -146,8 +146,7 @@ final class AppModel {
         do {
             switch topic {
             case "requests":
-                let snapshot = try await call { try $0.snapshot() }
-                applyRequests(pending: snapshot.pending, recent: snapshot.recent)
+                try await refreshRequests()
             case "leases":
                 gcloudOwnedAccountsRevision &+= 1
                 leases = try await call { try $0.listLeases() }
@@ -158,6 +157,9 @@ final class AppModel {
                 pairingCodes = try await call { try $0.listPairingCodes() }
             case "vaults":
                 vaults = try await call { try $0.listVaults() }
+                if pending.contains(where: { $0.kind == .add }) {
+                    try await refreshRequests()
+                }
             case "generators":
                 gcloudOwnedAccountsRevision &+= 1
                 generators = try await call { try $0.listGenerators() }
@@ -182,6 +184,11 @@ final class AppModel {
         } catch {
             // A failed refresh keeps the previous data; the next change retries.
         }
+    }
+
+    private func refreshRequests() async throws {
+        let snapshot = try await call { try $0.snapshot() }
+        applyRequests(pending: snapshot.pending, recent: snapshot.recent)
     }
 
     func refreshProxy() async {

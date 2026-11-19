@@ -130,6 +130,7 @@ impl Fixture {
         std::fs::write(dirs.proxy.join("ca.crt"), "fixture existing ca").unwrap();
         std::fs::write(dirs.proxy.join("ca.key"), "fixture existing key").unwrap();
         let core = Core::start(data, tmp.path().join("no-proxy-binary"), Arc::new(Quiet), StartOptions {
+            resume_key: Some([21; 32]),
             values_root: Some(tmp.path().to_owned()),
             settings: vec![(crate::settings::API_BIND.into(), json!("127.0.0.1")), (crate::settings::API_PORT.into(), json!(0))],
         }).unwrap();
@@ -367,11 +368,7 @@ fn approval_rejects_a_different_request_project_permission_or_delivery_before_cl
     assert!(f.approve(&other, &plan).is_err());
     assert!(f.approve(&request, &plan).is_err(), "a mismatched attempt consumes the plan");
 
-    let mut reviewed = f.decision();
-    if let Decision::ApproveGet { mode, hosts, .. } = &mut reviewed {
-        *mode = Mode::Sentinel;
-        *hosts = vec!["storage.googleapis.com".into()];
-    }
+    let reviewed = f.decision();
     let make = |mode, duration_secs, host: &str, access| Decision::ApproveGet {
         mode, duration_secs, hosts: if host.is_empty() { Vec::new() } else { vec![host.into()] },
         generation: Some(GenerationSelection {
@@ -381,15 +378,13 @@ fn approval_rejects_a_different_request_project_permission_or_delivery_before_cl
     };
     let access = f.key().access;
     for decision in [
-        make(Mode::Raw, Some(3600), "", access.clone()),
-        make(Mode::Sentinel, Some(7200), "storage.googleapis.com", access.clone()),
-        make(Mode::Sentinel, Some(0), "storage.googleapis.com", access.clone()),
-        make(Mode::Sentinel, Some(3600), "*", access.clone()),
+        make(Mode::Raw, Some(7200), "", access.clone()),
+        make(Mode::Raw, Some(0), "", access.clone()),
+        make(Mode::Raw, Some(3600), "storage.googleapis.com", access.clone()),
         make(Mode::Sentinel, Some(3600), "", access.clone()),
-        make(Mode::Sentinel, Some(3600), "https://storage.googleapis.com", access.clone()),
-        make(Mode::Sentinel, Some(3600), "storage.googleapis.com",
+        make(Mode::Raw, Some(3600), "",
             GcloudAccessRequest { project_id: "different-project".into(), ..access.clone() }),
-        make(Mode::Sentinel, Some(3600), "storage.googleapis.com",
+        make(Mode::Raw, Some(3600), "",
             GcloudAccessRequest { permissions: vec![asm_proto::generators::GcloudPermission::ComputeRead], ..access }),
     ] {
         let plan = f.core.gcloud_profile_plan(request.clone(), reviewed.clone()).unwrap().plan_id.unwrap();

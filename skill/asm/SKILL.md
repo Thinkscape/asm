@@ -39,16 +39,14 @@ upgrading `asm` to keep this file in step with the CLI.
    Acquisitions are sequential in input order. Every acquisition must succeed before the
    child starts; approval is not an atomic multi-lease transaction.
 4. **Follow the decision.** First generated access needs approval of the identity, scope,
-   delivery mode and lease duration. Request only what the task needs. The operator may
+   and lease duration. Request only what the task needs. The operator may
    narrow or extend the grant within one GitHub installation or one Google project.
    Use the **approved grant**, not the original flags, to determine what was granted.
    On first use of a Google profile, approval also authorizes the IAM setup shown.
    Later invocations may reuse or renew that grant. Static sentinel access can reuse a compatible lease; static raw access
    requires approval on every invocation.
 
-Generated credentials default to **raw**; static secrets default to **sentinel**.
-`--raw` asks for values but the operator may choose sentinel delivery. `--sentinel`
-forbids raw disclosure. Global `--raw`, `--sentinel` and `--hosts` apply to every exec binding.
+GitHub and Google generators deliver **raw tokens only**. Omit `--sentinel` and `--hosts` for generated tokens. Static secrets default to **sentinel**; `--sentinel` forbids raw disclosure. For a command that needs both kinds, `--hosts` applies only to the static fields.
 Give a specific `--reason` when the executable name alone does not explain the task.
 
 For substituted fields, exec configures the proxy and public CA files automatically.
@@ -98,7 +96,6 @@ If the manager lacks field/generator capabilities, upgrade it rather than droppi
 ```bash
 asm get --repositories acme/web GH_TOKEN 'Inspect repository metadata'
 asm get --repositories acme/web --permissions contents=read GH_TOKEN 'Read repository contents'
-asm get --repositories acme/web --sentinel --hosts api.github.com GH_TOKEN 'Read repository metadata through the proxy'
 asm get --lease LEASE_ID GH_TOKEN 'Continue reading acme/web'
 asm get --project my-staging-project --permissions storage=read CLOUDSDK_AUTH_ACCESS_TOKEN 'Read staging objects'
 ```
@@ -139,12 +136,6 @@ asm proxy-info
 Run proxy-env in the shell that will use sentinel files. It exports proxy and CA variables;
 `--unset` removes them, and fish users add `--shell fish`. It fails if no proxy is reachable.
 `FAIL firewall` means the operator must repair the Mac's firewall rule; do not bypass it.
-Verify GitHub App access against `repos/OWNER/REPO`, not `/user`:
-
-```bash
-asm exec --repositories acme/web GH_TOKEN -- gh api repos/acme/web
-asm exec --repositories acme/web --sentinel --hosts api.github.com GITHUB_TOKEN -- gh api repos/acme/web
-```
 
 Sentinels are restricted to approved HTTPS hosts. Request only needed hosts; broad
 wildcards are flagged. Substitution covers headers, paths, query and bodies up to 10 MB.
@@ -160,8 +151,7 @@ Response redaction is best effort.
 - Unknown network outcome (exit 1): the request may remain pending; repeating can recover it.
 - Ended pinned lease: request a new lease without `--lease`. Unavailable generation:
   report the error; do not switch apps, scope or delivery mode to bypass it.
-- Restart/lost request: repeat the command. Generated grants restart without token material;
-  explicit get/exec can mint under surviving authorization.
+- Manager restart: keep polling the same pending request. An unexpired generated token or sentinel remains valid under its existing lease; restart does not require `--refresh`.
 
 Raw exec avoids credential files, argv and ASM stdout, but the child receives values in
 memory/environment and can expose them. Avoid tracing, environment dumps and commands that

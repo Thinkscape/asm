@@ -183,6 +183,7 @@ pub struct StoredFile {
     pub field: String,
     pub relative_path: String,
     pub path: PathBuf,
+    pub delivery: crate::delivery::Delivery,
 }
 
 impl SecretsDir {
@@ -489,6 +490,7 @@ impl SecretsDir {
                     field: binding.field.clone(),
                     path: self.root.join(&path),
                     relative_path: path,
+                    delivery: crate::delivery::Delivery::from_field(result.mode, fields[binding.field.as_str()].substituted),
                 });
             }
         }
@@ -678,7 +680,7 @@ mod tests {
                     field: "value".into(),
                     relative_path: (*p).into(),
                     content: (*c).into(),
-                    substituted: true,
+                    substituted: Some(true),
                 })
                 .collect(),
         }
@@ -712,7 +714,7 @@ mod tests {
         result.credential_version = Some(version);
         result.credential_expires_at = Some(asm_proto::time::fmt_unix(4_600));
         result.generator_name = Some("release-bot".into());
-        result.files[0].substituted = mode == LeaseMode::Sentinel;
+        result.files[0].substituted = Some(mode == LeaseMode::Sentinel);
         result
     }
 
@@ -722,7 +724,7 @@ mod tests {
             field: (*field).into(),
             relative_path: (*path).into(),
             content: (*content).into(),
-            substituted: *field != "username",
+            substituted: Some(*field != "username"),
         }).collect();
         result
     }

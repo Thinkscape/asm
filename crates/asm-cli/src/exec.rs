@@ -2,6 +2,7 @@
 
 use crate::api::Api;
 use crate::bindings;
+use crate::delivery::Delivery;
 use crate::error::CliError;
 use crate::requests::{self, GenerationArgs, submit_get};
 use crate::state;
@@ -10,7 +11,7 @@ use asm_proto::generators::{
     generated_output_names,
 };
 use asm_proto::wire::{
-    GetResult, LeaseInfo, LeaseMode, LeaseStatus, LeasesResponse, RequestBody, RequestedMode,
+    GetResult, LeaseInfo, LeaseStatus, LeasesResponse, RequestBody, RequestedMode,
 };
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -22,8 +23,10 @@ use std::time::Instant;
 pub struct ExecArgs {
     #[arg(long, conflicts_with = "sentinel")]
     raw: bool,
+    /// Require substitution for static bindings. Cannot be combined with generated bindings.
     #[arg(long, conflicts_with = "raw")]
     sentinel: bool,
+    /// Proxy destination restrictions for static bindings only.
     #[arg(long, value_delimiter = ',')]
     hosts: Vec<String>,
     #[arg(long)]
@@ -193,6 +196,14 @@ pub fn run(args: ExecArgs) -> Result<(), CliError> {
     let (mut groups, destinations) = plan(&args.bindings, &entries)?;
     let mut github_groups = groups.iter().filter(|g| g.generated_output == Some(GITHUB_TOKEN_NAME)).count();
     let mut google_groups = groups.iter().filter(|g| g.generated_output == Some(GCLOUD_TOKEN_NAME)).count();
+    let generated_groups = github_groups + google_groups;
+    let generated = generated_groups != 0;
+    let has_static = generated_groups < groups.len();
+    let generated_mode = if generated {
+        mode.for_new_generated(if has_static { &[] } else { &hosts })?
+    } else {
+        mode
+    };
     if github_groups != 0 && matches!(&selectors.google, Some(GenerationRequest::GcloudAccess(_))) {
         return Err(CliError::invalid("managed Google Cloud and GitHub credentials require separate asm exec commands; --permissions cannot select both"));
     }
@@ -206,7 +217,7 @@ pub fn run(args: ExecArgs) -> Result<(), CliError> {
         (1.., false) => return Err(requests::gcloud_access_required()),
         _ => {}
     }
-    let capabilities = bindings::require_capabilities(&api, github_groups != 0 || google_groups != 0, true, selectors.capability())?;
+    let capabilities = bindings::require_capabilities(&api, generated, true, selectors.capability())?;
 
     let mut deadline = requests::deadline(args.wait);
     for group in &mut groups {
@@ -221,7 +232,12 @@ pub fn run(args: ExecArgs) -> Result<(), CliError> {
             }
             _ => None,
         };
-        let mut request = body(group.name.clone(), group.fields.clone(), mode, hosts.clone(), reason.clone(), None, generation, capabilities);
+        let (mode, hosts) = if group.generated_output.is_some() {
+            (generated_mode, Vec::new())
+        } else {
+            (mode, hosts.clone())
+        };
+        let mut request = body(group.name.clone(), group.fields.clone(), mode, hosts, reason.clone(), None, generation, capabilities);
         request.canonicalize()?;
         group.result = Some(submit_get(&api, &request, deadline, None, capabilities)?);
     }
@@ -231,16 +247,14 @@ pub fn run(args: ExecArgs) -> Result<(), CliError> {
         let lease = authority(&leases, group)?;
         let result = group.result.as_ref().expect("acquired");
         if group.generated_output.is_some() && (lease.credential_version != result.credential_version || !headroom(result.credential_expires_at.as_deref()) || !headroom(lease.credential_expires_at.as_deref())) {
-            let mode = match lease.mode {
-                LeaseMode::Raw => RequestedMode::Raw,
-                LeaseMode::Sentinel => RequestedMode::Sentinel,
-            };
-            let pinned = lease.generation.as_ref();
-            let request = body(lease.name.clone(), group.fields.clone(), mode, lease.hosts.clone(), reason.clone(), Some(lease.lease_id.clone()), requests::replay_managed_claims(pinned), capabilities);
-            group.result = Some(submit_get(&api, &request, deadline, pinned, capabilities)?);
+            let request = body(lease.name.clone(), group.fields.clone(), RequestedMode::Raw, Vec::new(), reason.clone(), Some(lease.lease_id.clone()), requests::replay_managed_claims(lease.generation.as_ref()), capabilities);
+            group.result = Some(submit_get(&api, &request, deadline, Some(lease), capabilities)?);
         }
     }
-    let needs_proxy = groups.iter().any(|g| g.result.as_ref().expect("acquired").files.iter().any(|f| f.substituted));
+    let needs_proxy = groups.iter().any(|g| {
+        let result = g.result.as_ref().expect("acquired");
+        result.files.iter().any(|f| Delivery::from_field(result.mode, f.substituted) != Delivery::Raw)
+    });
     let preparation = Instant::now();
     let proxy_env = if needs_proxy { crate::proxy::environment(&host, &api)? } else { Vec::new() };
     // Proxy/CA preparation is deliberately outside the acquisition wait budget.
@@ -259,11 +273,16 @@ pub fn run(args: ExecArgs) -> Result<(), CliError> {
     command.args(&args.command[1..]);
     for destination in destinations {
         let result = groups[destination.group].result.as_ref().expect("acquired");
-        let value = &result.files.iter().find(|f| f.field == destination.field).ok_or_else(changed)?.content;
-        if value.contains('\0') {
+        let file = result.files.iter().find(|f| f.field == destination.field).ok_or_else(changed)?;
+        if file.content.contains('\0') {
             return Err(CliError::failure("a credential contains NUL and cannot be placed in the child environment"));
         }
-        command.env(destination.name, value);
+        Delivery::from_field(result.mode, file.substituted).report(&destination.name);
+        command.env(destination.name, &file.content);
+    }
+    if needs_proxy {
+        eprintln!("asm exec configured the proxy and CA for this command.");
+        crate::delivery::proxy_hint();
     }
     for (key, value) in proxy_env {
         command.env_remove(key.to_ascii_lowercase());
@@ -289,8 +308,8 @@ mod tests {
 
     fn entries() -> Vec<asm_proto::wire::SecretEntry> {
         serde_json::from_value(json!([
-            {"name":"GH_TOKEN","aliases":["GITHUB_TOKEN"],"source_kind":"generator","generators":[{"generator_id":"app","name":"release-bot","available":true}],"vault":"GitHub App","kind":"single","fields":["value"],"lease":null},
-            {"name":"CLOUDSDK_AUTH_ACCESS_TOKEN","source_kind":"generator","generators":[{"generator_id":"gcp","name":"gcloud-dev","available":true}],"vault":"gcloud-dev","kind":"single","fields":["value"],"lease":null},
+            {"name":"GH_TOKEN","aliases":["GITHUB_TOKEN"],"source_kind":"generator","generators":[{"generator_id":"app","name":"release-bot"}],"vault":"GitHub App","kind":"single","fields":["value"],"lease":null},
+            {"name":"CLOUDSDK_AUTH_ACCESS_TOKEN","source_kind":"generator","generators":[{"generator_id":"gcp","name":"gcloud-dev"}],"vault":"gcloud-dev","kind":"single","fields":["value"],"lease":null},
             {"name":"work/login","vault":"work","kind":"login","fields":["username","password"],"lease":null}
         ])).unwrap()
     }

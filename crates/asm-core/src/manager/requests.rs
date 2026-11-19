@@ -1,7 +1,7 @@
-//! Host requests (`get`, `update`, `add`) and the shared pending list (which also holds
-//! revealed pairing requests). Pending requests, including the values of `update`/`add`,
-//! live in memory only; every state change happens under `Core::book`.
+//! Host requests (`get`, `update`, `add`) and the shared request book. Each request
+//! is sealed as one durable row, and transitions commit before changing the live book.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use asm_proto::crypto::{new_uuid_v4, sha256};
@@ -18,23 +18,29 @@ use asm_proto::wire::{
     GetResult, HostInfo, LeaseMode, RequestBody, RequestKind, RequestResult, RequestState,
     RequestStatus, ResultFile, SecretKind, WriteResult,
 };
+use serde::{Deserialize, Serialize};
 
+use super::catalog::CatalogMatch;
 use super::generation::GeneratedApproval;
 use super::pairing::{PairAttempt, PairState, Repair};
+use super::resume::SealedResume;
 use super::{
     Core, TOPIC_LEASES, TOPIC_REQUESTS, TOPIC_VAULTS, activity, lock, to_system_time,
 };
-use crate::error::{CoreError, Result};
+use crate::error::{CoreError, REQUEST_UNAVAILABLE, Result};
 use crate::ffi;
 use crate::proxy::ProxyEntry;
 use crate::store::{HistoryRecord, HostRecord, LeaseField, LeaseRecord};
 use crate::vault::names::NamedSecret;
-use crate::vault::{AddTarget, CollectionInfo, VaultConfig, VaultStatus};
+use crate::vault::{AddTarget, CollectionInfo, VaultConfig, VaultStatus, registry::VaultEntry};
 
 /// Resolved host requests stay pollable this long.
 const DONE_KEEP_SECS: i64 = 3600;
 /// Unrevealed pairing attempts expire after this long.
 pub const REVEAL_SECS: i64 = 60;
+
+const BOOK_NAMESPACE: &str = "request-book-v1";
+const INTERRUPTED: &str = "Approval was interrupted. Verify whether the operation completed before deciding again.";
 
 #[derive(Default)]
 pub struct Book {
@@ -43,6 +49,7 @@ pub struct Book {
     pub(crate) pairs: HashMap<String, PairAttempt>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Done {
     pub(crate) host_id: String,
     pub(crate) state: RequestState,
@@ -50,7 +57,7 @@ pub(crate) struct Done {
     pub(crate) generated: Option<GeneratedDelivery>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct GeneratedDelivery {
     pub lease_id: String,
     pub credential_version: u64,
@@ -58,8 +65,20 @@ pub(crate) struct GeneratedDelivery {
     pub operator_selected_grant: bool,
 }
 
+/// One upsert atomically replaces a request's prior state. A revealed pairing
+/// attempt and its popup are stored together; neither can outlive the other.
+#[derive(Serialize, Deserialize)]
+enum BookRow<'a> {
+    Pending(Cow<'a, Pending>),
+    Done(Cow<'a, Done>),
+    Pair {
+        attempt: Cow<'a, PairAttempt>,
+        pending: Option<Cow<'a, Pending>>,
+    },
+}
+
 /// A secret as resolved when the request was made.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SecretRef {
     pub vault_id: String,
     pub vault_name: String,
@@ -97,7 +116,7 @@ impl SecretRef {
 
 pub(crate) use asm_proto::wire::RequestedMode;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GeneratorTarget {
     pub requested_name: String,
     pub output_name: String,
@@ -118,7 +137,7 @@ impl GeneratorTarget {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum GetTarget {
     Vault(SecretRef),
     Generated(GeneratorTarget),
@@ -133,7 +152,7 @@ impl GetTarget {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct GetDetail {
     pub target: GetTarget,
     pub mode: RequestedMode,
@@ -154,7 +173,7 @@ pub(crate) fn substitutes(field: &str) -> bool {
     field != "username"
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct UpdateDetail {
     pub secret: SecretRef,
     pub field: String,
@@ -162,23 +181,13 @@ pub(crate) struct UpdateDetail {
     pub new_value: String,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct AddTargetData {
-    pub vault_id: String,
-    pub vault_name: String,
-    pub kind: ffi::VaultKind,
-    pub collections: Vec<CollectionInfo>,
-    pub personal_allowed: bool,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct AddDetail {
     pub name: String,
     pub value: String,
-    pub targets: Vec<AddTargetData>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum Detail {
     Pair {
         info: HostInfo,
@@ -194,7 +203,7 @@ pub(crate) enum Detail {
     Add(AddDetail),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Pending {
     pub id: String,
     pub created: i64,
@@ -298,7 +307,7 @@ pub(crate) fn status_str(s: RequestStatus) -> &'static str {
 pub(crate) enum Fail {
     /// The decision cannot be carried out as given; the request stays pending.
     Keep(CoreError),
-    /// The request becomes denied with this reason (e.g. `vault unavailable: …`).
+    /// The request becomes denied. This diagnostic is retained only on the manager.
     Deny(String),
 }
 
@@ -367,85 +376,260 @@ fn is_env_key(name: &str) -> bool {
         && c.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn accepts_add(vault: &VaultEntry, name: &str) -> bool {
+    vault.provider.status() == VaultStatus::Ready && match &vault.config {
+        VaultConfig::Bitwarden(config) => config.personal || !config.collections.is_empty(),
+        VaultConfig::EnvFile { .. } => is_env_key(name),
+        VaultConfig::Keychain => true,
+    }
+}
+
 impl Core {
-    fn record_history(&self, rows: &[HistoryRecord]) {
-        for r in rows {
-            if let Err(e) = self.store.insert_history(r) {
-                log::error!("request history: {}", e.message);
+    pub(super) fn seal_pending(&self, pending: &Pending) -> Result<SealedResume> {
+        self.resume.seal(BOOK_NAMESPACE, &pending.id, &BookRow::Pending(Cow::Borrowed(pending)))
+    }
+
+    pub(super) fn seal_done(&self, id: &str, done: &Done) -> Result<SealedResume> {
+        self.resume.seal(BOOK_NAMESPACE, id, &BookRow::Done(Cow::Borrowed(done)))
+    }
+
+    pub(super) fn seal_pair(&self, attempt: &PairAttempt, pending: Option<&Pending>) -> Result<SealedResume> {
+        self.resume.seal(BOOK_NAMESPACE, &attempt.id, &BookRow::Pair {
+            attempt: Cow::Borrowed(attempt),
+            pending: pending.map(Cow::Borrowed),
+        })
+    }
+
+    pub(super) fn save_pending_locked(&self, book: &mut Book, pending: Pending) -> Result<()> {
+        let row = if matches!(&pending.detail, Detail::Pair { .. }) {
+            let attempt = book.pairs.get(&pending.id)
+                .ok_or_else(|| CoreError::internal("pairing request is missing its attempt"))?;
+            self.seal_pair(attempt, Some(&pending))?
+        } else {
+            self.seal_pending(&pending)?
+        };
+        self.store.commit_request_book(&row, None)?;
+        Self::apply_pending_locked(book, pending);
+        Ok(())
+    }
+
+    /// Caller owns the live host pending row under authorization and book locks.
+    pub(super) fn mark_request_resolving(&self, pending: &mut Pending) -> Result<()> {
+        if pending.resolving || matches!(&pending.detail, Detail::Pair { .. }) {
+            return Err(CoreError::invalid("this request cannot be claimed"));
+        }
+        pending.resolving = true;
+        let result = self.seal_pending(pending)
+            .and_then(|row| self.store.commit_request_book(&row, None));
+        if result.is_err() {
+            pending.resolving = false;
+        }
+        result
+    }
+
+    pub(super) fn apply_pending_locked(book: &mut Book, pending: Pending) {
+        if let Some(existing) = book.pending.iter_mut().find(|p| p.id == pending.id) {
+            *existing = pending;
+        } else {
+            book.pending.push(pending);
+        }
+    }
+
+    pub(super) fn apply_done_locked(book: &mut Book, id: String, done: Done) {
+        Self::remove_pending_locked(book, &id);
+        book.done.insert(id, done);
+    }
+
+    pub(super) fn remove_pending_locked(book: &mut Book, id: &str) {
+        if let Some(index) = book.pending.iter().position(|p| p.id == id) {
+            book.pending.remove(index);
+        }
+    }
+
+    pub(super) fn insert_done_locked(
+        &self, book: &mut Book, id: String, done: Done, history: Option<HistoryRecord>,
+    ) -> Result<()> {
+        let row = self.seal_done(&id, &done)?;
+        self.store.commit_request_book(&row, history.as_ref())?;
+        Self::apply_done_locked(book, id, done);
+        Ok(())
+    }
+
+    pub(super) fn delete_book_row(&self, id: &str) -> Result<()> {
+        self.resume.remove(BOOK_NAMESPACE, id)
+    }
+
+    pub(super) fn save_pair_locked(
+        &self, book: &mut Book, attempt: PairAttempt, pending: Option<Pending>, history: Option<&HistoryRecord>,
+    ) -> Result<()> {
+        let row = self.seal_pair(&attempt, pending.as_ref())?;
+        self.store.commit_request_book(&row, history)?;
+        if let Some(pending) = pending {
+            Self::apply_pending_locked(book, pending);
+        } else {
+            Self::remove_pending_locked(book, &attempt.id);
+        }
+        book.pairs.insert(attempt.id.clone(), attempt);
+        Ok(())
+    }
+
+    /// Load before serving requests. A claimed operation may have reached its external
+    /// provider, so never replay it or mistake a process exit for an operator denial.
+    pub(super) fn restore_request_book(&self, t: i64) -> Result<()> {
+        let mut book = Book::default();
+        for (id, row) in self.resume.list::<BookRow<'static>>(BOOK_NAMESPACE)? {
+            match row {
+                BookRow::Pending(p) if p.id == id && !matches!(&p.detail, Detail::Pair { .. }) => {
+                    book.pending.push(p.into_owned());
+                }
+                BookRow::Done(d) if d.state.request_id == id && d.state.status.is_terminal() => {
+                    if let Some(delivery) = &d.generated
+                        && self.store.get_lease(&delivery.lease_id)?.is_none() {
+                        // Managed account retirement deletes its leases. A crash
+                        // after retirement must not recover their delivery rows.
+                        self.delete_book_row(&id)?;
+                        continue;
+                    }
+                    book.done.insert(id, d.into_owned());
+                }
+                BookRow::Pair { attempt, pending } if attempt.id == id
+                    && matches!(&attempt.state, PairState::Pending) == pending.is_some()
+                    && pending.as_ref().is_none_or(|p| p.id == id && matches!(&p.detail, Detail::Pair { .. })) =>
+                {
+                    book.pairs.insert(id, attempt.into_owned());
+                    if let Some(p) = pending {
+                        book.pending.push(p.into_owned());
+                    }
+                }
+                _ => return Err(CoreError::internal("request continuity state is inconsistent")),
             }
         }
+        book.pending.sort_by(|a, b| (a.created, &a.id).cmp(&(b.created, &b.id)));
+        let _authority = lock(&self.authorization);
+        for index in (0..book.pending.len()).rev() {
+            let p = &book.pending[index];
+            let revoked = p.host_id.as_deref().map(|id| self.host_is_active(id)).transpose()? == Some(false);
+            if revoked || p.expires <= t {
+                let id = p.id.clone();
+                let (status, reason, ended_at) = if revoked {
+                    (RequestStatus::Cancelled, Some("host revoked".into()), t)
+                } else {
+                    (RequestStatus::Expired, None, p.expires)
+                };
+                self.end_pending_locked(&mut book, &id, status, reason, None, ended_at, false)?;
+                continue;
+            }
+            let reconciled = if let Detail::Get(GetDetail { target: GetTarget::Generated(target), .. }) = &p.detail {
+                let mut current = target.clone();
+                self.reconcile_generator_target(&mut current, true);
+                (current != *target).then_some(current)
+            } else {
+                None
+            };
+            if reconciled.as_ref().is_some_and(|target| target.candidates.is_empty()) {
+                let id = p.id.clone();
+                self.finish_locked(&mut book, &id, Err(Some("no offered generators remain".into())), t, true)?;
+            } else if p.resolving || reconciled.is_some() {
+                let mut pending = p.clone();
+                if pending.resolving {
+                    pending.resolving = false;
+                    pending.error = Some(INTERRUPTED.into());
+                }
+                if let Some(target) = reconciled
+                    && let Detail::Get(GetDetail { target: GetTarget::Generated(current), .. }) = &mut pending.detail {
+                    *current = target;
+                }
+                self.save_pending_locked(&mut book, pending)?;
+            }
+        }
+        *lock(&self.book) = book;
+        drop(_authority);
+        self.expire_requests(t)
+    }
+
+    pub(super) fn host_is_active(&self, host_id: &str) -> Result<bool> {
+        Ok(self.store.get_host(host_id)?.is_some_and(|h| h.revoked_at.is_none()))
+    }
+
+    pub(super) fn require_active_host(&self, host_id: &str) -> Result<()> {
+        if !self.host_is_active(host_id)? {
+            return Err(CoreError::unauthorized("host was revoked"));
+        }
+        Ok(())
+    }
+
+    fn require_request_host(&self, host_id: &str, proof: Option<&[u8; 32]>) -> Result<()> {
+        match proof {
+            Some(hash) if self.store.host_by_proof(host_id, hash)?.is_none() => {
+                Err(CoreError::unauthorized("token rejected; run asm pair"))
+            }
+            Some(_) => Ok(()),
+            None => self.require_active_host(host_id),
+        }
+    }
+
+    /// Recheck the authority of a static terminal GET immediately before any
+    /// cached files (including unsubstituted ones) leave the manager.
+    fn check_static_delivery(&self, host_id: &str, result: &GetResult) -> Result<()> {
+        self.store.get_lease(&result.lease_id)?.filter(|lease| lease.host_id == host_id
+            && lease.source_kind == SourceKind::Vault && lease.mode == result.mode
+            && lease.is_active(self.generation_now()))
+            .ok_or_else(|| CoreError::vault_unavailable("lease ended; run asm get again"))?;
+        Ok(())
     }
 
     /// Expire pending requests and unrevealed pairing attempts; prune old resolved ones.
-    pub fn expire_requests(&self, t: i64) {
-        let mut rows = Vec::new();
-        let mut changed = false;
+    pub fn expire_requests(&self, t: i64) -> Result<()> {
+        let (mut changed, mut pending_changed) = (false, false);
         {
             let _authority = lock(&self.authorization);
-            let mut b = lock(&self.book);
-            let (expired, keep): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut b.pending)
-                .into_iter()
-                .partition(|p| p.expires <= t && (!p.resolving || matches!(&p.detail,
-                    Detail::Get(GetDetail { target: GetTarget::Generated(_), .. }))));
-            b.pending = keep;
-            for p in expired {
+            let mut book = lock(&self.book);
+            for index in (0..book.pending.len()).rev() {
+                let p = &book.pending[index];
+                if p.expires <= t && (!p.resolving || matches!(&p.detail,
+                    Detail::Get(GetDetail { target: GetTarget::Generated(_), .. }))) {
+                    let (id, expires) = (p.id.clone(), p.expires);
+                    self.end_pending_locked(&mut book, &id, RequestStatus::Expired, None, None, expires, false)?;
+                    pending_changed = true;
+                }
+            }
+            let ended_pairs: Vec<_> = book.pairs.values().filter(|a|
+                matches!(a.state, PairState::AwaitingReveal) && a.expires <= t).cloned().collect();
+            for mut attempt in ended_pairs {
+                attempt.state = PairState::Expired;
+                attempt.ended = Some(attempt.expires);
+                self.save_pair_locked(&mut book, attempt, None, None)?;
                 changed = true;
-                rows.push(p.history(RequestStatus::Expired, None, t));
-                self.log(activity::ended(&p, "expired", None));
-                match (&p.detail, &p.host_id) {
-                    (Detail::Pair { .. }, _) => {
-                        if let Some(a) = b.pairs.get_mut(&p.id) {
-                            a.state = PairState::Expired;
-                            a.ended = Some(t);
-                        }
-                    }
-                    (_, Some(host_id)) => {
-                        let state = p.ended_state(RequestStatus::Expired);
-                        b.done.insert(
-                            p.id.clone(),
-                            Done {
-                                host_id: host_id.clone(),
-                                state,
-                                at: t,
-                                generated: None,
-                            },
-                        );
-                    }
-                    _ => {}
-                }
             }
-            for a in b.pairs.values_mut() {
-                if matches!(a.state, PairState::AwaitingReveal) && a.expires <= t {
-                    a.state = PairState::Expired;
-                    a.ended = Some(t);
-                    changed = true;
-                }
+            let stale_done: Vec<_> = book.done.iter().filter(|(_, d)| d.at + DONE_KEEP_SECS <= t)
+                .map(|(id, _)| id.clone()).collect();
+            let stale_pairs: Vec<_> = book.pairs.iter().filter(|(_, a)| a.ended.is_some_and(|e| e + DONE_KEEP_SECS <= t))
+                .map(|(id, _)| id.clone()).collect();
+            for id in stale_done {
+                self.delete_book_row(&id)?;
+                book.done.remove(&id);
             }
-            b.done.retain(|_, d| d.at + DONE_KEEP_SECS > t);
-            b.pairs
-                .retain(|_, a| a.ended.is_none_or(|e| e + DONE_KEEP_SECS > t));
+            for id in stale_pairs {
+                self.delete_book_row(&id)?;
+                book.pairs.remove(&id);
+            }
         }
-        self.record_history(&rows);
-        if changed {
+        if changed || pending_changed {
             self.bump();
-            if !rows.is_empty() {
-                self.notify(TOPIC_REQUESTS);
-            }
         }
+        if pending_changed {
+            self.notify(TOPIC_REQUESTS);
+        }
+        Ok(())
     }
 
-    /// Resolve a secret name for a host's request; a miss while some vault is not ready →
-    /// `vault_unavailable`. A name that no current name resolves (ambiguous or not found)
-    /// but that equals the name recorded on one of the host's active leases resolves to
-    /// that lease's secret: names becoming vault-prefixed (or getting a `~hash`) must not
-    /// break the names an agent already holds leases under.
-    pub(crate) fn find_secret(&self, host_id: &str, query: &str) -> Result<NamedSecret> {
+    /// Resolve only against the catalog and this host's existing leases. An unavailable
+    /// provider must not turn an ordinary miss into a different client-visible error.
+    fn resolve_request_secret(&self, host_id: &str, query: &str) -> Result<CatalogMatch> {
         let catalog = self.secret_catalog()?;
-        let names = &catalog.static_entries;
         let e = match catalog.resolve(query) {
-            Ok(super::catalog::CatalogMatch::Vault(named)) => return Ok(named),
-            Ok(super::catalog::CatalogMatch::Generated(_)) => return Err(CoreError::invalid("generated secrets cannot be updated")),
-            Err(e) => e,
+            Err(e) if matches!(e.code, asm_proto::ErrorCode::NotFound | asm_proto::ErrorCode::Ambiguous) => e,
+            resolved => return resolved,
         };
         if catalog.generated.iter().any(|g| g.static_collisions.iter().any(|n| n == query)) {
             return Err(e);
@@ -457,37 +641,7 @@ impl Core {
                 && lease.generation.as_ref().is_some_and(|grant| grant.output_name() == output)) {
             return Err(e);
         }
-        if !matches!(
-            e.code,
-            asm_proto::ErrorCode::NotFound | asm_proto::ErrorCode::Ambiguous
-        ) {
-            return Err(e);
-        }
-        if let Some(n) = self.leased_secret(host_id, query, &names)? {
-            return Ok(n);
-        }
-        if e.code != asm_proto::ErrorCode::NotFound {
-            return Err(e);
-        }
-        let unavailable: Vec<String> = self
-            .registry
-            .all()
-            .into_iter()
-            .filter(|v| v.provider.status() != VaultStatus::Ready)
-            .map(|v| v.name)
-            .collect();
-        let relevant = match query.split_once('/') {
-            Some((vault, _)) => unavailable.iter().any(|u| u == vault),
-            None => !unavailable.is_empty(),
-        };
-        if relevant {
-            Err(CoreError::vault_unavailable(format!(
-                "{query:?} was not found in the available vaults; unavailable: {}",
-                unavailable.join(", ")
-            )))
-        } else {
-            Err(e)
-        }
+        self.leased_secret(host_id, query, &catalog.static_entries)?.map(CatalogMatch::Vault).ok_or(e)
     }
 
     /// The current entry of the secret behind the host's most recent active lease whose
@@ -529,11 +683,12 @@ impl Core {
             return Err(CoreError::invalid("agent label is too long"));
         }
         let t = self.generation_now();
+        self.require_active_host(&host.id)?;
         if !agent.is_empty() {
             self.store.upsert_agent(&host.id, &agent, t)?;
             self.notify(super::TOPIC_HOSTS);
         }
-        self.expire_requests(t);
+        self.expire_requests(t)?;
         match body {
             body @ RequestBody::Get { .. } => self.create_get(host, &agent, address, body),
             RequestBody::Update {
@@ -570,24 +725,31 @@ impl Core {
     }
 
     /// Push a pending request unless an equal one of the same host exists (re-attach).
-    pub(crate) fn push_pending(&self, p: Pending, same: impl Fn(&Pending) -> bool) -> RequestState {
-        let (state, inserted) = self.attach_pending(p, |current, _| same(current));
+    pub(crate) fn push_pending(&self, p: Pending, same: impl Fn(&Pending) -> bool) -> Result<RequestState> {
+        let authority = lock(&self.authorization);
+        let (state, inserted) = self.attach_pending(p, |current, _| same(current))?;
+        drop(authority);
         if inserted {
             self.bump();
             self.notify(TOPIC_REQUESTS);
         }
-        state
+        Ok(state)
     }
 
-    pub(crate) fn attach_pending(&self, p: Pending, same: impl Fn(&Pending, &Pending) -> bool) -> (RequestState, bool) {
+    /// Caller holds authorization (the generated path also checks its offered revisions).
+    pub(crate) fn attach_pending(&self, p: Pending, same: impl Fn(&Pending, &Pending) -> bool) -> Result<(RequestState, bool)> {
+        if let Some(host_id) = p.host_id.as_deref() {
+            self.require_active_host(host_id)?;
+        }
         let mut b = lock(&self.book);
         if let Some(existing) = b.pending.iter().find(|q| q.host_id == p.host_id && same(q, &p)) {
-            return (existing.state(), false);
+            return Ok((existing.state(), false));
         }
-        self.log(activity::requested(&p));
+        let event = activity::requested(&p);
         let state = p.state();
-        b.pending.push(p);
-        (state, true)
+        self.save_pending_locked(&mut b, p)?;
+        self.log(event);
+        Ok((state, true))
     }
 
     fn create_get(
@@ -611,19 +773,8 @@ impl Core {
             return self.generated_pinned_get(host, agent, name, id, mode, &requested,
                 fields.as_deref(), generation.as_ref(), *refresh, *refresh_from_version, &reason);
         }
-        let catalog = self.secret_catalog()?;
-        let resolved = match catalog.resolve(name) {
-            Ok(target) => target,
-            Err(e) if matches!(e.code, asm_proto::ErrorCode::NotFound | asm_proto::ErrorCode::Ambiguous) => {
-                if catalog.generated.iter().any(|g| g.static_collisions.iter().any(|n| n == name)) {
-                    return Err(e);
-                }
-                super::catalog::CatalogMatch::Vault(self.find_secret(&host.id, name)?)
-            }
-            Err(e) => return Err(e),
-        };
-        match resolved {
-            super::catalog::CatalogMatch::Generated(super::catalog::CatalogGeneratedTarget {
+        match self.resolve_request_secret(&host.id, name)? {
+            CatalogMatch::Generated(super::catalog::CatalogGeneratedTarget {
                 requested_name, output_name, pinned_generator_id, candidates,
             }) => {
                 body.validate_get_capabilities(SourceKind::Generator)?;
@@ -640,7 +791,7 @@ impl Core {
                 self.create_generated_get(host, agent, address, target, mode, wanted_fields,
                     requested, reason, *new_lease, *refresh, *refresh_from_version)
             }
-            super::catalog::CatalogMatch::Vault(named) => {
+            CatalogMatch::Vault(named) => {
                 body.validate_get_capabilities(SourceKind::Vault)?;
                 if generation.is_some() || *refresh || *new_lease || refresh_from_version.is_some() {
                     return Err(CoreError::invalid("generator options require a generated secret"));
@@ -660,13 +811,13 @@ impl Core {
                     requested_hosts: requested, reason, initial, suggestions,
                 };
                 let p = self.new_pending(host, agent, address, Detail::Get(detail.clone()));
-                Ok(self.push_pending(p, |q| match (&q.detail, &detail.target) {
+                self.push_pending(p, |q| match (&q.detail, &detail.target) {
                     (Detail::Get(g), GetTarget::Vault(s)) => matches!(&g.target,
                         GetTarget::Vault(other) if other.vault_id == s.vault_id && other.key == s.key)
                         && g.mode == detail.mode && g.wanted_fields == detail.wanted_fields
                         && g.requested_hosts == detail.requested_hosts && g.reason == detail.reason,
                     _ => false,
-                }))
+                })
             }
         }
     }
@@ -738,7 +889,7 @@ impl Core {
                 field: f.field.clone(),
                 relative_path: f.path.clone(),
                 content,
-                substituted: f.sentinel.is_some(),
+                substituted: Some(f.sentinel.is_some()),
             });
         }
         if lease.fields.iter().any(|f| wanted_fields.contains(&f.field) && f.sentinel.is_some())
@@ -769,15 +920,29 @@ impl Core {
             expires_at: None,
             pending_lifetime_secs: self.settings().request_lifetime_secs.max(1),
         };
-        lock(&self.book).done.insert(
-            id.clone(),
-            Done {
+        let history = HistoryRecord {
+            id: id.clone(),
+            kind: "get".into(),
+            host_id: Some(host.id.clone()),
+            host_label: host.label().to_string(),
+            summary: format!("get {} (existing lease)", secret.display),
+            status: "approved".into(),
+            deny_reason: None,
+            created_at: t,
+            resolved_at: t,
+        };
+        {
+            let _authority = lock(&self.authorization);
+            self.require_active_host(&host.id)?;
+            let Some(RequestResult::Get(result)) = &state.result else { unreachable!() };
+            self.check_static_delivery(&host.id, result)?;
+            self.insert_done_locked(&mut lock(&self.book), id.clone(), Done {
                 host_id: host.id.clone(),
                 state: state.clone(),
                 at: t,
                 generated: None,
-            },
-        );
+            }, Some(history))?;
+        }
         self.log(
             activity::Event::new(
                 activity::Category::Requests,
@@ -799,17 +964,6 @@ impl Core {
                 "expires_at": lease.expires_at.map(fmt_unix),
             })),
         );
-        self.record_history(&[HistoryRecord {
-            id,
-            kind: "get".into(),
-            host_id: Some(host.id.clone()),
-            host_label: host.label().to_string(),
-            summary: format!("get {} (existing lease)", secret.display),
-            status: "approved".into(),
-            deny_reason: None,
-            created_at: t,
-            resolved_at: t,
-        }]);
         self.notify(TOPIC_REQUESTS);
         Ok(Some(state))
     }
@@ -824,10 +978,9 @@ impl Core {
         value: String,
     ) -> Result<RequestState> {
         validate_secret_value(&value)?;
-        if matches!(self.secret_catalog()?.resolve(name), Ok(super::catalog::CatalogMatch::Generated(_))) {
+        let CatalogMatch::Vault(named) = self.resolve_request_secret(&host.id, name)? else {
             return Err(CoreError::invalid("generated secrets cannot be updated"));
-        }
-        let named = self.find_secret(&host.id, name)?;
+        };
         let secret = SecretRef::from_named(&named);
         let field = match field
             .map(|f| f.trim().to_string())
@@ -889,74 +1042,33 @@ impl Core {
             new_value: value,
         };
         let p = self.new_pending(host, agent, address, Detail::Update(detail.clone()));
-        Ok(self.push_pending(p, |q| {
+        self.push_pending(p, |q| {
             matches!(&q.detail, Detail::Update(u) if u.secret.vault_id == detail.secret.vault_id
                 && u.secret.key == detail.secret.key && u.field == detail.field
                 && hash_hex(&u.new_value) == hash)
-        }))
+        })
     }
 
-    /// Vaults that can receive `add <name>` (plan step 4 table).
-    pub(crate) fn add_targets(&self, name: &str) -> Vec<AddTargetData> {
-        let mut out = Vec::new();
-        for v in self.registry.all() {
-            if v.provider.status() != VaultStatus::Ready {
-                continue;
-            }
-            match &v.config {
+    /// Current writable destinations, for the manager's approval view only.
+    fn add_targets(&self, name: &str) -> Vec<ffi::AddTarget> {
+        self.registry.all().into_iter().filter(|v| accepts_add(v, name)).map(|v| {
+            let (kind, collections, personal_allowed) = match &v.config {
                 VaultConfig::Bitwarden(b) => {
-                    if b.collections.is_empty() && !b.personal {
-                        continue;
-                    }
                     let known = v.provider.collections().unwrap_or_default();
-                    let collections = b
-                        .collections
-                        .iter()
-                        .map(|id| {
-                            known
-                                .iter()
-                                .find(|c| &c.id == id)
-                                .cloned()
-                                .unwrap_or_else(|| CollectionInfo {
-                                    id: id.clone(),
-                                    name: b
-                                        .collection_names
-                                        .get(id)
-                                        .cloned()
-                                        .unwrap_or_else(|| id.clone()),
-                                    organization_id: None,
-                                })
-                        })
-                        .collect();
-                    out.push(AddTargetData {
-                        vault_id: v.id.clone(),
-                        vault_name: v.name.clone(),
-                        kind: ffi::VaultKind::Bitwarden,
-                        collections,
-                        personal_allowed: b.personal,
-                    });
+                    let collections = b.collections.iter().map(|id| {
+                        known.iter().find(|c| &c.id == id).cloned().unwrap_or_else(|| CollectionInfo {
+                            id: id.clone(),
+                            name: b.collection_names.get(id).cloned().unwrap_or_else(|| id.clone()),
+                            organization_id: None,
+                        }).into()
+                    }).collect();
+                    (ffi::VaultKind::Bitwarden, collections, b.personal)
                 }
-                VaultConfig::EnvFile { .. } => {
-                    if is_env_key(name) {
-                        out.push(AddTargetData {
-                            vault_id: v.id.clone(),
-                            vault_name: v.name.clone(),
-                            kind: ffi::VaultKind::EnvFile,
-                            collections: Vec::new(),
-                            personal_allowed: false,
-                        });
-                    }
-                }
-                VaultConfig::Keychain => out.push(AddTargetData {
-                    vault_id: v.id.clone(),
-                    vault_name: v.name.clone(),
-                    kind: ffi::VaultKind::Keychain,
-                    collections: Vec::new(),
-                    personal_allowed: false,
-                }),
-            }
-        }
-        out
+                VaultConfig::EnvFile { .. } => (ffi::VaultKind::EnvFile, Vec::new(), false),
+                VaultConfig::Keychain => (ffi::VaultKind::Keychain, Vec::new(), false),
+            };
+            ffi::AddTarget { vault_id: v.id, vault_name: v.name, kind, collections, personal_allowed }
+        }).collect()
     }
 
     fn create_add(
@@ -981,64 +1093,92 @@ impl Core {
                 "a secret named {name:?} already exists; use asm update"
             )));
         }
-        let targets = self.add_targets(&name);
-        if targets.is_empty() {
-            return Err(CoreError::vault_unavailable(format!(
-                "no available vault can store a secret named {name:?}"
-            )));
-        }
+        // Accept the request without probing writable targets. Only the operator sees
+        // which destinations, if any, can receive the value.
         let hash = hash_hex(&value);
-        let detail = AddDetail {
-            name,
-            value,
-            targets,
-        };
+        let detail = AddDetail { name, value };
         let p = self.new_pending(host, agent, address, Detail::Add(detail.clone()));
-        Ok(self.push_pending(p, |q| {
+        self.push_pending(p, |q| {
             matches!(&q.detail, Detail::Add(a) if a.name == detail.name && hash_hex(&a.value) == hash)
-        }))
+        })
     }
 
     /// `GET /requests/{id}`: the request's state. A raw result is returned once, then dropped.
     pub fn request_state(&self, host_id: &str, id: &str) -> Result<RequestState> {
-        self.expire_requests(self.generation_now());
-        let marker = {
-            let mut book = lock(&self.book);
+        self.request_state_with_proof(host_id, id, None)
+    }
+
+    pub(super) fn request_state_with_proof(
+        &self, host_id: &str, id: &str, proof: Option<&[u8; 32]>,
+    ) -> Result<RequestState> {
+        self.expire_requests(self.generation_now())?;
+        let outcome = (|| {
+            let authority = lock(&self.authorization);
+            self.require_request_host(host_id, proof)?;
+            let book = lock(&self.book);
             if let Some(pending) = book.pending.iter().find(|p| p.id == id && p.host_id.as_deref() == Some(host_id)) {
                 return Ok(pending.state());
             }
-            let done = book.done.get_mut(id).filter(|d| d.host_id == host_id)
+            let done = book.done.get(id).filter(|d| d.host_id == host_id)
                 .ok_or_else(|| CoreError::not_found("no such request"))?;
-            if let Some(marker) = &done.generated { marker.clone() } else {
-                let state = done.state.clone();
-                if matches!(&done.state.result, Some(RequestResult::Get(g)) if g.mode == LeaseMode::Raw) {
-                    done.state.result = None;
+            if let Some(delivery) = &done.generated {
+                let unavailable = || CoreError::vault_unavailable(
+                    "generated credential is no longer available; run asm get again");
+                if delivery.consumed {
+                    return Err(unavailable());
                 }
+                let delivery = delivery.clone();
+                // Generated authorization may take its cache and publication locks.
+                // The authority lock keeps cancellation and revocation out throughout.
+                drop(book);
+                let mode = self.check_generated_delivery(&delivery.lease_id, delivery.credential_version)?;
+                if mode == LeaseMode::Sentinel && lock(&self.proxy_state).dirty {
+                    self.publish_proxy_locked(&authority).map_err(|_|
+                        CoreError::vault_unavailable("generated credential publication failed; run asm get to retry"))?;
+                }
+                let mut result = self.validate_generated_delivery(&delivery.lease_id, delivery.credential_version)?;
+                result.operator_selected_grant = delivery.operator_selected_grant;
+                let mut book = lock(&self.book);
+                let done = book.done.get(id).ok_or_else(unavailable)?;
+                let mut state = done.state.clone();
+                if mode == LeaseMode::Raw {
+                    let mut retained = done.clone();
+                    retained.generated.as_mut().ok_or_else(unavailable)?.consumed = true;
+                    self.insert_done_locked(&mut book, id.to_owned(), retained, None)?;
+                }
+                state.result = Some(RequestResult::Get(result));
                 return Ok(state);
             }
-        };
-        let outcome = (|| -> Result<RequestState> {
-            let authority = lock(&self.authorization);
-            let mode = self.check_generated_delivery(&marker.lease_id, marker.credential_version)?;
-            if mode == LeaseMode::Sentinel && lock(&self.proxy_state).dirty {
-                self.publish_proxy_locked(&authority).map_err(|_|
-                    CoreError::vault_unavailable("generated credential publication failed; run asm get to retry"))?;
+
+            if let Some(RequestResult::Get(result)) = &done.state.result {
+                self.check_static_delivery(host_id, result)?;
+                if result.mode == LeaseMode::Sentinel
+                    && result.files.iter().any(|f| f.substituted == Some(true)) {
+                    let lease_id = result.lease_id.clone();
+                    drop(book);
+                    if lock(&self.proxy_state).dirty {
+                        self.publish_proxy_locked(&authority)?;
+                    }
+                    if !lock(&self.proxy_state).entries.contains_key(&lease_id) {
+                        return Err(CoreError::vault_unavailable("lease is suspended because its vault is unavailable"));
+                    }
+                    return Ok(lock(&self.book).done.get(id)
+                        .ok_or_else(|| CoreError::not_found("no such request"))?.state.clone());
+                }
+                if result.mode == LeaseMode::Raw {
+                    let mut book = book;
+                    let done = book.done.get_mut(id).expect("same locked row");
+                    let delivery = done.state.result.take();
+                    let committed = self.seal_done(id, done)
+                        .and_then(|row| self.store.commit_request_book(&row, None));
+                    if let Err(e) = committed {
+                        done.state.result = delivery;
+                        return Err(e);
+                    }
+                    return Ok(RequestState { result: delivery, ..done.state.clone() });
+                }
             }
-            let mut result = self.validate_generated_delivery(&marker.lease_id, marker.credential_version)?;
-            let mut book = lock(&self.book);
-            let done = book.done.get_mut(id).filter(|d| d.host_id == host_id)
-                .ok_or_else(|| CoreError::not_found("no such request"))?;
-            let delivery = done.generated.as_mut().filter(|d| d.lease_id == marker.lease_id
-                && d.credential_version == marker.credential_version)
-                .ok_or_else(|| CoreError::vault_unavailable("generated credential is no longer available; run asm get again"))?;
-            if result.mode == LeaseMode::Raw && delivery.consumed {
-                return Err(CoreError::vault_unavailable("generated credential is no longer available; run asm get again"));
-            }
-            if result.mode == LeaseMode::Raw { delivery.consumed = true; }
-            result.operator_selected_grant = delivery.operator_selected_grant;
-            let mut state = done.state.clone();
-            state.result = Some(RequestResult::Get(result));
-            Ok(state)
+            Ok(done.state.clone())
         })();
         self.notify_proxy_changed();
         outcome
@@ -1046,47 +1186,52 @@ impl Core {
 
     /// `DELETE /requests/{id}`.
     pub fn cancel_request(&self, host_id: &str, id: &str) -> Result<RequestState> {
+        self.cancel_request_with_proof(host_id, id, None)
+    }
+
+    pub(super) fn cancel_request_with_proof(
+        &self, host_id: &str, id: &str, proof: Option<&[u8; 32]>,
+    ) -> Result<RequestState> {
         let t = self.generation_now();
-        self.expire_requests(t);
-        let (state, row) = {
+        self.expire_requests(t)?;
+        let (state, changed) = {
             let _authority = lock(&self.authorization);
-            let mut b = lock(&self.book);
-            let pos = b
-                .pending
-                .iter()
-                .position(|p| p.id == id && p.host_id.as_deref() == Some(host_id));
-            match pos {
-                Some(i) if !b.pending[i].resolving || matches!(&b.pending[i].detail,
-                    Detail::Get(GetDetail { target: GetTarget::Generated(_), .. })) => {
-                    let p = b.pending.remove(i);
-                    let state = p.ended_state(RequestStatus::Cancelled);
-                    b.done.insert(
-                        p.id.clone(),
-                        Done {
-                            host_id: host_id.to_string(),
-                            state: state.clone(),
-                            at: t,
-                            generated: None,
-                        },
-                    );
-                    self.log(activity::ended(&p, "cancelled", None));
-                    (state, Some(p.history(RequestStatus::Cancelled, None, t)))
+            self.require_request_host(host_id, proof)?;
+            let mut book = lock(&self.book);
+            if let Some(p) = book.pending.iter().find(|p| p.id == id && p.host_id.as_deref() == Some(host_id)) {
+                if p.resolving && !matches!(&p.detail, Detail::Get(GetDetail { target: GetTarget::Generated(_), .. })) {
+                    return Ok(p.state());
                 }
-                Some(i) => (b.pending[i].state(), None),
-                None => match b.done.get_mut(id).filter(|d| d.host_id == host_id) {
-                    Some(d) => {
-                        if let Some(delivery) = d.generated.as_mut() { delivery.consumed = true; }
-                        if matches!(&d.state.result, Some(RequestResult::Get(g)) if g.mode == LeaseMode::Raw) {
-                            d.state.result = None;
+                let state = p.ended_state(RequestStatus::Cancelled);
+                self.end_pending_locked(&mut book, id, RequestStatus::Cancelled, None, None, t, false)?;
+                (state, true)
+            } else {
+                let done = book.done.get_mut(id).filter(|d| d.host_id == host_id)
+                    .ok_or_else(|| CoreError::not_found("no such request"))?;
+                let result = if matches!(&done.state.result, Some(RequestResult::Get(_))) {
+                    done.state.result.take()
+                } else {
+                    None
+                };
+                let newly_consumed = done.generated.as_mut().is_some_and(|d|
+                    !std::mem::replace(&mut d.consumed, true));
+                if result.is_some() || newly_consumed {
+                    let committed = self.seal_done(id, done)
+                        .and_then(|row| self.store.commit_request_book(&row, None));
+                    if let Err(e) = committed {
+                        if result.is_some() {
+                            done.state.result = result;
                         }
-                        (d.state.clone(), None)
+                        if newly_consumed {
+                            done.generated.as_mut().expect("delivery just marked consumed").consumed = false;
+                        }
+                        return Err(e);
                     }
-                    None => return Err(CoreError::not_found("no such request")),
-                },
+                }
+                (done.state.clone(), false)
             }
         };
-        if let Some(row) = row {
-            self.record_history(&[row]);
+        if changed {
             self.bump();
             self.notify(TOPIC_REQUESTS);
         }
@@ -1094,37 +1239,27 @@ impl Core {
     }
 
     /// Cancel every pending request of a host (host revoked).
-    pub(crate) fn cancel_host_requests(&self, host_id: &str) {
+    pub(crate) fn cancel_host_requests(&self, host_id: &str) -> Result<()> {
         let t = self.generation_now();
-        let rows: Vec<HistoryRecord> = {
+        let mut changed = false;
+        {
             let _authority = lock(&self.authorization);
-            let mut b = lock(&self.book);
-            let (gone, keep): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut b.pending)
-                .into_iter()
-                .partition(|p| p.host_id.as_deref() == Some(host_id));
-            b.pending = keep;
-            gone.iter()
-                .map(|p| {
-                    let state = p.ended_state(RequestStatus::Cancelled);
-                    b.done.insert(
-                        p.id.clone(),
-                        Done {
-                            host_id: host_id.to_string(),
-                            state,
-                            at: t,
-                            generated: None,
-                        },
-                    );
-                    self.log(activity::ended(p, "cancelled", Some("host revoked")));
-                    p.history(RequestStatus::Cancelled, Some("host revoked".into()), t)
-                })
-                .collect()
-        };
-        if !rows.is_empty() {
-            self.record_history(&rows);
+            let mut book = lock(&self.book);
+            for index in (0..book.pending.len()).rev() {
+                let p = &book.pending[index];
+                if p.host_id.as_deref() == Some(host_id) {
+                    let id = p.id.clone();
+                    self.end_pending_locked(&mut book, &id, RequestStatus::Cancelled,
+                        Some("host revoked".into()), None, t, false)?;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
             self.bump();
             self.notify(TOPIC_REQUESTS);
         }
+        Ok(())
     }
 
     // ---- resolution ----
@@ -1132,17 +1267,16 @@ impl Core {
     /// Carry out the operator's decision on a pending request.
     pub fn resolve_request(&self, id: &str, decision: ffi::Decision) -> Result<()> {
         let t = self.generation_now();
-        self.expire_requests(t);
+        self.expire_requests(t)?;
         // Phase 1: claim the request.
         let p = {
-            // Managed Google approvals can be denied while they are in flight.
-            // Serialize denial with the cloud-write and final-delivery gates.
-            let deny_authority = matches!(&decision, ffi::Decision::Deny { .. }).then(|| lock(&self.authorization));
+            // Serialize claiming/denial with the cloud-write and final delivery gates.
+            let authority = lock(&self.authorization);
             let mut b = lock(&self.book);
             let Some(i) = b.pending.iter().position(|p| p.id == id) else {
                 return Err(CoreError::not_found("this request is no longer pending"));
             };
-            let deniable_managed_get = deny_authority.is_some() && matches!(&b.pending[i].detail,
+            let deniable_managed_get = matches!(&decision, ffi::Decision::Deny { .. }) && matches!(&b.pending[i].detail,
                 Detail::Get(GetDetail { target: GetTarget::Generated(GeneratorTarget {
                     requested_generation: Some(GenerationRequest::GcloudAccess(_)), ..
                 }), .. }));
@@ -1164,14 +1298,24 @@ impl Core {
             }
             if let ffi::Decision::Deny { reason } = &decision {
                 let reason = Some(reason.trim().to_string()).filter(|r| !r.is_empty());
-                let p = b.pending.remove(i);
+                self.finish_locked(&mut b, id, Err(reason), t, false)?;
                 drop(b);
-                drop(deny_authority);
-                self.finish(p, Err(reason), t, false);
+                drop(authority);
+                self.notify_request_ended();
                 return Ok(());
             }
-            b.pending[i].resolving = true;
-            b.pending[i].clone()
+            if let Some(host_id) = b.pending[i].host_id.as_deref() {
+                self.require_active_host(host_id)?;
+            }
+            if matches!(&b.pending[i].detail, Detail::Pair { .. }) {
+                let mut pending = b.pending[i].clone();
+                pending.resolving = true;
+                self.save_pending_locked(&mut b, pending.clone())?;
+                pending
+            } else {
+                self.mark_request_resolving(&mut b.pending[i])?;
+                b.pending[i].clone()
+            }
         };
 
         // Phase 2: do the work without holding the book.
@@ -1190,7 +1334,7 @@ impl Core {
                 },
             ) => match generation.map(GenerationSelection::try_from).transpose() {
                 Ok(selection) => self.approve_get(&p, g, mode.into(), duration_secs, hosts, selection)
-                    .map(|r| Some(RequestResult::Get(r))),
+                    .map(|_| None),
                 Err(error) => Err(Fail::Keep(error)),
             },
             (Detail::Update(u), ffi::Decision::ApproveWrite { vault_id, .. }) => self
@@ -1213,95 +1357,100 @@ impl Core {
         // Phase 3: record the outcome.
         let t = self.generation_now();
         match outcome {
-            Ok(result) => {
-                let p = self.take_pending(id);
-                if let Some(p) = p {
-                    self.finish(p, Ok(result), t, false);
+            // Pairing and GET approvals already committed atomically with their
+            // delivery authority. A vault write cannot share that transaction.
+            Ok(None) => Ok(()),
+            Ok(Some(result)) => {
+                let changed = {
+                    let _authority = lock(&self.authorization);
+                    self.finish_locked(&mut lock(&self.book), id, Ok(Some(result)), t, false)?
+                };
+                if !changed {
+                    return Err(CoreError::vault_unavailable(
+                        "request ended during the write; verify the vault before trying again"));
                 }
+                self.notify_request_ended();
                 Ok(())
             }
             Err(Fail::Keep(e)) => {
-                self.keep_request_pending(id, &e);
+                self.keep_request_pending(id, &e)?;
                 Err(e)
             }
             Err(Fail::Deny(reason)) => {
-                if let Some(p) = self.take_pending(id) {
-                    self.finish(p, Err(Some(reason.clone())), t, true);
+                let changed = {
+                    let _authority = lock(&self.authorization);
+                    self.finish_locked(&mut lock(&self.book), id, Err(Some(reason.clone())), t, true)?
+                };
+                if changed {
+                    self.notify_request_ended();
                 }
                 Err(CoreError::vault_unavailable(reason))
             }
         }
     }
 
-    pub(super) fn keep_request_pending(&self, id: &str, error: &CoreError) {
+    pub(super) fn keep_request_pending(&self, id: &str, error: &CoreError) -> Result<()> {
         let mut book = lock(&self.book);
-        if let Some(pending) = book.pending.iter_mut().find(|p| p.id == id) {
+        if let Some(p) = book.pending.iter().find(|p| p.id == id) {
+            let mut pending = p.clone();
             pending.resolving = false;
             pending.error = Some(error.message.clone());
+            self.save_pending_locked(&mut book, pending)?;
         }
         drop(book);
         self.notify(TOPIC_REQUESTS);
+        Ok(())
     }
 
-    fn take_pending(&self, id: &str) -> Option<Pending> {
-        let mut b = lock(&self.book);
-        let i = b.pending.iter().position(|p| p.id == id)?;
-        Some(b.pending.remove(i))
-    }
-
-    /// Move a removed pending request to its terminal state. `Ok(result)` = approved,
-    /// `Err(reason)` = denied (`failed`: by a vault failure while approving).
-    pub(crate) fn finish(
-        &self,
-        p: Pending,
-        outcome: std::result::Result<Option<RequestResult>, Option<String>>,
-        t: i64,
-        failed: bool,
-    ) {
-        let event = match &outcome {
-            Ok(r) => activity::approved(&p, r.as_ref(), t),
-            Err(reason) => activity::ended(
-                &p,
-                if failed { "failed" } else { "denied" },
-                reason.as_deref(),
-            ),
-        };
-        self.log(event);
-        let (status, deny_reason, result) = match outcome {
-            Ok(r) => (RequestStatus::Approved, None, r),
-            Err(reason) => (RequestStatus::Denied, reason, None),
-        };
-        {
-            let mut b = lock(&self.book);
-            match (&p.detail, &p.host_id) {
-                (Detail::Pair { .. }, _) => {
-                    if let Some(a) = b.pairs.get_mut(&p.id) {
-                        if status == RequestStatus::Denied {
-                            a.state = PairState::Denied(deny_reason.clone());
-                        }
-                        a.ended = Some(t);
-                    }
-                }
-                (_, Some(host_id)) => {
-                    let mut state = p.ended_state(status);
-                    state.deny_reason = deny_reason.clone();
-                    state.result = result;
-                    b.done.insert(
-                        p.id.clone(),
-                        Done {
-                            host_id: host_id.clone(),
-                            state,
-                            at: t,
-                            generated: None,
-                        },
-                    );
-                }
-                _ => {}
-            }
-        }
-        self.record_history(&[p.history(status, deny_reason, t)]);
+    pub(super) fn notify_request_ended(&self) {
         self.bump();
         self.notify(TOPIC_REQUESTS);
+    }
+
+    /// Move the pending request to a terminal state without an intermediate gap.
+    /// `failed` means an internal denial reason must stay on the manager.
+    pub(super) fn finish_locked(
+        &self, book: &mut Book, id: &str,
+        outcome: std::result::Result<Option<RequestResult>, Option<String>>,
+        t: i64, failed: bool,
+    ) -> Result<bool> {
+        let (status, reason, result) = match outcome {
+            Ok(result) => (RequestStatus::Approved, None, result),
+            Err(reason) => (RequestStatus::Denied, reason, None),
+        };
+        self.end_pending_locked(book, id, status, reason, result, t, failed)
+    }
+
+    fn end_pending_locked(
+        &self, book: &mut Book, id: &str, status: RequestStatus, reason: Option<String>,
+        result: Option<RequestResult>, t: i64, failed: bool,
+    ) -> Result<bool> {
+        let Some(p) = book.pending.iter().find(|p| p.id == id) else { return Ok(false) };
+        let event = if status == RequestStatus::Approved {
+            activity::approved(p, result.as_ref(), t)
+        } else {
+            activity::ended(p, if failed { "failed" } else { status_str(status) }, reason.as_deref())
+        };
+        let history = p.history(status, reason.clone(), t);
+        if matches!(&p.detail, Detail::Pair { .. }) {
+            let mut attempt = book.pairs.get(id).cloned()
+                .ok_or_else(|| CoreError::internal("pairing request is missing its attempt"))?;
+            attempt.state = match status {
+                RequestStatus::Denied => PairState::Denied(reason),
+                RequestStatus::Expired => PairState::Expired,
+                _ => return Err(CoreError::internal("invalid pairing outcome")),
+            };
+            attempt.ended = Some(t);
+            self.save_pair_locked(book, attempt, None, Some(&history))?;
+        } else {
+            let host_id = p.host_id.clone().ok_or_else(|| CoreError::internal("request is missing its host"))?;
+            let mut state = p.ended_state(status);
+            state.deny_reason = if failed { Some(REQUEST_UNAVAILABLE.into()) } else { reason };
+            state.result = result;
+            self.insert_done_locked(book, id.to_owned(), Done { host_id, state, at: t, generated: None }, Some(history))?;
+        }
+        self.log(event);
+        Ok(true)
     }
 
     fn approve_get(
@@ -1312,11 +1461,11 @@ impl Core {
         duration_secs: Option<u64>,
         hosts: Vec<String>,
         generation: Option<GenerationSelection>,
-    ) -> std::result::Result<GetResult, Fail> {
+    ) -> std::result::Result<(), Fail> {
         if matches!(&g.target, GetTarget::Generated(_)) {
             let selection = generation.ok_or_else(|| CoreError::invalid("choose a generator and grant"))?;
             let approval = GeneratedApproval::new(g, mode, duration_secs, &hosts)?;
-            return self.approve_generated_get(p, g, approval, selection, None);
+            return self.approve_generated_get(p, g, approval, selection, None).map(|_| ());
         }
         if g.mode == RequestedMode::Sentinel && mode == LeaseMode::Raw {
             return Err(Fail::Keep(CoreError::invalid("this request requires sentinel delivery")));
@@ -1387,7 +1536,7 @@ impl Core {
                 field: field.clone(),
                 relative_path: path.clone(),
                 content: sentinel.clone().unwrap_or_else(|| value.clone()),
-                substituted: sentinel.is_some(),
+                substituted: Some(sentinel.is_some()),
             });
             fields.push(LeaseField {
                 field: field.clone(),
@@ -1419,19 +1568,7 @@ impl Core {
             credential_version: 0,
             requested_generation: None,
         };
-        self.store.insert_lease(&lease)?;
-        self.log_lease_created(&lease);
-        if mode == LeaseMode::Sentinel && g.has_substitutable_fields() {
-            self.store
-                .replace_secret_hosts(&s.vault_id, &s.key, &hosts)?;
-            self.sync_proxy_with(false, |st| {
-                st.dirty = true;
-                st.entries.insert(lease_id.clone(), entries);
-            });
-        }
-        lock(&self.last_active).insert(lease_id.clone());
-        self.notify(TOPIC_LEASES);
-        Ok(GetResult {
+        let result = RequestResult::Get(GetResult {
             lease_id,
             mode,
             hosts,
@@ -1442,7 +1579,46 @@ impl Core {
             credential_expires_at: None,
             credential_version: None,
             generator_name: None,
-        })
+        });
+        let event = activity::approved(p, Some(&result), t);
+        let mut state = p.ended_state(RequestStatus::Approved);
+        state.result = Some(result);
+        let done = Done { host_id: lease.host_id.clone(), state, at: t, generated: None };
+        let history = p.history(RequestStatus::Approved, None, t);
+        let row = self.seal_done(&p.id, &done)?;
+        let publication = {
+            let authority = lock(&self.authorization);
+            self.require_active_host(&lease.host_id)?;
+            let mut book = lock(&self.book);
+            if !book.pending.iter().any(|q| q.id == p.id && q.resolving && q.expires > self.generation_now()) {
+                return Err(Fail::Keep(CoreError::vault_unavailable("request ended before its lease was approved")));
+            }
+            if !entries.is_empty() {
+                self.store.replace_secret_hosts(&s.vault_id, &s.key, &lease.hosts)?;
+            }
+            self.store.insert_lease_with_request(&lease, &[row], &history)?;
+            Self::apply_done_locked(&mut book, p.id.clone(), done);
+            drop(book);
+            if entries.is_empty() {
+                Ok(())
+            } else {
+                {
+                    let mut proxy = lock(&self.proxy_state);
+                    proxy.dirty = true;
+                    proxy.entries.insert(lease.id.clone(), entries);
+                }
+                self.publish_proxy_locked(&authority)
+            }
+        };
+        lock(&self.last_active).insert(lease.id.clone());
+        self.log_lease_created(&lease);
+        self.log(event);
+        self.notify_proxy_changed();
+        self.notify(TOPIC_LEASES);
+        self.notify_request_ended();
+        // Approval is already durable. Polling refuses to release the sentinel until
+        // the proxy publishes the lease; a publication error must not re-open approval.
+        publication.map_err(Fail::Keep)
     }
 
     fn approve_update(
@@ -1465,20 +1641,19 @@ impl Core {
             .update(&s.key, &u.field, &u.new_value)
             .map_err(|e| Fail::Deny(format!("vault unavailable: {}", e.message)))?;
         let t = self.generation_now();
-        let leases: Vec<LeaseRecord> = self
-            .store
-            .active_leases(t)
-            .map_err(Fail::Keep)?
-            .into_iter()
-            .filter(|l| l.source_kind == SourceKind::Vault && l.vault_id == s.vault_id && l.secret_key == s.key)
-            .collect();
-        for l in leases.iter().filter(|l| l.mode == LeaseMode::Raw) {
-            match self.store.revoke_lease(&l.id, t) {
-                Ok(true) => self.log_lease_revoked(l, "secret updated"),
-                Ok(false) => {}
-                Err(e) => log::error!("revoke raw lease after update: {}", e.message),
+        let leases: Vec<LeaseRecord> = {
+            let _authority = lock(&self.authorization);
+            let leases: Vec<LeaseRecord> = self.store.active_leases(t)?
+                .into_iter()
+                .filter(|l| l.source_kind == SourceKind::Vault && l.vault_id == s.vault_id && l.secret_key == s.key)
+                .collect();
+            for l in leases.iter().filter(|l| l.mode == LeaseMode::Raw) {
+                if self.store.revoke_lease(&l.id, t)? {
+                    self.log_lease_revoked(l, "secret updated");
+                }
             }
-        }
+            leases
+        };
         let sentinel: Vec<&LeaseRecord> = leases
             .iter()
             .filter(|l| l.mode == LeaseMode::Sentinel)
@@ -1511,15 +1686,12 @@ impl Core {
         vault_id: &str,
         collection_id: Option<String>,
     ) -> std::result::Result<WriteResult, Fail> {
-        let Some(target) = a.targets.iter().find(|t| t.vault_id == vault_id) else {
-            return Err(Fail::Keep(CoreError::invalid(
-                "choose one of the offered vaults",
-            )));
-        };
-        let collection_id = match target.kind {
-            ffi::VaultKind::Bitwarden => match collection_id {
-                Some(c) if target.collections.iter().any(|x| x.id == c) => Some(c),
-                None if target.personal_allowed => None,
+        let entry = self.registry.get(vault_id).filter(|v| accepts_add(v, &a.name))
+            .ok_or_else(|| Fail::Keep(CoreError::invalid("choose an available vault")))?;
+        let collection_id = match &entry.config {
+            VaultConfig::Bitwarden(config) => match collection_id {
+                Some(c) if config.collections.contains(&c) => Some(c),
+                None if config.personal => None,
                 _ => {
                     return Err(Fail::Keep(CoreError::invalid(
                         "choose one of the offered collections",
@@ -1534,10 +1706,6 @@ impl Core {
                 a.name
             )));
         }
-        let entry = self
-            .registry
-            .get(vault_id)
-            .ok_or_else(|| Fail::Deny("vault unavailable: vault was removed".into()))?;
         entry
             .provider
             .add(&a.name, &a.value, &AddTarget { collection_id })
@@ -1545,14 +1713,16 @@ impl Core {
         self.notify(TOPIC_VAULTS);
         Ok(WriteResult {
             name: a.name.clone(),
-            vault: target.vault_name.clone(),
+            vault: entry.name,
         })
     }
 
     // ---- snapshot ----
 
     pub fn snapshot(&self) -> ffi::Snapshot {
-        self.expire_requests(self.generation_now());
+        if let Err(e) = self.expire_requests(self.generation_now()) {
+            log::error!("request expiration: {}", e.message);
+        }
         let default_duration = self.settings().lease_default_secs;
         let pending: Vec<Pending> = lock(&self.book).pending.clone();
         // Labels follow renames: look up the host's current name.
@@ -1629,10 +1799,8 @@ fn approval_choice(
     core: &Core,
     target: &GeneratorTarget,
     choice: &GenerationChoice,
-    requested_hosts: &[String],
 ) -> ffi::GeneratorApprovalChoice {
     let mut scope_catalog = Vec::new();
-    let mut suggested_hosts = Vec::new();
     let mut default_project_id = None;
     let mut gcloud_ready = None;
     let _authority = matches!(&choice.ceiling, GenerationGrant::GcloudAccess(_))
@@ -1644,27 +1812,13 @@ fn approval_choice(
         if let GenerationGrant::GcloudAccess(GcloudAccessGrant::Requested { access }) = &choice.ceiling {
             gcloud_ready = core.ready_gcloud_access_locked(&entry.record, access).ok().map(Into::into);
         }
-        let config = entry.record.config;
-        let hosts = config.uri_hosts(&choice.ceiling);
-        match config {
-            crate::generator::GeneratorConfig::GithubApp(_) => {
-                let remembered = core.store.secret_hosts(&choice.generator_id, crate::generator::OUTPUT_KEY)
-                    .unwrap_or_default();
-                let (initial, suggestions) = host_candidates(requested_hosts, &remembered, &hosts);
-                suggested_hosts.extend(initial.iter().chain(&suggestions).map(|h| pattern_check(h)));
-            }
-            crate::generator::GeneratorConfig::Gcloud(config) => {
-                default_project_id = Some(config.project_id);
-                suggested_hosts.extend(hosts.iter().map(|h| pattern_check(h)));
-                scope_catalog.extend(config.scope_catalog.into_iter().map(Into::<ffi::GcloudScopeOption>::into));
-            }
-            crate::generator::GeneratorConfig::GcloudConnection(_) => {
-                suggested_hosts.extend(hosts.iter().map(|h| pattern_check(h)));
-            }
+        if let crate::generator::GeneratorConfig::Gcloud(config) = entry.record.config {
+            default_project_id = Some(config.project_id);
+            scope_catalog.extend(config.scope_catalog.into_iter().map(Into::<ffi::GcloudScopeOption>::into));
         }
     }
     ffi::GeneratorApprovalChoice {
-        choice: choice.clone().into(), scope_catalog, suggested_hosts, default_project_id, gcloud_ready,
+        choice: choice.clone().into(), scope_catalog, default_project_id, gcloud_ready,
         scope_issues: target.requested_generation.as_ref().map(|request|
             choice.ceiling.scope_issues(request).unwrap_or_else(|e| vec![e.message])).unwrap_or_default(),
     }
@@ -1703,7 +1857,7 @@ fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi
                         .unwrap_or("Generator");
                     (target.requested_name.clone(), target.pinned_generator_id.clone(), label.into(),
                         SecretKind::Single, target.candidates.iter().map(|choice|
-                            approval_choice(core, target, choice, &g.requested_hosts)
+                            approval_choice(core, target, choice)
                         ).collect(), target.requested_generation.clone().map(Into::into))
                 }
             };
@@ -1732,19 +1886,9 @@ fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi
             new_value: u.new_value,
         },
         Detail::Add(a) => ffi::RequestDetail::Add {
+            targets: core.add_targets(&a.name),
             name: a.name,
             value: a.value,
-            targets: a
-                .targets
-                .into_iter()
-                .map(|t| ffi::AddTarget {
-                    vault_id: t.vault_id,
-                    vault_name: t.vault_name,
-                    kind: t.kind,
-                    collections: t.collections.into_iter().map(Into::into).collect(),
-                    personal_allowed: t.personal_allowed,
-                })
-                .collect(),
         },
     };
     ffi::PendingRequest {
@@ -1766,6 +1910,254 @@ fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use asm_proto::crypto::hex_encode;
+    use asm_proto::pairing::{client_commit, new_nonce};
+    use asm_proto::wire::{PairRequest, PairResponse, RevealRequest};
+    use serde_json::json;
+
+    struct Quiet;
+
+    impl ffi::ManagerObserver for Quiet {
+        fn changed(&self, _: String) {}
+    }
+
+    fn open_manager(tmp: &tempfile::TempDir) -> Arc<Core> {
+        let data = tmp.path().join("data");
+        let dirs = crate::paths::DataDirs::create(&data, Some(tmp.path())).unwrap();
+        if !dirs.proxy.join("ca.crt").exists() {
+            std::fs::write(dirs.proxy.join("ca.crt"), "isolated existing ca").unwrap();
+            std::fs::write(dirs.proxy.join("ca.key"), "isolated existing key").unwrap();
+        }
+        Core::start(data, tmp.path().join("no-proxy-binary"), Arc::new(Quiet), super::super::StartOptions {
+            values_root: Some(tmp.path().to_owned()),
+            resume_key: Some([42; 32]),
+            settings: vec![
+                (crate::settings::API_BIND.into(), json!("127.0.0.1")),
+                (crate::settings::API_PORT.into(), json!(0)),
+            ],
+        }).unwrap()
+    }
+
+    fn reopen(core: Arc<Core>, tmp: &tempfile::TempDir) -> Arc<Core> {
+        core.shutdown();
+        drop(core);
+        open_manager(tmp)
+    }
+
+    fn request_host(core: &Core) -> HostRecord {
+        let host = HostRecord {
+            id: new_uuid_v4(),
+            info: HostInfo { hostname: "request-host".into(), ..Default::default() },
+            name: String::new(),
+            address: "127.0.0.1".into(),
+            paired_at: core.generation_now(),
+            last_seen: None,
+            revoked_at: None,
+            machine_hint: None,
+        };
+        core.store.insert_host(&host, &[1; 32]).unwrap();
+        host
+    }
+
+    fn request_add(core: &Core, host: &HostRecord, name: &str, value: &str) -> RequestState {
+        core.create_request(host, "127.0.0.1", RequestBody::Add {
+            name: name.into(), value: value.into(), agent: String::new(),
+        }).unwrap()
+    }
+
+    #[test]
+    fn interrupted_write_keeps_its_id_deadline_and_value_without_replaying() {
+        const PROPOSAL: &str = "isolated-proposed-value-not-in-sqlite";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = open_manager(&tmp);
+        let output = tmp.path().join("secrets.env");
+        std::fs::write(&output, "EXISTING=value\n").unwrap();
+        let vault = core.save_vault(ffi::VaultDraft {
+            id: None, name: "test".into(),
+            config: ffi::VaultConfig::EnvFile { path: output.to_string_lossy().into_owned() },
+            client_secret: String::new(), master_password: String::new(),
+        }).unwrap();
+        let host = request_host(&core);
+        let pending = request_add(&core, &host, "PROPOSED", PROPOSAL);
+        {
+            let _authorization = lock(&core.authorization);
+            let mut book = lock(&core.book);
+            let p = book.pending.iter_mut().find(|p| p.id == pending.request_id).unwrap();
+            // Simulate the exact durable boundary before the provider is called.
+            core.mark_request_resolving(p).unwrap();
+        }
+        for path in [core.dirs.db(), core.dirs.db().with_extension("db-wal")] {
+            if let Ok(bytes) = std::fs::read(path) {
+                assert!(!bytes.windows(PROPOSAL.len()).any(|w| w == PROPOSAL.as_bytes()));
+            }
+        }
+
+        core = reopen(core, &tmp);
+        assert_eq!(core.request_state(&host.id, &pending.request_id).unwrap(), pending);
+        assert_eq!(request_add(&core, &host, "PROPOSED", PROPOSAL), pending);
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.pending[0].error.as_deref(), Some(INTERRUPTED));
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "EXISTING=value\n");
+
+        core.resolve_request(&pending.request_id, ffi::Decision::ApproveWrite {
+            vault_id: vault.id, collection_id: None,
+        }).unwrap();
+        core = reopen(core, &tmp);
+        let terminal = core.request_state(&host.id, &pending.request_id).unwrap();
+        assert_eq!(terminal.status, RequestStatus::Approved);
+        assert!(matches!(terminal.result, Some(RequestResult::Write(_))));
+        assert_eq!(core.snapshot().recent[0].id, pending.request_id);
+        assert!(std::fs::read_to_string(&output).unwrap().contains(PROPOSAL));
+        core.shutdown();
+    }
+
+    #[test]
+    fn terminal_decisions_and_host_revocation_survive_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = open_manager(&tmp);
+        let host = request_host(&core);
+        let denied = request_add(&core, &host, "DENIED", "test").request_id;
+        core.resolve_request(&denied, ffi::Decision::Deny { reason: "explicit denial".into() }).unwrap();
+        let cancelled = request_add(&core, &host, "CANCELLED", "test").request_id;
+        core.cancel_request(&host.id, &cancelled).unwrap();
+        let expired = {
+            let mut pending = core.new_pending(&host, "", "127.0.0.1", Detail::Add(AddDetail {
+                name: "EXPIRED".into(), value: "test".into(),
+            }));
+            pending.created -= 10;
+            pending.expires = core.generation_now() - 1;
+            let id = pending.id.clone();
+            core.save_pending_locked(&mut lock(&core.book), pending).unwrap();
+            id
+        };
+        core = reopen(core, &tmp);
+        let state = core.request_state(&host.id, &denied).unwrap();
+        assert_eq!(state.status, RequestStatus::Denied);
+        assert_eq!(state.deny_reason.as_deref(), Some("explicit denial"));
+        assert_eq!(core.request_state(&host.id, &cancelled).unwrap().status, RequestStatus::Cancelled);
+        assert_eq!(core.request_state(&host.id, &expired).unwrap().status, RequestStatus::Expired);
+        assert!(core.snapshot().pending.is_empty());
+
+        let revoked = request_add(&core, &host, "REVOKED", "test").request_id;
+        // Simulate stopping after the authoritative host row changed, before
+        // cancelling the requests that belonged to it.
+        assert!(core.store.revoke_host(&host.id, core.generation_now()).unwrap());
+        core = reopen(core, &tmp);
+        assert!(core.snapshot().pending.is_empty());
+        assert!(core.request_state(&host.id, &revoked).is_err());
+        assert!(core.snapshot().recent.iter().any(|r| r.id == revoked && r.outcome == ffi::RequestOutcome::Cancelled));
+        core.shutdown();
+    }
+
+    #[test]
+    fn raw_delivery_commits_once_and_checks_live_lease_and_host_proof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = open_manager(&tmp);
+        let env = tmp.path().join("secrets.env");
+        std::fs::write(&env, "DEMO_TOKEN=isolated-static-value\n").unwrap();
+        core.save_vault(ffi::VaultDraft {
+            id: None, name: "test".into(),
+            config: ffi::VaultConfig::EnvFile { path: env.to_string_lossy().into_owned() },
+            client_secret: String::new(), master_password: String::new(),
+        }).unwrap();
+        let host = request_host(&core);
+        let approve = |core: &Core, reason: &str| {
+            let body = serde_json::from_value(json!({
+                "kind": "get", "name": "DEMO_TOKEN", "raw": true, "reason": reason,
+            })).unwrap();
+            let r = core.create_request(&host, "127.0.0.1", body).unwrap();
+            core.resolve_request(&r.request_id, ffi::Decision::ApproveGet {
+                mode: ffi::LeaseMode::Raw, duration_secs: None, hosts: Vec::new(), generation: None,
+            }).unwrap();
+            r.request_id
+        };
+        let deliver = approve(&core, "consume after restart");
+        let revoked = approve(&core, "revoke before poll");
+        let leases = core.store.leases_of_host(&host.id).unwrap();
+        let lease = leases.iter().find(|l| l.reason == "revoke before poll").unwrap();
+        core.revoke_lease(&lease.id).unwrap();
+        assert!(core.store.rotate_host_token(&host, &[1; 32], &[2; 32]).unwrap());
+        // No credential can leave the manager if its consume mark cannot commit.
+        core.resume.close().unwrap();
+        assert!(core.request_state_with_proof(&host.id, &deliver, Some(&[2; 32])).is_err());
+
+        core = reopen(core, &tmp);
+        assert_eq!(core.request_state_with_proof(&host.id, &deliver, Some(&[1; 32])).unwrap_err().code,
+            asm_proto::ErrorCode::Unauthorized);
+        assert!(core.request_state_with_proof(&host.id, &revoked, Some(&[2; 32])).is_err());
+        let approved = core.request_state_with_proof(&host.id, &deliver, Some(&[2; 32])).unwrap();
+        let Some(RequestResult::Get(result)) = approved.result else { panic!("missing recovered delivery") };
+        assert_eq!(result.files[0].content, "isolated-static-value");
+
+        core = reopen(core, &tmp);
+        assert!(core.request_state_with_proof(&host.id, &deliver, Some(&[2; 32])).unwrap().result.is_none());
+        assert!(core.request_state_with_proof(&host.id, &revoked, Some(&[2; 32])).is_err());
+        core.shutdown();
+    }
+
+    fn start_pair(core: &Core, name: &str, ip: &str) -> (String, RevealRequest) {
+        let nonce = new_nonce();
+        let PairResponse::AwaitingReveal { pair_id, poll_token, .. } = core.pair_start(PairRequest {
+            client_commit: hex_encode(&client_commit(&nonce)),
+            host_info: HostInfo { hostname: name.into(), ..Default::default() },
+            pairing_code: None, previous: None, machine_hint: None,
+        }, ip).unwrap() else { panic!("missing pairing attempt") };
+        (pair_id, RevealRequest {
+            poll_token, client_nonce: hex_encode(&nonce),
+        })
+    }
+
+    #[test]
+    fn pairing_can_reveal_and_claim_the_same_attempt_across_restarts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = open_manager(&tmp);
+        let (pair_id, request) = start_pair(&core, "pair-host", "127.0.0.1");
+        core = reopen(core, &tmp);
+        let reveal = |core: &Core| core.pair_reveal(&pair_id, request.clone()).unwrap();
+        let PairResponse::Pending { expires_at, .. } = reveal(&core) else { panic!("pair did not reveal") };
+        core = reopen(core, &tmp);
+        assert_eq!(core.snapshot().pending[0].id, pair_id);
+        let PairResponse::Pending { expires_at: recovered, .. } = reveal(&core) else { panic!("pair lost reveal") };
+        assert_eq!(recovered, expires_at);
+        core.resolve_request(&pair_id, ffi::Decision::ApprovePair { name: "paired".into(), replace: false }).unwrap();
+        core = reopen(core, &tmp);
+        assert!(core.pair_poll(&pair_id, "wrong").is_err());
+        let PairResponse::Approved { host_id, token } = core.pair_poll(&pair_id, &request.poll_token).unwrap()
+            else { panic!("pair did not recover its approval") };
+        assert!(core.store.host_by_proof(&host_id, &sha256(token.as_bytes())).unwrap().is_some());
+        core = reopen(core, &tmp);
+        assert_eq!(core.pair_poll(&pair_id, &request.poll_token).unwrap_err().code, asm_proto::ErrorCode::NotFound);
+        assert!(core.snapshot().recent.iter().any(|r| r.id == pair_id && r.outcome == ffi::RequestOutcome::Approved));
+        core.shutdown();
+    }
+
+    #[test]
+    fn pairing_denial_expiry_and_host_revocation_are_final_after_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = open_manager(&tmp);
+        let (denied, deny_req) = start_pair(&core, "deny-pair", "127.0.0.1");
+        core.pair_reveal(&denied, deny_req.clone()).unwrap();
+        core.resolve_request(&denied, ffi::Decision::Deny { reason: "not this host".into() }).unwrap();
+
+        let (revoked, revoke_req) = start_pair(&core, "revoke-pair", "127.0.0.1");
+        core.pair_reveal(&revoked, revoke_req.clone()).unwrap();
+        core.resolve_request(&revoked, ffi::Decision::ApprovePair { name: "".into(), replace: false }).unwrap();
+        let host = core.store.list_hosts().unwrap().into_iter().find(|h| h.info.hostname == "revoke-pair").unwrap();
+        core.revoke_host(&host.id).unwrap();
+
+        let (expired, expire_req) = start_pair(&core, "expire-pair", "127.0.0.1");
+        core.expire_requests(core.generation_now() + REVEAL_SECS).unwrap();
+        core = reopen(core, &tmp);
+        assert!(core.snapshot().pending.is_empty());
+        assert!(core.pair_reveal(&denied, deny_req.clone()).is_err());
+        assert!(matches!(core.pair_poll(&denied, &deny_req.poll_token).unwrap(),
+            PairResponse::Denied { deny_reason: Some(reason) } if reason == "not this host"));
+        assert!(matches!(core.pair_poll(&expired, &expire_req.poll_token).unwrap(), PairResponse::Expired { .. }));
+        assert_eq!(core.pair_poll(&revoked, &revoke_req.poll_token).unwrap_err().code, asm_proto::ErrorCode::NotFound);
+        core.shutdown();
+    }
 
     fn v(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()

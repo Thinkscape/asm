@@ -67,18 +67,31 @@ impl Drop for Setup {
 
 /// A manager with a `.env` vault holding `DEMO_TOKEN`.
 fn setup() -> Setup {
+    let tmp = tempfile::tempdir().unwrap();
+    let m = open_manager(tmp.path());
+    let env_file = tmp.path().join("demo.env");
+    std::fs::write(&env_file, "DEMO_TOKEN=real-value-123\n").unwrap();
+    m.save_vault(VaultDraft {
+        id: None,
+        name: "demo".into(),
+        config: VaultConfig::EnvFile { path: env_file.to_string_lossy().into_owned() },
+        client_secret: String::new(),
+        master_password: String::new(),
+    }).expect("add .env vault");
+    Setup { m, tmp }
+}
+
+fn open_manager(root: &Path) -> Arc<Manager> {
     let bin_dir = workspace().join("dist/bin");
     assert!(
         bin_dir.join("iron-proxy").is_file(),
         "missing prerequisite {}; run `just proxy` before integration tests",
         bin_dir.join("iron-proxy").display()
     );
-    let tmp = tempfile::tempdir().unwrap();
-    let env_file = tmp.path().join("demo.env");
-    std::fs::write(&env_file, "DEMO_TOKEN=real-value-123\n").unwrap();
     let ports = free_ports(5);
     let options = StartOptions {
-        values_root: Some(tmp.path().join("values")),
+        resume_key: Some([19; 32]),
+        values_root: Some(root.join("values")),
         settings: vec![
             (keys::API_BIND.into(), json!("127.0.0.1")),
             (keys::API_PORT.into(), json!(0)),
@@ -91,19 +104,50 @@ fn setup() -> Setup {
             (keys::PROXY_HINTS.into(), json!(["127.0.0.1"])),
         ],
     };
-    let m = Manager::start_with(tmp.path().join("data"), bin_dir, Arc::new(Quiet), options)
-        .expect("start");
-    m.save_vault(VaultDraft {
-        id: None,
-        name: "demo".into(),
-        config: VaultConfig::EnvFile {
-            path: env_file.to_string_lossy().into_owned(),
-        },
-        client_secret: String::new(),
-        master_password: String::new(),
-    })
-    .expect("add .env vault");
-    Setup { m, tmp }
+    Manager::start_with(root.join("data"), bin_dir, Arc::new(Quiet), options).expect("start")
+}
+
+/// Exit the child process without running Drop, Core::shutdown, or a checkpoint hook.
+#[test]
+fn pending_write_survives_abrupt_process_exit() {
+    const CHILD_ROOT: &str = "ASM_TEST_PENDING_CRASH_DIRECTORY";
+    const PROPOSED: &str = "a-proposed-value-for-cold-restart-verification";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = Path::new(&root);
+        let manager = open_manager(root);
+        let (id, _) = pair_code(&manager, "restart-test", None, None);
+        let host = manager.core().store.get_host(&id).unwrap().unwrap();
+        let pending = manager.core().create_request(&host, "127.0.0.1", RequestBody::Add {
+            name: "AFTER_RESTART".into(), value: PROPOSED.into(), agent: "test".into(),
+        }).unwrap();
+        std::fs::write(root.join("client-receipt"), serde_json::to_vec(&(id, pending)).unwrap()).unwrap();
+        std::process::exit(0);
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pending_write_survives_abrupt_process_exit"])
+        .env(CHILD_ROOT, tmp.path()).status().unwrap();
+    assert!(status.success());
+    for path in ["data/asm.db", "data/asm.db-wal"] {
+        if let Ok(bytes) = std::fs::read(tmp.path().join(path)) {
+            assert!(!bytes.windows(PROPOSED.len()).any(|w| w == PROPOSED.as_bytes()));
+        }
+    }
+    let (host, initial): (String, asm_proto::wire::RequestState) =
+        serde_json::from_slice(&std::fs::read(tmp.path().join("client-receipt")).unwrap()).unwrap();
+    let manager = open_manager(tmp.path());
+    let resumed = manager.core().request_state(&host, &initial.request_id).unwrap();
+    assert_eq!(resumed.status, asm_proto::wire::RequestStatus::Pending);
+    assert_eq!(resumed.expires_at, initial.expires_at);
+    let pending = manager.snapshot().pending.into_iter().find(|p| p.id == initial.request_id).unwrap();
+    assert!(matches!(pending.detail, RequestDetail::Add { value, .. } if value == PROPOSED));
+    manager.resolve_request(initial.request_id.clone(), Decision::Deny { reason: "operator declined".into() }).unwrap();
+    manager.shutdown();
+    let manager = open_manager(tmp.path());
+    let ended = manager.core().request_state(&host, &initial.request_id).unwrap();
+    assert_eq!(ended.status, asm_proto::wire::RequestStatus::Denied);
+    assert_eq!(ended.deny_reason.as_deref(), Some("operator declined"));
+    manager.shutdown();
 }
 
 const HINT: &str = "4242424242424242424242424242424242424242424242424242424242424242";
