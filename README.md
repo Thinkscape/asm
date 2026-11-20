@@ -247,6 +247,13 @@ Routine renewal leaves old copies usable until natural expiry. Explicit `--refre
 the token; ASM can revoke known GitHub predecessors, not Google tokens. `--lease ID` pins an existing generated grant;
 `--new-lease` requests a fresh decision.
 
+Identical GitHub token requests from the same paired host and agent share one pending
+approval, lease and initial token. Each caller gets its own request ID and can collect
+the raw result once, while the host, lease and token are still valid. Denying, cancelling
+or expiring the pending approval ends it for all callers. After approval, cancelling one
+ID discards only that caller’s delivery. A pending approval accepts up to 64 callers;
+additional callers are rate-limited, not given a second approval.
+
 **Restart is not revocation.** On relaunch, the manager restores unexpired generated tokens, their versions, approved sentinel mappings, and pending request IDs. It does not issue a new token, renew a deadline, or deny a pending request just because the process stopped. The API and proxy are unreachable while the manager is down. Explicit revocation, provider expiry, and changes to the configured authority still apply.
 Previously issued generated sentinel leases keep their original mode, hosts and deadline. To use one explicitly, pin its lease ID. An unpinned request cannot reuse it; a new generated grant is always raw.
 

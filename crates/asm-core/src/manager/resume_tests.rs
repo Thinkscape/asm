@@ -111,13 +111,13 @@ fn closing_or_reopening_fences_prepared_writes_and_joined_request_history() {
         created_at: 1,
         resolved_at: 2,
     };
-    assert!(original_store.commit_request_book(&sealed, Some(&history)).is_err());
+    assert!(original_store.commit_request_book(&[sealed], Some(&history)).is_err());
     assert!(store.recent_history(1).unwrap().is_empty());
     assert_eq!(reopened.get::<String>("requests", "request").unwrap().as_deref(), Some("before-close"));
     let accepted = reopened.seal("requests", "request", &"resumed").unwrap();
-    store.commit_request_book(&accepted, Some(&history)).unwrap();
+    store.commit_request_book(std::slice::from_ref(&accepted), Some(&history)).unwrap();
     assert_eq!(reopened.get::<String>("requests", "request").unwrap().as_deref(), Some("resumed"));
     assert_eq!(store.recent_history(1).unwrap()[0].status, "approved");
     reopened.close().unwrap();
-    assert!(store.commit_request_book(&accepted, None).is_err());
+    assert!(store.commit_request_book(&[accepted], None).is_err());
 }

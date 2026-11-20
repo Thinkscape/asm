@@ -1701,10 +1701,10 @@ impl Store {
         Self::insert_history_with(&self.db(), h)
     }
 
-    pub(crate) fn commit_request_book(&self, row: &SealedResume, history: Option<&HistoryRecord>) -> Result<()> {
+    pub(crate) fn commit_request_book(&self, rows: &[SealedResume], history: Option<&HistoryRecord>) -> Result<()> {
         let mut db = self.db();
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        Self::apply_resume(&tx, std::slice::from_ref(row))?;
+        Self::apply_resume(&tx, rows)?;
         if let Some(history) = history {
             Self::insert_history_with(&tx, history)?;
         }

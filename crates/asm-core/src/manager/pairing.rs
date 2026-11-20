@@ -189,6 +189,7 @@ fn reveal_attempt(
     let code = format_pairing_code(pairing_code(cert_sha256, &nonce, &a.server_nonce));
     Ok(Reveal::Revealed(Pending {
         id: a.id.clone(),
+        attached_ids: Vec::new(),
         created: t,
         expires: t + lifetime,
         host_id: None,

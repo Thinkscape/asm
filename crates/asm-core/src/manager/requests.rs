@@ -36,6 +36,8 @@ use crate::vault::{AddTarget, CollectionInfo, VaultConfig, VaultStatus, registry
 
 /// Resolved host requests stay pollable this long.
 const DONE_KEEP_SECS: i64 = 3600;
+/// Bound the sealed pending row and its eventual delivery transaction.
+const MAX_GITHUB_CALLERS: usize = 64;
 /// Unrevealed pairing attempts expire after this long.
 pub const REVEAL_SECS: i64 = 60;
 
@@ -47,6 +49,14 @@ pub struct Book {
     pub(crate) pending: Vec<Pending>,
     pub(crate) done: HashMap<String, Done>,
     pub(crate) pairs: HashMap<String, PairAttempt>,
+}
+
+impl Book {
+    /// Only host polling and cancellation accept delivery IDs. Operator decisions use `Pending::id`.
+    pub(super) fn pending_for_caller(&self, host_id: &str, id: &str) -> Option<&Pending> {
+        self.pending.iter().find(|p| p.host_id.as_deref() == Some(host_id)
+            && (p.id == id || p.attached_ids.iter().any(|attached| attached == id)))
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -206,6 +216,9 @@ pub(crate) enum Detail {
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Pending {
     pub id: String,
+    /// Additional one-shot delivery IDs for this GitHub approval; `id` serves the first caller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) attached_ids: Vec<String>,
     pub created: i64,
     pub expires: i64,
     /// `None` for pairing requests.
@@ -257,24 +270,15 @@ impl Pending {
         (self.expires - self.created).max(0) as u64
     }
 
-    fn state(&self) -> RequestState {
+    pub(super) fn state_for(&self, id: &str, status: RequestStatus) -> RequestState {
         RequestState {
-            request_id: self.id.clone(),
+            request_id: id.to_owned(),
             kind: self.wire_kind(),
-            status: RequestStatus::Pending,
+            status,
             deny_reason: None,
             result: None,
-            expires_at: Some(fmt_unix(self.expires)),
+            expires_at: (status == RequestStatus::Pending).then(|| fmt_unix(self.expires)),
             pending_lifetime_secs: self.lifetime_secs(),
-        }
-    }
-
-    /// The terminal state this request ended in (no expiry any more).
-    pub(crate) fn ended_state(&self, status: RequestStatus) -> RequestState {
-        RequestState {
-            status,
-            expires_at: None,
-            ..self.state()
         }
     }
 
@@ -408,7 +412,7 @@ impl Core {
         } else {
             self.seal_pending(&pending)?
         };
-        self.store.commit_request_book(&row, None)?;
+        self.store.commit_request_book(&[row], None)?;
         Self::apply_pending_locked(book, pending);
         Ok(())
     }
@@ -420,7 +424,7 @@ impl Core {
         }
         pending.resolving = true;
         let result = self.seal_pending(pending)
-            .and_then(|row| self.store.commit_request_book(&row, None));
+            .and_then(|row| self.store.commit_request_book(&[row], None));
         if result.is_err() {
             pending.resolving = false;
         }
@@ -450,8 +454,38 @@ impl Core {
         &self, book: &mut Book, id: String, done: Done, history: Option<HistoryRecord>,
     ) -> Result<()> {
         let row = self.seal_done(&id, &done)?;
-        self.store.commit_request_book(&row, history.as_ref())?;
+        self.store.commit_request_book(&[row], history.as_ref())?;
         Self::apply_done_locked(book, id, done);
+        Ok(())
+    }
+
+    /// Commit the canonical rows and every caller's value-free terminal row together. Read
+    /// membership from the live book: another caller may have joined during provider I/O.
+    pub(super) fn complete_pending_locked<const N: usize>(
+        &self, book: &mut Book, mut done: Done, primary_rows: [SealedResume; N],
+        commit: impl FnOnce(&[SealedResume]) -> Result<()>,
+    ) -> Result<()> {
+        let index = book.pending.iter().position(|p| p.id == done.state.request_id)
+            .ok_or_else(|| CoreError::internal("cannot complete a missing pending request"))?;
+        let attached = &book.pending[index].attached_ids;
+        if attached.is_empty() {
+            commit(&primary_rows)?;
+        } else {
+            let mut rows = Vec::with_capacity(N + attached.len());
+            rows.extend(primary_rows);
+            for id in attached {
+                done.state.request_id.clone_from(id);
+                rows.push(self.seal_done(id, &done)?);
+            }
+            commit(&rows)?;
+        }
+        let pending = book.pending.remove(index);
+        for id in pending.attached_ids {
+            done.state.request_id.clone_from(&id);
+            book.done.insert(id, done.clone());
+        }
+        done.state.request_id.clone_from(&pending.id);
+        book.done.insert(pending.id, done);
         Ok(())
     }
 
@@ -463,7 +497,7 @@ impl Core {
         &self, book: &mut Book, attempt: PairAttempt, pending: Option<Pending>, history: Option<&HistoryRecord>,
     ) -> Result<()> {
         let row = self.seal_pair(&attempt, pending.as_ref())?;
-        self.store.commit_request_book(&row, history)?;
+        self.store.commit_request_book(&[row], history)?;
         if let Some(pending) = pending {
             Self::apply_pending_locked(book, pending);
         } else {
@@ -711,6 +745,7 @@ impl Core {
         let lifetime = self.settings().request_lifetime_secs.max(1) as i64;
         Pending {
             id: new_uuid_v4(),
+            attached_ids: Vec::new(),
             created: t,
             expires: t + lifetime,
             host_id: Some(host.id.clone()),
@@ -742,11 +777,25 @@ impl Core {
             self.require_active_host(host_id)?;
         }
         let mut b = lock(&self.book);
-        if let Some(existing) = b.pending.iter().find(|q| q.host_id == p.host_id && same(q, &p)) {
-            return Ok((existing.state(), false));
+        if let Some(existing) = b.pending.iter_mut().find(|q| q.host_id == p.host_id && same(q, &p)) {
+            if !matches!(&p.detail, Detail::Get(GetDetail { target: GetTarget::Generated(target), .. })
+                if target.output_name == asm_proto::generators::GITHUB_TOKEN_NAME) {
+                return Ok((existing.state_for(&existing.id, RequestStatus::Pending), false));
+            }
+            if existing.attached_ids.len() >= MAX_GITHUB_CALLERS - 1 {
+                return Err(CoreError::rate_limited("too many callers waiting for this GitHub approval"));
+            }
+            let state = existing.state_for(&p.id, RequestStatus::Pending);
+            existing.attached_ids.push(p.id);
+            if let Err(error) = self.seal_pending(existing)
+                .and_then(|row| self.store.commit_request_book(&[row], None)) {
+                existing.attached_ids.pop();
+                return Err(error);
+            }
+            return Ok((state, false));
         }
         let event = activity::requested(&p);
-        let state = p.state();
+        let state = p.state_for(&p.id, RequestStatus::Pending);
         self.save_pending_locked(&mut b, p)?;
         self.log(event);
         Ok((state, true))
@@ -1020,7 +1069,7 @@ impl Core {
                     && matches!(&q.detail, Detail::Update(u) if u.secret.vault_id == secret.vault_id
                         && u.secret.key == secret.key && u.field == field && hash_hex(&u.new_value) == hash)
             }) {
-                return Ok(q.state());
+                return Ok(q.state_for(&q.id, RequestStatus::Pending));
             }
         }
         let entry = self
@@ -1116,8 +1165,8 @@ impl Core {
             let authority = lock(&self.authorization);
             self.require_request_host(host_id, proof)?;
             let book = lock(&self.book);
-            if let Some(pending) = book.pending.iter().find(|p| p.id == id && p.host_id.as_deref() == Some(host_id)) {
-                return Ok(pending.state());
+            if let Some(pending) = book.pending_for_caller(host_id, id) {
+                return Ok(pending.state_for(id, RequestStatus::Pending));
             }
             let done = book.done.get(id).filter(|d| d.host_id == host_id)
                 .ok_or_else(|| CoreError::not_found("no such request"))?;
@@ -1170,7 +1219,7 @@ impl Core {
                     let done = book.done.get_mut(id).expect("same locked row");
                     let delivery = done.state.result.take();
                     let committed = self.seal_done(id, done)
-                        .and_then(|row| self.store.commit_request_book(&row, None));
+                        .and_then(|row| self.store.commit_request_book(&[row], None));
                     if let Err(e) = committed {
                         done.state.result = delivery;
                         return Err(e);
@@ -1198,12 +1247,13 @@ impl Core {
             let _authority = lock(&self.authorization);
             self.require_request_host(host_id, proof)?;
             let mut book = lock(&self.book);
-            if let Some(p) = book.pending.iter().find(|p| p.id == id && p.host_id.as_deref() == Some(host_id)) {
+            if let Some(p) = book.pending_for_caller(host_id, id) {
                 if p.resolving && !matches!(&p.detail, Detail::Get(GetDetail { target: GetTarget::Generated(_), .. })) {
-                    return Ok(p.state());
+                    return Ok(p.state_for(id, RequestStatus::Pending));
                 }
-                let state = p.ended_state(RequestStatus::Cancelled);
-                self.end_pending_locked(&mut book, id, RequestStatus::Cancelled, None, None, t, false)?;
+                let state = p.state_for(id, RequestStatus::Cancelled);
+                let approval_id = p.id.clone();
+                self.end_pending_locked(&mut book, &approval_id, RequestStatus::Cancelled, None, None, t, false)?;
                 (state, true)
             } else {
                 let done = book.done.get_mut(id).filter(|d| d.host_id == host_id)
@@ -1217,7 +1267,7 @@ impl Core {
                     !std::mem::replace(&mut d.consumed, true));
                 if result.is_some() || newly_consumed {
                     let committed = self.seal_done(id, done)
-                        .and_then(|row| self.store.commit_request_book(&row, None));
+                        .and_then(|row| self.store.commit_request_book(&[row], None));
                     if let Err(e) = committed {
                         if result.is_some() {
                             done.state.result = result;
@@ -1444,10 +1494,13 @@ impl Core {
             self.save_pair_locked(book, attempt, None, Some(&history))?;
         } else {
             let host_id = p.host_id.clone().ok_or_else(|| CoreError::internal("request is missing its host"))?;
-            let mut state = p.ended_state(status);
+            let mut state = p.state_for(id, status);
             state.deny_reason = if failed { Some(REQUEST_UNAVAILABLE.into()) } else { reason };
             state.result = result;
-            self.insert_done_locked(book, id.to_owned(), Done { host_id, state, at: t, generated: None }, Some(history))?;
+            let done = Done { host_id, state, at: t, generated: None };
+            let row = self.seal_done(id, &done)?;
+            self.complete_pending_locked(book, done, [row], |rows|
+                self.store.commit_request_book(rows, Some(&history)))?;
         }
         self.log(event);
         Ok(true)
@@ -1581,7 +1634,7 @@ impl Core {
             generator_name: None,
         });
         let event = activity::approved(p, Some(&result), t);
-        let mut state = p.ended_state(RequestStatus::Approved);
+        let mut state = p.state_for(&p.id, RequestStatus::Approved);
         state.result = Some(result);
         let done = Done { host_id: lease.host_id.clone(), state, at: t, generated: None };
         let history = p.history(RequestStatus::Approved, None, t);

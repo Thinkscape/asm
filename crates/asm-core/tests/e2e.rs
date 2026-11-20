@@ -1571,6 +1571,81 @@ fn generated_manager(tmp: &Path, ports: &[u16], bin_dir: PathBuf) -> (Arc<Genera
 }
 
 #[test]
+fn two_cold_github_cli_gets_share_one_approval_and_issuance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = Env {
+        cli: build_cli(),
+        config: tmp.path().join("config"),
+        secrets: tmp.path().join("first-secrets"),
+    };
+    // Share the paired host identity, but require each process to write its own material.
+    let second = Env {
+        cli: first.cli.clone(),
+        config: first.config.clone(),
+        secrets: tmp.path().join("second-secrets"),
+    };
+    let github = GithubFixture::new("cold-client", 41, 101, None);
+    let (approver, shutdown) = generated_manager(tmp.path(), &free_ports(5), workspace().join("dist/bin"));
+    let manager = &shutdown.0;
+    github.install(manager, "00000000-0000-4000-8000-000000000041", "cold-bot");
+    wait_healthy(manager);
+    let code = manager.create_pairing_code(
+        "cold CLI fixture".into(), Some(3600), Some(1), vec!["127.0.0.1/8".into()],
+    ).unwrap();
+    let paired = first.run(&["pair", &manager.general_settings().listening_on, &code.code], None);
+    assert_eq!(paired.code, 0, "fixture pairing failed");
+
+    let db = rusqlite::Connection::open_with_flags(
+        tmp.path().join("data/asm.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).unwrap();
+    let args = [
+        "get", "--json", "--no-reaper", "--wait", "30",
+        "--repositories", "acme/web", "--permissions", "contents=read",
+        "GH_TOKEN", "Read acme/web concurrently",
+    ];
+    let outputs = std::thread::scope(|scope| {
+        let gate = approver.busy.lock().unwrap();
+        let a = scope.spawn(|| first.run(&args, None));
+        wait_until("first cold approval", || manager.snapshot().pending.len() == 1);
+        let id = manager.snapshot().pending.pop().unwrap().id;
+        let mut row = db.prepare(
+            "SELECT sealed FROM resume_entries WHERE namespace = 'request-book-v1' AND id = ?1",
+        ).unwrap();
+        let mut sealed = || row.query_row([&id], |r| r.get::<_, Vec<u8>>(0)).unwrap();
+        let before = sealed();
+        let b = scope.spawn(|| second.run(&args, None));
+        // While the operator is gated, only attaching a caller rewrites this pending row.
+        // Seeing just one prompt would also be true before the second POST arrived.
+        wait_until("second cold caller to join the first approval", || sealed() != before);
+        assert_eq!(manager.snapshot().pending.len(), 1);
+        drop(gate);
+        [a.join().unwrap(), b.join().unwrap()]
+    });
+
+    // resolve_request publishes the result before the observer records its decision.
+    let _finished = approver.busy.lock().unwrap();
+    assert_eq!(approver.count(), 1);
+    assert!(approver.errors.lock().unwrap().is_empty());
+    assert_eq!(github.count(), 1);
+    let leases = manager.list_leases();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].credential_version, Some(1));
+    let token = github.token(0);
+    assert!(!token.is_empty());
+    for (output, env) in outputs.iter().zip([&first, &second]) {
+        assert_eq!(output.code, 0, "cold CLI get failed");
+        assert!(!output.stdout.contains(&token) && !output.stderr.contains(&token),
+            "CLI printed credential material");
+        let result: serde_json::Value = serde_json::from_str(&output.stdout).ok().expect("get JSON metadata");
+        assert!(result["lease_id"].as_str() == Some(leases[0].lease_id.as_str()));
+        assert!(result["credential_version"].as_u64() == Some(1));
+        let path = delivered_path(&result);
+        assert!(path == env.secrets.join("GH_TOKEN"), "wrong credential destination");
+        assert!(std::fs::read(path).unwrap() == token.as_bytes(), "incorrect delivered credential");
+    }
+}
+
+#[test]
 fn generated_github_lease_end_to_end() {
     let bin_dir = workspace().join("dist/bin");
     assert!(

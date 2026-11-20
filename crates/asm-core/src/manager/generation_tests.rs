@@ -644,7 +644,7 @@ fn generator_activity(f: &Fixture) -> Vec<ffi::ActivityEntry> {
 }
 
 // Exercise the manager's actual HTTPS and JSON projection; the provider fixture is local.
-fn wire_privacy_client(f: &Fixture) -> impl Fn(reqwest::Method, &str, Option<&RequestBody>) -> (u16, Value) {
+fn wire_client(f: &Fixture) -> impl Fn(reqwest::Method, &str, Option<&RequestBody>) -> (u16, Value) {
     let addr = f.core.api_addr().unwrap();
     let cert = reqwest::Certificate::from_pem(f.core.cert.cert_pem.as_bytes()).unwrap();
     let client = reqwest::blocking::Client::builder()
@@ -700,7 +700,7 @@ fn wire_privacy_vault_misses_add_targets_and_automatic_denial() {
     let vault = Arc::new(Vault(AtomicBool::new(true)));
     f.core.registry.insert(VaultEntry { id: VAULT.into(), name: VAULT.into(),
         config: VaultConfig::EnvFile { path: "/unused".into() }, provider: vault.clone() });
-    let api = wire_privacy_client(&f);
+    let api = wire_client(&f);
     let get = |name| f.body(name);
     let update = |name| -> RequestBody {
         serde_json::from_value(json!({"kind":"update","name":name,"value":"isolated-new-value"})).unwrap()
@@ -779,7 +779,7 @@ fn wire_privacy_generator_readiness_does_not_change_catalog_or_diagnose_pinned_f
 
     let f = Fixture::new();
     let first = f.first();
-    let api = wire_privacy_client(&f);
+    let api = wire_client(&f);
     let health = api(Method::GET, "health", None);
     let catalog = api(Method::GET, "secrets", None);
     assert_eq!(catalog.0, 200);
@@ -908,6 +908,7 @@ fn generation_mint_cancel_and_pending_deadline_discard_tokens() {
     for cancel in [true, false] {
         let f = Fixture::new();
         let pending = f.request(f.body("GH_TOKEN")).unwrap();
+        let attached = f.request(f.body("GH_TOKEN")).unwrap();
         let (gate, entered) = f.provider.block_next();
         let core = f.core.clone();
         let id = pending.request_id.clone();
@@ -916,10 +917,16 @@ fn generation_mint_cancel_and_pending_deadline_discard_tokens() {
             generation: Some(GenerationSelection { generator_id: "app-a".into(), generator_revision: 1,
                 grant: GenerationGrant::GithubApp(Fixture::grant()) }.into()) }));
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
-        if cancel { f.core.cancel_request(&f.host.id, &pending.request_id).unwrap(); }
-        else { f.at(10_000); }
+        if cancel { f.core.cancel_request(&f.host.id, &attached.request_id).unwrap(); }
+        else { f.at(f.core.settings().request_lifetime_secs as i64); }
         gate.release();
         assert!(worker.join().unwrap().is_err());
+        for caller in [pending, attached] {
+            let state = f.core.request_state(&f.host.id, &caller.request_id).unwrap();
+            assert_eq!(state.request_id, caller.request_id);
+            assert_eq!(state.status, if cancel { RequestStatus::Cancelled } else { RequestStatus::Expired });
+            assert!(state.result.is_none());
+        }
         assert!(f.core.store.list_leases().unwrap().is_empty());
         assert!(lock(&f.core.generation).cached.is_empty());
         assert_eq!(lock(&f.provider.state.revoked).len(), 1);
@@ -1209,9 +1216,9 @@ fn generation_github_operator_can_expand_but_only_exact_grants_are_reused() {
 
     let pending = f.request(editable()).unwrap();
     let legacy_pending = f.request(legacy()).unwrap();
-    assert_ne!(pending.request_id, legacy_pending.request_id);
-    assert_eq!(f.request(editable()).unwrap().request_id, pending.request_id);
+    let attached = f.request(editable()).unwrap();
     let snapshot = f.core.snapshot();
+    assert_eq!(snapshot.pending.len(), 2);
     for (id, editable, expected) in [
         (&pending.request_id, true, ceiling.clone()),
         (&legacy_pending.request_id, false, Fixture::grant()),
@@ -1229,11 +1236,15 @@ fn generation_github_operator_can_expand_but_only_exact_grants_are_reused() {
     let approval = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
     assert!(approval.operator_selected_grant);
     assert_eq!(approval.generation.as_ref().unwrap().grant, GenerationGrant::GithubApp(ceiling));
+    let other = get(f.core.request_state(&f.host.id, &attached.request_id).unwrap());
+    assert!(other.operator_selected_grant);
+    assert_eq!(other.generation, approval.generation);
+    assert_eq!(other.lease_id, approval.lease_id);
     let expected = json!({"repository_ids":[1, 2],"permissions":{"contents":"write","metadata":"read"}});
     assert_eq!(lock(&f.provider.state.bodies).as_slice(), std::slice::from_ref(&expected));
 
     assert_eq!(f.request(editable()).unwrap().status, RequestStatus::Pending);
-    assert_eq!(f.request(legacy()).unwrap().request_id, legacy_pending.request_id);
+    assert_eq!(f.core.request_state(&f.host.id, &legacy_pending.request_id).unwrap().status, RequestStatus::Pending);
     let exact = get(f.request(f.github_body(true, &["acme/repo2", "acme/repo1"], GithubPermission::Write)).unwrap());
     assert_eq!(exact.lease_id, approval.lease_id);
     assert!(!exact.operator_selected_grant);
@@ -1368,7 +1379,13 @@ fn generation_github_reattaches_pending_work_when_another_generator_appears_duri
         let reattached = f.request(f.body("GITHUB_TOKEN"));
         gate.release();
         approve.join().unwrap().unwrap();
-        assert_eq!(reattached.unwrap().request_id, pending.request_id);
+        let reattached = reattached.unwrap();
+        assert_ne!(reattached.request_id, pending.request_id);
+        let first = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
+        let joined = get(f.core.request_state(&f.host.id, &reattached.request_id).unwrap());
+        assert_eq!(first.lease_id, joined.lease_id);
+        assert_eq!(joined.credential_version, Some(1));
+        assert!(!first.files.is_empty() && first.files == joined.files);
     });
     assert!(f.core.snapshot().pending.is_empty());
     assert_eq!(f.issued(), 1);
@@ -1607,6 +1624,9 @@ fn generation_capability_and_candidate_snapshot_checks_fail_before_issuance() {
 
 #[path = "generation_admin_tests.rs"]
 mod admin;
+
+#[path = "generation_callers_tests.rs"]
+mod callers;
 
 #[test]
 fn generation_pending_raw_delivery_rejects_a_superseded_version_without_minting() {

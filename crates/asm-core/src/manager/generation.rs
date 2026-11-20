@@ -946,17 +946,17 @@ impl Core {
                     (Some(GenerationRequest::GcloudAccess(requested)),
                     Some(GenerationGrant::GcloudAccess(GcloudAccessGrant::Issued { access, .. })))
                     if access.project_id != requested.project_id);
-            let mut state = pending.ended_state(RequestStatus::Approved);
+            let mut state = pending.state_for(&pending.id, RequestStatus::Approved);
             state.result = Some(RequestResult::Get(result.clone()));
             let done = Done { host_id: lease.host_id.clone(), state, at: now,
                 generated: Some(GeneratedDelivery { lease_id: lease.id.clone(), credential_version: 1,
                     consumed: false, operator_selected_grant }) };
             let sealed = self.seal_generated(&lease, SavedToken::new(1, &credential), std::iter::empty())?;
             let sealed_done = self.seal_done(&pending.id, &done)?;
-            self.store.insert_lease_with_request(&lease, &[sealed, sealed_done],
-                &pending.history(RequestStatus::Approved, None, now))?;
+            let history = pending.history(RequestStatus::Approved, None, now);
+            self.complete_pending_locked(&mut lock(&self.book), done, [sealed, sealed_done], |rows|
+                self.store.insert_lease_with_request(&lease, rows, &history))?;
             lock(&self.generation).cached.insert(lease.id.clone(), cached);
-            Self::apply_done_locked(&mut lock(&self.book), pending.id.clone(), done);
             lock(&self.last_active).insert(lease.id.clone());
             self.lease_wake.notify_one();
             Ok(result)

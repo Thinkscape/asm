@@ -301,12 +301,7 @@ async fn get_request(
     let _ = long_poll(
         &core,
         q.wait,
-        move |c| {
-            let b = lock(&c.book);
-            Ok(b.pending
-                .iter()
-                .any(|p| p.id == id2 && p.host_id.as_deref() == Some(host_id.as_str())))
-        },
+        move |c| Ok(lock(&c.book).pending_for_caller(&host_id, &id2).is_some()),
         |still_pending| !still_pending,
     )
     .await?;
