@@ -268,24 +268,44 @@ fn resolve_github_grant(scope: &GithubScopeRequest, ceiling: &GithubGrant) -> Op
     Some(GithubGrant { installation_id: ceiling.installation_id, repositories, permissions: permissions.clone() })
 }
 
-/// Fresh reuse and an explicit pinned selector must match the issued grant,
-/// resolving repository names against one current installation by immutable ID.
-fn github_request_matches_grant(scope: &GithubScopeRequest, grant: &GithubGrant, ceiling: &GithubGrant) -> bool {
-    grant.installation_id == ceiling.installation_id
-        && scope.permissions.as_ref() == Some(&grant.permissions)
-        && scope.repositories.as_ref().is_some_and(|names| names.len() == grant.repositories.len()
-            && names.iter().all(|name| configured_github_repository(ceiling, name).is_some_and(|repo|
-                grant.repositories.binary_search_by_key(&repo.id, |approved| approved.id).is_ok())))
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopeMatch { Exact, Broader }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeaseReuse { StrictOrPinned, Ranked(ScopeMatch) }
+
+/// Resolve every requested repository in one current installation by immutable ID.
+fn github_scope_match(scope: &GithubScopeRequest, grant: &GithubGrant, ceiling: &GithubGrant) -> Option<ScopeMatch> {
+    let permissions = scope.permissions.as_ref()?;
+    let names = scope.repositories.as_ref()?;
+    if grant.installation_id != ceiling.installation_id
+        || !permissions.iter().all(|(key, level)| grant.permissions.get(key).is_some_and(|issued| issued >= level))
+        || !names.iter().all(|name| configured_github_repository(ceiling, name).is_some_and(|repo|
+            grant.repositories.binary_search_by_key(&repo.id, |approved| approved.id).is_ok()))
+    {
+        return None;
+    }
+    Some(if permissions == &grant.permissions && names.len() == grant.repositories.len() {
+        ScopeMatch::Exact
+    } else {
+        ScopeMatch::Broader
+    })
 }
 
-fn github_matching_choice_revision(lease: &LeaseRecord, target: &GeneratorTarget) -> Option<u64> {
-    let (Some(GenerationGrant::GithubApp(grant)), Some(GenerationRequest::GithubApp(scope))) =
-        (lease.generation.as_ref(), target.requested_generation.as_ref()) else { return None; };
-    target.candidates.iter().find_map(|choice| match &choice.ceiling {
-        GenerationGrant::GithubApp(ceiling) if choice.generator_id == lease.vault_id
-            && github_request_matches_grant(scope, grant, ceiling) => Some(choice.revision),
-        _ => None,
-    })
+/// Rank authorization duration, not the independently renewable provider token.
+fn reuse_rank(lease: &LeaseRecord) -> (i64, usize, Option<u64>) {
+    let breadth = match lease.generation.as_ref() {
+        Some(GenerationGrant::GithubApp(grant)) => grant.repositories.len()
+            * grant.permissions.values().map(|level| match level {
+                asm_proto::generators::GithubPermission::Read => 1,
+                asm_proto::generators::GithubPermission::Write => 2,
+                asm_proto::generators::GithubPermission::Admin => 3,
+            }).sum::<usize>(),
+        Some(GenerationGrant::GcloudAccess(GcloudAccessGrant::Issued { access, .. })) => access.permissions.len(),
+        Some(GenerationGrant::Gcloud(grant)) => grant.scopes.len(),
+        _ => 0,
+    };
+    (lease.expires_at.unwrap_or(i64::MAX), breadth, lease.approval_order)
 }
 
 fn same_generated_get(left: &GeneratorTarget, right: &GeneratorTarget) -> bool {
@@ -498,10 +518,84 @@ impl Core {
         })
     }
 
+    /// Caller holds authorization from candidate reconciliation through selection.
+    fn select_generated_lease(
+        &self, host: &HostRecord, agent: &str, target: &GeneratorTarget, fields: &[String], supports_broader: bool,
+    ) -> Result<Option<(LeaseRecord, LeaseReuse)>> {
+        let Some(request) = &target.requested_generation else { return Ok(None); };
+        let now = self.generation_now();
+        let mut latest_strict = None;
+        let mut best = None;
+        let mut best_rank = None;
+        for lease in self.store.generated_reuse_candidates(&host.id, &target.requested_name)? {
+            if target.pinned_generator_id.as_ref().is_some_and(|id| id != &lease.vault_id) {
+                continue;
+            }
+            let Some(grant) = &lease.generation else { continue; };
+            let relaxed = supports_broader && self.generators.with_entry(&lease.vault_id,
+                |entry| !entry.record.require_exact_scope_match) == Some(true);
+            if !relaxed && lease.agent != agent { continue; }
+            let active = lease.is_active(now) && fields.iter().all(|f| lease.fields.iter().any(|lf| &lf.field == f));
+            if relaxed && !active { continue; }
+            let choice = target.candidates.iter().find(|choice| choice.generator_id == lease.vault_id
+                && match (grant, &choice.ceiling) {
+                    (GenerationGrant::GithubApp(g), GenerationGrant::GithubApp(c)) => g.installation_id == c.installation_id,
+                    (GenerationGrant::Gcloud(_), GenerationGrant::Gcloud(_))
+                    | (GenerationGrant::GcloudAccess(_), GenerationGrant::GcloudAccess(_)) => true,
+                    _ => false,
+                });
+            let current = choice.is_some_and(|c| Some(c.revision) == lease.generator_revision);
+            if relaxed && !current { continue; }
+            let scope = match (grant, request) {
+                (GenerationGrant::GithubApp(g), GenerationRequest::GithubApp(r)) => choice.and_then(|c| {
+                    let GenerationGrant::GithubApp(ceiling) = &c.ceiling else { return None; };
+                    github_scope_match(r, g, ceiling)
+                }),
+                (GenerationGrant::Gcloud(g), GenerationRequest::Gcloud(r)) if r.scopes.as_ref() == Some(&g.scopes) =>
+                    Some(ScopeMatch::Exact),
+                (GenerationGrant::GcloudAccess(GcloudAccessGrant::Issued { access, .. }), GenerationRequest::GcloudAccess(r))
+                    if r == access => Some(ScopeMatch::Exact),
+                _ if relaxed && grant.covers_lease_reuse_request(request)? => Some(ScopeMatch::Broader),
+                _ => None,
+            };
+            if !relaxed {
+                // Strict mode preserves the newest relevant decision, including ended leases.
+                // Request history can block an older approval but cannot authorize delivery.
+                let relevant = scope == Some(ScopeMatch::Exact) || match request {
+                    GenerationRequest::GithubApp(_) => lease.requested_generation.as_ref() == Some(request),
+                    GenerationRequest::Gcloud(_) => matches!(grant, GenerationGrant::Gcloud(_)),
+                    GenerationRequest::GcloudAccess(_) => false,
+                };
+                if relevant && latest_strict.as_ref().is_none_or(|(order, _)| lease.approval_order > *order) {
+                    let exact = active && current && scope == Some(ScopeMatch::Exact);
+                    latest_strict = Some((lease.approval_order, exact.then_some(lease)));
+                }
+                continue;
+            }
+            let Some(scope) = scope else { continue; };
+            let rank = reuse_rank(&lease);
+            if best_rank.is_some_and(|best| rank <= best) { continue; }
+            // In particular, a still-unexpired managed lease can have lost its Ready IAM profile.
+            match self.authorized_generator(&lease, now) {
+                Ok(_) => {}
+                Err(e) if e.code == asm_proto::ErrorCode::VaultUnavailable => continue,
+                Err(e) => return Err(e),
+            }
+            best_rank = Some(rank);
+            best = Some((lease, LeaseReuse::Ranked(scope)));
+        }
+        if let Some((_, Some(lease))) = latest_strict
+            && best_rank.is_none_or(|rank| reuse_rank(&lease) > rank)
+        {
+            return Ok(Some((lease, LeaseReuse::StrictOrPinned)));
+        }
+        Ok(best)
+    }
+
     pub(crate) fn create_generated_get(
         &self, host: &HostRecord, agent: &str, address: &str, mut target: GeneratorTarget,
         mode: RequestedMode, wanted_fields: Vec<String>, requested: Vec<String>, reason: String,
-        new_lease: bool, refresh: bool, refresh_from_version: Option<u64>,
+        new_lease: bool, refresh: bool, refresh_from_version: Option<u64>, supports_broader: bool,
     ) -> Result<RequestState> {
         let mode = mode.for_new_generated(&requested)?;
         // Serialize the reuse decision and pending insertion with approval commit.
@@ -535,41 +629,21 @@ impl Core {
             };
             return Err(CoreError::invalid(message));
         }
-        if !new_lease {
-            let latest = self.store.leases_of_host(&host.id)?.into_iter()
-                .filter(|l| l.source_kind == SourceKind::Generator && l.agent == agent
-                    && l.mode == LeaseMode::Raw
-                    && l.name == target.requested_name
-                    && target.pinned_generator_id.as_ref().is_none_or(|id| id == &l.vault_id)
-                    // Preserve the newest decision for this scope, even if its
-                    // lease ended or its generator was removed. Request history
-                    // only chooses which lease to check; it cannot authorize reuse.
-                    && if github {
-                        l.requested_generation == target.requested_generation
-                            || github_matching_choice_revision(l, &target).is_some()
-                    } else if let Some(request @ GenerationRequest::GcloudAccess(_)) = target.requested_generation.as_ref() {
-                        gcloud_access_matches(l, request)
-                    } else {
-                        matches!(l.generation.as_ref(), Some(GenerationGrant::Gcloud(_)))
-                    })
-                .max_by_key(|l| l.approval_order.unwrap_or(0));
-            if let Some(lease) = latest {
-                let scope_matches = if github {
-                    github_matching_choice_revision(&lease, &target)
-                        .is_some_and(|revision| Some(revision) == lease.generator_revision)
-                } else {
-                    (managed || legacy_gcloud_request_compatible(&lease, target.requested_generation.as_ref()))
-                        && target.candidates.iter().any(|choice| choice.generator_id == lease.vault_id
-                            && Some(choice.revision) == lease.generator_revision)
-                };
-                if lease.is_active(self.generation_now())
-                    && wanted_fields.iter().all(|f| lease.fields.iter().any(|lf| &lf.field == f))
-                    && scope_matches {
-                    drop(authority);
-                    let result = self.materialize_generated(&lease.id, refresh, refresh_from_version)?;
-                    return self.generated_shortcut(host, result);
-                }
+        if !new_lease && let Some((lease, reuse)) =
+            self.select_generated_lease(host, agent, &target, &wanted_fields, supports_broader)?
+        {
+            drop(authority);
+            let result = self.materialize_generated(&lease.id, refresh, refresh_from_version)?;
+            let state = self.generated_shortcut(host, result, reuse)?;
+            if reuse == LeaseReuse::Ranked(ScopeMatch::Broader) {
+                self.log(Event::new(Category::Generators, "broader_lease_reused",
+                    format!("Reused {} lease with broader access than requested", lease.name))
+                    .host(Some(&host.id)).secret(&lease.name).detail(serde_json::json!({
+                        "request_id": state.request_id, "agent": agent, "generator_id": lease.vault_id,
+                        "lease_id": lease.id, "requested": target.requested_generation, "grant": lease.generation,
+                    })));
             }
+            return Ok(state);
         }
         let detail = GetDetail { target: GetTarget::Generated(target), mode, wanted_fields,
             requested_hosts: requested, reason, initial: Vec::new(), suggestions: Vec::new() };
@@ -625,7 +699,7 @@ impl Core {
                 self.generators.with_entry(&lease.vault_id, |entry| {
                     let GeneratorConfig::GithubApp(config) = &entry.record.config else { return false; };
                     let Some(ceiling) = config.ceiling(grant.installation_id) else { return false; };
-                    github_request_matches_grant(scope, grant, ceiling)
+                    github_scope_match(scope, grant, ceiling) == Some(ScopeMatch::Exact)
                 }) == Some(true)
             }
             (Some(GenerationGrant::GcloudAccess(GcloudAccessGrant::Issued { .. })), Some(request)) =>
@@ -640,15 +714,25 @@ impl Core {
             return Err(CoreError::invalid("request does not fit this lease"));
         }
         let result = self.materialize_generated(id, refresh, refresh_from_version)?;
-        self.generated_shortcut(host, result)
+        self.generated_shortcut(host, result, LeaseReuse::StrictOrPinned)
     }
 
-    fn generated_shortcut(&self, host: &HostRecord, result: GetResult) -> Result<RequestState> {
+    fn generated_shortcut(&self, host: &HostRecord, mut result: GetResult, reuse: LeaseReuse) -> Result<RequestState> {
         let authority = lock(&self.authorization);
+        if let LeaseReuse::Ranked(scope) = reuse {
+            // Materialization releases authorization while renewing. Respect a policy change before delivery.
+            if !result.generation.as_ref().is_some_and(|g| self.generators.with_entry(&g.generator_id,
+                |entry| !entry.record.require_exact_scope_match) == Some(true))
+            {
+                return Err(CoreError::invalid("generator lease reuse policy changed; request the token again"));
+            }
+            result.broader_lease_reuse = scope == ScopeMatch::Broader;
+        }
         let lease_id = result.lease_id.clone();
         let version = result.credential_version.unwrap_or(0);
         let consumed = result.mode == LeaseMode::Raw;
-        let metadata = self.with_generated_delivery(&lease_id, version, true, Self::generated_metadata)?;
+        let mut metadata = self.with_generated_delivery(&lease_id, version, true, Self::generated_metadata)?;
+        metadata.broader_lease_reuse = result.broader_lease_reuse;
         let id = new_uuid_v4();
         let retained = RequestState { request_id: id.clone(), kind: RequestKind::Get,
             status: RequestStatus::Approved, deny_reason: None, result: Some(RequestResult::Get(metadata)),
@@ -668,6 +752,7 @@ impl Core {
             generation: lease.generation.clone().map(|grant| GenerationSelection {
                 generator_id: lease.vault_id.clone(), generator_revision: lease.generator_revision.unwrap_or(0), grant }),
             operator_selected_grant: false,
+            broader_lease_reuse: false,
             generator_name: Some(lease.vault_name.clone()),
             credential_expires_at: Some(fmt_unix(cached.current.expires_at)), credential_version: Some(cached.version),
             files: Vec::new(),
@@ -1218,7 +1303,7 @@ impl Core {
     fn generator_info(&self, entry: &GeneratorEntry, warning: Option<String>) -> ffi::GeneratorInfo {
         ffi::GeneratorInfo { id: entry.record.id.clone(), name: entry.record.name.clone(),
             config: entry.record.config.clone().into(), revision: entry.record.revision,
-            status: entry.status().into(), warning }
+            status: entry.status().into(), warning, require_exact_scope_match: entry.record.require_exact_scope_match }
     }
 
     pub fn list_generators(&self) -> Vec<ffi::GeneratorInfo> {
@@ -1381,7 +1466,8 @@ impl Core {
                 None => self.store.list_generators()?.iter().map(|r| r.position).max().unwrap_or(0).saturating_add(1),
             };
             let affected_leases = if authority_changed && previous.is_some() { self.generator_leases(&id)? } else { Vec::new() };
-            let record = GeneratorRecord { id: id.clone(), name, config, revision, position };
+            let record = GeneratorRecord { id: id.clone(), name, config, revision, position,
+                require_exact_scope_match: draft.require_exact_scope_match };
             if key_changed || previous.is_none() {
                 put_key(&id, kind, material)?;
             }
@@ -1426,6 +1512,7 @@ impl Core {
                 format!("generator {} saved", entry.record.name)).detail(serde_json::json!({
                     "generator_id": id, "name": entry.record.name, "revision": entry.record.revision,
                     "config": entry.record.config,
+                    "require_exact_scope_match": entry.record.require_exact_scope_match,
                 })));
             entry
         };

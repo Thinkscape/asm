@@ -70,11 +70,6 @@ private struct GeneratorListPane: View {
 
     private var selected: GeneratorItem? { model.generators.first { $0.id == selection } }
 
-    private var selectedIsLegacyGcloud: Bool {
-        guard let selected, case .gcloud = selected.config else { return false }
-        return true
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             if model.generators.isEmpty {
@@ -98,11 +93,7 @@ private struct GeneratorListPane: View {
                 }
                 .contextMenu(forSelectionType: String.self) { ids in
                     if let id = ids.first, let generator = model.generators.first(where: { $0.id == id }) {
-                        if case .gcloud = generator.config {
-                            Button("Details…") { sheet = .edit(generator) }
-                        } else {
-                            Button("Edit…") { sheet = .edit(generator) }
-                        }
+                        Button("Edit…") { sheet = .edit(generator) }
                         Button("Remove…", role: .destructive) { removing = generator }
                     }
                 } primaryAction: { ids in
@@ -123,10 +114,7 @@ private struct GeneratorListPane: View {
                 Button {
                     if let selected { sheet = .edit(selected) }
                 } label: {
-                    Label(
-                        selectedIsLegacyGcloud ? "Details" : "Edit",
-                        systemImage: selectedIsLegacyGcloud ? "info.circle" : "pencil"
-                    )
+                    Label("Edit", systemImage: "pencil")
                 }
                 .disabled(selected == nil)
                 Button { removing = selected } label: { Label("Remove", systemImage: "minus") }
@@ -144,7 +132,7 @@ private struct GeneratorListPane: View {
                 case let .githubApp(config):
                     GithubAppSheet(model: model, generator: generator, savedConfig: config)
                 case let .gcloud(config):
-                    GcloudLegacyGeneratorSheet(generator: generator, config: config)
+                    GcloudLegacyGeneratorSheet(model: model, generator: generator, config: config)
                 case let .gcloudConnection(config):
                     GcloudGeneratorSheet(model: model, editing: (generator, config))
                 }
@@ -184,12 +172,28 @@ private extension GeneratorConfigItem {
     }
 }
 
+struct GeneratorLeaseReuseSection: View {
+    @Binding var requireExactScopeMatch: Bool
+
+    var body: some View {
+        Section {
+            Toggle("Require exact scope match for lease reuse", isOn: $requireExactScopeMatch)
+                .toggleStyle(.checkbox)
+        } header: {
+            Text("Lease reuse")
+        } footer: {
+            Text("When this is off, a compatible client can reuse a lease from another agent label on the same host without asking again. If the lease covers the request, the client receives the full grant, including any permissions it didn’t request.")
+        }
+    }
+}
+
 private struct GithubAppSheet: View {
     let model: AppModel
     let generator: GeneratorItem?
     let savedConfig: GithubAppConfigItem?
     @Environment(\.dismiss) private var dismiss
     @State private var name: String
+    @State private var requireExactScopeMatch: Bool
     @State private var clientID: String
     @State private var installations: [GithubGrantItem]
     @State private var verifiedAccounts: [UInt64: String] = [:]
@@ -208,6 +212,7 @@ private struct GithubAppSheet: View {
         self.generator = generator
         self.savedConfig = savedConfig
         _name = State(initialValue: generator?.name ?? "")
+        _requireExactScopeMatch = State(initialValue: generator?.requireExactScopeMatch ?? false)
         _clientID = State(initialValue: savedConfig?.clientID ?? "")
         _installations = State(initialValue: savedConfig?.installations ?? [])
     }
@@ -242,7 +247,8 @@ private struct GithubAppSheet: View {
         return GeneratorDraftItem(
             id: generator?.id, name: name.trimmingCharacters(in: .whitespaces),
             config: .githubApp(config),
-            credentials: privateKeyPEM.isEmpty ? .keep : .githubPrivateKey(pem: privateKeyPEM)
+            credentials: privateKeyPEM.isEmpty ? .keep : .githubPrivateKey(pem: privateKeyPEM),
+            requireExactScopeMatch: requireExactScopeMatch
         )
     }
 
@@ -278,6 +284,7 @@ private struct GithubAppSheet: View {
                     edit: { editingInstallation = .edit($0) },
                     remove: { removingInstallation = $0 }
                 )
+                GeneratorLeaseReuseSection(requireExactScopeMatch: $requireExactScopeMatch)
                 if generator != nil {
                     Section {
                         Text("Changing authentication or scope invalidates this generator’s leases. Renaming it preserves existing grants.")

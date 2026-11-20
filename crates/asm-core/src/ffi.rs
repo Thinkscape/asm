@@ -643,6 +643,7 @@ pub struct GeneratorDraft {
     pub name: String,
     pub config: GeneratorConfig,
     pub credentials: GeneratorCredentials,
+    pub require_exact_scope_match: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -653,6 +654,7 @@ pub struct GeneratorInfo {
     pub revision: u64,
     pub status: VaultStatus,
     pub warning: Option<String>,
+    pub require_exact_scope_match: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -1852,6 +1854,7 @@ mod generator_ffi_tests {
                 },
             },
             credentials: GeneratorCredentials::GithubPrivateKey { pem: "PRIVATE_FIXTURE_DO_NOT_DISCLOSE".into() },
+            require_exact_scope_match: false,
         };
         assert!(!format!("{draft:?}").contains("PRIVATE_FIXTURE_DO_NOT_DISCLOSE"));
         assert!(crate::generator::GeneratorConfig::try_from(draft.config).is_ok());
@@ -1934,6 +1937,7 @@ mod generator_ffi_tests {
             credentials: GeneratorCredentials::GcloudSession {
                 session_id: "PRIVATE_SESSION_ID".into(),
             },
+            require_exact_scope_match: false,
         };
         assert!(!format!("{draft:?}").contains("PRIVATE_SESSION_ID"));
         let config = crate::generator::GeneratorConfig::try_from(draft.config.clone()).unwrap();

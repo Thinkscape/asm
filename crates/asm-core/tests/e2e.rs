@@ -1320,6 +1320,7 @@ impl GithubFixture {
                 id: id.into(), name: name.into(),
                 config: GeneratorConfig::GithubApp(self.config.clone()),
                 revision: 1, position: self.config.installations[0].installation_id as i64,
+                require_exact_scope_match: false,
             },
             Arc::new(GeneratorClient::GithubApp(generator)),
         ).unwrap();
@@ -1770,12 +1771,14 @@ fn generated_github_lease_end_to_end() {
     assert_eq!(get_status(&outside_url, &token), 403, "an unapproved repository is not accessible");
     assert_generated_leases_are_raw(&manager);
 
-    // Alias reuse is one grant/version, not a second issuance or approval.
+    // The alias requests only metadata; negotiated reuse returns the full original grant.
     let alias = json_get(&env, &[
-        "--repositories", "acme/web", "--permissions", "contents=read", "GITHUB_TOKEN", "Continue reading acme/web",
+        "--repositories", "acme/web", "GITHUB_TOKEN", "Read repository metadata",
     ]);
     let alias_path = delivered_path(&alias);
     assert_eq!(alias["lease_id"], first["lease_id"]);
+    assert_eq!(alias["generation"], first["generation"]);
+    assert_eq!(approver.count(), 1, "covering lease reuse must not prompt again");
     assert_eq!(alias["credential_version"], 1);
     assert_eq!(std::fs::read_to_string(&alias_path).unwrap(), token);
     assert_ne!(alias_path, raw_path);

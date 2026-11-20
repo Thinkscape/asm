@@ -115,6 +115,7 @@ fn saved_connection(key: &GcloudProfileKey) -> GeneratorRecord {
         name: "Google connection".into(),
         revision: 1,
         position: 0,
+        require_exact_scope_match: false,
         config: GeneratorConfig::GcloudConnection(crate::generator::GcloudConnectionConfig {
             sdk_path: "/opt/homebrew/bin/gcloud".into(),
             account_subject: key.account_subject.clone(),

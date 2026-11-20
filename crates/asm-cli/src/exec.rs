@@ -139,7 +139,7 @@ fn body(
     generation: Option<GenerationRequest>,
     capabilities: bindings::GetCapabilities,
 ) -> RequestBody {
-    let client_capabilities = capabilities.client_capabilities(generation.as_ref(), lease_id.is_some());
+    let client_capabilities = capabilities.client_capabilities(generation.as_ref(), lease_id.is_some(), false);
     RequestBody::Get {
         name, fields: Some(fields), raw: mode == RequestedMode::Raw,
         sentinel: mode == RequestedMode::Sentinel, hosts, reason, lease_id,

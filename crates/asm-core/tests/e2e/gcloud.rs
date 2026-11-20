@@ -86,6 +86,7 @@ printf 'child-fixture-%s\n' "$(uuidgen)"
     let manager = running.0.clone();
     manager.core().install_generator_client(GeneratorRecord { id: "00000000-0000-4000-8000-000000000001".into(),
         name: "gcloud-dev".into(), config: GeneratorConfig::Gcloud(config), revision: 1, position: 0,
+        require_exact_scope_match: false,
     }, Arc::new(GeneratorClient::Gcloud(generator))).unwrap();
     let code = manager.create_pairing_code("Storage test".into(), Some(3600), Some(1), vec!["127.0.0.1/8".into()]).unwrap();
     assert_eq!(env.run(&["pair", &manager.general_settings().listening_on, &code.code], None).code, 0);

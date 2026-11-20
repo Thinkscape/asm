@@ -28,6 +28,8 @@ pub const CAPABILITY_SECRET_FIELDS_V1: &str = "secret_fields_v1";
 pub const CAPABILITY_OPERATOR_SELECTED_GRANT_V1: &str = "operator_selected_grant_v1";
 /// A fresh managed Google Cloud approval can select a different project.
 pub const CAPABILITY_OPERATOR_SELECTED_PROJECT_V1: &str = "operator_selected_project_v1";
+/// An unpinned generated request can reuse an existing, possibly broader grant.
+pub const CAPABILITY_BROADER_LEASE_REUSE_V1: &str = "broader_lease_reuse_v1";
 /// Lease duration choices: label and seconds (`None` = unlimited).
 pub const LEASE_DURATIONS: &[(&str, Option<u64>)] = &[
     ("5 min", Some(300)),
@@ -451,6 +453,13 @@ impl RequestBody {
         } if client_capabilities.iter().any(|c| c == CAPABILITY_OPERATOR_SELECTED_PROJECT_V1))
     }
 
+    /// Whether an automatic reuse may return more than the requested scope.
+    pub fn supports_broader_lease_reuse(&self) -> bool {
+        matches!(self, Self::Get {
+            generation: Some(_), lease_id: None, new_lease: false, client_capabilities, ..
+        } if client_capabilities.iter().any(|c| c == CAPABILITY_BROADER_LEASE_REUSE_V1))
+    }
+
     /// Negotiate only features that change request meaning, not arbitrary
     /// unknown JSON fields. Legacy static whole-item requests remain accepted.
     pub fn validate_get_capabilities(&self, source: SourceKind) -> Result<(), ApiError> {
@@ -549,6 +558,10 @@ pub struct GetResult {
     /// project-selection capability; this marker is not sufficient on its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub operator_selected_grant: bool,
+    /// An existing generated lease was reused with a grant covering the request.
+    /// Never set on fresh operator approvals or pinned deliveries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub broader_lease_reuse: bool,
     #[serde(default)]
     pub credential_expires_at: Option<String>,
     #[serde(default)]
@@ -563,6 +576,9 @@ impl GetResult {
     pub fn validate(&self) -> Result<(), ApiError> {
         match &self.generation {
             Some(selection) => {
+                if self.broader_lease_reuse && (self.operator_selected_grant || self.mode != LeaseMode::Raw) {
+                    return Err(ApiError::invalid("broader lease reuse requires existing raw authorization"));
+                }
                 selection.validate()?;
                 if !selection.grant.is_issued() {
                     return Err(ApiError::invalid("generated result requires an issued grant"));
@@ -573,7 +589,7 @@ impl GetResult {
                     return Err(ApiError::invalid("generated result requires a positive credential version and provider expiry"));
                 }
             }
-            None if self.operator_selected_grant || self.credential_version.is_some() || self.credential_expires_at.is_some() || self.generator_name.is_some() => {
+            None if self.operator_selected_grant || self.broader_lease_reuse || self.credential_version.is_some() || self.credential_expires_at.is_some() || self.generator_name.is_some() => {
                 return Err(ApiError::invalid("credential metadata requires a generation selection"));
             }
             None => {}
@@ -1042,6 +1058,19 @@ mod tests {
     }
 
     #[test]
+    fn broader_reuse_requires_an_opted_in_unpinned_generated_request() {
+        let mut value = json!({"generation":{"provider":"github_app","scope":{"repositories":["acme/web"]}}});
+        assert!(!get_body(value.clone()).supports_broader_lease_reuse());
+        value["client_capabilities"] = json!([CAPABILITY_BROADER_LEASE_REUSE_V1]);
+        assert!(get_body(value.clone()).supports_broader_lease_reuse());
+        for (field, changed) in [("lease_id", json!("pinned")), ("new_lease", json!(true)), ("generation", json!(null))] {
+            let mut other = value.clone();
+            other[field] = changed;
+            assert!(!get_body(other).supports_broader_lease_reuse());
+        }
+    }
+
+    #[test]
     fn generated_results_require_durable_version_and_parseable_provider_expiry() {
         let mut value = json!({
             "lease_id":"l","mode":"raw","hosts":[],"expires_at":"2026-11-18T00:00:00Z",
@@ -1055,6 +1084,13 @@ mod tests {
         assert!(!result.operator_selected_grant);
         result.validate().unwrap();
         assert_eq!(to_value(&result).unwrap(), value);
+        let mut reused = result.clone();
+        assert!(!reused.broader_lease_reuse);
+        reused.broader_lease_reuse = true;
+        reused.validate().unwrap();
+        assert_eq!(to_value(&reused).unwrap()["broader_lease_reuse"], true);
+        reused.operator_selected_grant = true;
+        assert!(reused.validate().is_err());
         {
             let mut approved = value.clone();
             approved["operator_selected_grant"] = json!(true);

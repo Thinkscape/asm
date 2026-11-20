@@ -191,9 +191,9 @@ asm exec --repositories acme/web --permissions pull_requests=read GH_TOKEN -- gh
 # Both GH_TOKEN and GITHUB_TOKEN are injected with the same value; no token files.
 ```
 
-For GitHub, `get` and `exec` require `--repositories OWNER/REPO[,OWNER/REPO...]` unless `get --lease ID` pins an existing grant. Permissions default to `metadata=read`; request additional access with `--permissions contents=read,pull_requests=write`. The popup marks what the agent requested. The operator can remove or add repositories and change permission levels within **one configured installation’s limits**. Installations cannot be combined in one token. A narrower request does not silently receive a previously approved broader raw token. Raw GitHub tokens need no proxy.
+For GitHub, `get` and `exec` require `--repositories OWNER/REPO[,OWNER/REPO...]` unless `get --lease ID` pins an existing grant. Permissions default to `metadata=read`; request additional access with `--permissions contents=read,pull_requests=write`. The popup marks what the agent requested. The operator can remove or add repositories and change permission levels within **one configured installation’s limits**. Installations cannot be combined in one token. Raw GitHub tokens need no proxy.
 
-For a Google Cloud connection, request **one project and an exact set of permissions**. `get` writes the approved token to a private file; `exec` injects `CLOUDSDK_AUTH_ACCESS_TOKEN` into the child without writing a token file:
+For a Google Cloud connection, request **one project and the permissions you need**. `get` writes the approved token to a private file; `exec` injects `CLOUDSDK_AUTH_ACCESS_TOKEN` into the child without writing a token file:
 
 ```sh
 asm get --project my-staging-project --permissions storage=read \
@@ -246,6 +246,12 @@ ends. Repeat get to refresh file views; exec never updates them or renews a runn
 Routine renewal leaves old copies usable until natural expiry. Explicit `--refresh` rotates
 the token; ASM can revoke known GitHub predecessors, not Google tokens. `--lease ID` pins an existing generated grant;
 `--new-lease` requests a fresh decision.
+
+**Automatic lease reuse.** GitHub and Google Cloud generators default to allowing broader matches. For an unpinned request, ASM looks for an active raw lease on the paired host for the requested output that covers **all** requested access. It prefers the latest lease expiration (no expiration wins), then the broadest grant, then the newest approval. For equal deadlines, GitHub breadth counts repositories times the sum of permission levels (read = 1, write = 2, admin = 3); Google breadth counts permission claims or legacy OAuth scopes.
+
+For example, a request for `acme/web` with `contents=read` can immediately receive an existing token with `contents=write,pull_requests=write`, even if a different agent on the host obtained it. **The token retains its full grant**, including any extra repositories or permissions. Managed Google leases must cover the requested claims on the **same project**; legacy Google leases must contain every requested OAuth scope. ASM records broader deliveries in the Activity Log under **Generators** without prompting again.
+
+Enable **Require exact scope match for lease reuse** in an individual generator’s settings to keep the previous behavior: ASM checks the newest relevant decision for the same agent and reuses it only if its issued scope matches exactly and the lease is still eligible. Older clients that do not negotiate broader reuse also use this behavior. `--lease ID` never silently substitutes a different lease, and `--new-lease` bypasses reuse entirely.
 
 Identical GitHub token requests from the same paired host and agent share one pending
 approval, lease and initial token. Each caller gets its own request ID and can collect

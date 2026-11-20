@@ -145,6 +145,7 @@ impl Fixture {
         let client = GcloudGenerator::connection_with_endpoint_for_tests(&config, ADC, &tmp.path().join("work"), endpoint).unwrap();
         let generator = new_uuid_v4();
         core.install_generator_client(GeneratorRecord { id: generator.clone(), name: "cloud".into(),
+            require_exact_scope_match: false,
             config: GeneratorConfig::GcloudConnection(config), revision: 1, position: 1 }, Arc::new(GeneratorClient::Gcloud(client))).unwrap();
         let host = HostRecord { id: new_uuid_v4(), info: HostInfo { hostname: "isolated-host".into(), ..Default::default() },
             name: String::new(), address: "127.0.0.1".into(), paired_at: now(), last_seen: None, revoked_at: None, machine_hint: None };

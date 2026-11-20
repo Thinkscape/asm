@@ -991,7 +991,8 @@ private extension GeneratorItem {
         case .gcloud, .gcloudConnection: .error(gcloudGeneratorLockedMessage)
         }
         self.init(id: generator.id, name: generator.name, config: GeneratorConfigItem(generator.config),
-                  revision: generator.revision, state: VaultState(generator.status, locked: locked), warning: generator.warning)
+                  revision: generator.revision, state: VaultState(generator.status, locked: locked), warning: generator.warning,
+                  requireExactScopeMatch: generator.requireExactScopeMatch)
     }
 }
 
@@ -1008,7 +1009,7 @@ private extension GeneratorCredentials {
 private extension GeneratorDraft {
     init(_ draft: GeneratorDraftItem) {
         self.init(id: draft.id, name: draft.name, config: GeneratorConfig(draft.config),
-                  credentials: GeneratorCredentials(draft.credentials))
+                  credentials: GeneratorCredentials(draft.credentials), requireExactScopeMatch: draft.requireExactScopeMatch)
     }
 }
 

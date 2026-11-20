@@ -440,6 +440,7 @@ struct GeneratorItem: Identifiable, Equatable, Sendable {
     var revision: UInt64
     var state: VaultState
     var warning: String?
+    var requireExactScopeMatch = false
 }
 
 enum GeneratorCredentialsItem: Sendable {
@@ -453,6 +454,7 @@ struct GeneratorDraftItem: Sendable {
     var name: String
     var config: GeneratorConfigItem
     var credentials: GeneratorCredentialsItem
+    var requireExactScopeMatch = false
 }
 
 struct GithubInstallationItem: Equatable, Sendable {

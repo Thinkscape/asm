@@ -671,6 +671,24 @@ impl GenerationGrant {
         }
     }
 
+    /// An existing credential must already cover every explicit request bound.
+    /// Unlike approval candidates, pending managed profiles confer no authority.
+    pub fn covers_lease_reuse_request(&self, request: &GenerationRequest) -> Result<bool, ApiError> {
+        match (self, request) {
+            (Self::GithubApp(grant), GenerationRequest::GithubApp(request)) if request.repositories.is_some() =>
+                grant.covers_request(request),
+            (Self::Gcloud(grant), GenerationRequest::Gcloud(request)) if request.scopes.is_some() =>
+                grant.covers_request(request),
+            (Self::GcloudAccess(grant @ GcloudAccessGrant::Issued { access, .. }), GenerationRequest::GcloudAccess(request)) => {
+                grant.validate()?;
+                request.validate()?;
+                Ok(access.project_id == request.project_id
+                    && request.permissions.iter().all(|p| access.permissions.binary_search(p).is_ok()))
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Match explicit claim bounds without adding or dropping authority.
     /// Requests must be canonicalized. GitHub requires repository names and
     /// defaults omitted permissions to `metadata:read`; legacy Google OAuth
@@ -1038,6 +1056,7 @@ mod tests {
         assert!(!google_grant.is_subset_of(&github_grant).unwrap());
         for (grant, request) in [(&github_grant, &google_request), (&google_grant, &github_request)] {
             assert!(!grant.covers_request(request).unwrap());
+            assert!(!grant.covers_lease_reuse_request(request).unwrap());
             assert_eq!(grant.scope_issues(request).unwrap(), ["requested scope belongs to a different credential provider"]);
         }
     }
@@ -1083,6 +1102,36 @@ mod tests {
     }
 
     #[test]
+    fn reuse_requires_all_explicit_repository_names_and_permission_levels() {
+        let granted = GenerationGrant::GithubApp(grant());
+        let request = |repos: &[&str], permission: &str, level| GenerationRequest::GithubApp(GithubScopeRequest {
+            repositories: Some(repos.iter().map(|r| (*r).to_owned()).collect()),
+            permissions: Some(BTreeMap::from([(permission.to_owned(), level)])),
+        });
+        assert!(granted.covers_lease_reuse_request(&request(&["ACME/web"], "contents", GithubPermission::Read)).unwrap());
+        for req in [
+            request(&["acme/web", "acme/docs"], "contents", GithubPermission::Read),
+            request(&["acme/web"], "contents", GithubPermission::Admin),
+            request(&["acme/web"], "issues", GithubPermission::Read),
+            GenerationRequest::GithubApp(GithubScopeRequest::default()),
+        ] {
+            assert!(!granted.covers_lease_reuse_request(&req).unwrap());
+        }
+    }
+
+    #[test]
+    fn legacy_lease_reuse_checks_explicit_oauth_scopes_as_a_set() {
+        let granted = GenerationGrant::Gcloud(gcloud(&[CLOUD, STORAGE]));
+        let request = |scopes: &[&str]| GenerationRequest::Gcloud(GcloudScopeRequest {
+            scopes: Some(scopes.iter().map(|s| (*s).to_owned()).collect()),
+        });
+        assert!(granted.covers_lease_reuse_request(&request(&[STORAGE])).unwrap());
+        assert!(!granted.covers_lease_reuse_request(&request(&[STORAGE, GcloudPermission::RunRead.scope()])).unwrap());
+        assert!(granted.covers_lease_reuse_request(&request(&["invalid"])).is_err());
+        assert!(!granted.covers_lease_reuse_request(&GenerationRequest::Gcloud(GcloudScopeRequest::default())).unwrap());
+    }
+
+    #[test]
     fn managed_google_leases_require_exact_project_claims_and_pinned_identity() {
         let mut access = GcloudAccessRequest {
             project_id: "demo-project".into(),
@@ -1123,6 +1172,8 @@ mod tests {
             assert!(!different.is_subset_of(&issued).unwrap());
             let other_request = GenerationRequest::GcloudAccess(other.clone());
             assert!(!issued.matches_request_exactly(&other_request).unwrap());
+            assert_eq!(issued.covers_lease_reuse_request(&other_request).unwrap(),
+                other.project_id == access.project_id && other.permissions.len() == 1);
             assert_eq!(issued.can_select_for(&other_request), other.project_id == access.project_id);
         }
         let pending = GenerationGrant::GcloudAccess(GcloudAccessGrant::Requested { access: access.clone() });
@@ -1131,6 +1182,7 @@ mod tests {
         assert!(!catalog.covers_request(&request).unwrap());
         for display in [pending, catalog] {
             assert!(!display.is_issued());
+            assert!(!display.covers_lease_reuse_request(&request).unwrap());
             assert!(!display.is_subset_of(&issued).unwrap());
             assert!(!issued.is_subset_of(&display).unwrap());
         }

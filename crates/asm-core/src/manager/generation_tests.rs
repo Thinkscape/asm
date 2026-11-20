@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use asm_proto::generators::{GCLOUD_TOKEN_NAME, GcloudAccessGrant, GcloudAccessRequest, GcloudGrant,
     GcloudPermission, GcloudScopeRequest, GithubGrant, GithubPermission, GithubRepository, GithubScopeRequest};
-use asm_proto::wire::{CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GENERATED_CREDENTIALS_V1,
+use asm_proto::wire::{CAPABILITY_BROADER_LEASE_REUSE_V1, CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GENERATED_CREDENTIALS_V1,
     CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_OPERATOR_SELECTED_GRANT_V1,
     CAPABILITY_OPERATOR_SELECTED_PROJECT_V1, CAPABILITY_SECRET_FIELDS_V1, HostInfo, RequestBody};
 use serde_json::{Value, json};
@@ -170,6 +170,8 @@ fn respond(mut stream: TcpStream, state: Arc<ProviderState>) {
         state.wait_for_release();
         let scopes = if form[0].1.starts_with("isolated-child-managed-broad-") {
             format!("{COMPUTE_SCOPE} {GCLOUD_SCOPE}")
+        } else if form[0].1.starts_with("isolated-child-legacy-broad-") {
+            format!("{GCLOUD_OTHER_SCOPE} {GCLOUD_SCOPE}")
         } else { GCLOUD_SCOPE.into() };
         (200, json!({ "scope": scopes, "expires_in": state.ttl.load(Ordering::SeqCst) }).to_string())
     } else if first == "POST /v1/projects/fixture-project/serviceAccounts/112233:testIamPermissions HTTP/1.1" {
@@ -412,7 +414,8 @@ impl Fixture {
     fn install_with_ceilings(&self, id: &str, name: &str, position: i64, installations: Vec<GithubGrant>) {
         let config = GithubAppConfig { client_id: format!("client-{id}"), installations };
         let generator = self.github_client(&config, crate::generator::github::test_pem()).unwrap();
-        self.core.install_generator_client(GeneratorRecord { id: id.into(), name: name.into(), config: GeneratorConfig::GithubApp(config), revision: 1, position },
+        self.core.install_generator_client(GeneratorRecord { id: id.into(), name: name.into(),
+            config: GeneratorConfig::GithubApp(config), revision: 1, position, require_exact_scope_match: false },
             Arc::new(GeneratorClient::GithubApp(generator))).unwrap();
     }
     fn github_client(&self, config: &GithubAppConfig, pem: &str) -> Result<GithubAppGenerator> {
@@ -437,7 +440,12 @@ case "$1:$2:$3" in
       printf 'isolated-parent\n'
     else
       [ "$#" -eq 9 ] && [ "$6" = '--impersonate-service-account={uid}' ] &&
-      [ "$7" = '--scopes={GCLOUD_SCOPE}' ] && [ "$8" = '--lifetime=3600s' ] || exit 7
+      [ "$8" = '--lifetime=3600s' ] || exit 7
+      case "$7" in
+        --scopes={GCLOUD_SCOPE}) prefix=isolated-child ;;
+        --scopes={GCLOUD_OTHER_SCOPE},{GCLOUD_SCOPE}) prefix=isolated-child-legacy-broad ;;
+        *) exit 7 ;;
+      esac
       case "$9" in --project={GCLOUD_PROJECT}|--project={GCLOUD_ALT_PROJECT}) ;; *) exit 7 ;; esac
       project=${{9#*=}}
       [ "$GOOGLE_CLOUD_QUOTA_PROJECT" = "$project" ] || exit 7
@@ -445,7 +453,7 @@ case "$1:$2:$3" in
         printf 'invalid_grant (do not expose this SDK diagnostic)\n' >&2
         exit 7
       fi
-      printf 'isolated-child-%s-%s\n' "$project" "${{PWD##*/}}"
+      printf '%s-%s-%s\n' "$prefix" "$project" "${{PWD##*/}}"
     fi ;;
   *) exit 7 ;;
 esac
@@ -467,7 +475,7 @@ esac
         let generator = GcloudGenerator::with_endpoint_for_tests(&config, GCLOUD_ADC_FIXTURE,
             &self._tmp.path().join("google-work"), self.provider.url.clone()).unwrap();
         self.core.install_generator_client(GeneratorRecord { id: GCLOUD_ID.into(), name: "cloud-dev".into(),
-            config: GeneratorConfig::Gcloud(config.clone()), revision: 1, position: 2 },
+            config: GeneratorConfig::Gcloud(config.clone()), revision: 1, position: 2, require_exact_scope_match: false },
             Arc::new(GeneratorClient::Gcloud(generator))).unwrap();
         config
     }
@@ -506,7 +514,7 @@ esac
         let client = GcloudGenerator::connection_with_endpoint_for_tests(&config, GCLOUD_ADC_FIXTURE,
             &self._tmp.path().join("managed-work"), self.provider.url.clone()).unwrap();
         self.core.install_generator_client(GeneratorRecord { id: CONNECTION_ID.into(), name: "managed-cloud".into(),
-            config: GeneratorConfig::GcloudConnection(config), revision: 1, position: 3 },
+            config: GeneratorConfig::GcloudConnection(config), revision: 1, position: 3, require_exact_scope_match: false },
             Arc::new(GeneratorClient::Gcloud(client))).unwrap();
     }
     fn gcloud_grant() -> GcloudGrant {
@@ -529,7 +537,7 @@ esac
         serde_json::from_value(json!({ "kind":"get", "name":name, "reason":"Read the approved repository", "agent":"agent-a",
             "generation":generation,
             "client_capabilities":[CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1,
-                CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_SECRET_FIELDS_V1] })).unwrap()
+                CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_SECRET_FIELDS_V1, CAPABILITY_BROADER_LEASE_REUSE_V1] })).unwrap()
     }
     fn request(&self, body: RequestBody) -> Result<RequestState> { self.core.create_request(&self.host, "127.0.0.1", body) }
     fn github_body(&self, editable: bool, repositories: &[&str], contents: GithubPermission) -> RequestBody {
@@ -596,6 +604,11 @@ esac
 impl Drop for Fixture { fn drop(&mut self) { self.core.shutdown(); } }
 fn get(state: RequestState) -> GetResult {
     match state.result.unwrap() { RequestResult::Get(result) => result, _ => panic!("expected get result") }
+}
+fn without_broader_reuse(mut body: RequestBody) -> RequestBody {
+    let RequestBody::Get { client_capabilities, .. } = &mut body else { unreachable!() };
+    client_capabilities.retain(|c| c != CAPABILITY_BROADER_LEASE_REUSE_V1);
+    body
 }
 fn conditional(f: &Fixture, lease: &str, version: u64) -> RequestBody {
     let mut body = f.body("GITHUB_TOKEN");
@@ -1118,7 +1131,7 @@ fn generation_failed_encrypted_refresh_commit_preserves_old_version_across_resta
 }
 
 #[test]
-fn generation_latest_ended_approval_does_not_rebind_to_older_active_identity() {
+fn generation_only_relaxed_clients_can_fall_back_to_an_older_active_approval() {
     let f = Fixture::new();
     f.install("app-b", "review-bot", 2);
     let a = f.first();
@@ -1128,10 +1141,48 @@ fn generation_latest_ended_approval_does_not_rebind_to_older_active_identity() {
     f.approve(&pending.request_id, "app-b", LeaseMode::Raw, 43_200).unwrap();
     let b = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
     f.core.revoke_lease(&b.lease_id).unwrap();
-    assert_eq!(f.request(f.body("GITHUB_TOKEN")).unwrap().status, RequestStatus::Pending);
+    assert_eq!(f.request(without_broader_reuse(f.body("GITHUB_TOKEN"))).unwrap().status, RequestStatus::Pending);
+    assert_eq!(get(f.request(f.body("GITHUB_TOKEN")).unwrap()).lease_id, a.lease_id);
     let mut pinned = f.body("GITHUB_TOKEN");
     if let RequestBody::Get { lease_id, .. } = &mut pinned { *lease_id = Some(a.lease_id.clone()); }
     assert_eq!(get(f.request(pinned).unwrap()).lease_id, a.lease_id);
+}
+
+#[test]
+fn generation_ranks_eligible_leases_by_authorization_expiry_then_grant_breadth_then_approval_order() {
+    let f = Fixture::new();
+    let narrow = Fixture::grant();
+    let mut broad = narrow.clone();
+    broad.permissions.insert("contents".into(), GithubPermission::Write);
+    f.install_with_ceilings("app-b", "review-bot", 2, vec![broad.clone()]);
+    let issue = |grant: &GithubGrant, duration_secs: Option<u64>| {
+        let mut body = f.github_body(true, &["acme/repo1"], GithubPermission::Read);
+        if let RequestBody::Get { new_lease, .. } = &mut body { *new_lease = true; }
+        let pending = f.request(body).unwrap();
+        f.core.resolve_request(&pending.request_id, ffi::Decision::ApproveGet {
+            mode: ffi::LeaseMode::Raw, duration_secs, hosts: vec![],
+            generation: Some(GenerationSelection { generator_id: "app-b".into(), generator_revision: 1,
+                grant: GenerationGrant::GithubApp(grant.clone()) }.into()),
+        }).unwrap();
+        get(f.core.request_state(&f.host.id, &pending.request_id).unwrap())
+    };
+    // Same clock and provider token TTL for every approval. Only the durable authorizations differ.
+    let indefinite = issue(&narrow, None);
+    let older_broad = issue(&broad, Some(3_600));
+    let newer_broad = issue(&broad, Some(3_600));
+    let longer_exact = issue(&narrow, Some(7_200));
+    let newest_exact = issue(&narrow, Some(3_600));
+    for (expected, broader) in [
+        (indefinite, false), (longer_exact, false), (newer_broad, true), (older_broad, true), (newest_exact, false),
+    ] {
+        let result = get(f.request(f.body("GH_TOKEN")).unwrap());
+        assert_eq!(result.lease_id, expected.lease_id);
+        assert_eq!(result.files, expected.files);
+        assert_eq!(result.broader_lease_reuse, broader);
+        f.core.revoke_lease(&expected.lease_id).unwrap();
+    }
+    assert_eq!(f.issued(), 5);
+    assert_eq!(f.request(f.body("GH_TOKEN")).unwrap().status, RequestStatus::Pending);
 }
 
 #[test]
@@ -1162,7 +1213,7 @@ fn generation_github_scope_is_required_before_reusing_an_approved_lease() {
 }
 
 #[test]
-fn generation_github_requests_cannot_reuse_or_approve_broader_authority() {
+fn generation_github_older_clients_cannot_reuse_or_approve_broader_authority() {
     let f = Fixture::new();
     let broad = f.first();
     let mut ceiling = Fixture::grant();
@@ -1177,7 +1228,7 @@ fn generation_github_requests_cannot_reuse_or_approve_broader_authority() {
             }));
             *lease_id = lease;
         }
-        body
+        without_broader_reuse(body)
     };
     assert!(f.request(metadata_only(Some(broad.lease_id))).is_err());
     let pending = f.request(metadata_only(None)).unwrap();
@@ -1205,14 +1256,14 @@ fn generation_github_requests_cannot_reuse_or_approve_broader_authority() {
 }
 
 #[test]
-fn generation_github_operator_can_expand_but_only_exact_grants_are_reused() {
+fn generation_github_operator_can_expand_and_capable_clients_reuse_the_actual_grant() {
     let f = Fixture::new();
     let mut ceiling = Fixture::grant();
     ceiling.repositories.push(GithubRepository { id: 2, full_name: "acme/repo2".into() });
     ceiling.permissions.insert("contents".into(), GithubPermission::Write);
     f.install_with_ceilings("app-b", "review-bot", 2, vec![ceiling.clone()]);
     let editable = || f.github_body(true, &["acme/repo1"], GithubPermission::Read);
-    let legacy = || f.github_body(false, &["acme/repo1"], GithubPermission::Read);
+    let legacy = || without_broader_reuse(f.github_body(false, &["acme/repo1"], GithubPermission::Read));
 
     let pending = f.request(editable()).unwrap();
     let legacy_pending = f.request(legacy()).unwrap();
@@ -1243,11 +1294,37 @@ fn generation_github_operator_can_expand_but_only_exact_grants_are_reused() {
     let expected = json!({"repository_ids":[1, 2],"permissions":{"contents":"write","metadata":"read"}});
     assert_eq!(lock(&f.provider.state.bodies).as_slice(), std::slice::from_ref(&expected));
 
-    assert_eq!(f.request(editable()).unwrap().status, RequestStatus::Pending);
+    let mut incoming = editable();
+    if let RequestBody::Get { agent, .. } = &mut incoming { *agent = "agent-b".into(); }
+    let shortcut = f.request(incoming).unwrap();
+    let request_id = shortcut.request_id.clone();
+    let reused = get(shortcut);
+    assert!(reused.broader_lease_reuse);
+    assert!(!reused.operator_selected_grant);
+    assert_eq!(reused.lease_id, approval.lease_id);
+    assert_eq!(reused.files, approval.files);
+    assert_eq!(reused.generation, approval.generation);
+    assert!(!approval.broader_lease_reuse);
     assert_eq!(f.core.request_state(&f.host.id, &legacy_pending.request_id).unwrap().status, RequestStatus::Pending);
     let exact = get(f.request(f.github_body(true, &["acme/repo2", "acme/repo1"], GithubPermission::Write)).unwrap());
     assert_eq!(exact.lease_id, approval.lease_id);
     assert!(!exact.operator_selected_grant);
+    assert!(!exact.broader_lease_reuse);
+    let events = generator_activity(&f);
+    let broader: Vec<_> = events.iter().filter(|e| e.kind == "broader_lease_reused").collect();
+    assert_eq!(broader.len(), 1, "neither fresh approval nor exact reuse is a broader delivery");
+    let event = broader[0];
+    assert_eq!(event.host_id.as_deref(), Some(f.host.id.as_str()));
+    let detail: Value = serde_json::from_str(event.detail.as_deref().unwrap()).unwrap();
+    assert_eq!(detail["request_id"], request_id);
+    assert_eq!(detail["agent"], "agent-b");
+    assert_eq!(detail["generator_id"], "app-b");
+    assert_eq!(detail["lease_id"], approval.lease_id);
+    assert_eq!(detail["requested"], json!({"provider":"github_app","scope":{
+        "repositories":["acme/repo1"],"permissions":{"contents":"read","metadata":"read"}
+    }}));
+    assert_eq!(detail["grant"], json!(approval.generation.as_ref().unwrap().grant));
+    assert!(!detail.to_string().contains(reused.files[0].content.as_str()));
     let mut pinned = editable();
     if let RequestBody::Get { lease_id, .. } = &mut pinned {
         *lease_id = Some(approval.lease_id.clone());
@@ -1316,6 +1393,7 @@ fn generation_github_pending_name_cannot_be_rebound_to_a_new_repository_id() {
     let pending = f.request(body()).unwrap();
     let replacement = Fixture::grant();
     let draft = ffi::GeneratorDraft { id: Some("app-b".into()), name: "review-bot".into(),
+        require_exact_scope_match: false,
         config: GeneratorConfig::GithubApp(GithubAppConfig { client_id: "client-app-b".into(),
             installations: vec![replacement.clone()] }).into(), credentials: ffi::GeneratorCredentials::Keep };
     let saved = f.core.save_generator_with_github(draft, |_, _| Ok(Some(crate::generator::github::test_pem().into())),
@@ -1411,13 +1489,21 @@ fn generation_new_approvals_reject_sentinel_before_issuance() {
 }
 
 #[test]
-fn generation_agent_affinity_and_explicit_lease_remain_host_authorized() {
+fn generation_relaxed_reuse_crosses_agent_labels_but_never_host_boundaries() {
     let f = Fixture::new();
     let first = f.first();
     let mut other = f.body("GH_TOKEN");
     if let RequestBody::Get { agent, .. } = &mut other { *agent = "agent-b".into(); }
-    assert_eq!(f.request(other.clone()).unwrap().status, RequestStatus::Pending);
+    assert_eq!(f.request(without_broader_reuse(other.clone())).unwrap().status, RequestStatus::Pending);
+    let reused = get(f.request(other.clone()).unwrap());
+    assert_eq!(reused.lease_id, first.lease_id);
+    assert!(!reused.broader_lease_reuse);
+    let mut second_host = f.host.clone();
+    second_host.id = new_uuid_v4();
+    f.core.store.insert_host(&second_host, &asm_proto::crypto::sha256(second_host.id.as_bytes())).unwrap();
+    assert_eq!(f.core.create_request(&second_host, "127.0.0.1", other.clone()).unwrap().status, RequestStatus::Pending);
     if let RequestBody::Get { lease_id, .. } = &mut other { *lease_id = Some(first.lease_id.clone()); }
+    assert!(f.core.create_request(&second_host, "127.0.0.1", other.clone()).is_err());
     assert_eq!(get(f.request(other).unwrap()).lease_id, first.lease_id);
 }
 
@@ -1426,6 +1512,7 @@ fn generation_save_persistence_failure_rolls_back_new_key_without_live_changes()
     let f = Fixture::new();
     let keys = Mutex::new(HashMap::<(String, String), String>::new());
     let draft = ffi::GeneratorDraft { id: None, name: "release-bot".into(),
+        require_exact_scope_match: false,
         config: GeneratorConfig::GithubApp(GithubAppConfig { client_id: "new-client".into(), installations: vec![Fixture::grant()] }).into(),
         credentials: ffi::GeneratorCredentials::GithubPrivateKey { pem: crate::generator::github::test_pem().into() } };
     assert!(f.core.save_generator_with_github(draft,
@@ -1495,6 +1582,7 @@ fn generation_revision_change_or_shutdown_during_mint_discards_result() {
             f.core.begin_generation_shutdown();
         } else {
             let draft = ffi::GeneratorDraft { id: Some("app-a".into()), name: "release-bot".into(),
+                require_exact_scope_match: false,
                 config: GeneratorConfig::GithubApp(GithubAppConfig { client_id: "changed-client".into(),
                     installations: vec![Fixture::grant()] }).into(), credentials: ffi::GeneratorCredentials::Keep };
             f.core.save_generator_with_github(draft, |_, _| Ok(Some(crate::generator::github::test_pem().into())),
@@ -1737,10 +1825,16 @@ fn managed_google_one_approval_provisions_and_releases_exact_access_then_renews(
     assert_eq!(cached.lease_id, first.lease_id);
     assert_eq!(cached.files, first.files);
     assert_eq!(f.issued(), 1);
-    let narrowed = f.request(body(&narrow)).unwrap();
-    assert_eq!(narrowed.status, RequestStatus::Pending);
-    assert!(narrowed.result.is_none(), "narrowing must never return the broader credential");
-    assert!(f.core.resolve_request(&narrowed.request_id, managed_approval(selector(&narrow))).is_err());
+    let covered = get(f.request(body(&narrow)).unwrap());
+    assert!(covered.broader_lease_reuse);
+    assert_eq!(covered.lease_id, first.lease_id);
+    assert_eq!(covered.generation, first.generation);
+    assert_eq!(covered.files, first.files);
+    let other_project = GcloudAccessRequest { project_id: GCLOUD_ALT_PROJECT.into(), ..narrow.clone() };
+    assert_eq!(f.request(body(&other_project)).unwrap().status, RequestStatus::Pending);
+    let old_client = f.request(without_broader_reuse(body(&narrow))).unwrap();
+    assert_eq!(old_client.status, RequestStatus::Pending);
+    assert!(f.core.resolve_request(&old_client.request_id, managed_approval(selector(&narrow))).is_err());
     let mut pin = body(&broad);
     if let RequestBody::Get { lease_id, refresh, refresh_from_version, .. } = &mut pin {
         *lease_id = Some(first.lease_id.clone()); *refresh = true; *refresh_from_version = Some(1);
@@ -1888,7 +1982,7 @@ fn google_account_delete_waits_for_sentinel_cutover_even_on_retry() {
 }
 
 #[test]
-fn managed_google_edited_approval_provisions_and_reuses_only_the_final_exact_profile() {
+fn managed_google_edited_approval_provisions_and_reuses_only_what_the_final_profile_covers() {
     use asm_proto::wire::CAPABILITY_OPERATOR_SELECTED_GRANT_V1;
 
     let narrow = managed_access(&[GcloudPermission::StorageRead]);
@@ -1937,7 +2031,15 @@ fn managed_google_edited_approval_provisions_and_reuses_only_the_final_exact_pro
         assert_eq!(lease.generation, Some(grant));
         assert_eq!(f.issued(), 1);
 
-        let same_original = f.request(opted_in.clone()).unwrap();
+        let mut follow_up = opted_in.clone();
+        if approved == &broad {
+            let reused = get(f.request(follow_up.clone()).unwrap());
+            assert_eq!(reused.generation, first.generation);
+            assert!(reused.broader_lease_reuse);
+            // Explicitly request a new authorization to exercise review of an existing Ready profile.
+            if let RequestBody::Get { new_lease, .. } = &mut follow_up { *new_lease = true; }
+        }
+        let same_original = f.request(follow_up).unwrap();
         assert_eq!(same_original.status, RequestStatus::Pending);
         assert!(same_original.result.is_none());
         let mut exact = managed_body(&f, approved.clone());
@@ -2154,6 +2256,33 @@ fn managed_google_switch_evidence_expiring_during_mint_prevents_delivery() {
 }
 
 #[test]
+fn generation_legacy_google_reuses_full_issued_scope_set_only_for_a_capable_unpinned_request() {
+    let f = Fixture::new();
+    let config = f.install_gcloud();
+    let mut broad = f.body(GCLOUD_TOKEN_NAME);
+    if let RequestBody::Get { generation: Some(GenerationRequest::Gcloud(scope)), .. } = &mut broad {
+        scope.scopes = Some(config.ceiling.scopes.clone());
+    }
+    let pending = f.request(broad.clone()).unwrap();
+    f.core.resolve_request(&pending.request_id, gcloud_approval(config.ceiling)).unwrap();
+    let first = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
+    let narrow = f.body(GCLOUD_TOKEN_NAME);
+    assert_eq!(f.request(without_broader_reuse(narrow.clone())).unwrap().status, RequestStatus::Pending);
+    let covered = get(f.request(narrow.clone()).unwrap());
+    assert!(covered.broader_lease_reuse);
+    assert_eq!(covered.generation, first.generation);
+    assert_eq!(covered.files, first.files);
+    assert_eq!(covered.lease_id, first.lease_id);
+    let exact = get(f.request(broad).unwrap());
+    assert_eq!(exact.lease_id, first.lease_id);
+    assert!(!exact.broader_lease_reuse);
+    let mut pin = narrow;
+    if let RequestBody::Get { lease_id, .. } = &mut pin { *lease_id = Some(first.lease_id); }
+    assert!(f.request(pin).is_err());
+    assert_eq!(f.issued(), 1);
+}
+
+#[test]
 fn generation_google_renews_only_approved_scopes_and_evicts_at_provider_expiry() {
     let f = Fixture::new();
     f.install_gcloud();
@@ -2268,6 +2397,7 @@ fn generation_google_approval_is_invalidated_by_concurrent_generator_revision() 
         crate::generator::gcloud::GcloudIdentity { subject: config.account_subject.clone(), email: config.account_email.clone() },
     ).unwrap();
     let save = f.core.save_generator_with(ffi::GeneratorDraft { id: Some(GCLOUD_ID.into()),
+        require_exact_scope_match: false,
         name: "cloud-dev".into(), config: GeneratorConfig::Gcloud(config).into(),
         credentials: ffi::GeneratorCredentials::GcloudSession { session_id } },
         |_, _| Ok(Some(GCLOUD_ADC_FIXTURE.into())),

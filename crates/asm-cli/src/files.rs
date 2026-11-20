@@ -671,6 +671,7 @@ mod tests {
             expires_at: expires.map(Into::into),
             generation: None,
             operator_selected_grant: false,
+            broader_lease_reuse: false,
             credential_expires_at: None,
             credential_version: None,
             generator_name: None,

@@ -838,7 +838,7 @@ impl Core {
                 };
                 let wanted_fields = select_fields(&["value".to_string()], fields.as_deref())?;
                 self.create_generated_get(host, agent, address, target, mode, wanted_fields,
-                    requested, reason, *new_lease, *refresh, *refresh_from_version)
+                    requested, reason, *new_lease, *refresh, *refresh_from_version, body.supports_broader_lease_reuse())
             }
             CatalogMatch::Vault(named) => {
                 body.validate_get_capabilities(SourceKind::Vault)?;
@@ -962,6 +962,7 @@ impl Core {
                 files,
                 generation: None,
                 operator_selected_grant: false,
+                broader_lease_reuse: false,
                 credential_expires_at: None,
                 credential_version: None,
                 generator_name: None,
@@ -1629,6 +1630,7 @@ impl Core {
             files,
             generation: None,
             operator_selected_grant: false,
+            broader_lease_reuse: false,
             credential_expires_at: None,
             credential_version: None,
             generator_name: None,

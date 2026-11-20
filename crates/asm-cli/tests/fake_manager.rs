@@ -34,6 +34,7 @@ const GCLOUD_LEGACY_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.re
 const GCLOUD_PROJECT: &str = "dev-project";
 const GCLOUD_OTHER_PROJECT: &str = "other-project";
 const SELECT_PROJECT: &str = "operator_selected_project_v1";
+const BROADER_REUSE: &str = "broader_lease_reuse_v1";
 
 fn start(handler: Arc<Handler>) -> Fake {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -725,11 +726,13 @@ fn generator_catalog() -> Value {
 fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
     let managed_google = scenario.starts_with("managed-google");
     let project_selection = scenario.starts_with("managed-google-project-");
+    let reuse = scenario.contains("-reuse-");
     let edited_approval = matches!(scenario,
         "managed-google-selected-broad" | "managed-google-selected-narrow"
         | "managed-google-selected-wrong-request" | "managed-google-selected-other-project"
         | "github-selected-broad" | "github-selected-narrow")
         || (project_selection && scenario != "managed-google-project-cached");
+    let pending = edited_approval || scenario == "managed-google-reuse-pending";
     let approved = Mutex::new(None::<Value>);
     let leases = Arc::new(Mutex::new(Vec::<Value>::new()));
     let ca = rcgen::generate_simple_self_signed(vec!["proxy ca".into()]).unwrap();
@@ -761,6 +764,9 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                 }
                 if project_selection {
                     capabilities.push(SELECT_PROJECT);
+                }
+                if reuse && scenario != "managed-google-reuse-unnegotiated" {
+                    capabilities.push(BROADER_REUSE);
                 }
                 (200, json!({"name":"asm-manager","version":"0.1.0","capabilities":capabilities}))
             }
@@ -901,7 +907,7 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                 let old_version = existing
                     .and_then(|i| records[i]["credential_version"].as_u64())
                     .unwrap_or(0);
-                let near_expiry = edited_approval || matches!(scenario, "near-expiry" | "managed-google-short" | "managed-google-selected-drift-on-renew");
+                let near_expiry = edited_approval || reuse || matches!(scenario, "near-expiry" | "managed-google-short" | "managed-google-selected-drift-on-renew");
                 let version =
                     if body["refresh"] == true || (near_expiry && exact.is_some()) {
                         old_version + 1
@@ -953,8 +959,10 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                             | "managed-google-selected-unmarked" | "managed-google-unnegotiated-selection" =>
                                 access["permissions"] = json!(["storage=read", "compute=read"]),
                             "managed-google-selected-narrow" => access["permissions"] = json!(["storage=read"]),
-                            "managed-google-other-project" | "managed-google-selected-other-project" =>
+                            "managed-google-other-project" | "managed-google-selected-other-project" | "managed-google-reuse-wrong-project" =>
                                 access["project_id"] = json!(GCLOUD_OTHER_PROJECT),
+                            "managed-google-reuse-missing-claim" => access["permissions"] = json!(["storage=create"]),
+                            _ if reuse => access["permissions"] = json!(["storage=read", "compute=read"]),
                             _ if project_selection => {
                                 access["project_id"] = json!(GCLOUD_OTHER_PROJECT);
                                 if matches!(scenario, "managed-google-project-switched" | "managed-google-project-only-permission-drift") {
@@ -992,7 +1000,7 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                             "repositories":[{"id":7,"full_name":"acme/web"}],
                             "permissions":{"contents":"read","metadata":"read"}
                         }),
-                        (None, "github-selected-broad" | "github-selected-unmarked") => json!({
+                        (None, "github-selected-broad" | "github-selected-unmarked" | "github-reuse-broad") => json!({
                             "installation_id":1,
                             "repositories":[{"id":7,"full_name":"acme/web"},{"id":8,"full_name":"acme/docs"}],
                             "permissions":{"contents":"write","metadata":"read"}
@@ -1038,8 +1046,12 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                     "generation":generation,"credential_version":if generated {json!(version)} else {Value::Null},"credential_expires_at":if generated {json!(expiry)} else {Value::Null},"generator_name":if generated {json!(generator_name)} else {Value::Null}});
                 let mut result = lease.clone();
                 result["files"] = json!(files);
+                if reuse && !matches!(scenario, "managed-google-reuse-unmarked" | "managed-google-reuse-selected-immediate")
+                    && (exact.is_none() || scenario == "managed-google-reuse-flag-on-pin") {
+                    result["broader_lease_reuse"] = json!(true);
+                }
                 if exact.is_none() && scenario != "managed-google-project-unmarked"
-                    && (edited_approval || matches!(scenario, "managed-google-unnegotiated-selection"
+                    && (edited_approval || matches!(scenario, "managed-google-unnegotiated-selection" | "managed-google-reuse-selected-immediate"
                         | "managed-google-project-cached" | "managed-google-selected-legacy-response"))
                 {
                     result["operator_selected_grant"] = json!(true);
@@ -1062,7 +1074,7 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                     records.push(lease);
                 }
                 let state = json!({"request_id":REQ,"kind":"get","status":"approved","result":result,"deny_reason":null});
-                if edited_approval && exact.is_none() {
+                if pending && exact.is_none() {
                     *approved.lock().unwrap() = Some(state);
                     (202, json!({"request_id":REQ,"kind":"get","status":"pending","pending_lifetime_secs":600}))
                 } else {
@@ -1076,7 +1088,7 @@ fn launcher_fixture(scenario: &'static str) -> (Fake, Env) {
                     json!({"request_id":REQ,"kind":"get","status":"pending","result":null,"deny_reason":null}),
                 )
             }
-            ("GET", p) if p.starts_with("/v1/requests/") && edited_approval => {
+            ("GET", p) if p.starts_with("/v1/requests/") && pending => {
                 let mut state = approved.lock().unwrap().clone().expect("approval for this request");
                 if scenario == "managed-google-selected-wrong-request" {
                     state["request_id"] = json!(LEASE);
@@ -1362,8 +1374,17 @@ fn get_managed_google_persists_the_exact_claims_and_refreshes_the_pinned_lease()
 }
 
 #[test]
-fn get_and_exec_honor_operator_selected_permissions_and_projects() {
+fn get_and_exec_preserve_approved_or_reused_grants_on_renewal() {
     for (scenario, output, lease_id, flags, grant_path, expected) in [
+        ("managed-google-reuse-broad", GCLOUD_NAME, GCLOUD_LEASE,
+            ["--project", GCLOUD_PROJECT, "--permissions", "storage=read"],
+            "/generation/grant/scope/access/permissions", json!(["storage=read", "compute=read"])),
+        ("github-reuse-broad", "GH_TOKEN", LEASE,
+            ["--repositories", "acme/web", "--permissions", "contents=read"],
+            "/generation/grant/scope", json!({
+                "installation_id":1, "repositories":[{"id":7,"full_name":"acme/web"},{"id":8,"full_name":"acme/docs"}],
+                "permissions":{"contents":"write","metadata":"read"}
+            })),
         ("managed-google-selected-narrow", GCLOUD_NAME, GCLOUD_LEASE,
             ["--project", GCLOUD_PROJECT, "--permissions", "compute=read,storage=read"],
             "/generation/grant/scope/access/permissions", json!(["storage=read"])),
@@ -1434,6 +1455,8 @@ fn get_and_exec_honor_operator_selected_permissions_and_projects() {
             assert!(sent[0]["client_capabilities"].as_array().unwrap().contains(&json!("operator_selected_grant_v1")));
             assert_eq!(sent[0]["client_capabilities"].as_array().unwrap().contains(&json!(SELECT_PROJECT)), switched);
             assert!(!sent[1]["client_capabilities"].as_array().unwrap().contains(&json!(SELECT_PROJECT)));
+            assert_eq!(sent[0]["client_capabilities"].as_array().unwrap().contains(&json!(BROADER_REUSE)), scenario.contains("-reuse-"));
+            assert!(!sent[1]["client_capabilities"].as_array().unwrap().contains(&json!(BROADER_REUSE)));
             assert!(sent[0]["lease_id"].is_null());
             assert_eq!(sent[1]["lease_id"], lease_id);
             assert_eq!(sent[1]["refresh"], forced);
@@ -1463,6 +1486,50 @@ fn pinned_get_rejects_a_new_lease_even_if_marked_operator_selected() {
     assert!(text(&get.stderr).contains("inconsistent get result"));
     assert_eq!(std::fs::read_to_string(e.secrets.join(GCLOUD_NAME)).unwrap(), "fixture-gcloud-v1");
     assert_eq!(posted(&f).len(), 2);
+}
+
+#[test]
+fn reuse_marker_requires_negotiation_immediate_delivery_and_covering_claims() {
+    for (scenario, message) in [
+        ("managed-google-reuse-pending", "negotiated automatic reuse"),
+        ("managed-google-reuse-unnegotiated", "negotiated automatic reuse"),
+        ("managed-google-reuse-missing-claim", "does not cover"),
+        ("managed-google-reuse-wrong-project", "does not cover"),
+        ("managed-google-reuse-unmarked", "exact Google Cloud project and permissions"),
+        ("managed-google-reuse-selected-immediate", "exact Google Cloud project and permissions"),
+    ] {
+        let (_fake, e) = launcher_fixture(scenario);
+        let get = asm(&e, &["get", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME, "Read data"], "");
+        assert!(!get.status.success(), "{scenario}");
+        assert!(text(&get.stderr).contains(message), "{scenario}: {}", text(&get.stderr));
+        assert!(!e.secrets.join(GCLOUD_NAME).exists());
+        let exec = asm(&e, &["exec", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME, "--", "/bin/echo", "launched"], "");
+        assert!(!exec.status.success(), "{scenario}");
+        assert!(text(&exec.stderr).contains(message), "{scenario}: {}", text(&exec.stderr));
+        assert!(exec.stdout.is_empty());
+    }
+}
+
+#[test]
+fn explicit_new_lease_and_pinned_deliveries_never_accept_a_reuse_marker() {
+    let (fake, e) = launcher_fixture("managed-google-reuse-flag-on-pin");
+    let get = asm(&e, &["get", "--new-lease", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME, "Read data"], "");
+    assert!(!get.status.success());
+    assert!(text(&get.stderr).contains("negotiated automatic reuse"));
+    assert!(!e.secrets.join(GCLOUD_NAME).exists());
+    let get = asm(&e, &["get", "--lease", GCLOUD_LEASE, "--refresh", GCLOUD_NAME, "Renew data access"], "");
+    assert!(!get.status.success());
+    assert!(text(&get.stderr).contains("negotiated automatic reuse"));
+    assert!(!e.secrets.join(GCLOUD_NAME).exists());
+    let sent = posted(&fake);
+    assert_eq!(sent.len(), 2);
+    assert!(sent.iter().all(|r| !r["client_capabilities"].as_array().unwrap().contains(&json!(BROADER_REUSE))));
+
+    let (_fake, e) = launcher_fixture("managed-google-reuse-flag-on-pin");
+    let exec = asm(&e, &["exec", "--project", GCLOUD_PROJECT, "--permissions", "storage=read", GCLOUD_NAME, "--", "/bin/echo", "launched"], "");
+    assert!(!exec.status.success());
+    assert!(text(&exec.stderr).contains("negotiated automatic reuse"));
+    assert!(exec.stdout.is_empty());
 }
 
 #[test]

@@ -306,6 +306,15 @@ pub(crate) fn submit_get(
     {
         return Err(CliError::failure("the manager sent invalid generated credential metadata"));
     }
+    if result.broader_lease_reuse {
+        if was_pending || !capabilities.broader_lease_reuse || !body.supports_broader_lease_reuse() {
+            return Err(CliError::failure("the manager returned broader lease reuse outside a negotiated automatic reuse request"));
+        }
+        match (generation, &result.generation) {
+            (Some(request), Some(selection)) if selection.grant.covers_lease_reuse_request(request)? => return Ok(result),
+            _ => return Err(CliError::failure("the reused lease does not cover the requested grant")),
+        }
+    }
     if let Some(pinned) = pinned {
         if result.generation.is_none() || result.generation != pinned.generation {
             return Err(CliError::failure("the manager changed the pinned generated credential grant"));
@@ -315,7 +324,9 @@ pub(crate) fn submit_get(
         }
         return Ok(result);
     }
-    let operator_selected = result.operator_selected_grant
+    // Older managers could return a same-project operator selection directly.
+    // With negotiated reuse, a direct response is not evidence of fresh review.
+    let operator_selected = (was_pending || !capabilities.broader_lease_reuse) && result.operator_selected_grant
         && capabilities.operator_selected_grant && body.supports_operator_selected_grant();
     // Immediate results may reuse a lease, even when no lease ID was pinned.
     let operator_selected_project = was_pending && result.operator_selected_grant
@@ -327,7 +338,7 @@ pub(crate) fn submit_get(
         // Legacy bound Google approvals already allowed edited OAuth scopes
         // before this capability existed. A capable manager must mark edits.
         (Some(GenerationRequest::Gcloud(_)), Some(GenerationGrant::Gcloud(_)))
-            if !capabilities.operator_selected_grant => {}
+            if !capabilities.operator_selected_grant && !capabilities.broader_lease_reuse => {}
         (Some(GenerationRequest::GcloudAccess(_)), _) => {
             return Err(CliError::failure("the manager did not approve the exact Google Cloud project and permissions or return a negotiated operator selection"));
         }
@@ -637,7 +648,7 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
         capability,
     )?;
     let generation = generation.or_else(|| replay_managed_claims(pinned.and_then(|lease| lease.generation.as_ref())));
-    let client_capabilities = capabilities.client_capabilities(generation.as_ref(), pinned.is_some());
+    let client_capabilities = capabilities.client_capabilities(generation.as_ref(), pinned.is_some(), a.new_lease);
     let mut body = RequestBody::Get {
         name: request_name,
         raw: mode == RequestedMode::Raw,
@@ -910,6 +921,7 @@ mod tests {
             expires_at: Some("2026-11-16T12:34:56Z".into()),
             generation: None,
             operator_selected_grant: false,
+            broader_lease_reuse: false,
             credential_expires_at: None,
             credential_version: None,
             generator_name: None,

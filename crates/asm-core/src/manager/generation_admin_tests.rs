@@ -61,6 +61,7 @@ fn edit(f: &Fixture, id: &str) -> ffi::GeneratorDraft {
     ffi::GeneratorDraft {
         id: Some(record.id), name: record.name, config: record.config.into(),
         credentials: ffi::GeneratorCredentials::Keep,
+        require_exact_scope_match: record.require_exact_scope_match,
     }
 }
 
@@ -225,6 +226,61 @@ fn generation_admin_display_rename_preserves_client_revision_and_lease() {
 }
 
 #[test]
+fn generation_admin_scope_policy_only_changes_reuse_not_existing_authority() {
+    let f = Fixture::new();
+    let keys = Keys::installed(&["app-a"]);
+    let first = f.first();
+    let lease = f.core.store.get_lease(&first.lease_id).unwrap().unwrap();
+    let client = f.core.generators.get("app-a").unwrap().client().unwrap();
+    for strict in [true, false] {
+        let mut draft = edit(&f, "app-a");
+        assert_ne!(draft.require_exact_scope_match, strict);
+        draft.require_exact_scope_match = strict;
+        let saved = keys.save(&f, draft).unwrap();
+        assert_eq!(saved.require_exact_scope_match, strict);
+        assert_eq!(f.core.list_generators()[0].require_exact_scope_match, strict);
+        assert_eq!(Some(saved.revision), lease.generator_revision);
+        assert!(Arc::ptr_eq(&client, &f.core.generators.get("app-a").unwrap().client().unwrap()));
+        assert_eq!(f.core.store.get_lease(&first.lease_id).unwrap().as_ref(), Some(&lease));
+        assert!(f.core.check_generated_delivery(&first.lease_id, 1).is_ok());
+    }
+    assert!(lock(&keys.written).is_empty());
+    assert!(lock(&f.provider.state.revoked).is_empty());
+}
+
+#[test]
+fn generation_strict_policy_keeps_agent_affinity_exact_scope_and_newest_decision() {
+    let f = Fixture::new();
+    let keys = Keys::installed(&["app-a"]);
+    let mut draft = edit(&f, "app-a");
+    draft.require_exact_scope_match = true;
+    keys.save(&f, draft).unwrap();
+    let first = f.first();
+    let mut other_agent = f.body("GH_TOKEN");
+    if let RequestBody::Get { agent, .. } = &mut other_agent { *agent = "agent-b".into(); }
+    assert_eq!(f.request(other_agent).unwrap().status, RequestStatus::Pending);
+    let mut narrower = f.body("GH_TOKEN");
+    if let RequestBody::Get { generation: Some(GenerationRequest::GithubApp(scope)), .. } = &mut narrower {
+        scope.permissions = None;
+    }
+    assert_eq!(f.request(narrower).unwrap().status, RequestStatus::Pending);
+    let mut fresh = f.body("GH_TOKEN");
+    if let RequestBody::Get { new_lease, .. } = &mut fresh { *new_lease = true; }
+    let pending = f.request(fresh).unwrap();
+    f.approve(&pending.request_id, "app-a", LeaseMode::Raw, 3_600).unwrap();
+    let latest = get(f.core.request_state(&f.host.id, &pending.request_id).unwrap());
+    let selected = get(f.request(f.body("GH_TOKEN")).unwrap());
+    assert_eq!(selected.lease_id, latest.lease_id, "strict mode ignores the older, longer lease");
+    assert!(!selected.broader_lease_reuse);
+    f.core.revoke_lease(&latest.lease_id).unwrap();
+    assert_eq!(f.request(f.body("GH_TOKEN")).unwrap().status, RequestStatus::Pending);
+    let mut pin = f.body("GH_TOKEN");
+    if let RequestBody::Get { lease_id, .. } = &mut pin { *lease_id = Some(first.lease_id.clone()); }
+    assert_eq!(get(f.request(pin).unwrap()).lease_id, first.lease_id);
+    assert_eq!(f.issued(), 2);
+}
+
+#[test]
 fn generation_admin_pending_edits_refresh_offered_revisions_without_adding_sources() {
     let f = Fixture::new();
     f.install("app-b", "review-bot", 2);
@@ -355,6 +411,7 @@ fn generation_admin_failed_new_save_deletes_only_the_new_credential() {
             client_id: "new-client".into(), installations: vec![Fixture::grant()],
         }).into(),
         credentials: ffi::GeneratorCredentials::GithubPrivateKey { pem: replacement_pem().to_string() },
+        require_exact_scope_match: false,
     };
     reject_generator_persistence(&f);
 
@@ -459,6 +516,7 @@ fn generation_admin_google_reconnect_rolls_back_adc_then_replaces_only_on_commit
     config.project_number = "999999".into(); // Untrusted draft metadata is not authority.
     let draft = ffi::GeneratorDraft { id: Some(GCLOUD_ID.into()), name: "cloud-dev".into(),
         config: GeneratorConfig::Gcloud(config).into(),
+        require_exact_scope_match: false,
         credentials: ffi::GeneratorCredentials::GcloudSession { session_id: session_id.clone() } };
     let db_material = Mutex::new(GCLOUD_ADC_FIXTURE.to_string());
     let writes = AtomicUsize::new(0);
@@ -542,6 +600,7 @@ esac
             account_email: "unverified@example.test".into(),
         }).into(),
         credentials: ffi::GeneratorCredentials::GcloudSession { session_id: session_id.clone() },
+        require_exact_scope_match: false,
     };
     let save = |draft| f.core.save_generator_with(draft,
         |id, kind| { assert_eq!(kind, creds::GCLOUD_ADC); keys.get(id) },

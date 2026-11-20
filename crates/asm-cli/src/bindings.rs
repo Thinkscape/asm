@@ -6,7 +6,7 @@ use asm_proto::bindings::SecretBinding;
 use asm_proto::generators::GenerationRequest;
 use asm_proto::names::resolve_catalog_name;
 use asm_proto::wire::{
-    CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GENERATED_CREDENTIALS_V1,
+    CAPABILITY_BROADER_LEASE_REUSE_V1, CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GENERATED_CREDENTIALS_V1,
     CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_OPERATOR_SELECTED_GRANT_V1,
     CAPABILITY_OPERATOR_SELECTED_PROJECT_V1, CAPABILITY_SECRET_FIELDS_V1,
     HealthResponse, SecretEntry, SecretsResponse,
@@ -16,6 +16,7 @@ use asm_proto::wire::{
 pub(crate) struct GetCapabilities {
     pub(crate) operator_selected_grant: bool,
     pub(crate) operator_selected_project: bool,
+    pub(crate) broader_lease_reuse: bool,
 }
 
 pub(crate) fn require_capabilities(
@@ -35,23 +36,26 @@ pub(crate) fn require_capabilities(
     Ok(GetCapabilities {
         operator_selected_grant: health.capabilities.iter().any(|c| c == CAPABILITY_OPERATOR_SELECTED_GRANT_V1),
         operator_selected_project: health.capabilities.iter().any(|c| c == CAPABILITY_OPERATOR_SELECTED_PROJECT_V1),
+        broader_lease_reuse: health.capabilities.iter().any(|c| c == CAPABILITY_BROADER_LEASE_REUSE_V1),
     })
 }
 
 impl GetCapabilities {
     pub(crate) fn client_capabilities(
-        self, generation: Option<&GenerationRequest>, pinned: bool,
+        self, generation: Option<&GenerationRequest>, pinned: bool, new_lease: bool,
     ) -> Vec<String> {
         let project = (self.operator_selected_project && !pinned
             && matches!(generation, Some(GenerationRequest::GcloudAccess(_))))
             .then_some(CAPABILITY_OPERATOR_SELECTED_PROJECT_V1);
+        let reuse = (self.broader_lease_reuse && generation.is_some() && !pinned && !new_lease)
+            .then_some(CAPABILITY_BROADER_LEASE_REUSE_V1);
         [
             CAPABILITY_GENERATED_CREDENTIALS_V1,
             CAPABILITY_SECRET_FIELDS_V1,
             CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1,
             CAPABILITY_GCLOUD_ACCESS_V1,
             CAPABILITY_OPERATOR_SELECTED_GRANT_V1,
-        ].into_iter().chain(project).map(str::to_owned).collect()
+        ].into_iter().chain(project).chain(reuse).map(str::to_owned).collect()
     }
 }
 

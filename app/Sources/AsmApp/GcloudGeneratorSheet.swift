@@ -23,6 +23,7 @@ struct GcloudGeneratorSheet: View {
                 }
                 GcloudSDKSection(state: state, locateSDK: { choosingSDK = true })
                 GcloudSignInSection(state: state)
+                GeneratorLeaseReuseSection(requireExactScopeMatch: $state.requireExactScopeMatch)
                 GcloudConnectionUsageSection()
                 if let error = state.saveError {
                     Section("Could not save") { Text(error).textSelection(.enabled) }
@@ -58,6 +59,7 @@ private final class GcloudConnectionSetup {
     private let editing: (generator: GeneratorItem, config: GcloudConnectionConfigItem)?
 
     var name: String
+    var requireExactScopeMatch: Bool
     var showingSaveWarning = false
     private(set) var saving = false
     private(set) var saveError: String?
@@ -77,6 +79,7 @@ private final class GcloudConnectionSetup {
         self.model = model
         self.editing = editing
         name = editing?.generator.name ?? ""
+        requireExactScopeMatch = editing?.generator.requireExactScopeMatch ?? false
         candidateSDKPath = editing?.config.sdkPath
     }
 
@@ -215,7 +218,8 @@ private final class GcloudConnectionSetup {
         let draft = GeneratorDraftItem(
             id: editing?.generator.id, name: name.trimmingCharacters(in: .whitespacesAndNewlines),
             config: .gcloudConnection(config),
-            credentials: login.map { .gcloudSession(sessionID: $0.id) } ?? .keep
+            credentials: login.map { .gcloudSession(sessionID: $0.id) } ?? .keep,
+            requireExactScopeMatch: requireExactScopeMatch
         )
         saving = true
         saveError = nil
@@ -332,31 +336,65 @@ private struct GcloudConnectionUsageSection: View {
 }
 
 struct GcloudLegacyGeneratorSheet: View {
+    let model: AppModel
     let generator: GeneratorItem
     let config: GcloudConfigItem
     @Environment(\.dismiss) private var dismiss
+    @State private var requireExactScopeMatch: Bool
+    @State private var saving = false
+    @State private var error: String?
+
+    init(model: AppModel, generator: GeneratorItem, config: GcloudConfigItem) {
+        self.model = model
+        self.generator = generator
+        self.config = config
+        _requireExactScopeMatch = State(initialValue: generator.requireExactScopeMatch)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             Form {
                 Section("Legacy Google Cloud generator") {
                     LabeledContent("Name") { Text(generator.name) }
-                    Text("This read-only configuration stays bound to its saved service account, project, and OAuth scope ceiling. To use project and permission requests, add a separate Google Cloud connection.")
+                    Text("This generator stays bound to its saved service account, project, and OAuth scope ceiling. To use project and permission requests, add a separate Google Cloud connection.")
                         .font(.callout).foregroundStyle(.secondary)
                     LabeledContent("Google sign-in account") { Text(config.accountEmail).textSelection(.enabled) }
                     LabeledContent("SDK executable") { Text(config.sdkPath).monospaced().textSelection(.enabled) }
                     if let warning = generator.warning { Text(warning).textSelection(.enabled) }
                 }
                 GcloudLegacyAuthoritySection(config: config)
+                GeneratorLeaseReuseSection(requireExactScopeMatch: $requireExactScopeMatch)
             }
             .formStyle(.grouped)
-            HStack {
-                Spacer()
-                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
-            }
-            .padding()
+            .disabled(saving)
+            SheetButtons(saveTitle: "Save", problem: nil, saving: saving, cancel: { dismiss() }, save: save)
+                .disabled(saving)
         }
         .frame(minWidth: 580, idealWidth: 640, maxWidth: 760, minHeight: 440, idealHeight: 560)
+        .interactiveDismissDisabled(saving)
+        .errorAlert($error)
+    }
+
+    private func save() {
+        guard !saving else { return }
+        guard requireExactScopeMatch != generator.requireExactScopeMatch else { dismiss(); return }
+        guard let current = model.generators.first(where: { $0.id == generator.id }),
+              current.revision == generator.revision else {
+            error = String(localized: "This generator changed. Close and reopen it before saving.")
+            return
+        }
+        let draft = GeneratorDraftItem(id: current.id, name: current.name, config: current.config,
+                                       credentials: .keep, requireExactScopeMatch: requireExactScopeMatch)
+        saving = true
+        Task {
+            defer { saving = false }
+            do {
+                _ = try await model.saveGenerator(draft)
+                dismiss()
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
     }
 }
 

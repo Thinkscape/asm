@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS generators(
     name     TEXT NOT NULL UNIQUE,
     config   TEXT NOT NULL,
     revision INTEGER NOT NULL,
-    position INTEGER NOT NULL
+    position INTEGER NOT NULL,
+    require_exact_scope_match INTEGER NOT NULL DEFAULT 0 CHECK (require_exact_scope_match IN (0, 1))
 );
 -- Preserve the exact cloud resource for cleanup even if creation was ambiguous,
 -- the generator was disconnected/removed, or another attempt replaces this one.
@@ -166,6 +167,7 @@ pub struct GeneratorRecord {
     pub config: GeneratorConfig,
     pub revision: u64,
     pub position: i64,
+    pub require_exact_scope_match: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -790,7 +792,8 @@ impl Store {
     pub fn list_generators(&self) -> Result<Vec<GeneratorRecord>> {
         let db = self.db();
         let mut st = db.prepare(
-            "SELECT id, name, config, revision, position FROM generators ORDER BY position, name",
+            "SELECT id, name, config, revision, position, require_exact_scope_match
+             FROM generators ORDER BY position, name",
         )?;
         let rows = st.query_map([], |r| {
             Ok((
@@ -799,16 +802,18 @@ impl Store {
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, i64>(4)?,
+                r.get::<_, bool>(5)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, name, config, revision, position) = row?;
+            let (id, name, config, revision, position, require_exact_scope_match) = row?;
             Ok(GeneratorRecord {
                 id,
                 name,
                 config: serde_json::from_str(&config)?,
                 revision: positive_u64(revision, "generator revision")?,
                 position,
+                require_exact_scope_match,
             })
         })
         .collect()
@@ -818,7 +823,7 @@ impl Store {
         let db = self.db();
         let row = db
             .query_row(
-                "SELECT name, config, revision, position FROM generators WHERE id = ?1",
+                "SELECT name, config, revision, position, require_exact_scope_match FROM generators WHERE id = ?1",
                 [id],
                 |r| {
                     Ok((
@@ -826,17 +831,19 @@ impl Store {
                         r.get::<_, String>(1)?,
                         r.get::<_, i64>(2)?,
                         r.get::<_, i64>(3)?,
+                        r.get::<_, bool>(4)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(name, config, revision, position)| {
+        row.map(|(name, config, revision, position, require_exact_scope_match)| {
             Ok(GeneratorRecord {
                 id: id.into(),
                 name,
                 config: serde_json::from_str(&config)?,
                 revision: positive_u64(revision, "generator revision")?,
                 position,
+                require_exact_scope_match,
             })
         })
         .transpose()
@@ -862,10 +869,12 @@ impl Store {
             return Err(source_name_error(&g.name));
         }
         tx.execute(
-            "INSERT INTO generators(id, name, config, revision, position) VALUES(?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO generators(id, name, config, revision, position, require_exact_scope_match)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, config = excluded.config,
-                                          revision = excluded.revision",
-            params![g.id, g.name, config, revision, g.position],
+                                          revision = excluded.revision,
+                                          require_exact_scope_match = excluded.require_exact_scope_match",
+            params![g.id, g.name, config, revision, g.position, g.require_exact_scope_match],
         )
         .map_err(|e| source_constraint_error(e, &g.name))?;
         tx.commit()?;
@@ -1256,6 +1265,18 @@ fn migrate(conn: &Connection) -> Result<()> {
                 "CREATE INDEX leases_gcloud_uid ON leases (({GCLOUD_LEASE_UID}))
                  WHERE source_kind = 'generator';",
             ))?;
+        }
+        tx.commit()?;
+    }
+    let has_scope_policy = |db: &Connection| -> rusqlite::Result<bool> {
+        db.prepare("SELECT 1 FROM pragma_table_info('generators') WHERE name = 'require_exact_scope_match'")?
+            .exists([])
+    };
+    if !has_scope_policy(conn)? {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        if !has_scope_policy(&tx)? {
+            tx.execute_batch("ALTER TABLE generators ADD COLUMN require_exact_scope_match
+                INTEGER NOT NULL DEFAULT 0 CHECK (require_exact_scope_match IN (0, 1));")?;
         }
         tx.commit()?;
     }
@@ -1937,6 +1958,12 @@ impl Store {
         self.query_leases("WHERE host_id = ?1", &[&host_id])
     }
 
+    /// Include ended leases: exact matching honors the newest decision even after it ends.
+    pub(crate) fn generated_reuse_candidates(&self, host_id: &str, name: &str) -> Result<Vec<LeaseRecord>> {
+        self.query_leases("WHERE host_id = ?1 AND name = ?2 AND source_kind = 'generator' AND mode = 'raw'",
+            &[&host_id, &name])
+    }
+
     pub fn get_lease(&self, id: &str) -> Result<Option<LeaseRecord>> {
         Ok(self
             .query_leases("WHERE id = ?1", &[&id])?
@@ -2181,6 +2208,7 @@ mod tests {
             }),
             revision: 1,
             position,
+            require_exact_scope_match: false,
         }
     }
 
@@ -2227,6 +2255,29 @@ mod tests {
     }
 
     #[test]
+    fn scope_policy_upgrade_defaults_to_relaxed_and_preserves_strict_edits_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asm.db");
+        let mut record = generator("generator", "release-bot", 3);
+        let lease = generated_lease("before-upgrade");
+        {
+            let store = Store::open(&path).unwrap();
+            store.upsert_generator(&record).unwrap();
+            store.insert_lease(&lease).unwrap();
+            store.db().execute_batch("ALTER TABLE generators DROP COLUMN require_exact_scope_match;").unwrap();
+        }
+        {
+            let upgraded = Store::open(&path).unwrap();
+            assert_eq!(upgraded.get_generator(&record.id).unwrap().as_ref(), Some(&record));
+            record.require_exact_scope_match = true;
+            upgraded.upsert_generator(&record).unwrap();
+        }
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.list_generators().unwrap(), [record]);
+        assert_eq!(reopened.get_lease(&lease.id).unwrap().as_ref(), Some(&lease));
+    }
+
+    #[test]
     fn migrates_singular_github_installation_without_changing_the_revision_or_lease() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("asm.db");
@@ -2245,7 +2296,7 @@ mod tests {
             let store = Store::open(&path).unwrap();
             store.insert_lease(&lease).unwrap();
             store.db().execute(
-                "INSERT INTO generators VALUES ('generator', 'release-bot', ?1, 17, 3)",
+                "INSERT INTO generators(id, name, config, revision, position) VALUES ('generator', 'release-bot', ?1, 17, 3)",
                 [legacy.to_string()],
             ).unwrap();
         }
@@ -2285,7 +2336,7 @@ mod tests {
         {
             let store = Store::open(&path).unwrap();
             store.db().execute(
-                "INSERT INTO generators VALUES ('bad', 'release-bot', ?1, 1, 1)", [&legacy],
+                "INSERT INTO generators(id, name, config, revision, position) VALUES ('bad', 'release-bot', ?1, 1, 1)", [&legacy],
             ).unwrap();
         }
         let store = Store::open(&path).unwrap();

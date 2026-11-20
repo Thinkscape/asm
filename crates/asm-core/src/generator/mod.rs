@@ -554,6 +554,7 @@ mod tests {
                     option(RUN_SCOPE, "run.googleapis.com"),
                 ],
             }),
+            require_exact_scope_match: false,
         }
     }
 
@@ -568,6 +569,7 @@ mod tests {
                     permissions: BTreeMap::from([("metadata".into(), GithubPermission::Read)]),
                 }],
             }),
+            require_exact_scope_match: false,
         }
     }
 

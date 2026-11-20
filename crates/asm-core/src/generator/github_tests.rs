@@ -681,6 +681,7 @@ fn generator_registry_loads_ready_without_remote_access_and_retains_provider_on_
     let workspace = tempfile::tempdir().unwrap();
     let runner = crate::generator::gcloud_cli::GcloudRunner::new(workspace.path().join("gcloud")).unwrap();
     registry.load_with(vec![GeneratorRecord { id:"one".into(),name:"release-bot".into(),revision:1,position:0,
+        require_exact_scope_match: false,
         config:GeneratorConfig::GithubApp(config()) }], &runner, |id,kind| {
         assert_eq!((id,kind),("one",crate::vault::creds::GITHUB_PRIVATE_KEY));
         Ok(Some(keys().0.clone()))
