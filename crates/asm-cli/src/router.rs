@@ -13,14 +13,15 @@ use crate::requests::unix_now;
 use crate::proxy::authority;
 use crate::state::{self, HostState};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs, UnixListener, UnixStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::timeout;
 
@@ -728,12 +729,56 @@ async fn tunnel(mut client: TcpStream, mut upstream: TcpStream, guard: TunnelGua
     }
 }
 
-async fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
-    match timeout(DIAL_TIMEOUT, TcpStream::connect((host, port))).await {
-        Ok(Ok(s)) => Ok(s),
-        Ok(Err(e)) => Err(e.to_string()),
+/// Connect the way browsers do (RFC 8305, simplified): resolve, alternate address
+/// families, and start the next attempt every 250 ms while earlier ones are still
+/// pending; the first connection wins. A network whose IPv6 route silently drops
+/// packets then still connects over IPv4 instead of timing out.
+async fn dial(target: impl ToSocketAddrs) -> Result<TcpStream, String> {
+    match timeout(DIAL_TIMEOUT, race_addresses(target)).await {
+        Ok(result) => result,
         Err(_) => Err("connection timed out".into()),
     }
+}
+
+async fn race_addresses(target: impl ToSocketAddrs) -> Result<TcpStream, String> {
+    const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(target).await.map_err(|e| e.to_string())?.collect();
+    let mut queue = interleave_families(addrs).into_iter();
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut last_error = String::from("no addresses");
+    loop {
+        if let Some(addr) = queue.next() {
+            attempts.spawn(TcpStream::connect(addr));
+        }
+        let outcome = if queue.len() > 0 {
+            match timeout(ATTEMPT_DELAY, attempts.join_next()).await {
+                Ok(outcome) => outcome,
+                Err(_) => continue,
+            }
+        } else {
+            attempts.join_next().await
+        };
+        match outcome {
+            // Dropping `attempts` aborts the slower connections.
+            Some(Ok(Ok(stream))) => return Ok(stream),
+            Some(Ok(Err(e))) => last_error = e.to_string(),
+            Some(Err(e)) => last_error = e.to_string(),
+            None => return Err(last_error),
+        }
+    }
+}
+
+/// Alternate address families, starting with the resolver's first choice.
+fn interleave_families(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (mut first, mut other): (VecDeque<_>, VecDeque<_>) =
+        addrs.into_iter().partition(|a| a.is_ipv6() == first_v6);
+    let mut out = Vec::with_capacity(first.len() + other.len());
+    while !first.is_empty() || !other.is_empty() {
+        out.extend(first.pop_front());
+        out.extend(other.pop_front());
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -869,7 +914,7 @@ async fn connect(router: Arc<Router>, mut client: TcpStream, host: String, port:
     if let Some(route) = router.current_route(&host, port) {
         return routed(router, client, host, port, route, extra).await;
     }
-    let mut upstream = match dial(&host, port).await {
+    let mut upstream = match dial((host.as_str(), port)).await {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("asm proxy-router: cannot connect to {}: {e}", authority(&host, port));
@@ -896,8 +941,8 @@ async fn routed(router: Arc<Router>, mut client: TcpStream, host: String, port: 
         "asm proxy-router: the asm proxy at {} did not answer; run asm doctor",
         route.proxy
     );
-    let mut up = match timeout(DIAL_TIMEOUT, TcpStream::connect(route.proxy.as_str())).await {
-        Ok(Ok(s)) => s,
+    let mut up = match dial(route.proxy.as_str()).await {
+        Ok(s) => s,
         _ => {
             let msg = format!(
                 "asm proxy-router: cannot reach the asm proxy at {}; run asm doctor",
@@ -1045,7 +1090,7 @@ async fn forward_http(mut client: TcpStream, head: RequestHead, extra: Vec<u8>) 
     let Some(length) = length else {
         return respond(&mut client, 400, "Bad Request", "asm proxy-router: invalid Content-Length").await;
     };
-    let mut up = match dial(&host, port).await {
+    let mut up = match dial((host.as_str(), port)).await {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("asm proxy-router: cannot connect to {}: {e}", authority(&host, port));
@@ -1083,6 +1128,28 @@ async fn forward_http(mut client: TcpStream, head: RequestHead, extra: Vec<u8>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_families_alternate_starting_with_the_resolvers_choice() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let resolved = vec![a("[2001:db8::1]:443"), a("[2001:db8::2]:443"), a("192.0.2.1:443"), a("192.0.2.2:443"), a("192.0.2.3:443")];
+        assert_eq!(
+            interleave_families(resolved),
+            [a("[2001:db8::1]:443"), a("192.0.2.1:443"), a("[2001:db8::2]:443"), a("192.0.2.2:443"), a("192.0.2.3:443")]
+        );
+        assert_eq!(interleave_families(vec![a("192.0.2.1:80"), a("[2001:db8::1]:80")]), [a("192.0.2.1:80"), a("[2001:db8::1]:80")]);
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_first_address_does_not_block_the_next() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // TEST-NET-1 is never routed: its SYN is dropped or refused, like a broken IPv6 path.
+        let addrs = [SocketAddr::from(([192, 0, 2, 1], 9)), listener.local_addr().unwrap()];
+        let started = std::time::Instant::now();
+        let stream = dial(&addrs[..]).await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), addrs[1]);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
 
     #[test]
     fn authorities() {
