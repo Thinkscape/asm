@@ -170,7 +170,10 @@ Already signed in? Do nothing. Otherwise:
    the grant lasts) and type the code.
 5. A password field with `maxlength` under 44, or one input box per OTP digit: use
    `asm login <URL> --reason "<why>"` instead. The operator signs in on the Mac and you
-   receive a storage-state file to load into your browser tool.
+   receive a storage-state file to load into your browser tool. When the site signs in
+   through a separate service host (the API URL from step 1 is on another host, such as
+   `clerk.example.com`), add `--fill-origin https://<that host>` so its session cookies
+   come along; without them the site signs you out again.
 
 | Error | Action |
 |---|---|

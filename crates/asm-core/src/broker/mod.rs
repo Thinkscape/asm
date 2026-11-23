@@ -633,8 +633,8 @@ impl Runner {
         code.ok_or_else(|| "the item has no authenticator key".to_owned())
     }
 
-    /// The storage state: cookies valid for the export host and the export origin's
-    /// localStorage.
+    /// The storage state: cookies valid for the export host or another approved fill
+    /// origin's host, and the export origin's localStorage.
     fn export(&self) -> Result<Zeroizing<String>, CdpError> {
         let cookies = self.cdp.call("Storage.getCookies", json!({}), None, CALL_TIMEOUT)?;
         let cookies = cookies["cookies"].as_array().cloned().unwrap_or_default();
@@ -648,7 +648,9 @@ impl Runner {
             // Never export a partial state.
             Err(e) => return Err(e),
         };
-        let state = fill::storage_state(&cookies, &self.spec.export_host, &self.spec.export_origin, &entries);
+        let mut hosts: Vec<&str> = vec![self.spec.export_host.as_str()];
+        hosts.extend(self.spec.fill_origins.iter().filter_map(|o| fill::origin_host(o)));
+        let state = fill::storage_state(&cookies, &hosts, &self.spec.export_origin, &entries);
         Ok(Zeroizing::new(state.to_string()))
     }
 
@@ -688,6 +690,13 @@ fn storage_missing(message: &str) -> bool {
 fn launch(chrome: &Path, profile: &Path, extra: &[String], url: &str) -> std::io::Result<(Child, Arc<Cdp>, String)> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().mode(0o700).create(profile)?;
+    // Chrome's password manager would offer to save the filled vault password in this
+    // profile; turn it off before the first start.
+    std::fs::DirBuilder::new().mode(0o700).create(profile.join("Default"))?;
+    std::fs::write(
+        profile.join("Default/Preferences"),
+        r#"{"credentials_enable_service":false,"profile":{"password_manager_enabled":false}}"#,
+    )?;
     let (commands_read, commands_write) = std::io::pipe()?;
     let (replies_read, replies_write) = std::io::pipe()?;
     let (r, w) = (commands_read.as_raw_fd(), replies_write.as_raw_fd());

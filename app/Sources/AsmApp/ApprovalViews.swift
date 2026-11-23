@@ -1353,6 +1353,17 @@ private struct LoginBrokerApproval: View {
         URL(string: exportOrigin)?.host() ?? exportOrigin
     }
 
+    /// Hosts whose cookies are handed over: the URL's host and each kept extra origin's
+    /// host (sign-in services such as Clerk or Auth0 keep the session there).
+    private var exportHosts: String {
+        var hosts = [exportHost]
+        for origin in detail.fillOrigins.dropFirst() where !removed.contains(origin) {
+            let host = URL(string: origin)?.host() ?? origin
+            if !hosts.contains(host) { hosts.append(host) }
+        }
+        return hosts.joined(separator: ", ")
+    }
+
     private var canAllow: Bool {
         context.armed && duration > 0 && !model.isResolving(context.request.id)
     }
@@ -1390,7 +1401,7 @@ private struct LoginBrokerApproval: View {
                         }
                     }
                 }
-                Text("Exports cookies valid for \(exportHost) and \(exportOrigin)'s localStorage")
+                Text("Exports cookies valid for \(exportHosts) and \(exportOrigin)'s localStorage")
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
                 GetDurationPicker(durations: durations, duration: $duration, maxSeconds: .max)

@@ -63,6 +63,12 @@ pub(crate) fn origin(host: &str, port: u16) -> String {
     if port == 443 { format!("https://{host}") } else { format!("https://{host}:{port}") }
 }
 
+/// The host of a canonical `https://host[:port]` origin.
+pub(crate) fn origin_host(origin: &str) -> Option<&str> {
+    let authority = origin.strip_prefix("https://")?;
+    Some(authority.rsplit_once(':').map_or(authority, |(host, _)| host))
+}
+
 /// The origin of an `https://` page URL, `None` for anything else.
 pub(crate) fn https_origin(url: &str) -> Option<String> {
     parse_https_url(url).ok().map(|(host, port)| origin(&host, port))
@@ -141,11 +147,13 @@ pub(crate) fn fill_call(object_id: &str, value: &str, origins: &[String]) -> zer
     out
 }
 
-/// A Playwright `storageState`: the kept cookies, and the export origin's localStorage
+/// A Playwright `storageState`: the cookies valid for any of `hosts` (the export host
+/// and the hosts of the other approved fill origins, where sign-in services such as
+/// Clerk or Auth0 keep their session), and the export origin's localStorage
 /// (`entries` as returned by `DOMStorage.getDOMStorageItems`: `[[key, value], …]`).
 /// Origins without localStorage are left out.
-pub(crate) fn storage_state(cookies: &[Value], host: &str, export_origin: &str, entries: &[Value]) -> Value {
-    let cookies: Vec<Value> = cookies.iter().filter(|c| keeps_cookie(c, host)).map(|c| json!({
+pub(crate) fn storage_state(cookies: &[Value], hosts: &[&str], export_origin: &str, entries: &[Value]) -> Value {
+    let cookies: Vec<Value> = cookies.iter().filter(|c| hosts.iter().any(|h| keeps_cookie(c, h))).map(|c| json!({
         "name": c["name"].as_str().unwrap_or(""),
         "value": c["value"].as_str().unwrap_or(""),
         "domain": c["domain"].as_str().unwrap_or(""),
@@ -220,9 +228,10 @@ mod tests {
         let mut lax = cookie("sid", "app.example.com");
         lax["sameSite"] = json!("Strict");
         lax["expires"] = json!(1_900_000_000.5);
-        let cookies = vec![lax, cookie("other", "other.test"), cookie("dom", ".example.com")];
+        let cookies = vec![lax, cookie("other", "other.test"), cookie("dom", ".example.com"), cookie("auth", "clerk.example.com"),
+            cookie("sibling", "evil.example.com")];
         let entries = vec![json!(["token", "t"]), json!(["broken"]), json!(["theme", "dark"])];
-        let state = storage_state(&cookies, "app.example.com", "https://app.example.com", &entries);
+        let state = storage_state(&cookies, &["app.example.com"], "https://app.example.com", &entries);
         assert_eq!(state, json!({
             "cookies": [
                 { "name": "sid", "value": "v", "domain": "app.example.com", "path": "/", "expires": 1_900_000_000.5,
@@ -234,13 +243,20 @@ mod tests {
                 { "name": "token", "value": "t" }, { "name": "theme", "value": "dark" },
             ] }],
         }));
-        let empty = storage_state(&[], "app.example.com", "https://app.example.com", &[]);
+        let empty = storage_state(&[], &["app.example.com"], "https://app.example.com", &[]);
         assert_eq!(empty, json!({ "cookies": [], "origins": [] }));
+        let names = |state: &Value| state["cookies"].as_array().unwrap().iter()
+            .map(|c| c["name"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        let with_auth_host = storage_state(&cookies, &["app.example.com", "clerk.example.com"], "https://app.example.com", &[]);
+        assert_eq!(names(&with_auth_host), ["sid", "dom", "auth"], "an approved sign-in host's cookies are exported, a sibling's are not");
     }
 
     #[test]
     fn origins() {
         assert_eq!(https_origin("https://Example.com:443/login?x=1").as_deref(), Some("https://example.com"));
+        assert_eq!(origin_host("https://sso.example.com:8443"), Some("sso.example.com"));
+        assert_eq!(origin_host("https://sso.example.com"), Some("sso.example.com"));
+        assert_eq!(origin_host("http://sso.example.com"), None);
         assert_eq!(https_origin("https://example.com:8443/").as_deref(), Some("https://example.com:8443"));
         assert_eq!(https_origin("http://example.com/"), None);
         assert_eq!(https_origin("about:blank"), None);

@@ -24,8 +24,10 @@ pub struct LoginArgs {
     /// Why you need to sign in (shown to the operator).
     #[arg(long)]
     pub reason: String,
-    /// Another origin the sign-in passes through where the vault login may be filled
-    /// (https://host[:port]; repeatable, at most 5).
+    /// Another origin the sign-in passes through: the vault login may be filled there and
+    /// its host's cookies are handed over too. Pass the sign-in service's origin when it
+    /// differs from the site (Clerk, Auth0: https://clerk.example.com). https://host[:port];
+    /// repeatable, at most 5.
     #[arg(long = "fill-origin", value_name = "ORIGIN")]
     pub fill_origins: Vec<String>,
     /// Stop waiting for the operator after this many seconds (exit 4 while still pending).
