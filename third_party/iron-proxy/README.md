@@ -476,16 +476,26 @@ values before forwarding upstream. You control where it looks:
 
 Replace-mode safeguards (asm fork):
 
-- A request that carries a proxy token in a header, the URL path or the query,
-  but goes to a host outside the entry's rules (or over plain HTTP without
-  `allow_plain_http`), is rejected with 403
+- A request that carries a proxy token in a header, the URL path, the query
+  or the body, but goes to a host outside the entry's rules (or over plain
+  HTTP without `allow_plain_http`), is rejected with 403
   `asm: sentinel not valid for this host or scheme`.
 - An entry with `replace: {proxy_value: …, ended: true}` (no `source` or
   `rules`) marks the token of an expired or revoked lease. It never
   substitutes and is not redacted; a request carrying it in a header, the URL
-  path or the query is rejected with 403
+  path, the query or the body is rejected with 403
   `asm: sentinel expired or revoked; run asm get again` (audit annotation
   `reject_reason: sentinel_ended`), whatever the destination.
+- Body scanning for these two checks is best effort. A body is scanned when it
+  carries no `Content-Encoding` other than `identity` and either its declared
+  length is within `max_request_body_bytes` or its length is unknown and it is
+  form (`application/x-www-form-urlencoded`) or JSON (`application/json`,
+  `*+json`). Over-limit, unknown-length non-form/JSON and content-encoded
+  bodies are not scanned (login entries fail closed on them instead). A body
+  that cannot be read is rejected with 400 `asm: request body could not be read`.
+- `match_body` substitution escapes the real value for the body's content
+  type: query-escaped in a form body, JSON-string-escaped in a JSON body,
+  unchanged otherwise.
 - A WebSocket upgrade that would receive a substituted value is rejected with
   403; WebSocket frames are relayed raw and cannot be redacted.
 - A request body larger than `max_request_body_bytes` that a transform had to
@@ -498,6 +508,77 @@ Replace-mode safeguards (asm fork):
   become `asm_redacted`. Values shorter than 8 bytes are not redacted. A
   content-encoded response to a request that received a substitution is
   refused with 502.
+
+Login entries (asm fork) substitute a sentinel only as one whole value of one
+HTTPS form submission, once:
+
+```yaml
+transforms:
+  - name: secrets
+    config:
+      secrets:
+        - source: {type: file, path: /path/to/password}
+          rules: [{host: login.example.com, methods: [POST, PUT, PATCH]}]
+          replace:
+            proxy_value: "asm_…"
+            login:
+              port: 443
+              target: "/session"          # escaped path, plus ?query when present
+              owner: "h1"                 # paired host allowed to redeem it
+              claim_file: "/path/to/claims/grant-id"   # absolute
+```
+
+- A login entry takes only `proxy_value`, `login` and `rules`; the rules are
+  exactly one rule for a literal host (no `*?[]\`, no `cidr`, no `paths`)
+  with methods `POST`, `PUT`, `PATCH`. Anything else fails with
+  `secrets[N]: login entries take only proxy_value, login and rules` (or a
+  message naming the bad `login`/`rules` field).
+- The request must arrive over TLS, match the rule, use `port` (default 443)
+  and have a request target equal to `target` byte for byte. A sentinel sent
+  anywhere else is rejected with 403
+  `asm: login sentinel not valid for METHOD https://host:port/target`
+  (`reject_reason: login_scope`).
+- The sentinel must be the entire value of exactly one field of an
+  identity-encoded form or JSON body (a JSON string value, never a key), and
+  appear nowhere else (headers, path, query, a second field); otherwise 403
+  `asm: login sentinel must be an entire form or JSON value, sent once`.
+  Other fields stay byte-identical; the value is form- or JSON-escaped.
+- While the entry exists, any request to its endpoint whose body is multipart,
+  content-encoded, over the limit, truncated or of another type is rejected
+  with 403 `asm: login body must be application/x-www-form-urlencoded or JSON
+  without Content-Encoding`. A request carrying two login sentinels gets 403
+  `asm: one login grant per request`.
+- When proxy authentication is on and the tunnel user is not `owner`: 403
+  `asm: this login grant belongs to another machine`. With it off, the
+  sentinel is a bearer capability, like other sentinels.
+- An unavailable source value gives 503 `asm: login secret unavailable`; the
+  request is never forwarded.
+- Only after every other check of the request has passed (other entries'
+  sentinels, `require`, WebSocket upgrades), and before forwarding, the proxy
+  creates `claim_file` exclusively (mode 0600, holding the RFC 3339 time of
+  use) and fsyncs it and its directory; a request rejected for another reason
+  leaves the grant unused. If the file already exists, or cannot be created,
+  the request gets 403 `asm: sentinel expired or revoked; run asm get again`
+  (`reject_reason: sentinel_ended`; a creation error is annotated
+  `claim_error`). The claim precedes forwarding, so an indeterminate upstream
+  outcome still consumes the grant.
+- Login entries never take part in ordinary replace-mode substitution; their
+  real values are redacted in responses like other entries'.
+
+`browser_hosts` (asm fork) approves marked browser CONNECTs (see Browser routes
+under TLS):
+
+```yaml
+      browser_hosts:
+        - {host: login.example.com, port: 443, until: 1767225600}  # Unix seconds
+```
+
+- Hosts are lowercase, ports 1–65535, `until` positive.
+- A CONNECT carrying `Asm-Browser-Route: 1` whose host (case-insensitive) and
+  port match an entry with `until` still in the future is annotated
+  `browser_route: allowed`. Any other marked CONNECT is rejected with 403
+  `asm: no active login grant routes this host through asm`
+  (`reject_reason: browser_route`).
 
 Query parameters are always scanned.
 
@@ -790,14 +871,67 @@ export HTTPS_PROXY=http://172.20.0.2:8080
 export ALL_PROXY=socks5h://172.20.0.2:8080
 ```
 
-The SOCKS5 implementation supports no-auth only and accepts IPv4, IPv6,
-and domain name address types.
+The SOCKS5 implementation supports no-auth (or, with `proxy.auth_file`,
+username/password only) and accepts IPv4, IPv6, and domain name address types.
+
+Proxy authentication (asm fork):
+
+```yaml
+proxy:
+  auth_file: "/path/to/proxy-auth" # Optional; absolute path
+```
+
+- When `proxy.auth_file` is set, the tunnel listener requires credentials.
+  Each line of the file is `<user>:<hex sha256(password)>`; the file is
+  re-read on every check, so it can be rewritten without a restart. A missing
+  file denies everyone. The HTTP/HTTPS listeners are not covered.
+- CONNECT and absolute-form requests need Basic `Proxy-Authorization`.
+  Without valid credentials the proxy answers
+  `407 Proxy Authentication Required` with
+  `Proxy-Authenticate: Basic realm="asm"` and closes the connection.
+- SOCKS5 accepts only method `0x02` and the RFC 1929 sub-negotiation
+  (`01 00` on success; `01 01`, then close, on failure).
+- The authenticated user is exposed to transforms as `TunnelUser` on every
+  request inside the tunnel (and on authenticated absolute-form requests).
+- Refused credentials are audited (and logged) with a `proxy_auth` reject
+  trace whose `reason` is `missing_credentials` or `invalid_credentials`; the
+  offered credentials are never recorded.
+- Without `auth_file`, behavior is unchanged.
 
 ### TLS
 
 iron-proxy generates leaf certificates on the fly, signed by the CA you provide.
 The client container must trust this CA (add it to the system trust store or pass
 it via `--cacert`). Certs are cached in an LRU cache keyed by SNI hostname.
+
+Browser routes (asm fork):
+
+```yaml
+tls:
+  browser_ca_cert: "/path/to/browser-ca.crt" # Optional; set both or neither
+  browser_ca_key: "/path/to/browser-ca.key"
+```
+
+- A CONNECT on the tunnel listener carrying `Asm-Browser-Route: 1` asks for a
+  leaf signed by the browser CA instead of `tls.ca_cert`. Any other non-empty
+  value is rejected with 403 `asm: invalid browser route marker`, as is the
+  header on absolute-form or direct (HTTP/HTTPS listener) requests. The header
+  is never forwarded upstream.
+- Issuance is default deny. A marked CONNECT is rejected with 403
+  `asm: browser routing is not enabled on this manager` when the browser CA is
+  not configured (or `tls.mode` is `sni-only`), and with 403
+  `asm: no active login grant routes this host through asm` unless the
+  `secrets` transform annotated it `browser_route: allowed` (via its
+  `browser_hosts`). Proxy authentication, when enabled, runs first.
+- Inside an approved route the client must speak TLS (anything else closes
+  the connection), the SNI must equal the CONNECT host (case-insensitive) or
+  the handshake fails, and every request whose `Host` hostname or port
+  (default 443) differs from the CONNECT target gets 421
+  `asm: request authority does not match the browser route`.
+- Every rejection above (invalid marker, the two default-deny rejections and
+  the 421) is audited and logged with a `browser_route` reject trace whose
+  `reason` is `invalid_marker`, `browser_routing_disabled`, `no_login_grant`
+  or `authority_mismatch`.
 
 ## Routing traffic to the proxy
 

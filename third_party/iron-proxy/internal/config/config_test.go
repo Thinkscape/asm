@@ -179,6 +179,43 @@ tls:
 `,
 			wantErr: "dns.records[0].value is required",
 		},
+		{
+			name: "browser ca cert without key",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+  browser_ca_cert: "/tmp/browser-ca.crt"
+`,
+			wantErr: "tls.browser_ca_cert and tls.browser_ca_key must be set together",
+		},
+		{
+			name: "browser ca key without cert",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+  browser_ca_key: "/tmp/browser-ca.key"
+`,
+			wantErr: "tls.browser_ca_cert and tls.browser_ca_key must be set together",
+		},
+		{
+			name: "relative auth file",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+proxy:
+  auth_file: "proxy-auth"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`,
+			wantErr: `proxy.auth_file must be an absolute path; got "proxy-auth"`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -188,6 +225,25 @@ tls:
 			require.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
+}
+
+func TestLoad_ProxyAuthAndBrowserCA(t *testing.T) {
+	yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+proxy:
+  auth_file: "/etc/asm/proxy-auth"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+  browser_ca_cert: "/tmp/browser-ca.crt"
+  browser_ca_key: "/tmp/browser-ca.key"
+`
+	cfg, err := Load(strings.NewReader(yaml))
+	require.NoError(t, err)
+	require.Equal(t, "/etc/asm/proxy-auth", cfg.Proxy.AuthFile)
+	require.Equal(t, "/tmp/browser-ca.crt", cfg.TLS.BrowserCACert)
+	require.Equal(t, "/tmp/browser-ca.key", cfg.TLS.BrowserCAKey)
 }
 
 func TestLoad_UnknownFields(t *testing.T) {

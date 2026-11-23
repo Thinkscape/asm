@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -116,6 +117,10 @@ type Proxy struct {
 	// upstream SOCKS5/HTTP CONNECT proxy. The standard HTTP_PROXY/HTTPS_PROXY/
 	// NO_PROXY environment variables override these fields when set.
 	UpstreamProxy UpstreamProxy `yaml:"upstream_proxy"`
+	// AuthFile (asm fork), when set, requires proxy authentication on the
+	// tunnel listener. The file is re-read on every check; each line is
+	// "<user>:<hex sha256(password)>". Must be an absolute path.
+	AuthFile string `yaml:"auth_file"`
 }
 
 // CIDRList is a list of CIDR strings whose presence in YAML is distinguishable
@@ -145,6 +150,11 @@ type TLS struct {
 	CAKey               string `yaml:"ca_key"`
 	CertCacheSize       int    `yaml:"cert_cache_size"`
 	LeafCertExpiryHours int    `yaml:"leaf_cert_expiry_hours"`
+	// BrowserCACert and BrowserCAKey (asm fork) name a second CA used only
+	// for CONNECTs marked "Asm-Browser-Route: 1" that the pipeline approved.
+	// Both or neither must be set; ignored in sni-only mode.
+	BrowserCACert string `yaml:"browser_ca_cert"`
+	BrowserCAKey  string `yaml:"browser_ca_key"`
 }
 
 // TLS mode values.
@@ -301,6 +311,9 @@ func Validate(cfg *Config) error {
 	default:
 		return fmt.Errorf("tls.mode must be %q or %q; got %q", TLSModeMITM, TLSModeSNIOnly, cfg.TLS.Mode)
 	}
+	if (cfg.TLS.BrowserCACert == "") != (cfg.TLS.BrowserCAKey == "") {
+		return fmt.Errorf("tls.browser_ca_cert and tls.browser_ca_key must be set together")
+	}
 
 	if _, err := parseLogLevel(cfg.Log.Level); err != nil {
 		return fmt.Errorf("log.level: %w", err)
@@ -315,6 +328,9 @@ func Validate(cfg *Config) error {
 
 	if err := dnsguard.ValidateCIDRs(cfg.Proxy.UpstreamDenyCIDRs.Values); err != nil {
 		return fmt.Errorf("proxy.upstream_deny_cidrs: %w", err)
+	}
+	if cfg.Proxy.AuthFile != "" && !filepath.IsAbs(cfg.Proxy.AuthFile) {
+		return fmt.Errorf("proxy.auth_file must be an absolute path; got %q", cfg.Proxy.AuthFile)
 	}
 
 	if cfg.Management.Listen != "" {

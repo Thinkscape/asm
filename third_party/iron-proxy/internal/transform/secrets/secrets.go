@@ -6,14 +6,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"text/template"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -29,6 +36,15 @@ func init() {
 // secretsConfig is the YAML config structure.
 type secretsConfig struct {
 	Secrets []secretEntry `yaml:"secrets"`
+	// BrowserHosts lists the (host, port) pairs a marked browser CONNECT
+	// (Asm-Browser-Route: 1) may be routed to, each until a Unix time.
+	BrowserHosts []browserHostConfig `yaml:"browser_hosts"`
+}
+
+type browserHostConfig struct {
+	Host  string `yaml:"host"`
+	Port  int    `yaml:"port"`
+	Until int64  `yaml:"until"`
 }
 
 type secretEntry struct {
@@ -61,6 +77,22 @@ type replaceConfig struct {
 	// carrying its proxy_value in a header, the path or the query is
 	// rejected with 403.
 	Ended bool `yaml:"ended,omitempty"`
+	// Login makes the entry a login entry: its sentinel is substituted only
+	// as an entire form or JSON value of one HTTPS request to the exact form
+	// action, once.
+	Login *loginConfig `yaml:"login,omitempty"`
+}
+
+type loginConfig struct {
+	Port int `yaml:"port"`
+	// Target is the escaped path plus "?query" when present.
+	Target string `yaml:"target"`
+	// Owner is the paired host ID allowed to redeem the sentinel when proxy
+	// authentication is on.
+	Owner string `yaml:"owner"`
+	// ClaimFile is created exclusively on first use; its existence ends the
+	// sentinel.
+	ClaimFile string `yaml:"claim_file"`
 }
 
 type injectConfig struct {
@@ -86,6 +118,7 @@ type resolvedSecret struct {
 	matchQuery     bool
 	require        bool
 	allowPlainHTTP bool
+	login          *loginConfig // non-nil for login entries
 
 	// inject mode fields
 	injectHeader     string
@@ -141,15 +174,34 @@ type Secrets struct {
 	// ended holds the proxy values of ended entries; they never substitute
 	// and are not redaction needles.
 	ended []string
-	// hasReplace is true when at least one entry is in replace mode.
+	// hasReplace is true when at least one entry is in replace mode
+	// (login entries included).
 	hasReplace bool
+	// hasLogin is true when at least one entry is a login entry.
+	hasLogin bool
+	// browserHosts are the (host, port) pairs a marked browser CONNECT may
+	// be routed to.
+	browserHosts []browserHostConfig
 }
 
 const (
 	msgSentinelNotValid = "asm: sentinel not valid for this host or scheme"
 	msgSentinelEnded    = "asm: sentinel expired or revoked; run asm get again"
 	msgWebSocketSwap    = "asm: sentinels are not substituted on WebSocket upgrades"
+	msgBodyUnreadable   = "asm: request body could not be read"
+
+	msgLoginRequest     = "asm: login sentinel not valid for %s %s"
+	msgLoginValue       = "asm: login sentinel must be an entire form or JSON value, sent once"
+	msgLoginBody        = "asm: login body must be application/x-www-form-urlencoded or JSON without Content-Encoding"
+	msgLoginMulti       = "asm: one login grant per request"
+	msgLoginUnavailable = "asm: login secret unavailable"
+	msgLoginOwner       = "asm: this login grant belongs to another machine"
+
+	msgBrowserRoute = "asm: no active login grant routes this host through asm"
 )
+
+// browserRouteHeader marks a CONNECT from an asm proxy router for a browser.
+const browserRouteHeader = "Asm-Browser-Route"
 
 func factory(cfg yaml.Node, logger *slog.Logger) (transform.Transformer, error) {
 	var c secretsConfig
@@ -223,12 +275,24 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 	resolved := make([]resolvedSecret, 0, len(cfg.Secrets))
 	var ended []string
 	hasReplace := false
+	hasLogin := false
+
+	if err := validateBrowserHosts(cfg.BrowserHosts); err != nil {
+		return nil, err
+	}
 
 	for i, entry := range cfg.Secrets {
 		// Normalize legacy top-level fields into a replace block.
 		replace, inject, err := normalizeEntry(i, &entry)
 		if err != nil {
 			return nil, err
+		}
+
+		if replace != nil && replace.Login != nil {
+			if err := validateLogin(i, &entry, replace); err != nil {
+				return nil, err
+			}
+			hasLogin = true
 		}
 
 		if replace != nil && replace.Ended {
@@ -283,11 +347,84 @@ func newFromConfig(cfg secretsConfig, registry sourceBuilderRegistry) (*Secrets,
 				require:        replace.Require,
 				allowPlainHTTP: replace.AllowPlainHTTP,
 				rules:          rules,
+				login:          replace.Login,
 			})
 		}
 	}
 
-	return &Secrets{secrets: resolved, ended: ended, hasReplace: hasReplace}, nil
+	return &Secrets{
+		secrets:      resolved,
+		ended:        ended,
+		hasReplace:   hasReplace,
+		hasLogin:     hasLogin,
+		browserHosts: cfg.BrowserHosts,
+	}, nil
+}
+
+// validateLogin checks a login entry: only proxy_value, login and rules may
+// be set, the login block is complete, and the rules name exactly one host
+// for the form-submission methods.
+func validateLogin(i int, entry *secretEntry, replace *replaceConfig) error {
+	if len(replace.MatchHeaders) > 0 || replace.MatchBody || replace.MatchPath || replace.MatchQuery ||
+		replace.Require || replace.AllowPlainHTTP || replace.Ended {
+		return fmt.Errorf("secrets[%d]: login entries take only proxy_value, login and rules", i)
+	}
+	login := replace.Login
+	if login.Port < 1 || login.Port > 65535 {
+		return fmt.Errorf("secrets[%d]: login.port must be 1-65535", i)
+	}
+	if !strings.HasPrefix(login.Target, "/") {
+		return fmt.Errorf("secrets[%d]: login.target must start with /", i)
+	}
+	if login.Owner == "" {
+		return fmt.Errorf("secrets[%d]: login.owner is required", i)
+	}
+	if !filepath.IsAbs(login.ClaimFile) {
+		return fmt.Errorf("secrets[%d]: login.claim_file must be an absolute path", i)
+	}
+	if !loginRuleShape(entry.Rules) {
+		return fmt.Errorf("secrets[%d]: login entries take exactly one rule with one literal host, no cidr or paths, and methods POST, PUT, PATCH", i)
+	}
+	return nil
+}
+
+// loginRuleShape reports whether rules is one rule for a literal host (no
+// glob characters), with no cidr or paths, for exactly the methods POST,
+// PUT and PATCH.
+func loginRuleShape(rules []hostmatch.RuleConfig) bool {
+	if len(rules) != 1 {
+		return false
+	}
+	r := rules[0]
+	if r.Host == "" || strings.ContainsAny(r.Host, `*?[]\`) || r.CIDR != "" || len(r.Paths) > 0 || len(r.Methods) != 3 {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, m := range r.Methods {
+		m = strings.ToUpper(m)
+		if (m != http.MethodPost && m != http.MethodPut && m != http.MethodPatch) || seen[m] {
+			return false
+		}
+		seen[m] = true
+	}
+	return true
+}
+
+// validateBrowserHosts checks each browser_hosts entry: a lowercase host, a
+// port in 1-65535 and a positive until.
+func validateBrowserHosts(hosts []browserHostConfig) error {
+	for i, h := range hosts {
+		if h.Host == "" || h.Host != strings.ToLower(h.Host) {
+			return fmt.Errorf("browser_hosts[%d]: host must be non-empty and lowercase", i)
+		}
+		if h.Port < 1 || h.Port > 65535 {
+			return fmt.Errorf("browser_hosts[%d]: port must be 1-65535", i)
+		}
+		if h.Until <= 0 {
+			return fmt.Errorf("browser_hosts[%d]: until must be positive", i)
+		}
+	}
+	return nil
 }
 
 // normalizeEntry validates the entry and returns either a replaceConfig or injectConfig.
@@ -363,11 +500,23 @@ func validateInject(i int, cfg *injectConfig) error {
 
 func (s *Secrets) Name() string { return "secrets" }
 
+// secretRecord is the audit record of one entry's substitutions.
+type secretRecord struct {
+	Secret    string   `json:"secret"`
+	Locations []string `json:"locations"`
+}
+
 func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
-	type secretRecord struct {
-		Secret    string   `json:"secret"`
-		Locations []string `json:"locations"`
+	// A marked browser CONNECT is approved only for a live browser_hosts
+	// pair; the proxy issues browser-CA leaves only for approved tunnels.
+	if req.Method == http.MethodConnect && req.Header.Get(browserRouteHeader) == "1" {
+		if !s.browserRouteAllowed(req, time.Now().Unix()) {
+			tctx.Annotate("reject_reason", "browser_route")
+			return rejectResult(req, http.StatusForbidden, msgBrowserRoute), nil
+		}
+		tctx.Annotate("browser_route", "allowed")
 	}
+
 	var swapped, injected []secretRecord
 	var unavailable []string
 
@@ -378,21 +527,48 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		req.Header.Del("Accept-Encoding")
 	}
 
+	var body []byte
+	bodyOK := false
+	if s.hasReplace || len(s.ended) > 0 {
+		var err error
+		body, bodyOK, err = scannableBody(req)
+		if err != nil {
+			tctx.Annotate("reject_reason", "body_unreadable")
+			return rejectResult(req, http.StatusBadRequest, msgBodyUnreadable), nil
+		}
+	}
+
 	// An ended sentinel reaches no destination, whatever else the request
 	// carries; the client learns to request a new lease.
 	for _, pv := range s.ended {
-		if sentinelInRequest(req, pv) {
+		if sentinelInRequest(req, pv, body) {
 			tctx.Annotate("reject_reason", "sentinel_ended")
 			return rejectResult(req, http.StatusForbidden, msgSentinelEnded), nil
 		}
 	}
 
+	// The login substitution is validated here and committed (claimed) only
+	// after every other check below has passed, so a request rejected for
+	// another reason never consumes the grant.
+	var login *pendingLogin
+	if s.hasLogin {
+		var res *transform.TransformResult
+		login, res = s.checkLogin(ctx, tctx, req, body, bodyOK)
+		if res != nil {
+			return res, nil
+		}
+	}
+
 	for _, sec := range s.secrets {
+		if sec.login != nil {
+			// Login entries are handled by checkLogin/commitLogin only.
+			continue
+		}
 		hostMatch := hostmatch.MatchAnyRule(sec.rules, req)
 		if sec.mode == "replace" && (!hostMatch || (req.TLS == nil && !sec.allowPlainHTTP)) {
 			// A sentinel headed somewhere it is not substituted would leak
 			// the placeholder (a bearer capability) to that destination.
-			if sentinelInRequest(req, sec.proxyValue) {
+			if sentinelInRequest(req, sec.proxyValue, body) {
 				tctx.Annotate("rejected", sec.source.Name())
 				tctx.Annotate("reject_reason", "sentinel_not_valid")
 				return rejectResult(req, http.StatusForbidden, msgSentinelNotValid), nil
@@ -461,9 +637,17 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	// WebSocket frames are relayed raw and cannot be redacted, so a
 	// substituted upgrade request would hand the real value to a channel
 	// with no response protection.
-	if len(swapped) > 0 && isWebSocketUpgrade(req) {
+	if (len(swapped) > 0 || login != nil) && isWebSocketUpgrade(req) {
 		tctx.Annotate("reject_reason", "websocket_upgrade")
 		return rejectResult(req, http.StatusForbidden, msgWebSocketSwap), nil
+	}
+
+	if login != nil {
+		record, res := commitLogin(tctx, req, login)
+		if res != nil {
+			return res, nil
+		}
+		swapped = append(swapped, *record)
 	}
 
 	if len(swapped) > 0 {
@@ -477,6 +661,212 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	}
 
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+// pendingLogin is a validated login substitution awaiting its claim.
+type pendingLogin struct {
+	sec      *resolvedSecret
+	kind     bodyKind
+	real     string
+	origBody io.ReadCloser // req.Body when the substitution was computed
+	replaced []byte
+}
+
+// checkLogin runs the validation half of the login phase: it finds the one
+// login entry whose sentinel the request carries and checks that the
+// request is an HTTPS submission to the entry's exact form action with the
+// sentinel as one whole body value. It returns the substitution to commit,
+// or a reject result. Nothing is claimed or changed on the request.
+func (s *Secrets) checkLogin(ctx context.Context, tctx *transform.TransformContext, req *http.Request, body []byte, bodyOK bool) (*pendingLogin, *transform.TransformResult) {
+	var hit *resolvedSecret
+	hits := 0
+	for i := range s.secrets {
+		sec := &s.secrets[i]
+		if sec.login != nil && sentinelInRequest(req, sec.proxyValue, body) {
+			hit = sec
+			hits++
+		}
+	}
+	if hits > 1 {
+		tctx.Annotate("reject_reason", "login_multi")
+		return nil, rejectResult(req, http.StatusForbidden, msgLoginMulti)
+	}
+
+	// A body the proxy cannot scan could hide a sentinel, so the login
+	// endpoint takes only identity-encoded form or JSON bodies.
+	kind := requestBodyKind(req)
+	loginBody := bodyOK && (kind == bodyForm || kind == bodyJSON)
+	if !loginBody {
+		for i := range s.secrets {
+			sec := &s.secrets[i]
+			if sec.login != nil && sec != hit && loginEndpointMatch(req, sec) {
+				tctx.Annotate("rejected", sec.source.Name())
+				tctx.Annotate("reject_reason", "login_body")
+				return nil, rejectResult(req, http.StatusForbidden, msgLoginBody)
+			}
+		}
+	}
+	if hit == nil {
+		return nil, nil
+	}
+
+	name := hit.source.Name()
+	reject := func(status int, reason, msg string) (*pendingLogin, *transform.TransformResult) {
+		tctx.Annotate("rejected", name)
+		tctx.Annotate("reject_reason", reason)
+		return nil, rejectResult(req, status, msg)
+	}
+	if !loginEndpointMatch(req, hit) {
+		return reject(http.StatusForbidden, "login_scope", fmt.Sprintf(msgLoginRequest, req.Method, requestURL(req)))
+	}
+	if sentinelInRequest(req, hit.proxyValue, nil) {
+		return reject(http.StatusForbidden, "login_value", msgLoginValue)
+	}
+	if !loginBody {
+		return reject(http.StatusForbidden, "login_body", msgLoginBody)
+	}
+	// With proxy authentication off the sentinel is a bearer capability,
+	// like exec sentinels.
+	if tctx.TunnelUser != "" && tctx.TunnelUser != hit.login.Owner {
+		return reject(http.StatusForbidden, "login_owner", msgLoginOwner)
+	}
+	realValue, err := hit.source.Get(ctx)
+	if err != nil {
+		return reject(http.StatusServiceUnavailable, "secret_unavailable", msgLoginUnavailable)
+	}
+	replaced, ok := swapLogin(kind, body, hit.proxyValue, realValue)
+	if !ok {
+		return reject(http.StatusForbidden, "login_value", msgLoginValue)
+	}
+	return &pendingLogin{sec: hit, kind: kind, real: realValue, origBody: req.Body, replaced: replaced}, nil
+}
+
+// commitLogin claims a validated login substitution and installs it. It
+// runs after every other check of the request has passed. The claim
+// precedes forwarding, so an indeterminate upstream outcome still consumes
+// the grant.
+func commitLogin(tctx *transform.TransformContext, req *http.Request, p *pendingLogin) (*secretRecord, *transform.TransformResult) {
+	name := p.sec.source.Name()
+	reject := func(reason, msg string) (*secretRecord, *transform.TransformResult) {
+		tctx.Annotate("rejected", name)
+		tctx.Annotate("reject_reason", reason)
+		return nil, rejectResult(req, http.StatusForbidden, msg)
+	}
+
+	replaced := p.replaced
+	if req.Body != p.origBody {
+		// A match_body entry rewrote the body after validation; substitute
+		// into the current body so its swap is kept.
+		current, ok, err := scannableBody(req)
+		if err != nil || !ok {
+			return reject("login_body", msgLoginBody)
+		}
+		if replaced, ok = swapLogin(p.kind, current, p.sec.proxyValue, p.real); !ok {
+			return reject("login_value", msgLoginValue)
+		}
+	}
+
+	if err := claimLogin(p.sec.login.ClaimFile, time.Now()); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
+			tctx.Annotate("claim_error", err.Error())
+		}
+		return reject("sentinel_ended", msgSentinelEnded)
+	}
+
+	req.Body = transform.NewBufferedBodyFromBytes(replaced)
+	addRedactPair(tctx, p.real, p.sec.proxyValue)
+	// A partial response could split an echoed value so response redaction
+	// cannot see it whole.
+	req.Header.Del("Range")
+	req.Header.Del("If-Range")
+	return &secretRecord{Secret: name, Locations: []string{"body"}}, nil
+}
+
+// swapLogin substitutes a login sentinel in a form or JSON body.
+func swapLogin(kind bodyKind, body []byte, sentinel, real string) ([]byte, bool) {
+	if kind == bodyForm {
+		return swapLoginForm(body, sentinel, real)
+	}
+	return swapLoginJSON(body, sentinel, real)
+}
+
+// loginEndpointMatch reports whether req is an HTTPS request to the login
+// entry's host, method, port and exact escaped request target.
+func loginEndpointMatch(req *http.Request, sec *resolvedSecret) bool {
+	return req.TLS != nil &&
+		hostmatch.MatchAnyRule(sec.rules, req) &&
+		effectivePort(req) == strconv.Itoa(sec.login.Port) &&
+		requestTarget(req) == sec.login.Target
+}
+
+// effectivePort is the port in req.Host, else the scheme's default.
+func effectivePort(req *http.Request) string {
+	if _, port, err := net.SplitHostPort(req.Host); err == nil && port != "" {
+		return port
+	}
+	if req.TLS != nil {
+		return "443"
+	}
+	return "80"
+}
+
+// requestTarget is the escaped path plus "?query" when the request has one.
+func requestTarget(req *http.Request) string {
+	target := req.URL.EscapedPath()
+	if req.URL.RawQuery != "" || req.URL.ForceQuery {
+		target += "?" + req.URL.RawQuery
+	}
+	return target
+}
+
+// requestURL renders the request as scheme://host:port/target for messages.
+func requestURL(req *http.Request) string {
+	scheme := "http"
+	if req.TLS != nil {
+		scheme = "https"
+	}
+	host := strings.ToLower(hostmatch.StripPort(req.Host))
+	return scheme + "://" + net.JoinHostPort(host, effectivePort(req)) + requestTarget(req)
+}
+
+// claimLogin creates path exclusively and makes it durable, recording the
+// time of use. An existing file means the sentinel was already used.
+func claimLogin(path string, now time.Time) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.WriteString(now.UTC().Format(time.RFC3339))
+	syncErr := f.Sync()
+	if err := errors.Join(writeErr, syncErr, f.Close()); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	syncErr = dir.Sync()
+	return errors.Join(syncErr, dir.Close())
+}
+
+// browserRouteAllowed reports whether the CONNECT target is a browser_hosts
+// pair whose until lies after now (Unix seconds).
+func (s *Secrets) browserRouteAllowed(req *http.Request, now int64) bool {
+	host, portStr, err := net.SplitHostPort(req.Host)
+	if err != nil {
+		return false
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return false
+	}
+	host = strings.ToLower(host)
+	for _, bh := range s.browserHosts {
+		if bh.Host == host && bh.Port == port && now < bh.Until {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Secrets) injectSecret(req *http.Request, sec *resolvedSecret, realValue string) ([]string, error) {
@@ -511,8 +901,12 @@ func (s *Secrets) formatValue(sec *resolvedSecret, realValue string) (string, er
 }
 
 // sentinelInRequest reports whether proxyValue occurs in any request header
-// value, the URL path or the query string. Bodies are not scanned.
-func sentinelInRequest(req *http.Request, proxyValue string) bool {
+// value, the URL path, the query string or, when body is non-nil, the
+// scanned body (see scannableBody; pass nil to skip the body).
+func sentinelInRequest(req *http.Request, proxyValue string, body []byte) bool {
+	if body != nil && bytes.Contains(body, []byte(proxyValue)) {
+		return true
+	}
 	for name, vals := range req.Header {
 		for _, v := range vals {
 			if headerContains(name, v, proxyValue) {
@@ -751,7 +1145,7 @@ func (s *Secrets) swapBody(req *http.Request, sec *resolvedSecret, realValue str
 		return ""
 	}
 
-	replaced := bytes.ReplaceAll(data, []byte(sec.proxyValue), []byte(realValue))
+	replaced := bytes.ReplaceAll(data, []byte(sec.proxyValue), []byte(escapeReal(requestBodyKind(req), realValue)))
 	req.Body = transform.NewBufferedBodyFromBytes(replaced)
 	return "body"
 }

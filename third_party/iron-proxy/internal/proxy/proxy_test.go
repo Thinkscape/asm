@@ -39,13 +39,18 @@ func testLogger() *slog.Logger {
 
 func generateTestCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey) {
 	t.Helper()
+	return generateTestCAWithCN(t, "Test CA")
+}
+
+func generateTestCAWithCN(t *testing.T, commonName string) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
 	template := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "Test CA"},
+		Subject:               pkix.Name{CommonName: commonName},
 		NotBefore:             time.Now().Add(-1 * time.Hour),
 		NotAfter:              time.Now().Add(24 * time.Hour),
 		IsCA:                  true,

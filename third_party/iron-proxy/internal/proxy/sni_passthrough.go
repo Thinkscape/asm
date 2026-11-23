@@ -26,7 +26,7 @@ const (
 // the transform pipeline with a host-only synthetic request, and on accept
 // TCP-passthroughs the connection to the upstream server.
 func (p *Proxy) handleSNIPassthrough(clientConn net.Conn) {
-	if err := p.serveSNIPassthrough(clientConn); err != nil {
+	if err := p.serveSNIPassthrough(clientConn, ""); err != nil {
 		p.logger.Debug("sni passthrough error", slog.String("error", err.Error()))
 	}
 }
@@ -36,7 +36,9 @@ func (p *Proxy) handleSNIPassthrough(clientConn net.Conn) {
 // listener and the CONNECT/SOCKS5 tunnel TLS branch in sni-only mode. The
 // upstream port is fixed at 443 — a client-supplied CONNECT port is ignored
 // so an attacker cannot pivot an allowlisted hostname onto a different port.
-func (p *Proxy) serveSNIPassthrough(clientConn net.Conn) error {
+// tunnelUser is the proxy-authenticated user of the carrying tunnel ("" on
+// the HTTPS listener or with proxy authentication off).
+func (p *Proxy) serveSNIPassthrough(clientConn net.Conn, tunnelUser string) error {
 	defer clientConn.Close()
 
 	sni, peeked, err := peekSNI(clientConn, sniPeekTimeout)
@@ -67,9 +69,10 @@ func (p *Proxy) serveSNIPassthrough(clientConn net.Conn) error {
 	}
 
 	tctx := &transform.TransformContext{
-		Logger: p.logger,
-		SNI:    sni,
-		Mode:   transform.ModeSNIOnly,
+		Logger:     p.logger,
+		SNI:        sni,
+		Mode:       transform.ModeSNIOnly,
+		TunnelUser: tunnelUser,
 	}
 
 	req := &http.Request{

@@ -15,10 +15,12 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/ironsh/iron-proxy/internal/certcache"
 	"github.com/ironsh/iron-proxy/internal/config"
 	"github.com/ironsh/iron-proxy/internal/transform"
 	"golang.org/x/net/http2"
@@ -83,13 +85,42 @@ func (p *Proxy) serveTunnelProxyHTTP(conn net.Conn) error {
 			p.handleTunnelCONNECT(w, r)
 			return
 		}
+		var user string
+		if p.authRequired() {
+			u, ok := p.authUser(r.Header)
+			if !ok {
+				p.rejectEarly(&transform.PipelineResult{
+					Host:       r.Host,
+					Method:     r.Method,
+					Path:       r.URL.Path,
+					RemoteAddr: r.RemoteAddr,
+					Mode:       transform.ModeMITM,
+				}, http.StatusProxyAuthRequired, proxyAuthTrace, proxyAuthReason(r.Header))
+				p.writeProxyAuthRequired(w)
+				return
+			}
+			user = u
+		}
 		if r.URL.Scheme != "http" {
 			http.Error(w, "unsupported proxy request scheme", http.StatusBadRequest)
 			return
 		}
-		p.handleDirectHTTP(w, r)
+		p.handleHTTP(w, r, nil, user)
 	}))
 }
+
+// Browser routes (asm fork): a CONNECT carrying "Asm-Browser-Route: 1" asks
+// for a leaf signed by the browser CA. It is issued only when the pipeline's
+// secrets transform approved the (host, port) pair for browser routing.
+const (
+	browserRouteHeader = "Asm-Browser-Route"
+	browserRouteTrace  = "browser_route"
+
+	msgBrowserRouteMarker    = "asm: invalid browser route marker"
+	msgBrowserRouteDisabled  = "asm: browser routing is not enabled on this manager"
+	msgBrowserRouteNoGrant   = "asm: no active login grant routes this host through asm"
+	msgBrowserRouteAuthority = "asm: request authority does not match the browser route"
+)
 
 // handleTunnelCONNECT handles HTTP CONNECT tunnel requests.
 func (p *Proxy) handleTunnelCONNECT(w http.ResponseWriter, req *http.Request) {
@@ -100,7 +131,38 @@ func (p *Proxy) handleTunnelCONNECT(w http.ResponseWriter, req *http.Request) {
 
 	p.logger.Debug("tunnel CONNECT", slog.String("target", host))
 
-	ok, rejectResp, tunnelInfo := p.tunnelTransformCheck(req.RemoteAddr, host, req.Header)
+	// preflight is the audit record for a CONNECT refused before the
+	// pipeline runs.
+	hostname, _, _ := net.SplitHostPort(host)
+	preflight := &transform.PipelineResult{
+		Host:       host,
+		Method:     http.MethodConnect,
+		RemoteAddr: req.RemoteAddr,
+		SNI:        hostname,
+		Mode:       p.tunnelMode(),
+	}
+
+	marker := req.Header.Get(browserRouteHeader)
+	browser := marker == "1"
+	if marker != "" && !browser {
+		p.rejectEarly(preflight, http.StatusForbidden, browserRouteTrace, "invalid_marker")
+		w.Header().Set("Connection", "close")
+		p.writeResponse(w, textResponse(http.StatusForbidden, msgBrowserRouteMarker))
+		return
+	}
+
+	var authUser string
+	if p.authRequired() {
+		user, ok := p.authUser(req.Header)
+		if !ok {
+			p.rejectEarly(preflight, http.StatusProxyAuthRequired, proxyAuthTrace, proxyAuthReason(req.Header))
+			p.writeProxyAuthRequired(w)
+			return
+		}
+		authUser = user
+	}
+
+	ok, rejectResp, tunnelInfo := p.tunnelTransformCheck(req.RemoteAddr, host, req.Header, authUser, browser)
 	if !ok {
 		w.Header().Set("Connection", "close")
 		if rejectResp == nil {
@@ -109,6 +171,10 @@ func (p *Proxy) handleTunnelCONNECT(w http.ResponseWriter, req *http.Request) {
 		}
 		p.writeResponse(w, rejectResp)
 		return
+	}
+	cache := p.certCache
+	if browser {
+		cache = p.browserCertCache
 	}
 
 	hj, ok := w.(http.Hijacker)
@@ -133,7 +199,7 @@ func (p *Proxy) handleTunnelCONNECT(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if err := p.serveTunnelWithReader(conn, rw.Reader, host, tunnelInfo); err != nil {
+	if err := p.serveTunnelWithReader(conn, rw.Reader, host, tunnelInfo, cache, browser); err != nil {
 		p.logger.Debug("tunnel connect error", slog.String("error", err.Error()))
 	}
 }
@@ -160,23 +226,45 @@ func (p *Proxy) handleSOCKS5(conn net.Conn, br *bufio.Reader) error {
 		return fmt.Errorf("read methods: %w", err)
 	}
 
-	// We only support no-auth (0x00)
-	hasNoAuth := false
-	for _, m := range methods {
-		if m == 0x00 {
-			hasNoAuth = true
-			break
+	var authUser string
+	if p.authRequired() {
+		// preflight is the audit record for a SOCKS5 handshake refused
+		// before the target is known.
+		preflight := &transform.PipelineResult{
+			Method:     http.MethodConnect,
+			RemoteAddr: conn.RemoteAddr().String(),
+			Mode:       p.tunnelMode(),
 		}
-	}
-	if !hasNoAuth {
-		if err := p.socks5Reply(conn, 0xFF); err != nil {
-			return fmt.Errorf("write no-acceptable-methods: %w", err)
+		// Only username/password (RFC 1929) is acceptable.
+		if !slices.Contains(methods, 0x02) {
+			p.rejectEarly(preflight, http.StatusProxyAuthRequired, proxyAuthTrace, "missing_credentials")
+			if err := p.socks5Reply(conn, 0xFF); err != nil {
+				return fmt.Errorf("write no-acceptable-methods: %w", err)
+			}
+			return nil
 		}
-		return nil
-	}
-	// Reply: use no-auth
-	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
-		return fmt.Errorf("write auth reply: %w", err)
+		if _, err := conn.Write([]byte{0x05, 0x02}); err != nil {
+			return fmt.Errorf("write auth reply: %w", err)
+		}
+		user, err := p.socks5Authenticate(conn, br)
+		if errors.Is(err, errSOCKS5AuthFailed) {
+			p.rejectEarly(preflight, http.StatusProxyAuthRequired, proxyAuthTrace, "invalid_credentials")
+		}
+		if err != nil {
+			return err
+		}
+		authUser = user
+	} else {
+		// Without an auth file only no-auth (0x00) is supported.
+		if !slices.Contains(methods, 0x00) {
+			if err := p.socks5Reply(conn, 0xFF); err != nil {
+				return fmt.Errorf("write no-acceptable-methods: %w", err)
+			}
+			return nil
+		}
+		if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+			return fmt.Errorf("write auth reply: %w", err)
+		}
 	}
 
 	// --- Connect request ---
@@ -235,7 +323,7 @@ func (p *Proxy) handleSOCKS5(conn net.Conn, br *bufio.Reader) error {
 
 	p.logger.Debug("tunnel SOCKS5 CONNECT", slog.String("target", target))
 
-	ok, _, tunnelInfo := p.tunnelTransformCheck(conn.RemoteAddr().String(), target, nil)
+	ok, _, tunnelInfo := p.tunnelTransformCheck(conn.RemoteAddr().String(), target, nil, authUser, false)
 	if !ok {
 		if err := p.socks5Reply(conn, 0x02); err != nil {
 			return fmt.Errorf("write connection-not-allowed: %w", err)
@@ -263,8 +351,12 @@ func (p *Proxy) socks5Reply(conn net.Conn, status byte) error {
 // pipeline to decide whether the tunnel should be allowed. When connectHeaders
 // is non-nil the headers from the original CONNECT request (e.g.
 // Proxy-Authorization) are forwarded to transforms so they can make
-// authentication and policy decisions at the tunnel level.
-func (p *Proxy) tunnelTransformCheck(remoteAddr, target string, connectHeaders http.Header) (bool, *http.Response, *transform.TunnelInfo) {
+// authentication and policy decisions at the tunnel level. authUser is the
+// proxy-authenticated user ("" when proxy auth is off); it becomes the
+// tunnel's AuthUser. When browser is set, the tunnel is additionally denied
+// unless browser routing is enabled and the secrets transform annotated the
+// CONNECT with browser_route=allowed.
+func (p *Proxy) tunnelTransformCheck(remoteAddr, target string, connectHeaders http.Header, authUser string, browser bool) (bool, *http.Response, *transform.TunnelInfo) {
 	host, _, _ := net.SplitHostPort(target)
 
 	hdr := http.Header{}
@@ -284,15 +376,13 @@ func (p *Proxy) tunnelTransformCheck(remoteAddr, target string, connectHeaders h
 	}
 	req.Body = transform.NewBufferedBody(http.NoBody, 0)
 
-	mode := transform.ModeMITM
-	if p.tlsMode == config.TLSModeSNIOnly {
-		mode = transform.ModeSNIOnly
-	}
+	mode := p.tunnelMode()
 
 	tctx := &transform.TransformContext{
-		Logger: p.logger,
-		SNI:    host,
-		Mode:   mode,
+		Logger:     p.logger,
+		SNI:        host,
+		Mode:       mode,
+		TunnelUser: authUser,
 	}
 
 	result := &transform.PipelineResult{
@@ -332,23 +422,104 @@ func (p *Proxy) tunnelTransformCheck(remoteAddr, target string, connectHeaders h
 		return false, rejectResp, nil
 	}
 
+	if browser {
+		if reason, msg := p.browserRouteDenial(result.RequestTransforms); msg != "" {
+			markReject(result, http.StatusForbidden, browserRouteTrace, reason)
+			p.logger.Info("browser route denied",
+				slog.String("target", target),
+				slog.String("reason", reason),
+			)
+			return false, textResponse(http.StatusForbidden, msg), nil
+		}
+	}
+
 	result.Action = transform.ActionContinue
 	result.StatusCode = http.StatusOK
 	return true, nil, &transform.TunnelInfo{
 		Target:            target,
 		RequestTransforms: result.RequestTransforms,
+		AuthUser:          authUser,
 	}
 }
 
-// serveTunnel peeks at the client's first byte after the CONNECT/SOCKS5
-// handshake to detect TLS (0x16) vs plain HTTP. TLS connections get MITM'd;
-// plain HTTP is served directly through handleHTTP. Anything else is rejected.
-func (p *Proxy) serveTunnel(clientConn net.Conn, target string, tunnelInfo *transform.TunnelInfo) error {
-	br := bufio.NewReader(clientConn)
-	return p.serveTunnelWithReader(clientConn, br, target, tunnelInfo)
+// browserRouteDenial reports why a marked CONNECT may not use the browser CA,
+// or "" when it may: browser routing must be configured and the secrets
+// transform must have annotated the CONNECT with browser_route=allowed. With
+// no secrets transform nothing is allowed.
+func (p *Proxy) browserRouteDenial(traces []transform.TransformTrace) (reason, msg string) {
+	if p.browserCertCache == nil {
+		return "browser_routing_disabled", msgBrowserRouteDisabled
+	}
+	for _, tr := range traces {
+		if tr.Name == "secrets" && tr.Annotations["browser_route"] == "allowed" {
+			return "", ""
+		}
+	}
+	return "no_login_grant", msgBrowserRouteNoGrant
 }
 
-func (p *Proxy) serveTunnelWithReader(clientConn net.Conn, br *bufio.Reader, target string, tunnelInfo *transform.TunnelInfo) error {
+// textResponse builds a synthetic plain-text response carrying msg.
+func textResponse(status int, msg string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Status:     strconv.Itoa(status) + " " + http.StatusText(status),
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+		Body:       io.NopCloser(strings.NewReader(msg + "\n")),
+	}
+}
+
+// tunnelMode is the transform mode of CONNECT/SOCKS5 tunnel requests.
+func (p *Proxy) tunnelMode() transform.Mode {
+	if p.tlsMode == config.TLSModeSNIOnly {
+		return transform.ModeSNIOnly
+	}
+	return transform.ModeMITM
+}
+
+// markReject records on result that the proxy itself (not a transform)
+// refused the request, as a reject trace named traceName.
+func markReject(result *transform.PipelineResult, status int, traceName, reason string) {
+	result.Action = transform.ActionReject
+	result.StatusCode = status
+	result.RequestTransforms = append(result.RequestTransforms, transform.TransformTrace{
+		Name:        traceName,
+		Action:      transform.ActionReject,
+		Annotations: map[string]any{"reason": reason},
+	})
+}
+
+// rejectEarly audits and logs a request refused before any pipeline run
+// (proxy authentication, browser route checks). result must never carry
+// credentials.
+func (p *Proxy) rejectEarly(result *transform.PipelineResult, status int, traceName, reason string) {
+	_, finish := p.beginPipelineRun(result)
+	markReject(result, status, traceName, reason)
+	finish()
+	p.logger.Info("request rejected by proxy",
+		slog.String("host", result.Host),
+		slog.String("method", result.Method),
+		slog.String("remote_addr", result.RemoteAddr),
+		slog.String("rejected_by", traceName),
+		slog.String("reason", reason),
+		slog.Int("status", status),
+	)
+}
+
+// serveTunnel peeks at the client's first byte after the SOCKS5 handshake to
+// detect TLS (0x16) vs plain HTTP. TLS connections get MITM'd with the root
+// CA; plain HTTP is served directly through handleHTTP. Anything else is
+// rejected.
+func (p *Proxy) serveTunnel(clientConn net.Conn, target string, tunnelInfo *transform.TunnelInfo) error {
+	br := bufio.NewReader(clientConn)
+	return p.serveTunnelWithReader(clientConn, br, target, tunnelInfo, p.certCache, false)
+}
+
+// serveTunnelWithReader dispatches on the client's first byte. cache signs
+// MITM leaves; browser restricts the tunnel to TLS for exactly target.
+func (p *Proxy) serveTunnelWithReader(clientConn net.Conn, br *bufio.Reader, target string, tunnelInfo *transform.TunnelInfo, cache *certcache.Cache, browser bool) error {
 	first, err := br.Peek(1)
 	if err != nil {
 		return fmt.Errorf("peek client protocol: %w", err)
@@ -359,7 +530,11 @@ func (p *Proxy) serveTunnelWithReader(clientConn net.Conn, br *bufio.Reader, tar
 
 	if first[0] == 0x16 {
 		// TLS ClientHello: MITM
-		return p.serveTunnelTLS(peekedConn, target, tunnelInfo)
+		return p.serveTunnelTLS(peekedConn, target, tunnelInfo, cache, browser)
+	}
+
+	if browser {
+		return fmt.Errorf("browser route %s: non-TLS first byte 0x%02x", target, first[0])
 	}
 
 	if isHTTPMethodByte(first[0]) {
@@ -371,17 +546,24 @@ func (p *Proxy) serveTunnelWithReader(clientConn net.Conn, br *bufio.Reader, tar
 }
 
 // serveTunnelTLS handles the TLS branch of a tunnel connection. In MITM mode
-// it terminates TLS and serves HTTP via handleHTTP; in sni-only mode it
-// peeks SNI and TCP-passthroughs to the SNI host on port 443 (the CONNECT
-// port is ignored to prevent port-pivot attacks).
-func (p *Proxy) serveTunnelTLS(clientConn net.Conn, target string, tunnelInfo *transform.TunnelInfo) error {
+// it terminates TLS with a leaf from cache and serves HTTP via handleHTTP; in
+// sni-only mode it peeks SNI and TCP-passthroughs to the SNI host on port 443
+// (the CONNECT port is ignored to prevent port-pivot attacks). For a browser
+// route the SNI and every inner request's authority must match target.
+func (p *Proxy) serveTunnelTLS(clientConn net.Conn, target string, tunnelInfo *transform.TunnelInfo, cache *certcache.Cache, browser bool) error {
 	if p.tlsMode == config.TLSModeSNIOnly {
-		return p.serveSNIPassthrough(clientConn)
+		return p.serveSNIPassthrough(clientConn, tunnelInfo.AuthUser)
 	}
 
+	targetHost, targetPort := splitAuthority(target, "443")
 	tlsConn := tls.Server(clientConn, &tls.Config{
-		GetCertificate: p.getCertificate,
-		NextProtos:     []string{"h2", "http/1.1"}, // offer HTTP/2 to tunnelled clients
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if browser && !strings.EqualFold(hello.ServerName, targetHost) {
+				return nil, fmt.Errorf("browser route %s: SNI %q does not match", target, hello.ServerName)
+			}
+			return issueLeaf(cache, hello)
+		},
+		NextProtos: []string{"h2", "http/1.1"}, // offer HTTP/2 to tunnelled clients
 	})
 	defer func() { _ = tlsConn.Close() }()
 
@@ -389,8 +571,25 @@ func (p *Proxy) serveTunnelTLS(clientConn net.Conn, target string, tunnelInfo *t
 		return fmt.Errorf("TLS handshake for %s: %w", target, err)
 	}
 
+	user := tunnelInfo.AuthUser
 	return serveOneHTTPConn(tlsConn, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p.handleHTTP(w, r, tunnelInfo)
+		if browser {
+			host, port := splitAuthority(r.Host, "443")
+			if !strings.EqualFold(host, targetHost) || port != targetPort {
+				p.rejectEarly(&transform.PipelineResult{
+					Host:       r.Host,
+					Method:     r.Method,
+					Path:       r.URL.Path,
+					RemoteAddr: r.RemoteAddr,
+					SNI:        r.TLS.ServerName,
+					Mode:       transform.ModeMITM,
+					Tunnel:     cloneTunnelInfo(tunnelInfo),
+				}, http.StatusMisdirectedRequest, browserRouteTrace, "authority_mismatch")
+				http.Error(w, msgBrowserRouteAuthority, http.StatusMisdirectedRequest)
+				return
+			}
+		}
+		p.handleHTTP(w, r, tunnelInfo, user)
 	}))
 }
 
@@ -399,8 +598,17 @@ func (p *Proxy) serveTunnelHTTP(clientConn net.Conn, target string, tunnelInfo *
 	defer clientConn.Close()
 
 	return serveOneHTTPConn(clientConn, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p.handleHTTP(w, r, tunnelInfo)
+		p.handleHTTP(w, r, tunnelInfo, tunnelInfo.AuthUser)
 	}))
+}
+
+// splitAuthority splits a host[:port] authority, using defaultPort when the
+// port is absent and stripping IPv6 brackets.
+func splitAuthority(authority, defaultPort string) (host, port string) {
+	if h, p, err := net.SplitHostPort(authority); err == nil {
+		return h, p
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(authority, "["), "]"), defaultPort
 }
 
 func serveOneHTTPConn(conn net.Conn, handler http.Handler) error {
@@ -451,6 +659,7 @@ func cloneTunnelInfo(info *transform.TunnelInfo) *transform.TunnelInfo {
 	return &transform.TunnelInfo{
 		Target:            info.Target,
 		RequestTransforms: traces,
+		AuthUser:          info.AuthUser,
 	}
 }
 

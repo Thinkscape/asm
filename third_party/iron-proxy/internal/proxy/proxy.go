@@ -52,6 +52,14 @@ type Proxy struct {
 	responseRetryHandler *responseretry.Handler
 	logger               *slog.Logger
 
+	// browserCertCache (asm fork) issues leaves only for CONNECTs marked
+	// Asm-Browser-Route: 1 that the pipeline approved. nil disables browser
+	// routing.
+	browserCertCache *certcache.Cache
+	// authFile (asm fork), when non-empty, requires proxy authentication on
+	// the tunnel listener; see proxyauth.go.
+	authFile string
+
 	// shutdownCtx is canceled by Shutdown to unblock in-flight TCP-passthrough
 	// connections that would otherwise sit on blocking Reads.
 	shutdownCtx    context.Context
@@ -96,6 +104,12 @@ type Options struct {
 	// requests can never pass through un-transformed (leaking placeholder
 	// credentials upstream) during startup.
 	Ready func() bool
+	// BrowserCertCache (asm fork) signs leaves for approved browser routes
+	// (CONNECT with Asm-Browser-Route: 1). nil disables browser routing.
+	BrowserCertCache *certcache.Cache
+	// AuthFile (asm fork), when non-empty, requires proxy authentication on
+	// the tunnel listener. Lines are "<user>:<hex sha256(password)>".
+	AuthFile string
 }
 
 // New creates a new Proxy. In TLSModeMITM, certCache must be non-nil. In
@@ -116,6 +130,8 @@ func New(opts Options) *Proxy {
 		tunnelAddr:           opts.TunnelAddr,
 		tunnelDone:           make(chan struct{}),
 		certCache:            opts.CertCache,
+		browserCertCache:     opts.BrowserCertCache,
+		authFile:             opts.AuthFile,
 		pipeline:             opts.Pipeline,
 		transport:            buildTransport(opts.Resolver, guard, opts.UpstreamResponseHeaderTimeout, opts.UpstreamProxy),
 		resolver:             opts.Resolver,
@@ -249,13 +265,18 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 }
 
 func (p *Proxy) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	if p.certCache == nil {
+	return issueLeaf(p.certCache, hello)
+}
+
+// issueLeaf returns a leaf for the ClientHello's SNI signed by cache's CA.
+func issueLeaf(cache *certcache.Cache, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if cache == nil {
 		return nil, fmt.Errorf("cert cache not configured")
 	}
 	if hello.ServerName == "" {
 		return nil, fmt.Errorf("no SNI provided")
 	}
-	return p.certCache.GetOrCreate(hello.ServerName)
+	return cache.GetOrCreate(hello.ServerName)
 }
 
 // beginPipelineRun snapshots the current pipeline and returns a finish
@@ -297,12 +318,14 @@ func notReadyResponse() *http.Response {
 }
 
 func (p *Proxy) handleDirectHTTP(w http.ResponseWriter, r *http.Request) {
-	p.handleHTTP(w, r, nil)
+	p.handleHTTP(w, r, nil, "")
 }
 
 // handleHTTP is the core HTTP request handler. tunnelInfo is non-nil only
-// when r originated inside a CONNECT/SOCKS5 tunnel.
-func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *transform.TunnelInfo) {
+// when r originated inside a CONNECT/SOCKS5 tunnel. tunnelUser is the
+// proxy-authenticated user of the carrying connection ("" when proxy
+// authentication is off or r arrived on the HTTP/HTTPS listeners).
+func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *transform.TunnelInfo, tunnelUser string) {
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
@@ -342,9 +365,10 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 	// Clone tunnelInfo so a transform that mutates the annotations map can't
 	// leak state into sibling requests that share the same tunnel.
 	tctx := &transform.TransformContext{
-		Logger: p.logger,
-		Mode:   transform.ModeMITM,
-		Tunnel: cloneTunnelInfo(tunnelInfo),
+		Logger:     p.logger,
+		Mode:       transform.ModeMITM,
+		Tunnel:     cloneTunnelInfo(tunnelInfo),
+		TunnelUser: tunnelUser,
 	}
 	if r.TLS != nil {
 		tctx.SNI = r.TLS.ServerName
@@ -365,6 +389,22 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 	if !p.isReady() {
 		markNotReady(result)
 		http.Error(w, notReadyMessage, http.StatusServiceUnavailable)
+		return
+	}
+
+	// The browser route marker is only meaningful on a CONNECT; anywhere
+	// else (absolute-form or direct requests) it is a client error.
+	if tunnelInfo == nil && r.Header.Get(browserRouteHeader) != "" {
+		markReject(result, http.StatusForbidden, browserRouteTrace, "invalid_marker")
+		p.logger.Info("request rejected by proxy",
+			slog.String("host", r.Host),
+			slog.String("method", r.Method),
+			slog.String("remote_addr", r.RemoteAddr),
+			slog.String("rejected_by", browserRouteTrace),
+			slog.String("reason", "invalid_marker"),
+			slog.Int("status", http.StatusForbidden),
+		)
+		http.Error(w, msgBrowserRouteMarker, http.StatusForbidden)
 		return
 	}
 
@@ -723,6 +763,7 @@ var hopByHopHeaders = []string{
 	"Keep-Alive",
 	"Proxy-Authenticate",
 	"Proxy-Authorization",
+	browserRouteHeader,
 	"Te",
 	"Trailer",
 	"Transfer-Encoding",

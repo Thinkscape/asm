@@ -98,6 +98,12 @@ func (b *BufferedBody) Truncated() bool {
 	return b.truncated
 }
 
+// MaxBytes returns the buffering limit the body was created with; 0 means
+// unlimited.
+func (b *BufferedBody) MaxBytes() int64 {
+	return b.maxBytes
+}
+
 // StreamingReader returns a reader for the final output (response write or
 // upstream send). If the body was never read by a transform, this returns the
 // original reader directly — no buffering occurs. If the body was buffered,

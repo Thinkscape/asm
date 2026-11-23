@@ -164,7 +164,7 @@ func startSNIPassthroughProxy(t *testing.T, allowed []string, upstream string) (
 	p, getResults := buildSNIProxy(t, allowed, false)
 	p.sniUpstreamPort = upstreamPort
 
-	addr := startAcceptLoop(t, func(c net.Conn) { _ = p.serveSNIPassthrough(c) })
+	addr := startAcceptLoop(t, func(c net.Conn) { _ = p.serveSNIPassthrough(c, "") })
 	return addr, getResults
 }
 
@@ -247,7 +247,7 @@ func TestSNIPassthrough_FailsClosedUntilReady(t *testing.T) {
 	p.ready = ready.Load
 	p.sniUpstreamPort = upstreamPort
 
-	proxyAddr := startAcceptLoop(t, func(c net.Conn) { _ = p.serveSNIPassthrough(c) })
+	proxyAddr := startAcceptLoop(t, func(c net.Conn) { _ = p.serveSNIPassthrough(c, "") })
 
 	conn, err := net.Dial("tcp", proxyAddr)
 	require.NoError(t, err)
@@ -334,7 +334,7 @@ func TestSNIPassthrough_ShutdownClosesInFlight(t *testing.T) {
 
 	done := make(chan struct{})
 	addr := startAcceptLoop(t, func(c net.Conn) {
-		_ = p.serveSNIPassthrough(c)
+		_ = p.serveSNIPassthrough(c, "")
 		close(done)
 	})
 

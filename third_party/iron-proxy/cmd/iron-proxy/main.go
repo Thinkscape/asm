@@ -173,7 +173,7 @@ func main() {
 
 	// Initialize cert cache. Not needed in sni-only mode since TLS is never
 	// terminated and no leaf certs are generated.
-	var certCache *certcache.Cache
+	var certCache, browserCertCache *certcache.Cache
 	if cfg.TLS.Mode != config.TLSModeSNIOnly {
 		leafExpiry := time.Duration(cfg.TLS.LeafCertExpiryHours) * time.Hour
 		certCache, err = certcache.New(cfg.TLS.CACert, cfg.TLS.CAKey, cfg.TLS.CertCacheSize, leafExpiry)
@@ -181,8 +181,22 @@ func main() {
 			logger.Error("initializing cert cache", slog.String("error", err.Error()))
 			os.Exit(1)
 		}
-	} else if cfg.TLS.CACert != "" || cfg.TLS.CAKey != "" {
-		logger.Warn("tls.ca_cert and tls.ca_key are ignored when tls.mode=sni-only")
+		// The browser CA (asm fork) signs leaves only for marked CONNECTs the
+		// pipeline approved; config.Validate ensures both paths or neither.
+		if cfg.TLS.BrowserCACert != "" {
+			browserCertCache, err = certcache.New(cfg.TLS.BrowserCACert, cfg.TLS.BrowserCAKey, cfg.TLS.CertCacheSize, leafExpiry)
+			if err != nil {
+				logger.Error("initializing browser cert cache", slog.String("error", err.Error()))
+				os.Exit(1)
+			}
+		}
+	} else {
+		if cfg.TLS.CACert != "" || cfg.TLS.CAKey != "" {
+			logger.Warn("tls.ca_cert and tls.ca_key are ignored when tls.mode=sni-only")
+		}
+		if cfg.TLS.BrowserCACert != "" {
+			logger.Warn("tls.browser_ca_cert and tls.browser_ca_key are ignored when tls.mode=sni-only")
+		}
 	}
 
 	// Build upstream resolver.
@@ -260,6 +274,8 @@ func main() {
 		TunnelAddr:                    cfg.Proxy.TunnelListen,
 		TLSMode:                       cfg.TLS.Mode,
 		CertCache:                     certCache,
+		BrowserCertCache:              browserCertCache,
+		AuthFile:                      cfg.Proxy.AuthFile,
 		Pipeline:                      holder,
 		Resolver:                      resolver,
 		Guard:                         guard,
