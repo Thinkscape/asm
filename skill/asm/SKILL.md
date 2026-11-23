@@ -7,7 +7,8 @@ description: "Request access to secrets such as API keys, access tokens, login c
 
 This skill ships inside the `asm` binary. `asm skill install` writes it to
 `~/.agents/skills/asm/SKILL.md` (`--dir DIR` for other skill folders); run it again after
-upgrading `asm` to keep this file in step with the CLI.
+upgrading `asm` to keep this file in step with the CLI. Setting up a machine or a browser,
+reinstalling and fixing failures are covered in `SETUP.md` next to this file.
 
 ## Workflow
 
@@ -145,11 +146,13 @@ Response redaction is best effort.
 ## Browser logins
 
 Sign in to websites in a browser you drive (the user's Chrome, T3 Code preview tabs,
-OpenBot profiles) without ever seeing the password.
+OpenBot agents) without ever seeing the password. Run every browser-login `asm` command on
+the machine where that browser runs.
 
-**Setup**, once per machine where the browser runs (the operator may need to do it):
-`asm browser install chrome|t3code|openbot` (OpenBot also needs `--trust-user-wide`), then
-restart that browser. Run every browser-login `asm` command on that same machine.
+**Setup** happens once per machine and browser: `asm browser install chrome|t3code|openbot`,
+then restart that browser. `asm browser status` shows what is installed. For per-browser
+steps, reinstalling, the proxy router and fixing failures, read `SETUP.md` next to this file
+(`asm skill install --print-setup` prints it).
 
 Already signed in? Do nothing. Otherwise:
 
@@ -183,13 +186,8 @@ Already signed in? Do nothing. Otherwise:
 | `403 sentinel expired or revoked` | Already used or ended; request a new grant. |
 | `403 this login grant belongs to another machine` | Request it on the browser's machine. |
 | `503 login secret unavailable` | The vault is locked; tell the operator. |
-| `502 asm proxy-router: …` | Run `asm doctor`. |
-| Certificate error on the site | Run `asm browser status`; restart the browser after install. |
-| Every HTTPS page fails | The router is down; run `asm doctor`. |
-
-Diagnostics: `asm doctor`, `asm browser status`, and the router logs
-(`journalctl --user -u asm-proxy-router` on Linux, `~/Library/Logs/asm-proxy-router.log`
-on macOS).
+| `ERR_TUNNEL_CONNECTION_FAILED` on a third-party host | Not caused by the grant: that host is unreachable from this machine (often a DNS ad-block). Ignore it unless the sign-in needs it. |
+| Anything else (`502 asm proxy-router: …`, certificate errors, every HTTPS page failing, `T3 updated its browser`) | Run `asm doctor` and follow `SETUP.md`, section "Diagnose and fix". |
 
 ## Outcomes and safety
 

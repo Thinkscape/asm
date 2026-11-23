@@ -140,16 +140,17 @@ Tarballs are `asm-linux-x86_64`, `asm-linux-aarch64` and `asm-macos-universal`. 
 
 ### The agent skill
 
-The skill that teaches agents the asm workflow ([`skill/asm/SKILL.md`](skill/asm/SKILL.md)) is built into the `asm` binary, so the installed skill always matches the CLI version, however the CLI was installed:
+The skill that teaches agents the asm workflow ([`skill/asm/SKILL.md`](skill/asm/SKILL.md)) and its setup and troubleshooting guide ([`skill/asm/SETUP.md`](skill/asm/SETUP.md): pairing, `asm browser install` per browser, the proxy router, a symptom → fix table) are built into the `asm` binary, so the installed skill always matches the CLI version, however the CLI was installed:
 
 ```sh
-asm skill install                                          # ~/.agents/skills/asm/SKILL.md
+asm skill install                                          # ~/.agents/skills/asm/SKILL.md and SETUP.md
 asm skill install --dir ~/.claude/skills --dir ~/.agents/skills   # several skill folders
+asm skill install --print-setup                            # print SETUP.md (--print: SKILL.md)
 asm skill status                                           # installed (current|outdated), foreign, symlink or missing
 asm skill uninstall
 ```
 
-`asm skill install` prints `installed: <path>`, `updated: <path>` (the skill text changed), `updated (asm-version only): <path>` (same text, installed by another `asm` version) or `up to date: <path>`; it writes nothing when the file already matches. Run it again after upgrading `asm`. The installed file records its origin at the end of the frontmatter, in the Agent Skills `metadata` map:
+`asm skill install` prints `installed: <path>`, `updated: <path>` (the skill or guide text changed), `updated (asm-version only): <path>` (same text, installed by another `asm` version) or `up to date: <path>`; it writes nothing when both files already match. Run it again after upgrading `asm`. `SETUP.md` belongs to the asm-installed `SKILL.md` beside it and is written and removed with it. The installed `SKILL.md` records its origin at the end of the frontmatter, in the Agent Skills `metadata` map:
 
 ```yaml
 metadata:
@@ -249,7 +250,7 @@ Install saves the manager's **browser CA** (`/proxy-info`), installs `asm proxy-
 
 - **chrome**: a CA row in the profile's `ServerCertificate` database and a PAC `proxy` preference. Restart Chrome once.
 - **t3code**: wraps each version of T3's `chrome-headless-shell` with `--proxy-server`; on Linux the CA goes into a private NSS database (needs `certutil`: `libnss3-tools` / `nss-tools`), on macOS into the login keychain. Takes effect the next time T3 starts its browser. When T3 downloads a newer browser, run the install again; `asm browser status`, `asm doctor` and `asm get --login-url` say so.
-- **openbot**: the CA goes into the user's trust store (`~/.pki/nssdb`, else `~/.local/share/pki/nssdb`, on Linux; the login keychain on macOS). In OpenBot, give a named browser profile the proxy `http://127.0.0.1:7418`, assign it to the agent and restart OpenBot. OpenBot's browsers run where its server runs: for a hosted server, install there as the server's user (for example `sudo -u openbot -H asm pair …` and `asm browser install openbot --trust-user-wide --no-service`) and run `asm proxy-router run --port 7418` as that user under a system service, since such users have no systemd user session.
+- **openbot**: the CA goes into the user's trust store (`~/.pki/nssdb`, else `~/.local/share/pki/nssdb`, on Linux; the login keychain on macOS). Route OpenBot's browser through the router either with a named browser profile (proxy `http://127.0.0.1:7418`, assigned to the agent, then restart OpenBot), or, on a Linux server, for the Shared and agent-only profiles too: OpenBot leaves those on the system proxy, so an `auto_proxy=<asm PAC>` environment variable on `openbot.service` routes them. OpenBot's browsers run where its server runs: for a hosted server, install there as the server's user (for example `sudo -u openbot -H asm pair …` and `asm browser install openbot --trust-user-wide --no-service`) and run `asm proxy-router run --port 7418` as that user under a system service, since such users have no systemd user session. [`SETUP.md`](skill/asm/SETUP.md) has the exact commands.
 
 The router sends only HTTPS to sites with an active login grant through the manager's proxy (marked with `Asm-Browser-Route: 1`) and everything else directly; HTTP always goes direct. While the router is down, HTTPS pages in configured browsers fail rather than bypass it. The proxy issues browser-CA certificates only for a granted site. Install refuses a browser that already uses another proxy. `asm browser uninstall <target>` restores the previous setting when nobody changed it since, and removes the router with the last install.
 
@@ -334,7 +335,7 @@ Commands:
 |`asm browser uninstall <chrome\|t3code\|openbot>`|chrome: `--profile`, `--user-data-dir`|Restores the setting asm replaced, unless it changed since (then `… was changed after install; left as is`). Removing the last install removes the router service and its routes.|
 |`asm browser status`|`--json`|One line per install: `installed`, `incomplete <reason> — fix: <command>` or `stale CA — fix: …`, plus the router line.|
 |`asm login <URL> [ITEM] --reason <REASON>`|`--fill-origin <https://host[:port]>` (repeatable, at most 5), `--wait <SECS>` (default 900), `--json`|The operator approves, the manager opens Chrome on the Mac and fills the vault login (never submits); the operator signs in and clicks **Hand over session**. Writes a Playwright storage state (cookies valid for the URL's host and for each approved `--fill-origin` host, so a separate sign-in service such as `clerk.example.com` keeps its session; the URL origin's localStorage) as a raw lease file and prints its path and cookie domains.|
-|`asm skill install`|`--dir <DIR>` (repeatable; default `~/.agents/skills`)<br>`--force`: replace a skill not installed by asm, or an `asm` symlink<br>`--print`: print the embedded `SKILL.md` instead|Writes `<DIR>/asm/SKILL.md` (folders 0755, file 0644). Prints `installed: …`, `updated: …`, `updated (asm-version only): …` or `up to date: …` per folder; refusals go to stderr and make the exit code 1. See [The agent skill](#the-agent-skill).|
+|`asm skill install`|`--dir <DIR>` (repeatable; default `~/.agents/skills`)<br>`--force`: replace a skill not installed by asm, or an `asm` symlink<br>`--print`: print the embedded `SKILL.md` instead<br>`--print-setup`: print the embedded `SETUP.md` instead|Writes `<DIR>/asm/SKILL.md` and `<DIR>/asm/SETUP.md` (folders 0755, files 0644). Prints `installed: …`, `updated: …`, `updated (asm-version only): …` or `up to date: …` per folder; refusals go to stderr and make the exit code 1. See [The agent skill](#the-agent-skill).|
 |`asm skill uninstall`|`--dir <DIR>` (repeatable)|Removes `<DIR>/asm/SKILL.md` only when asm installed it, then the `asm` folder when empty. Prints `removed: …`, `not installed: …` or `left alone (…): …`; exit 0.|
 |`asm skill status`|`--dir <DIR>` (repeatable)<br>`--json`|One line per folder: `installed (current)` or `installed (outdated)` with the installed `asm-version`, `foreign`, `symlink` or `missing`. `--json` adds `installed_version` and this CLI's `version`. Exit 0.|
 

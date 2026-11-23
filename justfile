@@ -84,7 +84,7 @@ install-cli-remote host: cli
 
 skill:
     mkdir -p dist/skill/asm
-    cp skill/asm/SKILL.md dist/skill/asm/SKILL.md
+    cp skill/asm/SKILL.md skill/asm/SETUP.md dist/skill/asm/
 
 dist: app cli skill
 

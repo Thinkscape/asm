@@ -33,7 +33,7 @@ mkdir -p "$dir/skill/asm"
 cp "$binary" "$dir/asm"
 chmod 0755 "$dir/asm"
 cp README.md LICENSE "$dir/"
-cp skill/asm/SKILL.md "$dir/skill/asm/SKILL.md"
+cp skill/asm/SKILL.md skill/asm/SETUP.md "$dir/skill/asm/"
 # COPYFILE_DISABLE and --no-xattrs keep macOS tar from adding AppleDouble (._*) entries and
 # extended attributes (com.apple.provenance) that GNU tar warns about.
 COPYFILE_DISABLE=1 tar --no-xattrs -C "$stage" -czf "$outdir/asm-$target.tar.gz" "asm-$target"

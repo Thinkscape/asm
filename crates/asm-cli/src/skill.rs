@@ -1,10 +1,12 @@
 //! `asm skill`: install the agent skill embedded in this binary into agents' skill folders
-//! (`<DIR>/asm/SKILL.md`, default DIR `~/.agents/skills`).
+//! (`<DIR>/asm/SKILL.md` and its companion `<DIR>/asm/SETUP.md`, default DIR
+//! `~/.agents/skills`).
 //!
-//! An installed file carries `installed-by: asm` and `asm-version` under the frontmatter's
-//! `metadata` map (the Agent Skills spec's place for client properties); only files with
-//! `installed-by: asm` are updated or removed without `--force`. Content is compared with the
-//! version value normalised, so a version-only difference is reported as such.
+//! An installed `SKILL.md` carries `installed-by: asm` and `asm-version` under the
+//! frontmatter's `metadata` map (the Agent Skills spec's place for client properties); only
+//! files with `installed-by: asm` are updated or removed without `--force`. Content is compared
+//! with the version value normalised, so a version-only difference is reported as such.
+//! `SETUP.md` belongs to the asm-installed `SKILL.md` beside it: written and removed with it.
 
 use crate::error::CliError;
 use asm_proto::error::EXIT_FAILURE;
@@ -17,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 /// The skill, as shipped with this CLI version.
 pub const SKILL: &str = include_str!("../../../skill/asm/SKILL.md");
+/// Setup and troubleshooting guide the skill refers to, installed beside it.
+pub const SETUP: &str = include_str!("../../../skill/asm/SETUP.md");
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MANAGED_KEY: &str = "installed-by";
@@ -24,6 +28,7 @@ const MANAGED_VALUE: &str = "asm";
 const VERSION_KEY: &str = "asm-version";
 const SKILL_DIR: &str = "asm";
 const SKILL_FILE: &str = "SKILL.md";
+const SETUP_FILE: &str = "SETUP.md";
 
 #[derive(Subcommand)]
 pub enum SkillCommand {
@@ -35,8 +40,11 @@ pub enum SkillCommand {
         #[arg(long, conflicts_with = "print")]
         force: bool,
         /// Print the embedded SKILL.md to stdout instead of installing it.
-        #[arg(long, conflicts_with = "dir")]
+        #[arg(long, conflicts_with_all = ["dir", "print_setup"])]
         print: bool,
+        /// Print the embedded SETUP.md (setup and troubleshooting) instead of installing.
+        #[arg(long, conflicts_with_all = ["dir", "force"])]
+        print_setup: bool,
     },
     /// Remove the asm skill from skill folders (only files installed by asm).
     Uninstall {
@@ -74,6 +82,10 @@ pub fn run(cmd: SkillCommand) -> Result<(), CliError> {
     match cmd {
         SkillCommand::Install { print: true, .. } => {
             print!("{SKILL}");
+            Ok(())
+        }
+        SkillCommand::Install { print_setup: true, .. } => {
+            print!("{SETUP}");
             Ok(())
         }
         SkillCommand::Install { dirs, force, .. } => {
@@ -332,13 +344,20 @@ pub fn status(dir: &Path) -> (State, Option<String>) {
             None => (State::Foreign, None),
             Some(version) => {
                 let state = match compare(&content, version.as_deref()) {
-                    Outcome::UpToDate => State::Current,
+                    Outcome::UpToDate if setup_current(&dir.join(SKILL_DIR)) => State::Current,
                     _ => State::Outdated,
                 };
                 (state, version)
             }
         },
     }
+}
+
+/// Whether `<sub>/SETUP.md` is a regular file with this CLI's guide.
+fn setup_current(sub: &Path) -> bool {
+    let path = sub.join(SETUP_FILE);
+    fs::symlink_metadata(&path).is_ok_and(|m| m.is_file())
+        && fs::read(&path).is_ok_and(|bytes| bytes == SETUP.as_bytes())
 }
 
 static SKILL_RENDERED: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| render(VERSION));
@@ -376,7 +395,8 @@ pub fn install(dir: &Path, force: bool) -> Result<(Outcome, PathBuf), String> {
     let outcome = match inspect(dir)? {
         Found::File(content) => match managed(&content) {
             Some(version) => match compare(&content, version.as_deref()) {
-                Outcome::UpToDate => return Ok((Outcome::UpToDate, path)),
+                Outcome::UpToDate if setup_current(&sub) => return Ok((Outcome::UpToDate, path)),
+                Outcome::UpToDate => Outcome::Updated,
                 outcome => outcome,
             },
             None if force => Outcome::Updated,
@@ -417,6 +437,12 @@ pub fn install(dir: &Path, force: bool) -> Result<(Outcome, PathBuf), String> {
         }
     };
     write_atomic(&sub, &path, SKILL_RENDERED.as_bytes())?;
+    if setup_current(&sub) {
+        return Ok((outcome, path));
+    }
+    write_atomic(&sub, &sub.join(SETUP_FILE), SETUP.as_bytes())?;
+    // A changed guide is a content update, not a version-only one.
+    let outcome = if outcome == Outcome::VersionOnly { Outcome::Updated } else { outcome };
     Ok((outcome, path))
 }
 
@@ -441,7 +467,8 @@ fn write_atomic(sub: &Path, path: &Path, bytes: &[u8]) -> Result<(), String> {
         Ok(_) => return Err(format!("error: {} is no longer a directory", sub.display())),
         Err(e) => return Err(io_message("inspecting", sub, &e)),
     }
-    let tmp = sub.join(format!(".{SKILL_FILE}.{}.tmp", std::process::id()));
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = sub.join(format!(".{name}.{}.tmp", std::process::id()));
     let result = (|| {
         let _ = fs::remove_file(&tmp);
         let mut file = fs::OpenOptions::new()
@@ -482,6 +509,14 @@ pub fn uninstall(dir: &Path) -> Result<Removal, String> {
         }
         Found::File(_) => {
             fs::remove_file(&path).map_err(|e| io_message("removing", &path, &e))?;
+            // SETUP.md belongs to the asm-installed SKILL.md; a symlink there is removed,
+            // never what it points to.
+            let setup = sub.join(SETUP_FILE);
+            match fs::remove_file(&setup) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(io_message("removing", &setup, &e)),
+            }
             // Only an empty directory goes; anything the user put beside SKILL.md stays.
             let _ = fs::remove_dir(&sub);
             Ok(Removal::Removed(path))
@@ -565,8 +600,27 @@ mod tests {
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir.join("asm")), 0o755);
         assert_eq!(mode(&skill_path(&dir)), 0o644);
+        assert_eq!(fs::read_to_string(dir.join("asm/SETUP.md")).unwrap(), SETUP);
+        assert_eq!(mode(&dir.join("asm/SETUP.md")), 0o644);
         assert_eq!(status(&dir), (State::Current, Some(VERSION.to_string())));
         assert_eq!(install(&dir, false).unwrap().0, Outcome::UpToDate);
+    }
+
+    #[test]
+    fn setup_guide_follows_the_skill() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path();
+        install(dir, false).unwrap();
+        let setup = dir.join("asm/SETUP.md");
+        fs::write(&setup, "edited\n").unwrap();
+        assert_eq!(status(dir).0, State::Outdated, "a changed guide is outdated");
+        assert_eq!(install(dir, false).unwrap().0, Outcome::Updated);
+        assert_eq!(fs::read_to_string(&setup).unwrap(), SETUP);
+        fs::remove_file(&setup).unwrap();
+        assert_eq!(status(dir).0, State::Outdated, "a missing guide is outdated");
+        assert_eq!(install(dir, false).unwrap().0, Outcome::Updated);
+        assert!(matches!(uninstall(dir).unwrap(), Removal::Removed(_)));
+        assert!(!dir.join("asm").exists(), "the guide goes with the skill");
     }
 
     #[test]
@@ -574,6 +628,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         fs::create_dir(t.path().join("asm")).unwrap();
         fs::write(skill_path(t.path()), render("0.0.1")).unwrap();
+        fs::write(t.path().join("asm/SETUP.md"), SETUP).unwrap();
         assert_eq!(status(t.path()), (State::Outdated, Some("0.0.1".into())));
         assert_eq!(install(t.path(), false).unwrap().0, Outcome::VersionOnly);
         assert_eq!(read(t.path()), *SKILL_RENDERED);

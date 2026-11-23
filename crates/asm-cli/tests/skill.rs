@@ -241,4 +241,8 @@ fn print_outputs_embedded_skill() {
     assert!(o.status.success());
     assert_eq!(out(&o), SKILL);
     assert!(!home.path().join(".agents").exists());
+    let o = asm(home.path(), &["skill", "install", "--print-setup"]);
+    assert!(o.status.success());
+    assert_eq!(out(&o), include_str!("../../../skill/asm/SETUP.md"));
+    assert!(!home.path().join(".agents").exists());
 }

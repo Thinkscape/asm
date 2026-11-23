@@ -1307,7 +1307,7 @@ fn install_openbot(trust_user_wide_ok: bool, r: RouterArgs) -> Result<(), CliErr
     save_records(&records)?;
     no_service_hint(service, port);
     println!(
-        "In OpenBot: create a named browser profile, set its proxy to http://127.0.0.1:{port}, assign it to your agents (shared and agent-only profiles cannot use a proxy). Restart OpenBot."
+        "In OpenBot: create a named browser profile, set its proxy to http://127.0.0.1:{port}, assign it to your agents, and restart OpenBot. OpenBot can't put a proxy on the Shared or agent-only profiles; on a Linux server an auto_proxy setting on the OpenBot service routes those too (asm skill install --print-setup, section OpenBot)."
     );
     Ok(())
 }

@@ -40,3 +40,7 @@ contents:
     dst: /usr/share/asm/skill/asm/SKILL.md
     file_info:
       mode: 0644
+  - src: skill/asm/SETUP.md
+    dst: /usr/share/asm/skill/asm/SETUP.md
+    file_info:
+      mode: 0644
