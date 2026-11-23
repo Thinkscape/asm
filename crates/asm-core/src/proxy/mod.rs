@@ -5,6 +5,7 @@
 //! (public mutators and the monitor's restart). `state` is only held briefly.
 
 pub mod audit;
+mod browser_ca;
 mod ca;
 mod config;
 mod files;
@@ -25,12 +26,13 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
-use asm_proto::crypto::{new_token, sha256_hex};
+use asm_proto::crypto::{new_token, proxy_password, sha256_hex};
 use asm_proto::rules::is_sentinel;
 use asm_proto::time::now_rfc3339;
 
 use crate::error::{CoreError, Result};
 use crate::paths::DataDirs;
+use crate::store::Store;
 
 pub use audit::ProxyEvent;
 pub use config::DEFAULT_DENY_CIDRS;
@@ -52,6 +54,8 @@ pub struct ProxyConfig {
     pub metrics_port: u16,
     pub max_body: u64,
     pub allow_plain_http: bool,
+    /// Tunnel clients must authenticate with per-host credentials (`proxy.auth_file`).
+    pub require_auth: bool,
     /// `None` = [`DEFAULT_DENY_CIDRS`].
     pub upstream_deny_cidrs: Option<Vec<String>>,
 }
@@ -67,6 +71,7 @@ impl Default for ProxyConfig {
             metrics_port: 7416,
             max_body: 10_485_760,
             allow_plain_http: false,
+            require_auth: false,
             upstream_deny_cidrs: None,
         }
     }
@@ -80,6 +85,8 @@ pub struct ProxyEntry {
     pub sentinel: String,
     pub value: String,
     pub hosts: Vec<String>,
+    /// Set for the single-use password entry of a login grant (exactly one host).
+    pub login: Option<LoginBinding>,
 }
 
 impl std::fmt::Debug for ProxyEntry {
@@ -90,8 +97,27 @@ impl std::fmt::Debug for ProxyEntry {
             .field("sentinel", &self.sentinel)
             .field("value", &REDACTED)
             .field("hosts", &self.hosts)
+            .field("login", &self.login)
             .finish()
     }
+}
+
+/// The exact form submission a login entry's sentinel may be substituted in, and the
+/// paired host allowed to redeem it (checked when proxy authentication is on).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginBinding {
+    pub port: u16,
+    /// Escaped path plus `?query` when present.
+    pub target: String,
+    pub owner: String,
+}
+
+/// A `(host, port)` a marked browser CONNECT may be routed to until `until` (Unix s).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserRoute {
+    pub host: String,
+    pub port: u16,
+    pub until: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +149,12 @@ const LOG_DRAIN: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(250);
 const HEALTH_EVERY_TICKS: u32 = 8;
 const PID_FILE: &str = "iron-proxy.pid";
+/// Per-host proxy credentials (`proxy.auth_file`): `<host id>:<hex sha256(password)>`.
+const AUTH_FILE: &str = "proxy-auth";
+/// Durable single-use claims of login entries, outside the values directory.
+const CLAIMS_DIR: &str = "login-claims";
+/// Claim files of a lease are kept this long after it ended.
+const CLAIM_KEEP_SECS: i64 = 3600;
 
 struct Running {
     child: Child,
@@ -146,6 +178,8 @@ struct Failure {
 struct State {
     cfg: ProxyConfig,
     entries: Vec<ProxyEntry>,
+    /// Desired browser routes; rendered with `entries` by every config write.
+    routes: Vec<BrowserRoute>,
     /// Desired entries have not yet been successfully published. No restart may use
     /// the on-disk config until these entries and their values have been rewritten.
     apply_pending: bool,
@@ -170,6 +204,7 @@ pub struct ProxySupervisor {
     dirs: DataDirs,
     ca: ca::CaPaths,
     ca_expiry: Option<String>,
+    browser_ca: ca::CaPaths,
     on_change: Arc<dyn Fn() + Send + Sync>,
     on_event: EventSink,
     logs: Arc<logs::LogSink>,
@@ -185,21 +220,24 @@ impl ProxySupervisor {
     /// Ensure the CA, write config and value files for `entries`, spawn iron-proxy and
     /// start the restart-with-backoff monitor. Succeeds even when the binary cannot be
     /// spawned (the status carries the error); fails when the CA cannot be created.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         bin_dir: PathBuf,
         dirs: DataDirs,
+        store: &Store,
         cfg: ProxyConfig,
         entries: Vec<ProxyEntry>,
+        routes: Vec<BrowserRoute>,
         on_change: Arc<dyn Fn() + Send + Sync>,
         on_event: EventSink,
     ) -> Result<Arc<Self>> {
-        let sup = Self::prepare(bin_dir, dirs, cfg, on_change, on_event)?;
-        sup.activate(entries)?;
+        let sup = Self::prepare(bin_dir, dirs, cfg, store, on_change, on_event)?;
+        sup.activate(entries, routes)?;
         Ok(sup)
     }
 
     pub(crate) fn prepare(
-        bin_dir: PathBuf, dirs: DataDirs, cfg: ProxyConfig,
+        bin_dir: PathBuf, dirs: DataDirs, cfg: ProxyConfig, store: &Store,
         on_change: Arc<dyn Fn() + Send + Sync>, on_event: EventSink,
     ) -> Result<Arc<Self>> {
         let binary = bin_dir.join("iron-proxy");
@@ -208,6 +246,10 @@ impl ProxySupervisor {
             .ok()
             .and_then(|pem| ca::pem_to_der(&pem).ok())
             .and_then(|der| ca::not_after(&der));
+        let browser_ca = browser_ca::ensure(&dirs.proxy)?;
+        let claims = dirs.proxy.join(CLAIMS_DIR);
+        crate::paths::ensure_private_dir(&claims)?;
+        prune_claims(&claims, store, crate::manager::now());
         // Dummy value file of the ended-sentinel entries of earlier versions.
         let _ = std::fs::remove_file(dirs.proxy.join("blocked.value"));
 
@@ -216,12 +258,14 @@ impl ProxySupervisor {
             binary,
             ca,
             ca_expiry,
+            browser_ca,
             on_change,
             on_event,
             ops: Mutex::new(()),
             state: Mutex::new(State {
                 cfg,
                 entries: Vec::new(),
+                routes: Vec::new(),
                 apply_pending: false,
                 sentinels: files::SentinelStore::load(&dirs.proxy),
                 child: None,
@@ -239,7 +283,7 @@ impl ProxySupervisor {
         }))
     }
 
-    pub(crate) fn activate(self: &Arc<Self>, entries: Vec<ProxyEntry>) -> Result<()> {
+    pub(crate) fn activate(self: &Arc<Self>, entries: Vec<ProxyEntry>, routes: Vec<BrowserRoute>) -> Result<()> {
         validate_entries(&entries)?;
         let sup = self;
         {
@@ -248,7 +292,11 @@ impl ProxySupervisor {
             sup.logs
                 .set_redactor(redact::Redactor::new(&values_of(&entries)));
             sup.write_files(&entries)?;
-            let cfg = lock(&sup.state).cfg.clone();
+            let cfg = {
+                let mut st = lock(&sup.state);
+                st.routes = routes;
+                st.cfg.clone()
+            };
             sup.write_config(&cfg, &entries)?;
             lock(&sup.state).entries = entries;
             if let Err(e) = sup.spawn_locked() {
@@ -265,10 +313,11 @@ impl ProxySupervisor {
         Ok(())
     }
 
-    /// Replace the full entry set: write/delete value files, rewrite the config, reload;
-    /// on any failure stop the child and retry the desired set with backoff.
-    pub fn apply(&self, entries: Vec<ProxyEntry>) -> Result<()> {
-        let result = self.apply_deferred(entries);
+    /// Replace the full entry and browser route set: write/delete value files, rewrite
+    /// the config, reload; on any failure stop the child and retry the desired set with
+    /// backoff.
+    pub fn apply(&self, entries: Vec<ProxyEntry>, routes: Vec<BrowserRoute>) -> Result<()> {
+        let result = self.apply_deferred(entries, routes);
         self.notify_changed();
         result
     }
@@ -277,17 +326,19 @@ impl ProxySupervisor {
     /// [`Self::notify_changed`] after releasing the caller's authorization/state locks,
     /// whether publication succeeds or fails. Lifecycle events retain their existing
     /// nonblocking [`EventSink`] contract.
-    pub fn apply_deferred(&self, entries: Vec<ProxyEntry>) -> Result<()> {
+    pub fn apply_deferred(&self, entries: Vec<ProxyEntry>, routes: Vec<BrowserRoute>) -> Result<()> {
         let _ops = lock(&self.ops);
-        self.apply_locked(entries)
+        self.apply_locked(entries, routes)
     }
 
     /// Drop existing client connections before publishing replacement entries.
     /// As with `apply_deferred`, automatic recovery only uses the new desired set.
-    pub(crate) fn apply_after_stopping_deferred(&self, entries: Vec<ProxyEntry>) -> Result<()> {
+    pub(crate) fn apply_after_stopping_deferred(
+        &self, entries: Vec<ProxyEntry>, routes: Vec<BrowserRoute>,
+    ) -> Result<()> {
         let _ops = lock(&self.ops);
         self.kill_locked();
-        self.apply_locked(entries)
+        self.apply_locked(entries, routes)
     }
 
     /// Deliver the observer notification deferred by [`Self::apply_deferred`].
@@ -296,12 +347,14 @@ impl ProxySupervisor {
         self.notify();
     }
 
-    fn apply_locked(&self, entries: Vec<ProxyEntry>) -> Result<()> {
+    fn apply_locked(&self, entries: Vec<ProxyEntry>, routes: Vec<BrowserRoute>) -> Result<()> {
         let (cfg, running, old_values) = {
-            let st = lock(&self.state);
+            let mut st = lock(&self.state);
             if st.shutdown {
                 return Err(CoreError::internal("proxy supervisor is shut down"));
             }
+            // Like the entries below, retained even when the rewrite fails.
+            st.routes = routes;
             (st.cfg.clone(), st.child.is_some(), values_of(&st.entries))
         };
         // Until the old child is gone, lines may still mention ended values.
@@ -509,6 +562,25 @@ impl ProxySupervisor {
         Ok(sha256_hex(ca::pem_to_der(&self.ca_pem()?)?))
     }
 
+    /// PEM of the browser CA that `asm browser install` adds to browsers.
+    pub fn browser_ca_pem(&self) -> Result<String> {
+        Ok(std::fs::read_to_string(&self.browser_ca.cert)?)
+    }
+
+    /// Replace the proxy credentials file with one line per `(host id, token hash)`:
+    /// `<id>:<hex sha256(proxy_password(token hash))>`. An empty list denies everyone.
+    pub fn write_auth_users(&self, users: &[(String, [u8; 32])]) -> Result<()> {
+        let mut lines = String::with_capacity(users.len() * 104);
+        for (id, hash) in users {
+            lines.push_str(id);
+            lines.push(':');
+            lines.push_str(&sha256_hex(proxy_password(hash)));
+            lines.push('\n');
+        }
+        files::write_private_atomic(&self.dirs.proxy, AUTH_FILE, lines.as_bytes())?;
+        Ok(())
+    }
+
     /// Kill the child (process group) and delete every value file.
     pub fn shutdown(&self) {
         {
@@ -563,14 +635,23 @@ impl ProxySupervisor {
         files::prune_dir(&self.dirs.values, &keep);
     }
 
-    /// Record the active sentinel set, then render and atomically write the config.
+    /// Durable claim file of a login entry (created by iron-proxy on first use).
+    fn claim_path(&self, e: &ProxyEntry) -> PathBuf {
+        self.dirs
+            .proxy
+            .join(CLAIMS_DIR)
+            .join(claim_file_name(&e.lease_id, e.index))
+    }
+
+    /// Record the active sentinel set, then render the desired entries and browser
+    /// routes and atomically write the config.
     fn write_config(&self, cfg: &ProxyConfig, entries: &[ProxyEntry]) -> Result<()> {
-        let ended = {
+        let (ended, routes) = {
             let mut st = lock(&self.state);
             let active: Vec<&str> = entries.iter().map(|e| e.sentinel.as_str()).collect();
             st.sentinels.update(&active);
             st.sentinels.save(&self.dirs.proxy)?;
-            st.sentinels.ended()
+            (st.sentinels.ended(), st.routes.clone())
         };
         let render: Vec<config::RenderEntry<'_>> = entries
             .iter()
@@ -581,14 +662,20 @@ impl ProxySupervisor {
                     .join(files::value_file_name(&e.lease_id, e.index)),
                 sentinel: &e.sentinel,
                 hosts: &e.hosts,
+                login: e.login.as_ref(),
+                claim_path: e.login.as_ref().map(|_| self.claim_path(e)),
             })
             .collect();
         let yaml = config::render(&config::RenderInput {
             cfg,
             ca_cert: &self.ca.cert,
             ca_key: &self.ca.key,
+            browser_ca_cert: &self.browser_ca.cert,
+            browser_ca_key: &self.browser_ca.key,
+            auth_file: &self.dirs.proxy.join(AUTH_FILE),
             entries: &render,
             ended: &ended,
+            routes: &routes,
         });
         let path = config::config_path(&self.dirs);
         let name = path
@@ -992,6 +1079,40 @@ fn values_of(entries: &[ProxyEntry]) -> Vec<String> {
     entries.iter().map(|e| e.value.clone()).collect()
 }
 
+/// `<lease>.<index>.claim`: the claim file of the login entry `(lease_id, index)`.
+fn claim_file_name(lease_id: &str, index: usize) -> String {
+    format!("{}.claim", files::value_file_name(lease_id, index))
+}
+
+/// Delete claim files whose lease no longer exists or ended more than
+/// [`CLAIM_KEEP_SECS`] ago. A claim is the only record that a login sentinel was
+/// used, so files are kept whenever the lease cannot be read.
+fn prune_claims(dir: &std::path::Path, store: &Store, now: i64) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some((lease_id, _)) = name
+            .strip_suffix(".claim")
+            .and_then(|stem| stem.rsplit_once('.'))
+        else {
+            continue;
+        };
+        let stale = match store.get_lease(lease_id) {
+            Ok(None) => true,
+            Ok(Some(lease)) => lease
+                .revoked_at
+                .into_iter()
+                .chain(lease.expires_at)
+                .min()
+                .is_some_and(|ended| ended + CLAIM_KEEP_SECS <= now),
+            Err(_) => false,
+        };
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 fn validate_entries(entries: &[ProxyEntry]) -> Result<()> {
     let mut seen = HashSet::new();
     for e in entries {
@@ -1010,6 +1131,12 @@ fn validate_entries(entries: &[ProxyEntry]) -> Result<()> {
         if e.hosts.is_empty() || e.hosts.iter().any(|h| h.is_empty()) {
             return Err(CoreError::invalid(format!(
                 "proxy entry {}.{}: no hosts",
+                e.lease_id, e.index
+            )));
+        }
+        if e.login.is_some() && e.hosts.len() != 1 {
+            return Err(CoreError::invalid(format!(
+                "proxy entry {}.{}: a login entry has exactly one host",
                 e.lease_id, e.index
             )));
         }

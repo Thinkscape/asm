@@ -11,9 +11,10 @@ use asm_proto::generators::{
     GithubPermission, GithubScopeRequest,
 };
 use asm_proto::names::{canonical_generated_output, generated_output};
+use asm_proto::rules::LoginTarget;
 use asm_proto::wire::{
-    CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1,
-    GetResult, LeaseInfo, LeaseMode, LeaseStatus, LeasesResponse, MAX_POLL_WAIT_SECS, RequestBody,
+    CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_LOGIN_GRANT_V1,
+    GetResult, LeaseInfo, LeaseMode, LeaseStatus, LeasesResponse, LoginScope, MAX_POLL_WAIT_SECS, RequestBody,
     RequestResult, RequestState, RequestStatus, RequestedMode, SecretsResponse, WriteResult,
 };
 use serde::Serialize;
@@ -180,7 +181,7 @@ impl Backoff {
 }
 
 /// Submit without filesystem side effects. One deadline covers POST, polling and backoff.
-fn submit(
+pub(crate) fn submit(
     api: &Api,
     body: &RequestBody,
     deadline: Option<Instant>,
@@ -390,6 +391,8 @@ struct JsonGet<'a> {
     generator_name: &'a Option<String>,
     credential_expires_at: &'a Option<String>,
     credential_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    login: Option<&'a LoginScope>,
     files: Vec<JsonFile<'a>>,
 }
 
@@ -519,14 +522,33 @@ pub struct GetArgs {
     /// Ask for a new generated authorization instead of reusing one.
     #[arg(long, conflicts_with_all = ["lease", "refresh"])]
     pub new_lease: bool,
+    /// Ask for a single-use login grant for this exact HTTPS form action (the URL the
+    /// login form submits to). NAME is then optional: the manager infers the vault
+    /// login from the URL's host.
+    #[arg(long, value_name = "URL", conflicts_with_all = [
+        "raw", "sentinel", "hosts", "lease", "refresh", "new_lease",
+        "repositories", "project", "permissions", "gcloud_scopes",
+    ])]
+    pub login_url: Option<String>,
+    /// Why you need access (instead of the REASON argument).
+    #[arg(long = "reason", value_name = "TEXT", conflicts_with = "reason")]
+    pub reason_flag: Option<String>,
     /// [DEST=]SOURCE[::FIELD].
-    pub name: String,
+    #[arg(required_unless_present = "login_url")]
+    pub name: Option<String>,
     /// Why you need access.
-    pub reason: String,
+    #[arg(required_unless_present_any = ["login_url", "reason_flag"])]
+    pub reason: Option<String>,
 }
 
 pub fn get(a: GetArgs) -> Result<(), CliError> {
-    let reason = asm_proto::rules::validate_reason(&a.reason)?;
+    if let Some(url) = a.login_url.clone() {
+        return get_login(a, &url);
+    }
+    let (Some(name), Some(reason)) = (a.name.clone(), a.reason.clone().or(a.reason_flag.clone())) else {
+        return Err(CliError::invalid("asm get needs NAME and REASON"));
+    };
+    let reason = asm_proto::rules::validate_reason(&reason)?;
     let hosts = parse_hosts(&a.hosts)?;
     let mode = RequestedMode::from_flags(a.raw, a.sentinel)?;
     let selectors = a.generation_args.into_selectors(a.gcloud_scopes)?;
@@ -543,7 +565,7 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
         if !asm_proto::crypto::is_uuid(id) {
             return Err(CliError::invalid("invalid lease id"));
         }
-        let binding = asm_proto::bindings::parse_binding(&a.name)?;
+        let binding = asm_proto::bindings::parse_binding(&name)?;
         let lease = owned.leases.iter().find(|l| &l.lease_id == id)
             .ok_or_else(|| CliError::from(asm_proto::error::ApiError::new(ErrorCode::NotFound, "lease not found")))?;
         let selection = lease.generation.as_ref()
@@ -590,7 +612,7 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
         (binding, name, Some(selection.grant.output_name()), field.map(|f| vec![f]))
     } else {
         let entries = crate::bindings::catalog(&s.api)?;
-        let binding = asm_proto::bindings::parse_get_binding(&a.name, &entries)?;
+        let binding = asm_proto::bindings::parse_get_binding(&name, &entries)?;
         let resolved = crate::bindings::resolve(binding.clone(), &entries);
         match resolved {
             Ok(resolved) => {
@@ -663,6 +685,7 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
         hosts,
         reason: reason.clone(),
         agent: crate::hostinfo::agent_label(),
+        login: None,
     };
     body.canonicalize()?;
     let result = submit_get(&s.api, &body, deadline(a.wait), pinned, capabilities)
@@ -679,8 +702,25 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
     if stored.iter().any(|file| file.delivery != crate::delivery::Delivery::Raw) {
         crate::delivery::proxy_hint();
     }
+    print_get(a.json, &result, &stored);
+    if let Some(selection) = &result.generation {
+        let mode = if result.mode == LeaseMode::Sentinel { " --sentinel" } else { "" };
+        eprintln!("refresh: asm get --lease {} --refresh{} {} {}", result.lease_id, mode, crate::bindings::shell_quote(&name), crate::bindings::shell_quote(&reason));
+        if a.refresh {
+            match &selection.grant {
+                GenerationGrant::GithubApp(_) => eprintln!("warning: explicit refresh can invalidate tokens used by running consumers"),
+                GenerationGrant::Gcloud(_) | GenerationGrant::GcloudAccess(_) =>
+                    eprintln!("warning: previously released Google tokens may remain usable until credential expiry"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Print a stored get result: JSON (`--json`) or the text block.
+fn print_get(json: bool, result: &GetResult, stored: &[crate::files::StoredFile]) {
     let mut out = std::io::stdout().lock();
-    if a.json {
+    if json {
         let j = JsonGet {
             lease_id: &result.lease_id,
             mode: result.mode,
@@ -690,6 +730,7 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
             generator_name: &result.generator_name,
             credential_expires_at: &result.credential_expires_at,
             credential_version: result.credential_version,
+            login: result.login.as_ref(),
             files: stored
                 .iter()
                 .map(|f| JsonFile {
@@ -710,23 +751,199 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
             out,
             "{}",
             get_block(
-                &result,
+                result,
                 &stored.iter().map(|f| f.path.clone()).collect::<Vec<_>>()
             )
         );
     }
-    if let Some(selection) = &result.generation {
-        let mode = if result.mode == LeaseMode::Sentinel { " --sentinel" } else { "" };
-        eprintln!("refresh: asm get --lease {} --refresh{} {} {}", result.lease_id, mode, crate::bindings::shell_quote(&a.name), crate::bindings::shell_quote(&reason));
-        if a.refresh {
-            match &selection.grant {
-                GenerationGrant::GithubApp(_) => eprintln!("warning: explicit refresh can invalidate tokens used by running consumers"),
-                GenerationGrant::Gcloud(_) | GenerationGrant::GcloudAccess(_) =>
-                    eprintln!("warning: previously released Google tokens may remain usable until credential expiry"),
-            }
+}
+
+/// `asm get --login-url URL [ITEM] --reason TEXT`: a single-use login grant for one
+/// HTTPS form action, routed through asm by this machine's proxy router.
+fn get_login(a: GetArgs, url: &str) -> Result<(), CliError> {
+    let reason = a
+        .reason
+        .as_deref()
+        .or(a.reason_flag.as_deref())
+        .ok_or_else(|| CliError::invalid("--login-url needs a reason: --reason TEXT"))?;
+    let reason = asm_proto::rules::validate_reason(reason)?;
+    if let Some(name) = &a.name {
+        let binding = asm_proto::bindings::parse_binding(name)?;
+        if binding.field.is_some() || binding.destination.is_some() {
+            return Err(CliError::invalid("--login-url takes a whole login item"));
         }
     }
+    let target = asm_proto::rules::parse_login_url(url)?;
+    let canonical = target.canonical_url();
+    let s = Session::open()?;
+    let dir = s.secrets_dir()?;
+    if crate::router::status()?.is_none() {
+        return Err(CliError::failure(
+            "no asm proxy-router on this machine; the browser must run on this machine: asm browser install <target>",
+        ));
+    }
+    let capabilities = crate::bindings::require_capabilities(&s.api, false, false, Some(CAPABILITY_LOGIN_GRANT_V1))?;
+    s.sync_leases()?;
+    let name = match &a.name {
+        None => String::new(),
+        Some(spec) => {
+            let entries = crate::bindings::catalog(&s.api)?;
+            let binding = asm_proto::bindings::parse_get_binding(spec, &entries)?;
+            match crate::bindings::resolve(binding.clone(), &entries) {
+                Ok(r) if r.generated_output.is_some() => {
+                    return Err(CliError::invalid("--login-url needs a vault login item"));
+                }
+                Ok(r) => r.request_name,
+                Err(e) if e.code == Some(ErrorCode::NotFound) => binding.source,
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    if !name.is_empty() {
+        check_name(&name)?;
+    }
+    let mut client_capabilities = capabilities.client_capabilities(None, false, false);
+    client_capabilities.push(CAPABILITY_LOGIN_GRANT_V1.to_owned());
+    let mut body = RequestBody::Get {
+        name,
+        raw: false,
+        sentinel: false,
+        fields: None,
+        generation: None,
+        refresh: false,
+        refresh_from_version: None,
+        new_lease: false,
+        lease_id: None,
+        client_capabilities,
+        hosts: Vec::new(),
+        reason: reason.clone(),
+        agent: crate::hostinfo::agent_label(),
+        login: Some(LoginScope { url: canonical.clone() }),
+    };
+    body.canonicalize()?;
+    let result = submit_get(&s.api, &body, deadline(a.wait), None, capabilities)
+        .map_err(|e| if e.message == CliError::acquisition_elapsed().message { CliError::pending() } else { e })?;
+    let until = check_login_grant(&result, &canonical, &target.host)?;
+    let routed = route_barrier(&s, &target, until);
+    let stored = dir.store(&result)?;
+    crate::reaper::ensure_running(dir);
+    for file in &stored {
+        file.delivery.report(&file.relative_path);
+    }
+    print_get(a.json, &result, &stored);
+    routed?;
+    let totp = match result.files.iter().any(|f| f.field == "totp") {
+        true => {
+            let spec = match totp_item(&s, a.name.as_deref(), &result.lease_id) {
+                Some(item) => crate::bindings::shell_quote(&format!("{item}::totp")),
+                None => "<ITEM>::totp".to_owned(),
+            };
+            format!(
+                "; for a one-time code run: asm get {spec} --reason {}",
+                crate::bindings::shell_quote(&reason)
+            )
+        }
+        false => String::new(),
+    };
+    eprintln!("open or reload the login page now, type the username and the sentinel, submit once{totp}");
     Ok(())
+}
+
+/// The item spelling `asm get ITEM::totp` resolves: ITEM as the user gave it, else the
+/// catalog name the manager recorded on the lease (binding-escaped). `None` when the
+/// lease is not listed.
+fn totp_item(s: &Session, given: Option<&str>, lease_id: &str) -> Option<String> {
+    if let Some(name) = given {
+        return Some(name.to_owned());
+    }
+    let leases: LeasesResponse = s.api.get("/leases").ok()?;
+    leases
+        .leases
+        .into_iter()
+        .find(|l| l.lease_id == lease_id)
+        .map(|l| crate::bindings::binding_escape(&l.name))
+}
+
+/// The approved grant must be exactly the one requested: this form action, sentinel
+/// delivery for its host only, an expiry, a substituted password and at most a plain
+/// username and one-time code. Returns the expiry (unix time).
+fn check_login_grant(r: &GetResult, url: &str, host: &str) -> Result<i64, CliError> {
+    let wrong = || CliError::failure("the manager returned a different login grant than requested");
+    if r.login.as_ref().map(|l| l.url.as_str()) != Some(url)
+        || r.mode != LeaseMode::Sentinel
+        || r.hosts != [host]
+        || r.generation.is_some()
+    {
+        return Err(wrong());
+    }
+    let until = r
+        .expires_at
+        .as_deref()
+        .and_then(asm_proto::time::parse_unix)
+        .ok_or_else(wrong)?;
+    let mut password = false;
+    for f in &r.files {
+        match (f.field.as_str(), f.substituted) {
+            ("password", Some(true)) => password = true,
+            ("username" | "totp", Some(false)) => {}
+            _ => return Err(wrong()),
+        }
+    }
+    if !password {
+        return Err(wrong());
+    }
+    Ok(until)
+}
+
+/// Interval and limit of the route barrier's CONNECT probes.
+const ROUTE_PROBE_EVERY: Duration = Duration::from_millis(500);
+const ROUTE_PROBE_FOR: Duration = Duration::from_secs(10);
+
+/// Wait until the manager's proxy accepts a marked CONNECT for the grant's host and
+/// port (its config now carries the route), then hand the route to the local router.
+fn route_barrier(s: &Session, target: &LoginTarget, until: i64) -> Result<(), CliError> {
+    let r = crate::proxy::resolve_for(&s.api)?;
+    let (hint, port) = r.recommended()?;
+    let auth = r.proxy_auth().then(|| crate::proxy::proxy_authorization(&s.host));
+    let connect_to = crate::proxy::authority(&target.host, target.port);
+    let deadline = Instant::now() + ROUTE_PROBE_FOR;
+    loop {
+        let started = Instant::now();
+        if probe_route(hint, port, &connect_to, auth.as_deref()) == Some(200) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError::failure("the proxy did not activate the route; run asm doctor"));
+        }
+        std::thread::sleep(ROUTE_PROBE_EVERY.saturating_sub(started.elapsed()));
+    }
+    crate::router::push_route(&target.host, target.port, until, &crate::proxy::authority(hint, port))?;
+    Ok(())
+}
+
+/// Send one marked CONNECT for `target` to the proxy at `hint:port`; the answer's
+/// status code, `None` when there is none.
+fn probe_route(hint: &str, port: u16, target: &str, auth: Option<&str>) -> Option<u16> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::ToSocketAddrs;
+    let timeout = Duration::from_secs(2);
+    let mut stream = (hint, port)
+        .to_socket_addrs()
+        .ok()?
+        .find_map(|a| std::net::TcpStream::connect_timeout(&a, timeout).ok())?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    let mut req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nAsm-Browser-Route: 1\r\n");
+    if let Some(auth) = auth {
+        req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut line = String::new();
+    BufReader::new(stream.take(1024)).read_line(&mut line).ok()?;
+    let mut parts = line.split_whitespace();
+    parts.next().filter(|v| v.starts_with("HTTP/1."))?;
+    parts.next()?.parse().ok()
 }
 
 /// The text block `asm get` prints.
@@ -741,6 +958,9 @@ fn get_block(r: &GetResult, paths: &[PathBuf]) -> String {
     };
     let expires = r.expires_at.as_deref().unwrap_or("never");
     let mut s = format!("mode: {mode}\nhosts: {hosts}\nexpires: {expires}\n");
+    if let Some(login) = &r.login {
+        s.push_str(&format!("login: {} (single use; routed through asm until {expires})\n", login.url));
+    }
     if let Some(generation) = &r.generation {
         s.push_str(&format!("lease: {}\ngenerator: {}\ngrant: {}\ncredential expires: {}\ncredential version: {}\n",
             r.lease_id,
@@ -925,6 +1145,7 @@ mod tests {
             credential_expires_at: None,
             credential_version: None,
             generator_name: None,
+            login: None,
             files: vec![ResultFile {
                 field: "value".into(),
                 relative_path: "T".into(),
@@ -937,6 +1158,12 @@ mod tests {
             get_block(&r, &p),
             "mode: sentinel\nhosts: api.github.com,*.githubusercontent.com\nexpires: 2026-11-16T12:34:56Z\n/run/user/1000/asm/secrets/GITHUB_TOKEN\n"
         );
+        r.login = Some(LoginScope { url: "https://example.com/session".into() });
+        assert_eq!(
+            get_block(&r, &p),
+            "mode: sentinel\nhosts: api.github.com,*.githubusercontent.com\nexpires: 2026-11-16T12:34:56Z\nlogin: https://example.com/session (single use; routed through asm until 2026-11-16T12:34:56Z)\n/run/user/1000/asm/secrets/GITHUB_TOKEN\n"
+        );
+        r.login = None;
         r.mode = LeaseMode::Raw;
         r.hosts.clear();
         r.expires_at = None;
@@ -944,6 +1171,51 @@ mod tests {
             get_block(&r, &[]),
             "mode: raw\nhosts: none (raw value)\nexpires: never\n"
         );
+    }
+
+    #[test]
+    fn login_grants_must_match_the_request() {
+        let file = |field: &str, substituted| ResultFile {
+            field: field.into(),
+            relative_path: format!("work/Site.{field}"),
+            content: "x".into(),
+            substituted: Some(substituted),
+        };
+        let url = "https://login.example.test/session";
+        let ok = GetResult {
+            lease_id: "l".into(),
+            mode: LeaseMode::Sentinel,
+            hosts: vec!["login.example.test".into()],
+            expires_at: Some("2999-01-01T00:00:00Z".into()),
+            generation: None,
+            operator_selected_grant: false,
+            broader_lease_reuse: false,
+            credential_expires_at: None,
+            credential_version: None,
+            generator_name: None,
+            login: Some(LoginScope { url: url.into() }),
+            files: vec![file("username", false), file("password", true), file("totp", false)],
+        };
+        let host = "login.example.test";
+        assert_eq!(check_login_grant(&ok, url, host), Ok(asm_proto::time::parse_unix("2999-01-01T00:00:00Z").unwrap()));
+        let only_password = GetResult { files: vec![file("password", true)], ..ok.clone() };
+        assert!(check_login_grant(&only_password, url, host).is_ok());
+        for bad in [
+            GetResult { login: None, ..ok.clone() },
+            GetResult { login: Some(LoginScope { url: "https://login.example.test/other".into() }), ..ok.clone() },
+            GetResult { mode: LeaseMode::Raw, ..ok.clone() },
+            GetResult { hosts: vec!["*.example.test".into()], ..ok.clone() },
+            GetResult { expires_at: None, ..ok.clone() },
+            GetResult { files: vec![file("username", false), file("password", false)], ..ok.clone() },
+            GetResult { files: vec![file("username", true), file("password", true)], ..ok.clone() },
+            GetResult { files: vec![file("password", true), file("note", false)], ..ok.clone() },
+            GetResult { files: vec![file("username", false)], ..ok.clone() },
+        ] {
+            assert_eq!(
+                check_login_grant(&bad, url, host).unwrap_err().message,
+                "error: the manager returned a different login grant than requested"
+            );
+        }
     }
 
     #[test]

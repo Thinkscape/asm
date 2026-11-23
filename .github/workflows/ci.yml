@@ -47,6 +47,9 @@ jobs:
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # certutil lets the browser tests run the full NSS install path for t3code.
+      - name: NSS tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libnss3-tools
       # asm-core is macOS-only; the CLI and the shared crate are what runs on Linux.
       - name: cargo test -p asm-proto -p asm-cli
         run: cargo test --locked -p asm-proto -p asm-cli
@@ -64,7 +67,7 @@ jobs:
           go-version-file: third_party/iron-proxy/go.mod
           cache-dependency-path: third_party/iron-proxy/go.sum
       - name: go test
-        run: go test -race -count=1 ./internal/transform/... ./internal/proxy/...
+        run: go test -race -count=1 ./internal/transform/... ./internal/proxy/... ./internal/certcache/... ./internal/config/...
 
   cli-linux:
     name: CLI build (${{ matrix.target }})

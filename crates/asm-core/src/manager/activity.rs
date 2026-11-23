@@ -409,6 +409,12 @@ fn request_detail(p: &Pending) -> Map<String, Value> {
             d.insert("field".into(), json!(u.field));
         }
         Detail::Add(_) => {}
+        Detail::Login(l) => {
+            d.insert("vault".into(), json!(l.secret.vault_name));
+            d.insert("url".into(), json!(l.url));
+            d.insert("fill_origins".into(), json!(l.fill_origins));
+            d.insert("reason".into(), json!(l.reason));
+        }
     }
     d
 }
@@ -419,6 +425,7 @@ fn request_event(p: &Pending, kind: &'static str, summary: String, extra: Value)
         Detail::Get(g) => (Category::Requests, Some(g.target.display())),
         Detail::Update(u) => (Category::Requests, Some(u.secret.display.as_str())),
         Detail::Add(a) => (Category::Requests, Some(a.name.as_str())),
+        Detail::Login(l) => (Category::Requests, Some(l.secret.display.as_str())),
     };
     let mut d = request_detail(p);
     if let Value::Object(x) = extra {
@@ -469,6 +476,7 @@ pub(crate) fn requested(p: &Pending) -> Event {
             hosts_text(&g.requested_hosts),
             g.reason
         ),
+        Detail::Login(l) => format!("{} requested for {}: {}", p.summary(), l.url, l.reason),
         _ => format!("{} requested", p.summary()),
     };
     request_event(p, "requested", summary, Value::Null)
@@ -481,6 +489,16 @@ pub(crate) fn ended(p: &Pending, kind: &'static str, reason: Option<&str>) -> Ev
         None => format!("{} {kind}", subject(p)),
     };
     request_event(p, kind, summary, json!({ "deny_reason": reason }))
+}
+
+/// An approved `asm login` opened its sign-in browser; the request ends at hand-over.
+pub(crate) fn broker_started(p: &Pending, fill_origins: &[String]) -> Event {
+    request_event(
+        p,
+        "browser_opened",
+        format!("{}: sign-in browser opened for {}", subject(p), fill_origins.join(", ")),
+        json!({ "approved_fill_origins": fill_origins }),
+    )
 }
 
 /// An approved request; `result` is what the host receives (values are not read from it).
@@ -818,6 +836,7 @@ mod tests {
             approval_order: None,
             credential_version: 0,
             requested_generation: None,
+            login: None,
         }
     }
 

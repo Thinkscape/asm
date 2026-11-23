@@ -144,7 +144,7 @@ fn body(
         name, fields: Some(fields), raw: mode == RequestedMode::Raw,
         sentinel: mode == RequestedMode::Sentinel, hosts, reason, lease_id,
         generation, refresh: false, refresh_from_version: None, new_lease: false,
-        client_capabilities, agent: crate::hostinfo::agent_label(),
+        client_capabilities, agent: crate::hostinfo::agent_label(), login: None,
     }
 }
 

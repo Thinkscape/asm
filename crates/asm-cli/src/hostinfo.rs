@@ -29,7 +29,7 @@ pub fn collect() -> HostInfo {
     }
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: buf is valid for buf.len() bytes; gethostname NUL-terminates on success
     // (the final byte stays 0 because we pass len - 1).

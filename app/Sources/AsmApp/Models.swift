@@ -4,7 +4,7 @@ import Foundation
 // UniFFI records onto these, so the views stay independent of binding details.
 
 enum RequestKind: String, Equatable, Sendable {
-    case pair, get, update, add
+    case pair, get, update, add, login
 
     var title: String {
         switch self {
@@ -12,6 +12,7 @@ enum RequestKind: String, Equatable, Sendable {
         case .get: "Get"
         case .update: "Update"
         case .add: "Add"
+        case .login: "Sign in"
         }
     }
 
@@ -21,6 +22,7 @@ enum RequestKind: String, Equatable, Sendable {
         case .get: "key"
         case .update: "pencil"
         case .add: "plus.circle"
+        case .login: "person.badge.key"
         }
     }
 }
@@ -63,6 +65,29 @@ enum RequestDetail: Equatable, Sendable {
     case get(GetDetail)
     case update(name: String, vaultID: String, vaultName: String, field: String, oldValue: String, newValue: String)
     case add(name: String, value: String, targets: [AddTargetItem])
+    case login(LoginDetail)
+}
+
+/// `asm login`: the operator signs in on this Mac with a vault login the manager fills
+/// into a browser; the agent receives the site's cookies and the URL origin's localStorage.
+struct LoginDetail: Equatable, Sendable {
+    var name: String
+    var vaultName: String
+    var url: String
+    /// The URL's origin first (always filled), then extra origins the agent asked to fill.
+    var fillOrigins: [String]
+    var reason: String
+    var hasTotp: Bool
+}
+
+/// An approved `asm login` whose sign-in browser is open.
+struct BrokerSessionItem: Identifiable, Equatable, Sendable {
+    var id: String { requestID }
+    var requestID: String
+    var url: String
+    var hostLabel: String
+    var startedAt: Date
+    var status: String
 }
 
 /// The pairing machine looks like an already paired host.
@@ -102,6 +127,9 @@ struct GetDetail: Equatable, Sendable {
     var operatorSelectedGrant: Bool = false
     /// The paired client accepts a managed Google grant for a project other than the one it requested.
     var operatorSelectedGcloudProject: Bool = false
+    /// A single-use login grant for this form action URL: proxied delivery only, at most
+    /// one hour, and the site is routed through asm until it expires.
+    var login: String?
 }
 
 struct PendingItem: Identifiable, Equatable, Sendable {
@@ -741,6 +769,7 @@ struct ProxySettingsItem: Equatable, Sendable {
     var metricsPort: Int = 7416
     var maxRequestBodyBytes: Int = 10_485_760
     var allowPlainHTTP: Bool = false
+    var requireAuth: Bool = false
 }
 
 /// Proxy health as the core reports it (`ProxyState`).
@@ -901,6 +930,8 @@ enum DecisionItem: Sendable {
     case approvePair(name: String, replace: Bool)
     case approveGet(raw: Bool, durationSecs: UInt64?, hosts: [String], generation: GenerationSelectionItem?)
     case approveWrite(vaultID: String, collectionID: String?)
+    /// `durationSecs`: how long the handed-over session stays valid (`nil` = 1 hour).
+    case approveLogin(durationSecs: UInt64?, fillOrigins: [String])
 }
 
 struct HostPatternCheckItem: Equatable, Sendable {

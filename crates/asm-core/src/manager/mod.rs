@@ -15,7 +15,7 @@ use tokio::sync::{Notify, watch};
 use crate::error::{CoreError, Result};
 use crate::ffi::ManagerObserver;
 use crate::paths::DataDirs;
-use crate::proxy::{EventSink, ProxyEntry, ProxyEvent, ProxySupervisor};
+use crate::proxy::{BrowserRoute, EventSink, LoginBinding, ProxyEntry, ProxyEvent, ProxySupervisor};
 use crate::settings::Settings;
 use crate::store::{LeaseRecord, Store};
 use crate::tls::ServerCert;
@@ -93,6 +93,8 @@ pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Default)]
 pub struct ProxyState {
     pub entries: BTreeMap<String, Vec<ProxyEntry>>,
+    /// Browser routes of active login leases, published with `entries`.
+    pub routes: Vec<BrowserRoute>,
     /// Active sentinel leases whose vault cannot be read (lease id → message).
     pub suspended: BTreeMap<String, String>,
     /// Desired entries have not been successfully published to the proxy.
@@ -164,6 +166,11 @@ pub struct Core {
     pub(crate) firewall: Mutex<firewall::FirewallCheck>,
     /// Wakes the firewall check loop (listener changes, proxy starts, wake).
     firewall_wake: Arc<Notify>,
+    /// Serialises proxy credential syncs: each one reads the hosts and writes the file
+    /// as one step, so a stale read never overwrites a newer write.
+    proxy_auth_sync: Mutex<()>,
+    /// `asm login` sign-in browsers.
+    pub(crate) broker: crate::broker::Broker,
 }
 
 /// One manager per data directory: take an exclusive lock on its lock file, or fail with
@@ -222,6 +229,29 @@ mod lock_tests {
 /// `(field, value)` pairs read from a vault.
 type Values = Vec<(String, String)>;
 
+/// Browser routes of the active login leases: each grant's `(host, port)` until it
+/// expires (the latest expiry wins for a shared pair).
+fn login_routes(active: &[LeaseRecord]) -> Vec<BrowserRoute> {
+    let mut routes: Vec<BrowserRoute> = Vec::new();
+    for lease in active {
+        let (Some(login), Some(until)) = (&lease.login, lease.expires_at) else {
+            continue;
+        };
+        let target = match asm_proto::rules::parse_login_url(&login.url) {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("lease {}: invalid login URL: {}", lease.id, e.message);
+                continue;
+            }
+        };
+        match routes.iter_mut().find(|r| r.host == target.host && r.port == target.port) {
+            Some(r) => r.until = r.until.max(until),
+            None => routes.push(BrowserRoute { host: target.host, port: target.port, until }),
+        }
+    }
+    routes
+}
+
 /// Build the proxy entries of one sentinel lease from the secret's current values.
 fn lease_entries(
     lease: &LeaseRecord,
@@ -235,12 +265,24 @@ fn lease_entries(
         let Some((_, value)) = values.iter().find(|(name, _)| name == &f.field) else {
             return Err(format!("field {:?} is no longer in the vault", f.field));
         };
+        let login = match &lease.login {
+            None => None,
+            Some(scope) => match asm_proto::rules::parse_login_url(&scope.url) {
+                Ok(t) => Some(LoginBinding { port: t.port, target: t.target, owner: lease.host_id.clone() }),
+                Err(e) => {
+                    // Never publish a login sentinel as an ordinary, reusable entry.
+                    log::error!("lease {}: invalid login URL: {}", lease.id, e.message);
+                    continue;
+                }
+            },
+        };
         out.push(ProxyEntry {
             lease_id: lease.id.clone(),
             index,
             sentinel: sentinel.clone(),
             value: value.clone(),
             hosts: lease.hosts.clone(),
+            login,
         });
     }
     Ok(out)
@@ -387,6 +429,7 @@ impl Core {
             bin_dir.clone(),
             dirs.clone(),
             settings.proxy.clone(),
+            &store,
             on_change,
             on_event,
         )?;
@@ -398,7 +441,8 @@ impl Core {
             .build()?;
         let rt_handle = rt.handle().clone();
         let (changes, _) = watch::channel(0u64);
-        let core = Arc::new(Self {
+        let core = Arc::new_cyclic(|weak| Self {
+            broker: crate::broker::Broker::new(dirs.data.join("broker"), weak.clone()),
             dirs,
             bin_dir,
             store,
@@ -428,22 +472,28 @@ impl Core {
             lease_wake: Arc::new(Notify::new()),
             firewall: Mutex::new(firewall::FirewallCheck::default()),
             firewall_wake,
+            proxy_auth_sync: Mutex::new(()),
         });
+        // A crashed manager may have left a sign-in browser running.
+        core.broker.cleanup_leftovers();
         // Restore and validate authority before opening either listener.
         let recovered = (|| -> Result<()> {
             core.restore_generated()?;
             core.restore_request_book(now())?;
             let t = now();
             let active = core.store.active_leases(t)?;
-            let entries = {
+            let (entries, routes) = {
                 let mut state = lock(&core.proxy_state);
                 let ids: HashSet<&str> = active.iter().map(|lease| lease.id.as_str()).collect();
                 state.entries.retain(|id, _| ids.contains(id.as_str()));
                 Self::project_generated_entries(&mut state, &active, &lock(&core.generation), t);
+                state.routes = login_routes(&active);
                 state.dirty = false;
-                state.flatten()
+                (state.flatten(), state.routes.clone())
             };
-            core.proxy.activate(entries)
+            // The credentials file must exist before a proxy requiring it starts.
+            core.sync_proxy_auth();
+            core.proxy.activate(entries, routes)
         })();
         if let Err(error) = recovered {
             core.shutdown();
@@ -747,7 +797,8 @@ impl Core {
                         if !unchanged {
                             let entries = lease.fields.iter().enumerate().filter_map(|(index, f)|
                                 f.sentinel.as_ref().map(|sentinel| ProxyEntry { lease_id: lease.id.clone(), index,
-                                    sentinel: sentinel.clone(), value: cached.current.token.clone(), hosts: lease.hosts.clone() })).collect();
+                                    sentinel: sentinel.clone(), value: cached.current.token.clone(), hosts: lease.hosts.clone(),
+                                    login: None })).collect();
                             state.entries.insert(lease.id.clone(), entries);
                             state.dirty = true;
                         }
@@ -775,8 +826,13 @@ impl Core {
         let generation = lock(&self.generation);
         Self::project_generated_entries(&mut state, &active, &generation, t);
         drop(generation);
+        let routes = login_routes(&active);
+        if routes != state.routes {
+            state.routes = routes;
+            state.dirty = true;
+        }
         if !state.dirty { return Ok(()); }
-        let result = self.proxy.apply_deferred(state.flatten());
+        let result = self.proxy.apply_deferred(state.flatten(), state.routes.clone());
         if result.is_ok() {
             state.dirty = false;
             state.account_cutovers.clear();
@@ -793,7 +849,7 @@ impl Core {
     /// Cut off forwarding on the old process even if writing new config fails.
     fn publish_proxy_account_retirement_locked(&self, _guard: &MutexGuard<'_, ()>, profile_id: i64) -> Result<()> {
         let mut state = lock(&self.proxy_state);
-        let result = self.proxy.apply_after_stopping_deferred(state.flatten());
+        let result = self.proxy.apply_after_stopping_deferred(state.flatten(), state.routes.clone());
         state.dirty = result.is_err();
         if state.dirty {
             state.account_cutovers.insert(profile_id);
@@ -825,6 +881,32 @@ impl Core {
 
     pub fn sync_proxy(&self, retry_suspended: bool) {
         self.sync_proxy_with(retry_suspended, |_| {})
+    }
+
+    /// Rewrite the proxy credentials file from the active hosts. Runs at startup and
+    /// after every host change, whether or not authentication is required, so turning
+    /// it on never meets a stale file. On failure the file denies everyone.
+    pub(crate) fn sync_proxy_auth(&self) {
+        let _sync = lock(&self.proxy_auth_sync);
+        let synced = self
+            .store
+            .active_host_token_hashes()
+            .and_then(|users| self.proxy.write_auth_users(&users));
+        if let Err(e) = synced {
+            let denied = self.proxy.write_auth_users(&[]);
+            log::error!("proxy credentials: {}", e.message);
+            let summary = match denied {
+                Ok(()) => format!(
+                    "proxy credentials could not be updated ({}); the proxy now rejects every host until the next host change or restart",
+                    e.message
+                ),
+                Err(d) => format!(
+                    "proxy credentials could not be updated ({}) or cleared ({})",
+                    e.message, d.message
+                ),
+            };
+            self.log(activity::Event::new(activity::Category::Proxy, "auth_sync_failed", summary));
+        }
     }
 
     /// Lease ids of active sentinel leases that are suspended.
@@ -892,6 +974,7 @@ impl Core {
 
     pub fn shutdown(&self) {
         self.begin_generation_shutdown();
+        self.broker.shutdown();
         self.shutdown_gcloud_setup();
         self.gcloud_profiles.shutdown();
         if let Some(api) = lock(&self.api).take() {

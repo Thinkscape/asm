@@ -43,6 +43,31 @@ pub fn sha256_hex(data: impl AsRef<[u8]>) -> String {
     hex_encode(&sha256(data))
 }
 
+/// HMAC-SHA256 (RFC 2104).
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        block[..32].copy_from_slice(&sha256(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(block.map(|b| b ^ 0x36));
+    inner.update(msg);
+    let mut outer = Sha256::new();
+    outer.update(block.map(|b| b ^ 0x5c));
+    outer.update(inner.finalize());
+    outer.finalize().into()
+}
+
+/// Proxy-authentication password of a paired host, derived from the SHA-256 of
+/// its bearer token. Manager and CLI derive it independently; the token itself
+/// never reaches the proxy.
+pub fn proxy_password(token_hash: &[u8; 32]) -> String {
+    hex_encode(&hmac_sha256(token_hash, b"asm proxy auth v1"))
+}
+
 /// Constant-time equality (length leaks; contents do not).
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -148,5 +173,19 @@ mod tests {
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn hmac_sha256_rfc4231() {
+        assert_eq!(
+            hex_encode(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // Case 6: a key longer than the block size is hashed first.
+        assert_eq!(
+            hex_encode(&hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+        assert_eq!(proxy_password(&[0; 32]).len(), 64);
     }
 }

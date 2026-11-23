@@ -131,9 +131,12 @@ struct MenuBarPanel: View {
                 LockedVaultsSection(locked: locked, unlock: { model.unlockingVaultID = $0 }, dismissPanel: { dismiss() })
                 Divider()
             }
-            PendingSection(pending: model.pending) { id in
+            PendingSection(pending: model.pending, sessions: model.brokerSessions) { id in
                 dismiss()
                 model.openApproval(for: id)
+            } openSessions: {
+                dismiss()
+                model.openBrokerSessions()
             }
             Divider()
             RecentSection(recent: model.recent) { id in
@@ -368,14 +371,24 @@ private struct LockedVaultsSection: View {
 
 private struct PendingSection: View {
     let pending: [PendingItem]
+    /// Open `asm login` sign-in browsers.
+    let sessions: [BrokerSessionItem]
     let open: (String) -> Void
+    let openSessions: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Pending").font(.headline)
-            if pending.isEmpty {
+            if pending.isEmpty && sessions.isEmpty {
                 Text("No pending requests.").foregroundStyle(.secondary).font(.callout)
             } else {
+                ForEach(sessions) { session in
+                    Button(action: openSessions) {
+                        PendingRow(kind: .login, host: session.hostLabel, hostname: "",
+                                   summary: String(localized: "Sign-in browser: \(session.status)"), createdAt: session.startedAt)
+                    }
+                    .buttonStyle(HoverRowButtonStyle())
+                }
                 ForEach(pending) { item in
                     Button {
                         open(item.id)

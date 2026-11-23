@@ -191,6 +191,22 @@ impl Core {
         }
         Ok(build_catalog(&listings, choices))
     }
+
+    /// Vault login items listed to hosts (the `/secrets` catalog) with a URI for
+    /// `url_host`: exact host matches, else matches on a parent domain of it.
+    pub(crate) fn vault_logins_for_host(&self, url_host: &str) -> Result<Vec<NamedSecret>> {
+        let logins: Vec<NamedSecret> = self.secret_catalog()?.static_entries.into_iter()
+            .filter(|n| n.meta.kind == SecretKind::Login).collect();
+        let exact: Vec<NamedSecret> = logins.iter()
+            .filter(|n| n.meta.uri_hosts.iter().any(|h| h == url_host)).cloned().collect();
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        let parents: Vec<&str> = url_host.match_indices('.').map(|(i, _)| &url_host[i + 1..])
+            .filter(|p| p.contains('.')).collect();
+        Ok(logins.into_iter()
+            .filter(|n| n.meta.uri_hosts.iter().any(|h| parents.contains(&h.as_str()))).collect())
+    }
 }
 
 #[cfg(test)]

@@ -85,6 +85,99 @@ pub fn is_broad(pattern: &str) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Login URLs
+// ---------------------------------------------------------------------------
+
+/// The exact HTTPS endpoint a login grant is valid for: the form's action URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginTarget {
+    /// Lowercase DNS host name.
+    pub host: String,
+    pub port: u16,
+    /// Request target: path plus optional `?query`, `%` escapes verbatim.
+    pub target: String,
+}
+
+impl LoginTarget {
+    /// `https://host[:port]<target>`, omitting `:443`.
+    pub fn canonical_url(&self) -> String {
+        if self.port == 443 {
+            format!("https://{}{}", self.host, self.target)
+        } else {
+            format!("https://{}:{}{}", self.host, self.port, self.target)
+        }
+    }
+}
+
+/// Parse a login form's action URL: `https://` only, a DNS host name (no IP literal,
+/// userinfo or glob), port 1–65535 (default 443), and a printable-ASCII request
+/// target without whitespace or fragment. An empty path is `/`, as browsers send it.
+pub fn parse_login_url(url: &str) -> Result<LoginTarget, ApiError> {
+    if url.contains('#') {
+        return Err(ApiError::invalid("login URL must not contain a #fragment"));
+    }
+    let (host, port, rest) = split_https_url(url, "login URL")?;
+    let target = if rest.starts_with('/') { rest.to_string() } else { format!("/{rest}") };
+    if let Some(c) = target.chars().find(|c| !c.is_ascii_graphic()) {
+        return Err(ApiError::invalid(format!(
+            "login URL path contains {c:?}; give the form action exactly as the browser sends it (percent-encoded)"
+        )));
+    }
+    Ok(LoginTarget { host, port, target })
+}
+
+/// Host and port of an `https://` URL with any path, under the same host rules as
+/// [`parse_login_url`].
+pub fn parse_https_url(url: &str) -> Result<(String, u16), ApiError> {
+    let (host, port, _) = split_https_url(url, "URL")?;
+    Ok((host, port))
+}
+
+/// `(host, port, rest)` where `rest` is everything after the authority (empty, or
+/// starting with `/`, `?` or `#`).
+fn split_https_url<'a>(url: &'a str, what: &str) -> Result<(String, u16, &'a str), ApiError> {
+    let rest = url
+        .get(..8)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        .map(|_| &url[8..])
+        .ok_or_else(|| ApiError::invalid(format!("{what} must start with https://")))?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, rest) = rest.split_at(end);
+    if authority.contains('@') {
+        return Err(ApiError::invalid(format!("{what} must not contain user info")));
+    }
+    if authority.starts_with('[') {
+        return Err(ApiError::invalid("login grants need a DNS host name"));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = (!port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| port.parse::<u16>().ok())
+                .flatten()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| ApiError::invalid(format!("{what} has an invalid port {port:?}")))?;
+            (host, port)
+        }
+        None => (authority, 443),
+    };
+    let host = normalize_host_pattern(host)?;
+    if host.contains(['*', '?', '[', ']', '\\']) {
+        return Err(ApiError::invalid(format!("{what} host {host:?} must be a literal host name")));
+    }
+    // Browsers parse a host whose last label is a number (decimal, octal or `0x` hex)
+    // as IPv4 (WHATWG URL), so such a host is an IP literal, not a DNS name.
+    let last_label = host.trim_end_matches('.').rsplit('.').next().unwrap_or("");
+    let numeric = match last_label.strip_prefix("0x") {
+        Some(hex) => hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => last_label.bytes().all(|b| b.is_ascii_digit()),
+    };
+    if numeric {
+        return Err(ApiError::invalid("login grants need a DNS host name"));
+    }
+    Ok((host, port, rest))
+}
+
 /// Go `path.Match` on `name`; `None` for a malformed pattern (`ErrBadPattern`).
 pub fn glob_match(pattern: &str, name: &str) -> Option<bool> {
     path_match(pattern.as_bytes(), name.as_bytes()).ok()
@@ -568,5 +661,42 @@ mod tests {
         assert!(check_relative_path("a/b/c").is_err());
         assert!(check_relative_path("a//b").is_err());
         assert!(check_relative_path("").is_err());
+    }
+
+    #[test]
+    fn login_urls() {
+        let t = parse_login_url("https://Example.com:443/a").unwrap();
+        assert_eq!(t, LoginTarget { host: "example.com".into(), port: 443, target: "/a".into() });
+        assert_eq!(t.canonical_url(), "https://example.com/a");
+        let t = parse_login_url("https://login.example.com:8443/session?return_to=%2F").unwrap();
+        assert_eq!((t.port, t.target.as_str()), (8443, "/session?return_to=%2F"));
+        assert_eq!(t.canonical_url(), "https://login.example.com:8443/session?return_to=%2F");
+        assert_eq!(parse_login_url("https://example.com").unwrap().target, "/");
+        assert_eq!(parse_login_url("HTTPS://example.com?x=1").unwrap().target, "/?x=1");
+        for bad in [
+            "http://example.com/a",
+            "https://127.0.0.1/a",
+            "https://[::1]/a",
+            "https://10.1/a",
+            "https://example.com/a#frag",
+            "https://user@example.com/a",
+            "https://example.com/caf\u{e9}",
+            "https://ex\u{e4}mple.com/a",
+            "https://example.com/a b",
+            "https://*.example.com/a",
+            "https://example.com:0/a",
+            "https://example.com:65536/a",
+            "https://example.com:/a",
+            "https:///a",
+            "https://0x7f000001/login",
+            "https://1.2.3.0x4/login",
+            "https://login.0X/a",
+        ] {
+            assert!(parse_login_url(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_https_url("https://Example.com/login#x").unwrap(), ("example.com".into(), 443));
+        assert_eq!(parse_https_url("https://example.com:8443").unwrap(), ("example.com".into(), 8443));
+        assert!(parse_https_url("https://192.168.1.1/").is_err());
+        assert!(parse_login_url("https://0x7f.example.com/a").is_ok(), "only the last label decides");
     }
 }

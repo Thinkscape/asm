@@ -309,7 +309,13 @@ enum Source {
     /// Index into `item.fields`.
     Custom(usize),
     Notes,
+    /// `login.totp`: the authenticator key; [`BitwardenProvider::read`] yields the
+    /// current code, never the key.
+    Totp,
 }
+
+/// Reserved field name for the generated one-time code of a login item.
+const TOTP_FIELD: &str = "totp";
 
 fn str_at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
     let mut cur = v;
@@ -323,7 +329,8 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
     s.filter(|s| !s.is_empty())
 }
 
-/// Exposed fields of an item in order: `(field name, where it lives, value)`.
+/// Exposed fields of an item in order: `(field name, where it lives, value)`. The value
+/// of [`Source::Totp`] is the authenticator key; it must be mapped before leaving.
 fn field_sources(item: &Value) -> Vec<(String, Source, String)> {
     let mut out: Vec<(String, Source, String)> = Vec::new();
     let ty = item.get("type").and_then(Value::as_i64).unwrap_or(0);
@@ -342,6 +349,11 @@ fn field_sources(item: &Value) -> Vec<(String, Source, String)> {
         if let Some(p) = non_empty(str_at(item, &["login", "password"])) {
             push("password", Source::Password, p, &mut out);
         }
+        if let Some(k) = non_empty(str_at(item, &["login", "totp"]))
+            && crate::totp::parse(k).is_ok()
+        {
+            push(TOTP_FIELD, Source::Totp, k, &mut out);
+        }
     }
     if let Some(fields) = item.get("fields").and_then(Value::as_array) {
         for (i, f) in fields.iter().enumerate() {
@@ -352,7 +364,8 @@ fn field_sources(item: &Value) -> Vec<(String, Source, String)> {
             if let (Some(name), Some(value)) = (
                 non_empty(str_at(f, &["name"])),
                 non_empty(str_at(f, &["value"])),
-            ) {
+            ) && name != TOTP_FIELD
+            {
                 push(name, Source::Custom(i), value, &mut out);
             }
         }
@@ -438,6 +451,11 @@ fn is_visible(item: &Value, cfg: &BitwardenConfig) -> bool {
 
 /// Set `field` of a fetched item to `value` in place.
 fn set_field(item: &mut Value, field: &str, value: &str) -> Result<()> {
+    if field == TOTP_FIELD {
+        return Err(CoreError::invalid(
+            "totp is generated from the item's authenticator key and cannot be updated",
+        ));
+    }
     let src = field_sources(item)
         .into_iter()
         .find(|(n, _, _)| n == field)
@@ -471,8 +489,23 @@ fn set_field(item: &mut Value, field: &str, value: &str) -> Result<()> {
         }
         Source::Custom(i) => item["fields"][i]["value"] = v,
         Source::Notes => item["notes"] = v,
+        Source::Totp => unreachable!("totp is rejected above"),
     }
     Ok(())
+}
+
+/// `(field, value)` pairs of an item as handed out at `now`: a login's authenticator key
+/// becomes its current TOTP code.
+fn field_values(item: &Value, now: u64) -> Vec<(String, String)> {
+    field_sources(item)
+        .into_iter()
+        .filter_map(|(n, src, v)| match src {
+            Source::Totp => crate::totp::parse(&v)
+                .ok()
+                .map(|key| (n, crate::totp::current_code(&key, now))),
+            _ => Some((n, v)),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,10 +1447,10 @@ impl VaultProvider for BitwardenVault {
 
     fn read(&self, key: &str) -> Result<Vec<(String, String)>> {
         let item = self.fetch_visible(&self.endpoint()?, key)?;
-        let fields: Vec<(String, String)> = field_sources(&item)
-            .into_iter()
-            .map(|(n, _, v)| (n, v))
-            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let fields = field_values(&item, now);
         if fields.is_empty() {
             return Err(CoreError::not_found(
                 "the Bitwarden item has no usable fields",
@@ -1749,7 +1782,8 @@ mod tests {
                       {"name":"password","value":"shadowed","type":0,"linkedId":null},
                       {"name":"linked","value":null,"type":3,"linkedId":101},
                       {"name":"flag","value":"true","type":2,"linkedId":null},
-                      {"name":"empty","value":"","type":0,"linkedId":null}],
+                      {"name":"empty","value":"","type":0,"linkedId":null},
+                      {"name":"totp","value":"reserved name","type":0,"linkedId":null}],
             "login":{"uris":[{"match":null,"uri":"https://GitHub.com/login"},{"match":null,"uri":"api.github.com"},
                              {"match":null,"uri":"androidapp://com.github.android"},{"match":null,"uri":"https://user@github.com:443/x"}],
                      "username":"octocat","password":"hunter2","totp":null,"passwordRevisionDate":null},
@@ -1781,6 +1815,32 @@ mod tests {
             .collect();
         assert_eq!(values[1], ("password".to_owned(), "hunter2".to_owned()));
         assert_eq!(values[2], ("otp seed".to_owned(), "JBSWY3DP".to_owned()));
+        assert!(
+            !values.iter().any(|(n, _)| n == "totp"),
+            "a custom field named totp is reserved and skipped"
+        );
+    }
+
+    #[test]
+    fn login_totp_reads_as_the_current_code() {
+        let mut item = login_item();
+        item["login"]["totp"] = json!("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP");
+        let m = map_item(&item).unwrap();
+        assert_eq!(m.fields, ["username", "password", "totp", "otp seed"]);
+        let key = crate::totp::parse("JBSWY3DPEHPK3PXP").unwrap();
+        let values = field_values(&item, 1_111_111_109);
+        assert_eq!(
+            values[2],
+            ("totp".to_owned(), crate::totp::current_code(&key, 1_111_111_109))
+        );
+        assert!(values.iter().all(|(_, v)| !v.contains("JBSWY3DPEHPK3PXP")));
+        assert_eq!(values[2].1.len(), 6);
+        assert_eq!(
+            set_field(&mut item, "totp", "123456").unwrap_err().code,
+            asm_proto::ErrorCode::Invalid
+        );
+        item["login"]["totp"] = json!("steam://JBSWY3DP");
+        assert_eq!(map_item(&item).unwrap().fields, ["username", "password", "otp seed"]);
     }
 
     #[test]

@@ -20,6 +20,10 @@ final class AppModel {
 
     private(set) var pending: [PendingItem] = []
     private(set) var recent: [RecentItem] = []
+    /// Approved `asm login` requests whose sign-in browser is open (shown in the approval panel).
+    private(set) var brokerSessions: [BrokerSessionItem] = []
+    /// A failed "Hand over session" or "Cancel", by request ID.
+    private(set) var brokerErrors: [String: String] = [:]
     private(set) var vaults: [VaultItem] = []
     private(set) var generators: [GeneratorItem] = []
     private(set) var hasRecordedGcloudAccounts = false
@@ -188,7 +192,7 @@ final class AppModel {
 
     private func refreshRequests() async throws {
         let snapshot = try await call { try $0.snapshot() }
-        applyRequests(pending: snapshot.pending, recent: snapshot.recent)
+        applyRequests(pending: snapshot.pending, recent: snapshot.recent, brokerSessions: snapshot.brokerSessions)
     }
 
     func refreshProxy() async {
@@ -212,7 +216,9 @@ final class AppModel {
         }
     }
 
-    private func applyRequests(pending newPending: [PendingItem], recent newRecent: [RecentItem]) {
+    private func applyRequests(
+        pending newPending: [PendingItem], recent newRecent: [RecentItem], brokerSessions newSessions: [BrokerSessionItem]
+    ) {
         let known = Set(pending.map(\.id))
         let arrived = newPending.contains { !known.contains($0.id) }
         pending = newPending
@@ -220,9 +226,11 @@ final class AppModel {
             requestResolutions.removeValue(forKey: id)
         }
         recent = newRecent
+        brokerSessions = newSessions
+        brokerErrors = brokerErrors.filter { id, _ in newSessions.contains { $0.id == id } }
         let next = newPending.first { $0.id == shownRequestID } ?? newPending.first
         show(next)
-        if newPending.isEmpty {
+        if newPending.isEmpty && newSessions.isEmpty {
             panel.close()
         } else if arrived {
             panel.present(takeFocus: false)
@@ -233,7 +241,8 @@ final class AppModel {
         let redisplay = panel.prepare(for: next)
         shownRequestID = next?.id
         shownRequest = next
-        if redisplay && next != nil { panel.present(takeFocus: false) }
+        // Open sign-in browsers keep the panel up after its last request resolves.
+        if redisplay && (next != nil || !brokerSessions.isEmpty) { panel.present(takeFocus: false) }
     }
 
     // MARK: Approval
@@ -244,6 +253,12 @@ final class AppModel {
     func openApproval(for id: String) {
         guard let request = pending.first(where: { $0.id == id }) else { return }
         show(request)
+        panel.present(takeFocus: true)
+    }
+
+    /// Opens the approval panel on the open sign-in browsers (menu bar click).
+    func openBrokerSessions() {
+        guard !brokerSessions.isEmpty else { return }
         panel.present(takeFocus: true)
     }
 
@@ -290,6 +305,27 @@ final class AppModel {
                 requestResolutions[id] = .failed(error)
             } else {
                 requestResolutions.removeValue(forKey: id)
+            }
+        }
+    }
+
+    /// "Hand over session": the agent receives the sign-in browser's session.
+    func handOverBrokerSession(_ id: String) {
+        brokerAction(id) { try $0.brokerHandover(requestID: id) }
+    }
+
+    /// "Cancel": closes the sign-in browser and denies the request.
+    func cancelBrokerSession(_ id: String) {
+        brokerAction(id) { try $0.brokerCancel(requestID: id) }
+    }
+
+    private func brokerAction(_ id: String, _ work: @escaping @Sendable (CoreBridge) throws -> Void) {
+        brokerErrors.removeValue(forKey: id)
+        Task {
+            let error = await perform(work)
+            await refresh("requests")
+            if let error, brokerSessions.contains(where: { $0.id == id }) {
+                brokerErrors[id] = error
             }
         }
     }

@@ -489,7 +489,7 @@ impl Core {
                 .map_err(|failure| {
                     let error = match failure {
                         Fail::Keep(error) => error,
-                        Fail::Deny(reason) => CoreError::vault_unavailable(reason),
+                        Fail::Deny(reason) | Fail::Refuse(reason) => CoreError::vault_unavailable(reason),
                     };
                     let iam_status = if plan.previous.as_ref().is_some_and(|p| p.phase == GcloudProfilePhase::Ready) {
                         "No Google IAM changes were made."

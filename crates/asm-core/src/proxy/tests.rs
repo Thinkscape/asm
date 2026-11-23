@@ -125,6 +125,10 @@ fn file_count(dir: &std::path::Path) -> usize {
     std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
 }
 
+fn test_store(dirs: &DataDirs) -> Store {
+    Store::open(&dirs.db()).unwrap()
+}
+
 #[test]
 fn start_without_binary_but_existing_ca_reports_error() {
     let tmp = tempfile::tempdir().unwrap();
@@ -137,6 +141,7 @@ fn start_without_binary_but_existing_ca_reports_error() {
         sentinel: new_sentinel(),
         value: REAL.into(),
         hosts: vec!["example.com".into()],
+        login: None,
     };
     assert!(!format!("{entry:?}").contains(REAL));
     let (calls, cb) = counter();
@@ -144,8 +149,10 @@ fn start_without_binary_but_existing_ca_reports_error() {
     let sup = ProxySupervisor::start(
         tmp.path().join("nobin"),
         dirs.clone(),
+        &test_store(&dirs),
         ProxyConfig::default(),
         vec![entry],
+        vec![],
         cb,
         ev,
     )
@@ -159,6 +166,11 @@ fn start_without_binary_but_existing_ca_reports_error() {
     assert_eq!(file_count(&dirs.values), 1);
     let yaml = std::fs::read_to_string(dirs.proxy.join("iron-proxy.yaml")).unwrap();
     assert!(!yaml.contains(REAL));
+    assert!(yaml.contains("browser_ca_cert:") && yaml.contains("browser_hosts: []"), "{yaml}");
+    assert!(sup.browser_ca_pem().unwrap().contains("BEGIN CERTIFICATE"));
+    use std::os::unix::fs::PermissionsExt;
+    let claims = std::fs::metadata(dirs.proxy.join(CLAIMS_DIR)).unwrap();
+    assert!(claims.is_dir() && claims.permissions().mode() & 0o777 == 0o700);
     sup.shutdown();
     assert_eq!(file_count(&dirs.values), 0);
 }
@@ -171,8 +183,10 @@ fn start_fails_when_ca_cannot_be_created() {
     let (_, ev) = events();
     let err = ProxySupervisor::start(
         tmp.path().join("nobin"),
-        dirs,
+        dirs.clone(),
+        &test_store(&dirs),
         ProxyConfig::default(),
+        vec![],
         vec![],
         cb,
         ev,
@@ -190,6 +204,7 @@ fn rejects_malformed_entries() {
         sentinel: new_sentinel(),
         value: "v".into(),
         hosts: vec!["h".into()],
+        login: None,
     };
     assert!(validate_entries(std::slice::from_ref(&ok)).is_ok());
     assert!(validate_entries(&[ok.clone(), ok.clone()]).is_err());
@@ -210,10 +225,75 @@ fn rejects_malformed_entries() {
     assert!(
         validate_entries(&[ProxyEntry {
             hosts: vec![],
-            ..ok
+            ..ok.clone()
         }])
         .is_err()
     );
+    let login = ProxyEntry {
+        login: Some(LoginBinding { port: 443, target: "/session".into(), owner: "host-1".into() }),
+        ..ok
+    };
+    assert!(validate_entries(std::slice::from_ref(&login)).is_ok());
+    let err = validate_entries(&[ProxyEntry {
+        hosts: vec!["a.example".into(), "b.example".into()],
+        ..login
+    }])
+    .unwrap_err();
+    assert!(err.message.contains("exactly one host"), "{}", err.message);
+}
+
+#[test]
+fn auth_users_file_lists_each_host_with_its_hashed_password() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, cb) = counter();
+    let sup = publication_supervisor(tmp.path(), cb);
+    let hash = asm_proto::crypto::sha256(b"bearer-token");
+    sup.write_auth_users(&[("h1".into(), hash), ("h2".into(), [7; 32])]).unwrap();
+    let path = sup.dirs.proxy.join(AUTH_FILE);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "h1:{}\nh2:{}\n",
+            sha256_hex(proxy_password(&hash)),
+            sha256_hex(proxy_password(&[7; 32]))
+        )
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    sup.write_auth_users(&[]).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "", "deny all");
+}
+
+#[test]
+fn prune_claims_keeps_claims_of_live_and_recently_ended_leases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = DataDirs::create(&tmp.path().join("data"), Some(tmp.path())).unwrap();
+    let store = test_store(&dirs);
+    let now = 1_800_000_000;
+    let lease = |id: &str, expires_at: Option<i64>, revoked_at: Option<i64>| crate::store::LeaseRecord {
+        id: id.into(), host_id: "h".into(), vault_id: "v".into(), vault_name: "v".into(),
+        secret_key: "k".into(), name: "n".into(), mode: asm_proto::wire::LeaseMode::Sentinel,
+        fields: vec![], hosts: vec!["login.example".into()], reason: "r".into(), agent: String::new(),
+        created_at: now - 7200, expires_at, revoked_at,
+        source_kind: asm_proto::generators::SourceKind::Vault, generation: None,
+        generator_revision: None, credential_expires_at: None, approval_order: None,
+        credential_version: 0, requested_generation: None, login: None,
+    };
+    store.insert_lease(&lease("live", Some(now + 60), None)).unwrap();
+    store.insert_lease(&lease("recent", Some(now - 60), None)).unwrap();
+    store.insert_lease(&lease("old", Some(now - 3601), None)).unwrap();
+    store.insert_lease(&lease("revoked", Some(now + 60), Some(now - 3600))).unwrap();
+    let dir = tmp.path().join("claims");
+    std::fs::create_dir(&dir).unwrap();
+    for id in ["live", "recent", "old", "revoked", "gone"] {
+        std::fs::write(dir.join(claim_file_name(id, 1)), "t").unwrap();
+    }
+    prune_claims(&dir, &store, now);
+    let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    left.sort();
+    assert_eq!(left, ["live.1.claim", "recent.1.claim"]);
 }
 
 #[test]
@@ -246,11 +326,13 @@ fn end_to_end_with_patched_iron_proxy() {
         sentinel: sentinel.clone(),
         value: REAL.into(),
         hosts: vec!["127.0.0.1".into()],
+        login: None,
     };
     let (echo_port, seen) = echo_server();
     let (_, cb) = counter();
     let (events, ev) = events();
-    let sup = ProxySupervisor::start(bin, dirs.clone(), cfg.clone(), vec![entry], cb, ev).unwrap();
+    let store = test_store(&dirs);
+    let sup = ProxySupervisor::start(bin, dirs.clone(), &store, cfg.clone(), vec![entry], vec![], cb, ev).unwrap();
     wait_for("healthy proxy", Duration::from_secs(15), || {
         sup.status().healthy
     });
@@ -274,7 +356,7 @@ fn end_to_end_with_patched_iron_proxy() {
     assert_eq!(file_count(&dirs.values), 1);
 
     // Ending the lease: reload in place, sentinel now refused, value file deleted.
-    sup.apply(vec![]).unwrap();
+    sup.apply(vec![], vec![]).unwrap();
     let st = sup.status();
     assert_eq!(
         st.pid,
@@ -352,7 +434,7 @@ fn end_to_end_with_patched_iron_proxy() {
     assert!(!sup.status().running);
     assert!(!pid_alive(pid), "iron-proxy pid {pid} still running");
     assert_eq!(file_count(&dirs.values), 0);
-    assert!(sup.apply(vec![]).is_err());
+    assert!(sup.apply(vec![], vec![]).is_err());
 }
 
 fn skip_without_binary(test: &str) -> Option<PathBuf> {
@@ -406,7 +488,8 @@ fn port_conflict_is_reported_as_down_and_recovers() {
     };
     let (_, cb) = counter();
     let (events, ev) = events();
-    let sup = ProxySupervisor::start(bin, dirs, cfg.clone(), vec![], cb, ev).unwrap();
+    let store = test_store(&dirs);
+    let sup = ProxySupervisor::start(bin, dirs, &store, cfg.clone(), vec![], vec![], cb, ev).unwrap();
     wait_for("Down", Duration::from_secs(15), || {
         matches!(sup.status().phase, Phase::Down { .. })
     });
@@ -474,7 +557,7 @@ fn orphan_with_our_config_is_killed_at_start() {
     let (_, cb) = counter();
     let (_, ev) = events();
     let first =
-        ProxySupervisor::start(bin.clone(), dirs.clone(), cfg.clone(), vec![], cb, ev).unwrap();
+        ProxySupervisor::start(bin.clone(), dirs.clone(), &test_store(&dirs), cfg.clone(), vec![], vec![], cb, ev).unwrap();
     first.shutdown();
     drop(first);
 
@@ -497,7 +580,8 @@ fn orphan_with_our_config_is_killed_at_start() {
     });
     let (_, cb) = counter();
     let (events, ev) = events();
-    let sup = ProxySupervisor::start(bin, dirs, cfg, vec![], cb, ev).unwrap();
+    let store = test_store(&dirs);
+    let sup = ProxySupervisor::start(bin, dirs, &store, cfg, vec![], vec![], cb, ev).unwrap();
     assert!(orphan.try_wait().unwrap().is_some() || orphan.wait().is_ok());
     let killed = lifecycle(&events, "orphan_killed");
     assert_eq!(
@@ -537,6 +621,7 @@ fn publication_supervisor(
         binary,
         ca: ca::CaPaths::new(&dirs.proxy),
         ca_expiry: None,
+        browser_ca: browser_ca::paths(&dirs.proxy),
         logs: Arc::new(logs::LogSink::new(dirs.logs.join("proxy.log"))),
         on_change,
         on_event,
@@ -544,6 +629,7 @@ fn publication_supervisor(
         state: Mutex::new(State {
             cfg: loopback_config(),
             entries: Vec::new(),
+            routes: Vec::new(),
             apply_pending: false,
             sentinels: files::SentinelStore::default(),
             child: None,
@@ -568,6 +654,7 @@ fn publication_entry(value: &str) -> ProxyEntry {
         sentinel: new_sentinel(),
         value: value.into(),
         hosts: vec!["api.github.com".into()],
+        login: None,
     }
 }
 
@@ -595,7 +682,7 @@ fn rotation_value_write_failure_stops_child_and_rewrites_before_recovery() {
     let (_, cb) = counter();
     let sup = publication_supervisor(tmp.path(), cb);
     let initial = publication_entry(REAL);
-    sup.apply(vec![initial.clone()]).unwrap();
+    sup.apply(vec![initial.clone()], vec![]).unwrap();
     wait_for_publication(&sup, 1);
     let pid = sup.status().pid.unwrap();
     let value_path = sup
@@ -608,7 +695,7 @@ fn rotation_value_write_failure_stops_child_and_rewrites_before_recovery() {
         ..initial
     };
 
-    assert!(sup.apply(vec![replacement]).is_err());
+    assert!(sup.apply(vec![replacement], vec![]).is_err());
     assert!(!sup.status().running);
     assert!(!pid_alive(pid));
     assert!(lock(&sup.state).apply_pending);
@@ -640,13 +727,13 @@ fn removal_rewrite_failures_never_restart_the_old_grant() {
         let sup = publication_supervisor(tmp.path(), cb);
         let initial = publication_entry(REAL);
         let sentinel = initial.sentinel.clone();
-        sup.apply(vec![initial]).unwrap();
+        sup.apply(vec![initial], vec![]).unwrap();
         wait_for_publication(&sup, 1);
         let pid = sup.status().pid.unwrap();
         let blocked = sup.dirs.proxy.join(blocked_name);
         block_publication_file(&blocked);
 
-        assert!(sup.apply(vec![]).is_err());
+        assert!(sup.apply(vec![], vec![]).is_err());
         assert!(!sup.status().running);
         assert!(!pid_alive(pid));
         assert!(lock(&sup.state).entries.is_empty());
@@ -677,7 +764,7 @@ fn failed_rotation_followed_by_removal_cannot_recover_the_rotated_grant() {
     let (_, cb) = counter();
     let sup = publication_supervisor(tmp.path(), cb);
     let initial = publication_entry(REAL);
-    sup.apply(vec![initial.clone()]).unwrap();
+    sup.apply(vec![initial.clone()], vec![]).unwrap();
     wait_for_publication(&sup, 1);
     let value_path = sup
         .dirs
@@ -688,12 +775,12 @@ fn failed_rotation_followed_by_removal_cannot_recover_the_rotated_grant() {
         sup.apply(vec![ProxyEntry {
             value: "never-published-token".into(),
             ..initial
-        }])
+        }], vec![])
         .is_err()
     );
     let blocked = sup.dirs.proxy.join("sentinels.json");
     block_publication_file(&blocked);
-    assert!(sup.apply(vec![]).is_err());
+    assert!(sup.apply(vec![], vec![]).is_err());
     retry_publication(&sup);
     assert_eq!(lock(&sup.state).spawns, 1);
     assert!(lock(&sup.state).entries.is_empty());
@@ -714,12 +801,43 @@ fn failed_rotation_followed_by_removal_cannot_recover_the_rotated_grant() {
 }
 
 #[test]
+fn browser_routes_follow_the_desired_snapshot_through_retries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, cb) = counter();
+    let sup = publication_supervisor(tmp.path(), cb);
+    let route = |host: &str| BrowserRoute { host: host.into(), port: 443, until: 4_000_000_000 };
+    let started = || std::fs::read_to_string(sup.dirs.proxy.join("started.yaml")).unwrap();
+    let mut login = publication_entry(REAL);
+    login.hosts = vec!["login.example".into()];
+    login.login = Some(LoginBinding { port: 443, target: "/session".into(), owner: "host-1".into() });
+    sup.apply(vec![login.clone()], vec![route("login.example")]).unwrap();
+    wait_for_publication(&sup, 1);
+    let yaml = started();
+    assert!(yaml.contains("browser_hosts: [{host: \"login.example\", port: 443, until: 4000000000}]"), "{yaml}");
+    let claim = sup.dirs.proxy.join(CLAIMS_DIR).join(claim_file_name(&login.lease_id, login.index));
+    assert!(yaml.contains(&format!("claim_file: \"{}\"", claim.display())), "{yaml}");
+    assert!(yaml.contains("methods: [\"POST\", \"PUT\", \"PATCH\"]"), "{yaml}");
+
+    // A failed publication keeps the new desired routes; the retry renders them.
+    let blocked = sup.dirs.proxy.join("sentinels.json");
+    block_publication_file(&blocked);
+    assert!(sup.apply(vec![], vec![route("other.example")]).is_err());
+    assert_eq!(lock(&sup.state).routes, [route("other.example")]);
+    std::fs::remove_dir(&blocked).unwrap();
+    retry_publication(&sup);
+    wait_for_publication(&sup, 2);
+    let yaml = started();
+    assert!(yaml.contains("{host: \"other.example\"") && !yaml.contains("login.example"), "{yaml}");
+    sup.shutdown();
+}
+
+#[test]
 fn explicit_restart_cannot_bypass_a_pending_value_rewrite() {
     let tmp = tempfile::tempdir().unwrap();
     let (_, cb) = counter();
     let sup = publication_supervisor(tmp.path(), cb);
     let initial = publication_entry(REAL);
-    sup.apply(vec![initial.clone()]).unwrap();
+    sup.apply(vec![initial.clone()], vec![]).unwrap();
     wait_for_publication(&sup, 1);
     let value_path = sup
         .dirs
@@ -730,7 +848,7 @@ fn explicit_restart_cannot_bypass_a_pending_value_rewrite() {
         sup.apply(vec![ProxyEntry {
             value: "replacement-token".into(),
             ..initial
-        }])
+        }], vec![])
         .is_err()
     );
     assert!(sup.restart().is_err());
@@ -763,7 +881,7 @@ fn deferred_apply_notifies_only_after_caller_releases_locks() {
     let initial = publication_entry(REAL);
     {
         let _authorization = lock(&authorization);
-        sup.apply_deferred(vec![initial]).unwrap();
+        sup.apply_deferred(vec![initial], vec![]).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
     sup.notify_changed();
@@ -773,13 +891,13 @@ fn deferred_apply_notifies_only_after_caller_releases_locks() {
     block_publication_file(&blocked);
     {
         let _authorization = lock(&authorization);
-        assert!(sup.apply_deferred(vec![]).is_err());
+        assert!(sup.apply_deferred(vec![], vec![]).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
     sup.notify_changed();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     std::fs::remove_dir(blocked).unwrap();
-    sup.apply(vec![]).unwrap();
+    sup.apply(vec![], vec![]).unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     sup.shutdown();
 }
@@ -790,14 +908,14 @@ fn invalid_desired_entries_stop_child_and_cannot_restart() {
     let (_, cb) = counter();
     let sup = publication_supervisor(tmp.path(), cb);
     let initial = publication_entry(REAL);
-    sup.apply(vec![initial.clone()]).unwrap();
+    sup.apply(vec![initial.clone()], vec![]).unwrap();
     wait_for_publication(&sup, 1);
     let pid = sup.status().pid.unwrap();
     assert!(
         sup.apply(vec![ProxyEntry {
             value: String::new(),
             ..initial
-        }])
+        }], vec![])
         .is_err()
     );
     assert!(!sup.status().running);
@@ -806,7 +924,7 @@ fn invalid_desired_entries_stop_child_and_cannot_restart() {
     retry_publication(&sup);
     assert!(!sup.status().running);
     assert_eq!(lock(&sup.state).spawns, 1);
-    sup.apply(vec![]).unwrap();
+    sup.apply(vec![], vec![]).unwrap();
     wait_for_publication(&sup, 2);
     assert!(!lock(&sup.state).apply_pending);
     sup.shutdown();
@@ -818,7 +936,7 @@ fn failed_restart_retains_the_new_desired_credential() {
     let (_, cb) = counter();
     let sup = publication_supervisor(tmp.path(), cb);
     let initial = publication_entry(REAL);
-    sup.apply(vec![initial.clone()]).unwrap();
+    sup.apply(vec![initial.clone()], vec![]).unwrap();
     wait_for_publication(&sup, 1);
     let binary_backup = sup.binary.with_extension("saved");
     std::fs::rename(&sup.binary, &binary_backup).unwrap();
@@ -826,7 +944,7 @@ fn failed_restart_retains_the_new_desired_credential() {
         sup.apply(vec![ProxyEntry {
             value: "replacement-token".into(),
             ..initial
-        }])
+        }], vec![])
         .is_err()
     );
     assert!(!sup.status().running);
@@ -860,6 +978,7 @@ fn rewrite_failures_stop_forwarding_and_never_recover_an_old_grant() {
         let sup = Arc::get_mut(&mut sup).unwrap();
         sup.binary = binary;
         sup.ca = ca::ensure(&sup.binary, &sup.dirs.proxy).unwrap();
+        sup.browser_ca = browser_ca::ensure(&sup.dirs.proxy).unwrap();
         let mut st = lock(&sup.state);
         st.cfg.allow_plain_http = true;
         st.cfg.upstream_deny_cidrs = Some(vec!["192.0.2.0/24".into()]);
@@ -881,7 +1000,7 @@ fn rewrite_failures_stop_forwarding_and_never_recover_an_old_grant() {
     };
     let sentinel = initial.sentinel.clone();
     let (echo_port, seen) = echo_server();
-    sup.apply(vec![initial.clone()]).unwrap();
+    sup.apply(vec![initial.clone()], vec![]).unwrap();
     wait_for("initial proxy", Duration::from_secs(10), ready);
     assert_eq!(via_proxy(cfg.port, echo_port, &sentinel).0, 200);
     assert_eq!(lock(&seen).last().map(String::as_str), Some(REAL));
@@ -895,7 +1014,7 @@ fn rewrite_failures_stop_forwarding_and_never_recover_an_old_grant() {
         sup.apply(vec![ProxyEntry {
             value: "replacement-token".into(),
             ..initial
-        }])
+        }], vec![])
         .is_err()
     );
     assert!(!sup.status().running);
@@ -915,7 +1034,7 @@ fn rewrite_failures_stop_forwarding_and_never_recover_an_old_grant() {
     // must rewrite a blocked sentinel instead of restarting with that old grant.
     let blocked = sup.dirs.proxy.join("sentinels.json");
     block_publication_file(&blocked);
-    assert!(sup.apply(vec![]).is_err());
+    assert!(sup.apply(vec![], vec![]).is_err());
     assert!(!sup.status().running);
     assert!(TcpStream::connect(("127.0.0.1", cfg.port)).is_err());
     retry_publication(&sup);

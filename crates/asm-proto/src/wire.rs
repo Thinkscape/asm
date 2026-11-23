@@ -3,7 +3,7 @@
 
 use crate::error::ApiError;
 use crate::generators::{GenerationRequest, GenerationSelection, SourceKind};
-use crate::rules::validate_agent_text;
+use crate::rules::{parse_login_url, validate_agent_text};
 use serde::{Deserialize, Serialize};
 
 /// Path prefix of every endpoint.
@@ -30,6 +30,10 @@ pub const CAPABILITY_OPERATOR_SELECTED_GRANT_V1: &str = "operator_selected_grant
 pub const CAPABILITY_OPERATOR_SELECTED_PROJECT_V1: &str = "operator_selected_project_v1";
 /// An unpinned generated request can reuse an existing, possibly broader grant.
 pub const CAPABILITY_BROADER_LEASE_REUSE_V1: &str = "broader_lease_reuse_v1";
+/// Single-use login grants (`asm get --login-url`).
+pub const CAPABILITY_LOGIN_GRANT_V1: &str = "login_grant_v1";
+/// Operator-assisted sign-in handing over a browser storage state (`asm login`).
+pub const CAPABILITY_LOGIN_BROKER_V1: &str = "login_broker_v1";
 /// Lease duration choices: label and seconds (`None` = unlimited).
 pub const LEASE_DURATIONS: &[(&str, Option<u64>)] = &[
     ("5 min", Some(300)),
@@ -326,6 +330,13 @@ pub struct SecretsResponse {
     pub secrets: Vec<SecretEntry>,
 }
 
+/// The exact HTTPS form action a login grant is valid for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginScope {
+    /// Canonical `https://host[:port]<path>[?query]` (see [`crate::rules::parse_login_url`]).
+    pub url: String,
+}
+
 /// `POST /requests` body, tagged by `kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -358,6 +369,10 @@ pub enum RequestBody {
         /// Proxy destination restrictions, not applicable to new generated requests.
         #[serde(default)]
         hosts: Vec<String>,
+        /// A single-use login grant for this form action; `name` may then be empty,
+        /// meaning "infer the vault login from the URL's host".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<LoginScope>,
         reason: String,
         #[serde(default)]
         agent: String,
@@ -376,6 +391,19 @@ pub enum RequestBody {
         #[serde(default)]
         agent: String,
     },
+    /// Operator-assisted sign-in: the manager fills a browser on the Mac and hands
+    /// the agent the resulting storage state. An empty `name` means "infer".
+    Login {
+        name: String,
+        url: String,
+        reason: String,
+        #[serde(default)]
+        extra_fill_origins: Vec<String>,
+        #[serde(default)]
+        agent: String,
+        #[serde(default)]
+        client_capabilities: Vec<String>,
+    },
 }
 
 impl RequestBody {
@@ -385,6 +413,7 @@ impl RequestBody {
             RequestBody::Get { .. } => RequestKind::Get,
             RequestBody::Update { .. } => RequestKind::Update,
             RequestBody::Add { .. } => RequestKind::Add,
+            RequestBody::Login { .. } => RequestKind::Login,
         }
     }
 
@@ -393,7 +422,8 @@ impl RequestBody {
         match self {
             RequestBody::Get { name, .. }
             | RequestBody::Update { name, .. }
-            | RequestBody::Add { name, .. } => name,
+            | RequestBody::Add { name, .. }
+            | RequestBody::Login { name, .. } => name,
         }
     }
 
@@ -402,7 +432,8 @@ impl RequestBody {
         match self {
             RequestBody::Get { agent, .. }
             | RequestBody::Update { agent, .. }
-            | RequestBody::Add { agent, .. } => agent,
+            | RequestBody::Add { agent, .. }
+            | RequestBody::Login { agent, .. } => agent,
         }
     }
 
@@ -411,9 +442,24 @@ impl RequestBody {
     pub fn canonicalize(&mut self) -> Result<(), ApiError> {
         if let Self::Get {
             raw, sentinel, fields, generation, refresh, new_lease, lease_id,
-            refresh_from_version, ..
+            refresh_from_version, hosts, login, ..
         } = self
         {
+            if let Some(login) = login {
+                let conflicts = [
+                    ("raw", *raw),
+                    ("fields", fields.is_some()),
+                    ("hosts", !hosts.is_empty()),
+                    ("generation", generation.is_some()),
+                    ("lease_id", lease_id.is_some()),
+                    ("refresh", *refresh),
+                    ("new_lease", *new_lease),
+                ];
+                if let Some((flag, _)) = conflicts.iter().find(|(_, set)| *set) {
+                    return Err(ApiError::invalid(format!("a login grant does not take {flag}")));
+                }
+                login.url = parse_login_url(&login.url)?.canonical_url();
+            }
             RequestedMode::from_flags(*raw, *sentinel)?;
             if *new_lease && (lease_id.is_some() || *refresh) {
                 return Err(ApiError::invalid("new_lease conflicts with lease_id and refresh"));
@@ -463,7 +509,7 @@ impl RequestBody {
     /// Negotiate only features that change request meaning, not arbitrary
     /// unknown JSON fields. Legacy static whole-item requests remain accepted.
     pub fn validate_get_capabilities(&self, source: SourceKind) -> Result<(), ApiError> {
-        if let Self::Get { fields, generation, sentinel, client_capabilities, .. } = self {
+        if let Self::Get { fields, generation, sentinel, login, client_capabilities, .. } = self {
             let require = |capability| {
                 if client_capabilities.iter().any(|c| c == capability) {
                     Ok(())
@@ -483,6 +529,9 @@ impl RequestBody {
             if fields.is_some() || *sentinel {
                 require(CAPABILITY_SECRET_FIELDS_V1)?;
             }
+            if login.is_some() {
+                require(CAPABILITY_LOGIN_GRANT_V1)?;
+            }
         }
         Ok(())
     }
@@ -495,6 +544,7 @@ pub enum RequestKind {
     Get,
     Update,
     Add,
+    Login,
 }
 
 /// Request lifecycle state: `pending` → one terminal state.
@@ -568,6 +618,9 @@ pub struct GetResult {
     pub credential_version: Option<u64>,
     #[serde(default)]
     pub generator_name: Option<String>,
+    /// Set on login grants: the form action the password sentinel is valid for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<LoginScope>,
 }
 
 impl GetResult {
@@ -639,6 +692,8 @@ pub struct LeaseInfo {
     pub credential_version: Option<u64>,
     #[serde(default)]
     pub generator_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<LoginScope>,
 }
 
 /// `GET /leases` response.
@@ -660,6 +715,13 @@ pub struct ProxyInfo {
     /// manager's first check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firewall_blocks_proxy: Option<bool>,
+    /// The proxy requires per-host credentials (`host_id` /
+    /// [`crate::crypto::proxy_password`] of the token hash).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proxy_auth: bool,
+    /// PEM of the asm browser CA; absent from managers without browser logins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_ca_pem: Option<String>,
 }
 
 #[cfg(test)]
@@ -969,6 +1031,50 @@ mod tests {
         assert!(!sentinel && !refresh && !new_lease);
         assert_eq!((fields, generation, lease_id, refresh_from_version), (None, None, None, None));
         assert!(client_capabilities.is_empty());
+    }
+
+    #[test]
+    fn login_grants_canonicalize_the_url_and_reject_other_get_flags() {
+        let mut body = get_body(json!({"name":"","login":{"url":"https://Example.com:443/session?return_to=%2F"}}));
+        body.canonicalize().unwrap();
+        let RequestBody::Get { name, login, .. } = &body else { panic!() };
+        assert_eq!((name.as_str(), login.as_ref().unwrap().url.as_str()), ("", "https://example.com/session?return_to=%2F"));
+        assert!(body.validate_get_capabilities(SourceKind::Vault).unwrap_err().message.contains(CAPABILITY_LOGIN_GRANT_V1));
+        let RequestBody::Get { client_capabilities, .. } = &mut body else { panic!() };
+        client_capabilities.push(CAPABILITY_LOGIN_GRANT_V1.into());
+        body.validate_get_capabilities(SourceKind::Vault).unwrap();
+        for (flag, extra) in [
+            ("raw", json!({"raw":true})),
+            ("fields", json!({"fields":["password"]})),
+            ("hosts", json!({"hosts":["example.com"]})),
+            ("generation", json!({"generation":{"provider":"github_app","scope":{"repositories":["acme/web"],"permissions":{}}}})),
+            ("lease_id", json!({"lease_id":"l"})),
+            ("refresh", json!({"refresh":true})),
+            ("new_lease", json!({"new_lease":true})),
+        ] {
+            let mut extra = extra;
+            extra["login"] = json!({"url":"https://example.com/session"});
+            let err = get_body(extra).canonicalize().unwrap_err();
+            assert!(err.message.contains(flag), "{flag}: {}", err.message);
+        }
+        assert!(get_body(json!({"login":{"url":"http://example.com/session"}})).canonicalize().is_err());
+        let plain = serde_json::to_value(get_body(json!({}))).unwrap();
+        assert!(plain.get("login").is_none(), "absent login is not serialized for older managers");
+    }
+
+    #[test]
+    fn login_wire_fields_are_optional() {
+        let info: ProxyInfo = from_str(r#"{"port":7412,"hints":["mac"],"ca_sha256":"ab"}"#).unwrap();
+        assert_eq!((info.proxy_auth, info.browser_ca_pem.as_deref()), (false, None));
+        let with = ProxyInfo { proxy_auth: true, browser_ca_pem: Some("PEM".into()), ..info };
+        assert_eq!(
+            to_value(&with).unwrap(),
+            json!({"port":7412,"hints":["mac"],"ca_sha256":"ab","proxy_auth":true,"browser_ca_pem":"PEM"})
+        );
+        let login: RequestBody = from_str(r#"{"kind":"login","name":"","url":"https://example.com/login","reason":"r"}"#).unwrap();
+        assert_eq!(login.kind(), RequestKind::Login);
+        let RequestBody::Login { extra_fill_origins, client_capabilities, .. } = login else { panic!() };
+        assert!(extra_fill_origins.is_empty() && client_capabilities.is_empty());
     }
 
     #[test]

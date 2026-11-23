@@ -675,6 +675,7 @@ mod tests {
             credential_expires_at: None,
             credential_version: None,
             generator_name: None,
+            login: None,
             files: files
                 .iter()
                 .map(|(p, c)| ResultFile {

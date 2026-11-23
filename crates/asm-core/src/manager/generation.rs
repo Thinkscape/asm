@@ -646,7 +646,7 @@ impl Core {
             return Ok(state);
         }
         let detail = GetDetail { target: GetTarget::Generated(target), mode, wanted_fields,
-            requested_hosts: requested, reason, initial: Vec::new(), suggestions: Vec::new() };
+            requested_hosts: requested, reason, initial: Vec::new(), suggestions: Vec::new(), login: None };
         let p = self.new_pending(host, agent, address, Detail::Get(detail));
         let (state, inserted) = self.attach_pending(p, |q, p| q.agent == agent
             && matches!((&q.detail, &p.detail), (Detail::Get(g), Detail::Get(detail))
@@ -756,6 +756,7 @@ impl Core {
             generator_name: Some(lease.vault_name.clone()),
             credential_expires_at: Some(fmt_unix(cached.current.expires_at)), credential_version: Some(cached.version),
             files: Vec::new(),
+            login: None,
         }
     }
 
@@ -995,7 +996,8 @@ impl Core {
                 expires_at: duration.map(|d| now.saturating_add(d.min(i64::MAX as u64) as i64)), revoked_at: None,
                 source_kind: SourceKind::Generator, generation: Some(grant),
                 generator_revision: Some(generator_revision), credential_expires_at: None,
-                approval_order: Some(order), credential_version: 1, requested_generation: target.requested_generation.clone() };
+                approval_order: Some(order), credential_version: 1, requested_generation: target.requested_generation.clone(),
+                login: None };
             (lease, entry.client()?, managed_selector)
         };
         let check_live_entry = |lease: &LeaseRecord| -> Result<_> {

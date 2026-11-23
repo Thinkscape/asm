@@ -82,7 +82,7 @@ fn managed_lease_storage_keeps_issued_authority_separate_from_the_original_reque
         created_at: 1, expires_at: Some(3), revoked_at: None, source_kind: SourceKind::Generator,
         generation: Some(GenerationGrant::GcloudAccess(GcloudAccessGrant::Requested { access: access.clone() })),
         generator_revision: Some(1), credential_expires_at: Some(2), approval_order: Some(1),
-        credential_version: 1, requested_generation: Some(expected.clone()),
+        credential_version: 1, requested_generation: Some(expected.clone()), login: None,
     };
     assert!(store.insert_lease(&lease).is_err());
     let grant = GenerationGrant::GcloudAccess(GcloudAccessGrant::Issued {
@@ -161,6 +161,7 @@ fn issued_lease(id: &str, key: &GcloudProfileKey, uid: &str) -> LeaseRecord {
         approval_order: Some(1),
         credential_version: 1,
         requested_generation: Some(GenerationRequest::GcloudAccess(key.access.clone())),
+        login: None,
     }
 }
 

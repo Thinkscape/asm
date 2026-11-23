@@ -382,6 +382,7 @@ impl Core {
                         .host(Some(&host_id))
                         .detail(json!({ "code_label": label, "address": ip, "host_info": info })),
                     );
+                    self.sync_proxy_auth();
                     self.notify(TOPIC_HOSTS);
                     return Ok(PairResponse::Approved { host_id, token });
                 }
@@ -411,6 +412,7 @@ impl Core {
                         .host(Some(&host_id))
                         .detail(detail),
                     );
+                    self.sync_proxy_auth();
                     self.notify(TOPIC_HOSTS);
                     return Ok(PairResponse::Approved { host_id, token });
                 }
@@ -598,6 +600,7 @@ impl Core {
         }
         self.log(approved);
         self.notify_request_ended();
+        self.sync_proxy_auth();
         self.notify(TOPIC_HOSTS);
         Ok(())
     }

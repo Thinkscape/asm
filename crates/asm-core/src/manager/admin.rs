@@ -691,6 +691,7 @@ impl Core {
             }
             tokens
         };
+        self.sync_proxy_auth();
         if let Some(host) = self.store.get_host(host_id)? {
             self.log(Event::new(Category::Pairing, "revoked", format!("host {} revoked", host.label()))
                 .host(Some(host_id)).detail(serde_json::json!({ "hostname": host.info.hostname, "address": host.address })));
@@ -901,6 +902,7 @@ impl Core {
             metrics_port: p.metrics_port,
             max_request_body_bytes: p.max_body,
             allow_plain_http: p.allow_plain_http,
+            require_auth: p.require_auth,
         }
     }
 
@@ -946,9 +948,14 @@ impl Core {
             metrics_port: ps.metrics_port,
             max_body: ps.max_request_body_bytes,
             allow_plain_http: ps.allow_plain_http,
+            require_auth: ps.require_auth,
             upstream_deny_cidrs: s.proxy.upstream_deny_cidrs.clone(),
         };
         if cfg != self.proxy.config() {
+            if cfg.require_auth {
+                // The restarted proxy reads the credentials file from its first request.
+                self.sync_proxy_auth();
+            }
             self.proxy.set_config(cfg.clone())?;
         }
         s.proxy = cfg;

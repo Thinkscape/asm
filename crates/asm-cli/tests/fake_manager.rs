@@ -2593,3 +2593,1080 @@ fn legacy_static_github_spellings_remain_independent_without_generators() {
             .all(|body| body["generation"].is_null() && body["fields"].is_null())
     );
 }
+
+const LOGIN_URL: &str = "https://login.example.test/session";
+
+/// A fake manager proxy answering every CONNECT with `status`; records the heads.
+fn connect_answering(status: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let heads = Arc::new(Mutex::new(Vec::new()));
+    let seen = heads.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            // `resolve_for` opens and closes a bare TCP connection to pick a hint.
+            if !head.is_empty() {
+                seen.lock().unwrap().push(head);
+            }
+            let _ = write!(reader.get_mut(), "HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+        }
+    });
+    (port, heads)
+}
+
+/// A manager that approves every login grant at once with `granted_url`; its proxy
+/// (requiring per-host credentials) answers marked CONNECTs with `proxy_status`.
+fn login_fixture(granted_url: &'static str, proxy_status: &'static str) -> (Fake, Env, u16, Arc<Mutex<Vec<String>>>) {
+    login_fixture_item(granted_url, proxy_status, "work/Site", "work/Site")
+}
+
+/// [`login_fixture`] for the item `name` (catalog spelling) whose files are
+/// `<file_base>.<field>`; `GET /leases` lists the grant once it was approved.
+fn login_fixture_item(
+    granted_url: &'static str,
+    proxy_status: &'static str,
+    name: &'static str,
+    file_base: &'static str,
+) -> (Fake, Env, u16, Arc<Mutex<Vec<String>>>) {
+    let (proxy_port, heads) = connect_answering(proxy_status);
+    let ca = rcgen::generate_simple_self_signed(vec!["proxy ca".into()]).unwrap();
+    let ca_hash = asm_proto::crypto::sha256_hex(ca.cert.der());
+    let ca = ca.cert.pem();
+    let granted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let f = start(Arc::new(move |method, path, _body| match (method, path) {
+        ("GET", "/v1/health") => (
+            200,
+            json!({"name":"asm-manager","version":"0.7.0","capabilities":["secret_fields_v1","login_grant_v1"]}),
+        ),
+        ("GET", "/v1/leases") if granted.load(std::sync::atomic::Ordering::SeqCst) => (
+            200,
+            json!({"leases":[{"lease_id":LEASE,"name":name,"mode":"sentinel","hosts":["login.example.test"],
+                "expires_at":"2999-01-01T00:00:00Z","status":"active","fields":["username","password","totp"],
+                "login":{"url":granted_url}}]}),
+        ),
+        ("GET", "/v1/leases") => (200, json!({"leases":[]})),
+        ("GET", "/v1/secrets") => (
+            200,
+            json!({"secrets":[{"name":name,"vault":"work","kind":"login","fields":["username","password","totp"],"lease":null}]}),
+        ),
+        ("GET", "/v1/proxy-info") => (
+            200,
+            json!({"port":proxy_port,"hints":["127.0.0.1"],"ca_sha256":ca_hash,"proxy_auth":true}),
+        ),
+        ("GET", "/v1/ca.crt") => (200, json!(ca)),
+        ("POST", "/v1/requests") => {
+            granted.store(true, std::sync::atomic::Ordering::SeqCst);
+            (
+                200,
+                json!({"request_id":REQ,"kind":"get","status":"approved","deny_reason":null,"result":{
+                    "lease_id":LEASE,"mode":"sentinel","hosts":["login.example.test"],"expires_at":"2999-01-01T00:00:00Z",
+                    "login":{"url":granted_url},
+                    "files":[{"field":"username","relative_path":format!("{file_base}.username"),"content":"octocat","substituted":false},
+                             {"field":"password","relative_path":format!("{file_base}.password"),"content":"asm_0123456789012345678901234567890123456789","substituted":true},
+                             {"field":"totp","relative_path":format!("{file_base}.totp"),"content":"123456","substituted":false}]}}),
+            )
+        }
+        _ => (
+            404,
+            json!({"error":{"code":"not_found","message":format!("{method} {path}")}}),
+        ),
+    }));
+    let e = env();
+    write_host_json(&e, &f);
+    (f, e, proxy_port, heads)
+}
+
+/// `asm proxy-router run` in the test's configuration directory, killed on drop.
+struct RouterProcess(std::process::Child);
+
+impl Drop for RouterProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn start_router(e: &Env) -> RouterProcess {
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let child = Command::new(env!("CARGO_BIN_EXE_asm"))
+        .args(["proxy-router", "run", "--port", &port.to_string()])
+        .env_clear()
+        .env("HOME", e.cfg.parent().unwrap())
+        .env("XDG_CONFIG_HOME", &e.cfg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let router = RouterProcess(child);
+    let sock = e.cfg.join("asm/router.sock");
+    assert!(
+        wait_for(Duration::from_secs(10), || std::os::unix::net::UnixStream::connect(&sock).is_ok()),
+        "router did not start"
+    );
+    router
+}
+
+fn router_status(e: &Env) -> Value {
+    let out = asm(e, &["proxy-router", "status", "--json"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn get_login_url_validates_arguments_before_contacting_the_manager() {
+    let e = env();
+    let url = "https://login.example.test/session";
+    for conflict in [
+        vec!["--raw"],
+        vec!["--sentinel"],
+        vec!["--hosts", "a.test"],
+        vec!["--lease", LEASE],
+        vec!["--refresh"],
+        vec!["--new-lease"],
+        vec!["--repositories", GITHUB_REPOSITORY],
+        vec!["--project", GCLOUD_PROJECT, "--permissions", "storage=read"],
+        vec!["--permissions", "contents=read"],
+        vec!["--gcloud-scope", GCLOUD_LEGACY_SCOPE],
+    ] {
+        let mut args = vec!["get", "--login-url", url, "--reason", "sign in"];
+        args.extend(conflict.iter().copied());
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{conflict:?}");
+        assert!(text(&out.stderr).contains("cannot be used with"), "{conflict:?}: {}", text(&out.stderr));
+    }
+    for (args, message) in [
+        (vec!["get", "--login-url", url, "work/Site::password", "--reason", "r"], "invalid: --login-url takes a whole login item"),
+        (vec!["get", "--login-url", url, "DEST=work/Site", "--reason", "r"], "invalid: --login-url takes a whole login item"),
+        (vec!["get", "--login-url", "http://login.example.test/session", "--reason", "r"], "invalid: login URL must start with https://"),
+        (vec!["get", "--login-url", url], "invalid: --login-url needs a reason: --reason TEXT"),
+    ] {
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(text(&out.stderr).trim(), message, "{args:?}");
+    }
+    // A positional reason and --reason conflict; without --login-url both NAME and
+    // REASON stay required.
+    for args in [
+        vec!["get", "--login-url", url, "work/Site", "why", "--reason", "why"],
+        vec!["get", "work/Site", "why", "--reason", "why"],
+        vec!["get", "work/Site"],
+        vec!["get", "--reason", "why"],
+    ] {
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(text(&out.stderr).contains("Usage: asm get"), "{args:?}: {}", text(&out.stderr));
+    }
+    // --reason also serves ordinary gets.
+    let (f, e) = paired("approve-get");
+    let out = asm(&e, &["get", "--hosts", "api.example.com", "work/GitHub", "--reason", "deploy the site"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(posted(&f)[0]["reason"], "deploy the site");
+}
+
+#[test]
+fn get_login_url_requires_a_local_router() {
+    let (f, e, _, _) = login_fixture(LOGIN_URL, "200 Connection established");
+    let out = asm(&e, &["get", "--login-url", LOGIN_URL, "--reason", "sign in"], "");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        text(&out.stderr).trim(),
+        "error: no asm proxy-router on this machine; the browser must run on this machine: asm browser install <target>"
+    );
+    assert!(posted(&f).is_empty());
+}
+
+#[test]
+fn get_login_url_grants_routes_and_prints_the_login() {
+    let (f, e, proxy_port, heads) = login_fixture(LOGIN_URL, "200 Connection established");
+    let _router = start_router(&e);
+    let out = asm(
+        &e,
+        &["get", "--json", "--login-url", "https://Login.Example.test:443/session", "--reason", "sign in"],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let sent = posted(&f);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["name"], "");
+    assert_eq!(sent[0]["login"], json!({"url": LOGIN_URL}));
+    assert_eq!((sent[0]["raw"].clone(), sent[0]["sentinel"].clone()), (json!(false), json!(false)));
+    assert!(sent[0]["client_capabilities"].as_array().unwrap().contains(&json!("login_grant_v1")));
+
+    let j: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(j["login"], json!({"url": LOGIN_URL}));
+    assert_eq!(j["files"].as_array().unwrap().len(), 3);
+    assert_eq!(std::fs::read_to_string(e.secrets.join("work/Site.username")).unwrap(), "octocat");
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("open or reload the login page now, type the username and the sentinel, submit once; for a one-time code run: asm get 'work/Site::totp' --reason 'sign in'"),
+        "{stderr}"
+    );
+
+    // The barrier probed the manager proxy with the marker and this host's credentials,
+    // then handed the route to the router.
+    let heads = heads.lock().unwrap().clone();
+    assert!(!heads.is_empty());
+    use base64::Engine as _;
+    let password = asm_proto::crypto::proxy_password(&sha256(TOKEN.as_bytes()));
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("h1:{password}"));
+    assert!(heads[0].starts_with("CONNECT login.example.test:443 HTTP/1.1\r\n"), "{}", heads[0]);
+    assert!(heads[0].contains("Asm-Browser-Route: 1\r\n"), "{}", heads[0]);
+    assert!(heads[0].contains(&format!("Proxy-Authorization: Basic {basic}\r\n")), "{}", heads[0]);
+    let status = router_status(&e);
+    assert_eq!(
+        status["routes"],
+        json!([{"host":"login.example.test","port":443,"expires_at":"2999-01-01T00:00:00Z"}])
+    );
+    let saved: Value = serde_json::from_slice(&std::fs::read(e.cfg.join("asm/router-routes.json")).unwrap()).unwrap();
+    assert_eq!(saved["routes"][0]["proxy"], format!("127.0.0.1:{proxy_port}"));
+}
+
+/// An inferred item's one-time-code hint names it as the catalog does (from the
+/// lease), never by its sanitized file name.
+#[test]
+fn get_login_url_totp_hint_uses_the_leased_item_name() {
+    let (_f, e, _, _) =
+        login_fixture_item(LOGIN_URL, "200 Connection established", "work/GitHub (work): a=b", "work/GitHub__work___a_b");
+    let _router = start_router(&e);
+    let out = asm(&e, &["get", "--login-url", LOGIN_URL, "--reason", "sign in"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(e.secrets.join("work/GitHub__work___a_b.totp").exists());
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains(r"; for a one-time code run: asm get 'work/GitHub (work)\: a\=b::totp' --reason 'sign in'"),
+        "{stderr}"
+    );
+    // That spelling is the one asm get resolves.
+    let b = asm_proto::bindings::parse_binding(r"work/GitHub (work)\: a\=b::totp").unwrap();
+    assert_eq!((b.source.as_str(), b.field.as_deref()), ("work/GitHub (work): a=b", Some("totp")));
+}
+
+#[test]
+fn get_login_url_refuses_a_different_grant() {
+    let (_f, e, _, _) = login_fixture("https://login.example.test/other", "200 Connection established");
+    let _router = start_router(&e);
+    let out = asm(&e, &["get", "--login-url", LOGIN_URL, "work/Site", "sign in"], "");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        text(&out.stderr).trim(),
+        "error: the manager returned a different login grant than requested"
+    );
+    assert!(!e.secrets.join("work/Site.password").exists());
+    assert_eq!(router_status(&e)["routes"], json!([]));
+}
+
+#[test]
+fn get_login_url_writes_files_even_when_the_route_does_not_activate() {
+    let (_f, e, _, heads) = login_fixture(LOGIN_URL, "403 Forbidden");
+    let _router = start_router(&e);
+    let out = asm(&e, &["get", "--login-url", LOGIN_URL, "--reason", "sign in"], "");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = text(&out.stderr);
+    assert!(stderr.trim_end().ends_with("error: the proxy did not activate the route; run asm doctor"), "{stderr}");
+    assert!(!stderr.contains("open or reload"), "{stderr}");
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!("login: {LOGIN_URL} (single use; routed through asm until 2999-01-01T00:00:00Z)\n")),
+        "{stdout}"
+    );
+    assert!(stdout.contains(&e.secrets.join("work/Site.password").display().to_string()), "{stdout}");
+    assert!(e.secrets.join("work/Site.password").exists());
+    assert!(heads.lock().unwrap().len() >= 15, "probed every 500 ms for 10 s");
+    assert_eq!(router_status(&e)["routes"], json!([]));
+}
+
+#[test]
+fn proxy_credentials_are_exported_but_never_shown() {
+    let (_f, e, proxy_port, _) = login_fixture(LOGIN_URL, "200 Connection established");
+    let password = asm_proto::crypto::proxy_password(&sha256(TOKEN.as_bytes()));
+    let out = asm(&e, &["proxy-env"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    let url = format!("http://h1:{password}@127.0.0.1:{proxy_port}");
+    for name in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"] {
+        assert!(stdout.contains(&format!("export {name}='{url}'\n")), "{stdout}");
+    }
+    let out = asm(&e, &["proxy-info"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains(&format!("  http://127.0.0.1:{proxy_port}  (recommended)\n")), "{stdout}");
+    assert!(stdout.contains(&format!("  socks5h://127.0.0.1:{proxy_port}  (recommended)\n")), "{stdout}");
+    assert!(
+        stdout.contains("auth: per-host credentials (added by asm exec, asm proxy-env and the proxy router)\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(&password) && !stdout.contains("h1:"), "{stdout}");
+    let out = asm(&e, &["proxy-info", "--json"], "");
+    let j: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(j["proxy_auth"], true);
+    assert_eq!(j["recommended"], format!("http://127.0.0.1:{proxy_port}"));
+}
+
+// ---------------------------------------------------------------------------
+// asm browser install|uninstall|status, asm doctor's browser checks
+// ---------------------------------------------------------------------------
+
+/// `YYYY, MM, DD` of `now + days`, for certificate validity.
+fn ymd(days: i64) -> (i32, u8, u8) {
+    let s = asm_proto::time::fmt_unix(unix_now() + days * 86_400);
+    (s[0..4].parse().unwrap(), s[5..7].parse().unwrap(), s[8..10].parse().unwrap())
+}
+
+fn validity(params: &mut rcgen::CertificateParams, from: i64, to: i64) {
+    let (y, m, d) = ymd(from);
+    params.not_before = rcgen::date_time_ymd(y, m, d);
+    let (y, m, d) = ymd(to);
+    params.not_after = rcgen::date_time_ymd(y, m, d);
+}
+
+/// A browser CA like the manager's (CN, pathlen 0) that can sign leaves.
+struct TestCa {
+    pem: String,
+    der: Vec<u8>,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+impl TestCa {
+    fn new() -> Self {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Agents Secrets Manager Browser CA");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::CrlSign];
+        validity(&mut params, -1, 3650);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        TestCa {
+            pem: cert.pem(),
+            der: cert.der().to_vec(),
+            issuer: rcgen::Issuer::new(params, key),
+        }
+    }
+
+    fn sha(&self) -> String {
+        asm_proto::crypto::sha256_hex(&self.der)
+    }
+
+    /// A server leaf for `host`: (chain DER, key DER). `signed` false gives a
+    /// self-signed leaf followed by this CA.
+    fn leaf(&self, host: &str, signed: bool) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let mut params = rcgen::CertificateParams::new(vec![host.to_owned()]).unwrap();
+        params.distinguished_name.push(rcgen::DnType::CommonName, host);
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        validity(&mut params, -1, 30);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = if signed { params.signed_by(&key, &self.issuer) } else { params.self_signed(&key) }.unwrap();
+        (vec![cert.der().to_vec(), self.der.clone()], key.serialize_der())
+    }
+}
+
+/// A paired manager whose `/proxy-info` carries `browser_ca` (absent when `None`).
+fn browser_fixture(browser_ca: Option<String>) -> (Fake, Env, Arc<Mutex<Option<String>>>) {
+    let ca = Arc::new(Mutex::new(browser_ca));
+    let served = ca.clone();
+    let f = start(Arc::new(move |method, path, _body| match (method, path) {
+        ("GET", "/v1/health") => (200, json!({"name":"asm-manager","version":"0.8.0","capabilities":["login_grant_v1"]})),
+        ("GET", "/v1/leases") => (200, json!({"leases":[]})),
+        ("GET", "/v1/proxy-info") => {
+            let mut info = json!({"port":1,"hints":["127.0.0.1"],"ca_sha256":"ab"});
+            if let Some(pem) = served.lock().unwrap().clone() {
+                info["browser_ca_pem"] = json!(pem);
+            }
+            (200, info)
+        }
+        _ => (404, json!({"error":{"code":"not_found","message":format!("{method} {path}")}})),
+    }));
+    let e = env();
+    write_host_json(&e, &f);
+    (f, e, ca)
+}
+
+/// A Chrome user data directory with `Default/Preferences` = `prefs`.
+fn chrome_udd(e: &Env, prefs: &str) -> PathBuf {
+    let udd = e.cfg.parent().unwrap().join("udd");
+    std::fs::create_dir_all(udd.join("Default")).unwrap();
+    std::fs::write(udd.join("Default/Preferences"), prefs).unwrap();
+    std::fs::write(udd.join("Last Version"), "158.0.7000.1").unwrap();
+    std::fs::canonicalize(udd).unwrap()
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+fn pac_text(port: u16) -> String {
+    format!(
+        "function FindProxyForURL(url, host) {{\n  if (url.substring(0, 6) == \"https:\" || url.substring(0, 4) == \"wss:\") return \"PROXY 127.0.0.1:{port}\";\n  return \"DIRECT\";\n}}\n"
+    )
+}
+
+/// The PAC text of a profile's `proxy` pref.
+fn profile_pac(profile: &Path) -> Option<String> {
+    use base64::Engine;
+    let prefs = read_json(&profile.join("Preferences"));
+    assert_eq!(prefs["proxy"]["mode"], "pac_script");
+    let url = prefs["proxy"]["pac_url"].as_str()?;
+    let b64 = url.strip_prefix("data:application/x-ns-proxy-autoconfig;base64,")?;
+    String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64).ok()?).ok()
+}
+
+/// `trust_settings` of the CA row `sha` in `<profile>/ServerCertificate`.
+fn ca_row(profile: &Path, sha: &str) -> Option<Vec<u8>> {
+    let db = rusqlite::Connection::open(profile.join("ServerCertificate")).unwrap();
+    db.query_row(
+        "SELECT trust_settings FROM certificates WHERE sha256hash_hex = ?1",
+        [sha],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+fn install_chrome(e: &Env, udd: &Path, extra: &[&str]) -> Output {
+    let mut args = vec!["browser", "install", "chrome", "--no-service", "--user-data-dir", udd.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    asm(e, &args, "")
+}
+
+fn browser_records(e: &Env) -> Vec<Value> {
+    match std::fs::read(e.cfg.join("asm/browsers.json")) {
+        Ok(b) => serde_json::from_slice::<Value>(&b).unwrap()["records"].as_array().unwrap().clone(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[test]
+fn browser_chrome_install_reinstall_status_doctor_uninstall() {
+    let ca = TestCa::new();
+    let (f, e, served) = browser_fixture(Some(ca.pem.clone()));
+    let udd = chrome_udd(&e, "{}");
+    let profile = udd.join("Default");
+    let key = profile.to_str().unwrap();
+
+    let out = install_chrome(&e, &udd, &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).ends_with("restart the browser once. HTTPS pages need asm's proxy router; asm doctor checks it.\n"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(text(&out.stdout).contains("start \"asm proxy-router run\" under your supervisor"));
+    assert_eq!(ca_row(&profile, &ca.sha()), Some(vec![0x0A, 0x02, 0x08, 0x03]));
+    assert_eq!(profile_pac(&profile).unwrap(), pac_text(7418));
+    let ca_file = e.cfg.join(format!("asm/browser/ca-{}.crt", &ca.sha()[..8]));
+    assert_eq!(std::fs::read_to_string(&ca_file).unwrap(), ca.pem);
+    let records = browser_records(&e);
+    assert_eq!(records.len(), 1);
+    let r = &records[0];
+    assert_eq!((r["target"].as_str(), r["key"].as_str()), (Some("chrome"), Some(key)));
+    assert_eq!(r["original"], Value::Null);
+    assert_eq!(r["ca_shas"], json!([ca.sha()]));
+    assert_eq!(r["current_sha"], ca.sha());
+    assert_eq!((r["router_port"].as_u64(), r["service"].as_bool()), (Some(7418), Some(false)));
+    assert_eq!(r["version"], env!("CARGO_PKG_VERSION"));
+
+    let out = asm(&e, &["browser", "status"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!("chrome {key}: installed\nrouter: not running (no service) — fix: start \"asm proxy-router run\" under your supervisor\n")
+    );
+
+    // Doctor: the router is down, the browser is fine.
+    let out = asm(&e, &["doctor"], "");
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("FAIL router: proxy router not running — fix: start \"asm proxy-router run\" under your supervisor\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains(&format!("ok browser: chrome {key}: installed\n")), "{stdout}");
+    assert_eq!(out.status.code(), Some(1));
+
+    // A new manager CA: status calls it stale; reinstall replaces the row.
+    let ca2 = TestCa::new();
+    *served.lock().unwrap() = Some(ca2.pem.clone());
+    let out = asm(&e, &["browser", "status"], "");
+    let fix = format!("asm browser install chrome --user-data-dir {} --profile Default --no-service", udd.display());
+    assert!(text(&out.stdout).starts_with(&format!("chrome {key}: stale CA — fix: {fix}\n")), "{}", text(&out.stdout));
+    let out = asm(&e, &["browser", "status", "--json"], "");
+    let j: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(j["browsers"][0]["state"], "stale");
+    assert_eq!(j["browsers"][0]["fix"], fix);
+    assert_eq!(j["router"]["running"], false);
+    let out = install_chrome(&e, &udd, &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(ca_row(&profile, &ca.sha()), None);
+    assert!(ca_row(&profile, &ca2.sha()).is_some());
+    assert_eq!(browser_records(&e)[0]["ca_shas"], json!([ca2.sha()]));
+    assert_eq!(browser_records(&e)[0]["original"], Value::Null);
+
+    // A removed pref is reported with the command that fixes it.
+    std::fs::write(profile.join("Preferences"), "{\"other\":1}").unwrap();
+    let out = asm(&e, &["browser", "status"], "");
+    assert!(
+        text(&out.stdout).starts_with(&format!(
+            "chrome {key}: incomplete the proxy setting in {key}/Preferences is not asm's — fix: {fix}\n"
+        )),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = install_chrome(&e, &udd, &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+
+    // Uninstall: the pref and the row go; the last record takes the saved routes along.
+    std::fs::write(e.cfg.join("asm/router-routes.json"), "{\"routes\":[]}").unwrap();
+    let out = asm(&e, &["browser", "uninstall", "chrome", "--user-data-dir", udd.to_str().unwrap()], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(read_json(&profile.join("Preferences")), json!({"other": 1}));
+    assert_eq!(ca_row(&profile, &ca2.sha()), None);
+    assert!(browser_records(&e).is_empty());
+    assert!(!e.cfg.join("asm/router-routes.json").exists());
+    assert!(!ca_file.exists());
+    // Without installs, doctor has no router or browser lines.
+    let out = asm(&e, &["doctor"], "");
+    assert!(!text(&out.stdout).contains("router:"), "{}", text(&out.stdout));
+    assert!(f.log.lock().unwrap().iter().any(|(_, p, _)| p == "/v1/proxy-info"));
+}
+
+#[test]
+fn browser_chrome_uninstall_restores_only_unchanged_settings() {
+    let ca = TestCa::new();
+    let (_f, e, _) = browser_fixture(Some(ca.pem.clone()));
+    // `system` is not a proxy setup; it comes back on uninstall.
+    let udd = chrome_udd(&e, "{\"proxy\":{\"mode\":\"system\"},\"x\":[1]}");
+    let profile = udd.join("Default");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(profile.join("Preferences"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    let out = install_chrome(&e, &udd, &["--port", "7500"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(profile_pac(&profile).unwrap(), pac_text(7500));
+    assert_eq!(std::fs::metadata(profile.join("Preferences")).unwrap().permissions().mode() & 0o777, 0o640);
+    assert_eq!(browser_records(&e)[0]["original"], json!({"mode": "system"}));
+    // Reinstalling keeps the first original.
+    let out = install_chrome(&e, &udd, &["--port", "7500"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(browser_records(&e)[0]["original"], json!({"mode": "system"}));
+    let uninstall = || asm(&e, &["browser", "uninstall", "chrome", "--user-data-dir", udd.to_str().unwrap()], "");
+    let out = uninstall();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(read_json(&profile.join("Preferences")), json!({"proxy": {"mode": "system"}, "x": [1]}));
+
+    // Changed by the user after install: left as is, with a warning.
+    let out = install_chrome(&e, &udd, &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let mut prefs = read_json(&profile.join("Preferences"));
+    prefs["proxy"] = json!({"mode": "direct"});
+    std::fs::write(profile.join("Preferences"), prefs.to_string()).unwrap();
+    let out = uninstall();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stderr),
+        format!("warning: the proxy setting in {}/Preferences was changed after install; left as is\n", profile.display())
+    );
+    assert_eq!(read_json(&profile.join("Preferences"))["proxy"], json!({"mode": "direct"}));
+    assert_eq!(ca_row(&profile, &ca.sha()), None);
+    let out = uninstall();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("is not installed for"), "{}", text(&out.stderr));
+}
+
+#[test]
+fn browser_chrome_refusals() {
+    let (f, e, _) = browser_fixture(Some(TestCa::new().pem));
+    // An existing proxy setup.
+    let udd = chrome_udd(&e, "{\"proxy\":{\"mode\":\"fixed_servers\",\"server\":\"http://p:3128\"}}");
+    let out = install_chrome(&e, &udd, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        text(&out.stderr),
+        "error: this browser already uses a proxy (profile proxy setting, mode fixed_servers); asm browser logins can't chain proxies yet\n"
+    );
+    // A running browser (this test process holds the lock).
+    std::fs::write(udd.join("Default/Preferences"), "{}").unwrap();
+    let mut host = [0u8; 256];
+    // SAFETY: the buffer is valid for its length minus the final NUL.
+    assert_eq!(unsafe { libc::gethostname(host.as_mut_ptr().cast(), host.len() - 1) }, 0);
+    let host = std::ffi::CStr::from_bytes_until_nul(&host).unwrap().to_str().unwrap().to_owned();
+    let pid = std::process::id();
+    std::os::unix::fs::symlink(format!("{host}-{pid}"), udd.join("SingletonLock")).unwrap();
+    let out = install_chrome(&e, &udd, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(text(&out.stderr), format!("error: quit the browser first (pid {pid}), then re-run\n"));
+    std::fs::remove_file(udd.join("SingletonLock")).unwrap();
+    // Too old.
+    std::fs::write(udd.join("Last Version"), "120.0.1.2").unwrap();
+    let out = install_chrome(&e, &udd, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("asm browser logins need Chrome 134 or later"), "{}", text(&out.stderr));
+    assert!(f.log.lock().unwrap().iter().all(|(_, p, _)| p != "/v1/proxy-info"), "refused before contacting the manager");
+    // A manager without browser logins: nothing changes.
+    std::fs::write(udd.join("Last Version"), "158.0.1.2").unwrap();
+    let (_f2, e2, _) = browser_fixture(None);
+    let udd2 = chrome_udd(&e2, "{}");
+    let out = install_chrome(&e2, &udd2, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(text(&out.stderr), "error: the manager does not support browser logins; upgrade it\n");
+    assert_eq!(read_json(&udd2.join("Default/Preferences")), json!({}));
+    assert!(!udd2.join("Default/ServerCertificate").exists());
+    assert!(browser_records(&e2).is_empty());
+}
+
+#[test]
+fn browser_chrome_profile_by_display_name() {
+    let ca = TestCa::new();
+    let (_f, e, _) = browser_fixture(Some(ca.pem.clone()));
+    let udd = chrome_udd(&e, "{}");
+    std::fs::create_dir_all(udd.join("Profile 1")).unwrap();
+    std::fs::write(udd.join("Profile 1/Preferences"), "{}").unwrap();
+    std::fs::write(
+        udd.join("Local State"),
+        json!({"profile":{"info_cache":{"Default":{"name":"Person 1"},"Profile 1":{"name":"Work"}}}}).to_string(),
+    )
+    .unwrap();
+    let out = install_chrome(&e, &udd, &["--profile", "Nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        text(&out.stderr),
+        format!("error: no profile \"Nope\" in {}; profiles: Default (Person 1), Profile 1 (Work)\n", udd.display())
+    );
+    let out = install_chrome(&e, &udd, &["--profile", "Work"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(ca_row(&udd.join("Profile 1"), &ca.sha()).is_some());
+    assert_eq!(profile_pac(&udd.join("Profile 1")).unwrap(), pac_text(7418));
+    assert_eq!(read_json(&udd.join("Default/Preferences")), json!({}));
+    let r = &browser_records(&e)[0];
+    assert_eq!(r["key"], udd.join("Profile 1").to_str().unwrap());
+    assert_eq!(r["profile"], "Profile 1");
+    // Uninstall finds it by directory name too.
+    let out = asm(&e, &["browser", "uninstall", "chrome", "--user-data-dir", udd.to_str().unwrap(), "--profile", "Profile 1"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(read_json(&udd.join("Profile 1/Preferences")), json!({}));
+}
+
+#[test]
+fn browser_openbot_and_t3code_need_user_wide_trust() {
+    let (f, e, _) = browser_fixture(Some(TestCa::new().pem));
+    let out = asm(&e, &["browser", "install", "openbot"], "");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        text(&out.stderr),
+        "OpenBot only trusts the OS certificate store. This adds the asm browser CA to your user's trust store; every app using it will trust certificates the asm manager issues (asm issues them only for sites with an active login grant). Re-run with --trust-user-wide to continue.\n"
+    );
+    if cfg!(target_os = "macos") {
+        let out = asm(&e, &["browser", "install", "t3code"], "");
+        assert_eq!(out.status.code(), Some(2));
+        assert_eq!(
+            text(&out.stderr),
+            "T3 Code's browser on macOS only trusts the OS certificate store. This adds the asm browser CA to your user's trust store; every app using it will trust certificates the asm manager issues (asm issues them only for sites with an active login grant). Re-run with --trust-user-wide to continue.\n"
+        );
+    }
+    assert!(f.log.lock().unwrap().is_empty());
+    assert!(browser_records(&e).is_empty());
+}
+
+/// `certutil` on this machine's `PATH`.
+fn certutil_available() -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("certutil").is_file()))
+}
+
+/// Linux: the full t3code install against a fake `T3CODE_HOME` (needs `certutil`).
+#[test]
+fn browser_t3code_linux() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let ca = TestCa::new();
+    let (_f, e, _) = browser_fixture(Some(ca.pem.clone()));
+    let base = e.cfg.parent().unwrap().join("t3");
+    let version = base.join("tools/chrome-headless-shell/linux64/157.0.1");
+    std::fs::create_dir_all(&version).unwrap();
+    std::fs::write(version.join("chrome-headless-shell"), "#!/bin/sh\necho real \"$@\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(version.join("chrome-headless-shell"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var("PATH").unwrap_or_default();
+    let vars = [("T3CODE_HOME", base.to_str().unwrap()), ("PATH", path.as_str()), ("ASM_NO_REAPER", "1")];
+    let install = || asm_env(&e, &["browser", "install", "t3code", "--no-service"], "", &vars);
+    if !certutil_available() {
+        let out = install();
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(
+            text(&out.stderr),
+            "error: install NSS tools: sudo apt install libnss3-tools (Debian/Ubuntu) or sudo dnf install nss-tools (Fedora)\n"
+        );
+        return;
+    }
+    std::fs::write(base.join("service.env"), "HTTPS_PROXY=http://p:3128\n").unwrap();
+    let out = install();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("sets HTTPS_PROXY); asm browser logins can't chain proxies yet"));
+    std::fs::remove_file(base.join("service.env")).unwrap();
+    let out = install();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).ends_with(
+        "takes effect the next time T3 starts its browser (idle browsers close after 5 minutes; restart T3 to apply now)\n"
+    ));
+    let data = e.cfg.join("asm/browser/t3code");
+    let wrapper = std::fs::read_to_string(version.join("chrome-headless-shell")).unwrap();
+    assert!(wrapper.contains(&format!("export XDG_DATA_HOME='{}'\n", data.display())), "{wrapper}");
+    assert_eq!(std::fs::read_link(data.join("home/.pki/nssdb")).unwrap(), data.join("pki/nssdb"));
+    let listed = Command::new("certutil")
+        .args(["-L", "-d", &format!("sql:{}", data.join("pki/nssdb").display())])
+        .output()
+        .unwrap();
+    assert!(text(&listed.stdout).contains(&format!("asm browser CA {}", &ca.sha()[..8])));
+    let out = asm_env(&e, &["browser", "status"], "", &vars);
+    assert!(text(&out.stdout).starts_with(&format!("t3code {}: installed\n", base.display())), "{}", text(&out.stdout));
+    // T3 downloads a new browser version.
+    let newer = base.join("tools/chrome-headless-shell/linux64/158.0.2");
+    std::fs::create_dir_all(&newer).unwrap();
+    std::fs::write(newer.join("chrome-headless-shell"), "#!/bin/sh\n").unwrap();
+    let out = asm_env(&e, &["browser", "status"], "", &vars);
+    assert!(
+        text(&out.stdout).starts_with(&format!(
+            "t3code {}: T3 updated its browser to 158.0.2 — fix: asm browser install t3code --no-service\n",
+            base.display()
+        )),
+        "{}",
+        text(&out.stdout)
+    );
+    let out = asm_env(&e, &["browser", "uninstall", "t3code"], "", &vars);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(version.join("chrome-headless-shell")).unwrap(), "#!/bin/sh\necho real \"$@\"\n");
+    assert!(!data.exists());
+    assert!(!base.join("tools/chrome-headless-shell/asm-real").exists());
+}
+
+// ---------------------------------------------------------------------------
+// Real Chrome (gated): ASM_TEST_CHROME=<path> cargo test -p asm-cli browser_install_chrome
+// ---------------------------------------------------------------------------
+
+/// An HTTPS server presenting `chain` that answers every request with `body`.
+fn tls_page(chain: Vec<Vec<u8>>, key: Vec<u8>, body: &'static str) -> u16 {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                chain.into_iter().map(CertificateDer::from).collect(),
+                PrivateKeyDer::Pkcs8(key.into()),
+            )
+            .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let Ok(conn) = ServerConnection::new(config) else { return };
+                let mut tls = StreamOwned::new(conn, stream);
+                serve_page(&mut tls, body);
+            });
+        }
+    });
+    port
+}
+
+/// Read one request head and answer it with an HTML page holding `body`.
+fn serve_page(s: &mut (impl Read + Write), body: &str) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if s.read(&mut byte).unwrap_or(0) == 0 {
+            return;
+        }
+        head.push(byte[0]);
+    }
+    let html = format!("<html><body>{body}</body></html>");
+    let _ = write!(
+        s,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+        html.len()
+    );
+    let _ = s.flush();
+}
+
+fn http_page(body: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            std::thread::spawn(move || serve_page(&mut stream, body));
+        }
+    });
+    port
+}
+
+/// A stand-in for the proxy router on `listener`: records each request line and
+/// tunnels every CONNECT to 127.0.0.1:`upstream`.
+fn fake_router(listener: TcpListener, upstream: Arc<std::sync::atomic::AtomicU16>) -> Arc<Mutex<Vec<String>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (log, upstream) = (log.clone(), upstream.clone());
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut first = String::new();
+                if reader.read_line(&mut first).unwrap_or(0) == 0 {
+                    return;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                log.lock().unwrap().push(first.trim_end().to_owned());
+                let mut client = reader.into_inner();
+                if !first.starts_with("CONNECT ") {
+                    let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    return;
+                }
+                let port = upstream.load(std::sync::atomic::Ordering::SeqCst);
+                let Ok(mut up) = std::net::TcpStream::connect(("127.0.0.1", port)) else { return };
+                let _ = client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+                let (mut c2, mut u2) = (client.try_clone().unwrap(), up.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut c2, &mut u2);
+                    let _ = u2.shutdown(std::net::Shutdown::Write);
+                });
+                let _ = std::io::copy(&mut up, &mut client);
+                let _ = client.shutdown(std::net::Shutdown::Write);
+            });
+        }
+    });
+    seen
+}
+
+/// `chrome --headless=new --dump-dom <url>` on the profile in `udd` (60 s at most).
+fn chrome_dump(chrome: &Path, udd: &Path, rules: &str, url: &str) -> String {
+    let mut child = Command::new(chrome)
+        .args([
+            "--headless=new",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--use-mock-keychain",
+            "--password-store=basic",
+            "--disable-gpu",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-sync",
+            "--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable",
+        ])
+        .arg(format!("--user-data-dir={}", udd.display()))
+        .arg(format!("--host-resolver-rules={rules}"))
+        .args(["--dump-dom", url])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.wait();
+    reader.join().unwrap()
+}
+
+#[test]
+fn browser_install_chrome() {
+    let Some(chrome) = std::env::var_os("ASM_TEST_CHROME").map(PathBuf::from) else {
+        eprintln!("skipped: set ASM_TEST_CHROME to a Chrome executable");
+        return;
+    };
+    // 1–2. Install into a temporary profile; the CA row and the PAC are as specified.
+    let ca = TestCa::new();
+    let (_f, e, _) = browser_fixture(Some(ca.pem.clone()));
+    let udd = chrome_udd(&e, "{}");
+    let profile = udd.join("Default");
+    let router = TcpListener::bind("127.0.0.1:0").unwrap();
+    let router_port = router.local_addr().unwrap().port();
+    let out = install_chrome(&e, &udd, &["--port", &router_port.to_string()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(ca_row(&profile, &ca.sha()).is_some());
+    assert_eq!(profile_pac(&profile).unwrap(), pac_text(router_port));
+
+    // 3. HTTPS goes through the router to a server with a test-CA leaf: trusted.
+    let (chain, key) = ca.leaf("example.test", true);
+    let trusted = tls_page(chain, key, "TRUST-OK");
+    let (chain, key) = ca.leaf("example.test", false);
+    let untrusted = tls_page(chain, key, "UNTRUSTED-LOADED");
+    let direct = http_page("HTTP-DIRECT");
+    let upstream = Arc::new(std::sync::atomic::AtomicU16::new(trusted));
+    let seen = fake_router(router, upstream.clone());
+    let rules = format!("MAP example.test:443 127.0.0.1:{trusted}, MAP example.test:80 127.0.0.1:{direct}");
+    let dom = chrome_dump(&chrome, &udd, &rules, "https://example.test/");
+    assert!(dom.contains("TRUST-OK"), "{dom}");
+    let ours = |seen: &Mutex<Vec<String>>| {
+        seen.lock().unwrap().iter().filter(|l| l.contains("example.test")).cloned().collect::<Vec<_>>()
+    };
+    assert!(ours(&seen).iter().any(|l| l.starts_with("CONNECT example.test:443 ")), "{:?}", seen.lock().unwrap());
+
+    // 4. http:// goes direct; a chain the test CA did not sign does not load.
+    let before = ours(&seen).len();
+    let dom = chrome_dump(&chrome, &udd, &rules, "http://example.test/");
+    assert!(dom.contains("HTTP-DIRECT"), "{dom}");
+    assert_eq!(ours(&seen).len(), before, "{:?}", seen.lock().unwrap());
+    upstream.store(untrusted, std::sync::atomic::Ordering::SeqCst);
+    let dom = chrome_dump(&chrome, &udd, &rules, "https://example.test/");
+    assert!(!dom.contains("UNTRUSTED-LOADED"), "{dom}");
+    assert!(ours(&seen).len() > before, "the untrusted page went through the router too");
+
+    // 5. Reinstall, then uninstall: the proxy pref is gone.
+    let out = install_chrome(&e, &udd, &["--port", &router_port.to_string()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = asm(&e, &["browser", "uninstall", "chrome", "--user-data-dir", udd.to_str().unwrap()], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(read_json(&profile.join("Preferences")).get("proxy").is_none());
+    assert_eq!(ca_row(&profile, &ca.sha()), None);
+}
+
+// ---------------------------------------------------------------------------
+// asm login
+// ---------------------------------------------------------------------------
+
+const STORAGE_STATE: &str = r#"{"cookies":[{"name":"sid","value":"s3cr3t","domain":"the-internet.example.test","path":"/","expires":-1,"httpOnly":true,"secure":true,"sameSite":"Lax"},{"name":"pref","value":"1","domain":".example.test","path":"/","expires":-1,"httpOnly":false,"secure":true,"sameSite":"Lax"}],"origins":[{"origin":"https://the-internet.example.test","localStorage":[]}]}"#;
+
+/// A manager approving `asm login` at once with `result`.
+fn login_broker(result: Value) -> (Fake, Env) {
+    let f = start(Arc::new(move |method, path, _body| match (method, path) {
+        ("GET", "/v1/health") => (200, json!({"name":"asm-manager","version":"0.8.0","capabilities":["login_broker_v1"]})),
+        ("GET", "/v1/leases") => (200, json!({"leases":[]})),
+        ("GET", "/v1/secrets") => (
+            200,
+            json!({"secrets":[{"name":"work/Site","vault":"work","kind":"login","fields":["username","password"],"lease":null}]}),
+        ),
+        ("POST", "/v1/requests") => (
+            200,
+            json!({"request_id":REQ,"kind":"login","status":"approved","deny_reason":null,"result":result.clone()}),
+        ),
+        _ => (404, json!({"error":{"code":"not_found","message":format!("{method} {path}")}})),
+    }));
+    let e = env();
+    write_host_json(&e, &f);
+    (f, e)
+}
+
+fn storage_state_result(mode: &str, files: Value) -> Value {
+    json!({"lease_id":LEASE,"mode":mode,"hosts":[],"expires_at":"2999-01-01T00:00:00Z","files":files})
+}
+
+#[test]
+fn login_hands_over_the_storage_state() {
+    let (f, e) = login_broker(storage_state_result(
+        "raw",
+        json!([{"field":"storage-state","relative_path":"work/Site.storage-state","content":STORAGE_STATE,"substituted":false}]),
+    ));
+    let out = asm(
+        &e,
+        &["login", "https://the-internet.example.test/login", "--reason", "broker test", "--fill-origin", "https://SSO.example.test:443", "--fill-origin", "https://sso.example.test"],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let path = e.secrets.join("work/Site.storage-state");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), STORAGE_STATE);
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "storage state: {}\ncookie domains: the-internet.example.test, .example.test\nexpires: 2999-01-01T00:00:00Z\n",
+            path.display()
+        )
+    );
+    let p = path.display();
+    assert!(
+        text(&out.stderr).ends_with(&format!(
+            "load it with your browser tool: omp tab.loadState({p}), Playwright MCP --storage-state {p}\n"
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+    let body = &posted(&f)[0];
+    assert_eq!(
+        *body,
+        json!({"kind":"login","name":"","url":"https://the-internet.example.test/login","reason":"broker test",
+            "extra_fill_origins":["https://sso.example.test"],"agent":"test-agent","client_capabilities":["login_broker_v1"]})
+    );
+
+    // With ITEM and --json.
+    let out = asm(&e, &["login", "https://the-internet.example.test/login", "work/Site", "--reason", "again", "--json"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let j: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(j["path"], path.to_str().unwrap());
+    assert_eq!(j["cookie_domains"], json!(["the-internet.example.test", ".example.test"]));
+    assert_eq!(j["lease_id"], LEASE);
+    assert_eq!(posted(&f)[1]["name"], "work/Site");
+}
+
+#[test]
+fn login_refuses_other_result_shapes() {
+    let state = |field: &str| json!({"field":field,"relative_path":format!("work/Site.{field}"),"content":STORAGE_STATE,"substituted":false});
+    for result in [
+        storage_state_result("sentinel", json!([state("storage-state")])),
+        storage_state_result("raw", json!([state("password")])),
+        storage_state_result("raw", json!([state("storage-state"), state("username")])),
+        storage_state_result("raw", json!([])),
+    ] {
+        let (_f, e) = login_broker(result.clone());
+        let out = asm(&e, &["login", "https://the-internet.example.test/login", "--reason", "r"], "");
+        assert_eq!(out.status.code(), Some(1), "{result}");
+        assert_eq!(
+            text(&out.stderr),
+            "error: the manager did not return a browser storage state (expected one raw storage-state file)\n",
+            "{result}"
+        );
+        assert!(!e.secrets.join("work").exists(), "{result}");
+    }
+    let (_f, e) = login_broker(storage_state_result(
+        "raw",
+        json!([{"field":"storage-state","relative_path":"work/Site.storage-state","content":"{\"nope\":1}","substituted":false}]),
+    ));
+    let out = asm(&e, &["login", "https://the-internet.example.test/login", "--reason", "r"], "");
+    assert_eq!(text(&out.stderr), "error: the manager sent an invalid storage state\n");
+}
+
+#[test]
+fn login_validates_arguments_before_posting() {
+    let (f, e) = login_broker(Value::Null);
+    let six: Vec<String> = (0..6).map(|i| format!("https://s{i}.example.test")).collect();
+    let mut many = vec!["login", "https://a.example.test/", "--reason", "r"];
+    for o in &six {
+        many.extend(["--fill-origin", o.as_str()]);
+    }
+    for (args, message) in [
+        (vec!["login", "http://a.example.test/", "--reason", "r"], "invalid: URL must start with https://"),
+        (vec!["login", "https://a.example.test/", "--reason", "r", "--fill-origin", "https://b.example.test/login"], "invalid: --fill-origin \"https://b.example.test/login\" must be https://host[:port]"),
+        (vec!["login", "https://a.example.test/", "--reason", "r", "--fill-origin", "http://b.example.test"], "invalid: --fill-origin \"http://b.example.test\" must be https://host[:port]"),
+        (vec!["login", "https://a.example.test/", "work/Site::password", "--reason", "r"], "invalid: asm login takes a whole login item"),
+        (many, "invalid: at most 5 --fill-origin values"),
+    ] {
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(text(&out.stderr).trim(), message, "{args:?}");
+    }
+    let out = asm(&e, &["login", "https://a.example.test/"], "");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(f.log.lock().unwrap().is_empty());
+}

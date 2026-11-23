@@ -125,14 +125,19 @@ name = "asm-cli"
 version = "0.7.0"
 dependencies = [
  "asm-proto",
+ "base64 0.22.1",
  "clap",
+ "httparse",
  "libc",
  "rcgen",
  "reqwest",
+ "ring",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

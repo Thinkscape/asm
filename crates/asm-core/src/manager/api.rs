@@ -8,7 +8,7 @@ use std::time::Duration;
 use asm_proto::{ApiError, ErrorCode};
 use asm_proto::generators::{GenerationSelection, SourceKind};
 use asm_proto::wire::{
-    CAPABILITY_BROADER_LEASE_REUSE_V1,
+    CAPABILITY_BROADER_LEASE_REUSE_V1, CAPABILITY_LOGIN_BROKER_V1, CAPABILITY_LOGIN_GRANT_V1,
     CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1,
     CAPABILITY_OPERATOR_SELECTED_GRANT_V1, CAPABILITY_OPERATOR_SELECTED_PROJECT_V1,
     CAPABILITY_SECRET_FIELDS_V1, HealthResponse, LeaseBrief,
@@ -169,6 +169,8 @@ async fn health() -> Json<HealthResponse> {
             CAPABILITY_OPERATOR_SELECTED_GRANT_V1.into(),
             CAPABILITY_OPERATOR_SELECTED_PROJECT_V1.into(),
             CAPABILITY_BROADER_LEASE_REUSE_V1.into(),
+            CAPABILITY_LOGIN_GRANT_V1.into(),
+            CAPABILITY_LOGIN_BROKER_V1.into(),
         ],
     })
 }
@@ -343,6 +345,7 @@ async fn leases(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<Lease
                 mode: l.mode,
                 hosts: l.hosts,
                 expires_at: l.expires_at.map(asm_proto::time::fmt_unix),
+                login: l.login,
             })
             .collect();
         Ok(LeasesResponse { leases })
@@ -377,6 +380,8 @@ async fn proxy_info(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<P
             hints,
             ca_sha256: core.proxy.ca_sha256_hex()?,
             firewall_blocks_proxy: core.firewall_blocks_proxy(),
+            proxy_auth: core.proxy.config().require_auth,
+            browser_ca_pem: Some(core.proxy.browser_ca_pem()?),
         })
     })
     .await?;

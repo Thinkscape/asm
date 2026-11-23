@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use asm_proto::generators::{
     GcloudAccessGrant, GcloudAccessRequest, GenerationGrant, GenerationRequest, SourceKind,
 };
-use asm_proto::wire::{HostInfo, LeaseMode, LeaseStatus};
+use asm_proto::wire::{HostInfo, LeaseMode, LeaseStatus, LoginScope};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
@@ -118,7 +118,8 @@ CREATE TABLE IF NOT EXISTS leases(
     credential_expires_at INTEGER,
     approval_order INTEGER,
     credential_version INTEGER NOT NULL DEFAULT 0,
-    requested_generation TEXT
+    requested_generation TEXT,
+    login TEXT
 );
 CREATE INDEX IF NOT EXISTS leases_secret ON leases(vault_id, secret_key);
 CREATE TABLE IF NOT EXISTS secret_hosts(
@@ -385,6 +386,8 @@ pub struct LeaseRecord {
     /// Durable high-water mark; generated credentials never reset it after restart.
     pub credential_version: u64,
     pub requested_generation: Option<GenerationRequest>,
+    /// Login grant scope (form action URL) of a single-use login sentinel lease.
+    pub login: Option<LoginScope>,
 }
 
 impl LeaseRecord {
@@ -1235,6 +1238,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("approval_order", "INTEGER"),
         ("credential_version", "INTEGER NOT NULL DEFAULT 0"),
         ("requested_generation", "TEXT"),
+        ("login", "TEXT"),
     ] {
         let exists = conn
             .prepare("SELECT 1 FROM pragma_table_info('leases') WHERE name = ?1")?
@@ -1570,6 +1574,23 @@ impl Store {
         Ok(out)
     }
 
+    /// `(host id, SHA-256 of its bearer token)` of every non-revoked host.
+    pub fn active_host_token_hashes(&self) -> Result<Vec<(String, [u8; 32])>> {
+        let db = self.db();
+        let mut st =
+            db.prepare("SELECT id, token_hash FROM hosts WHERE revoked_at IS NULL ORDER BY paired_at")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, hash) = r?;
+            let hash: [u8; 32] = hash
+                .try_into()
+                .map_err(|_| CoreError::internal("invalid persisted host token hash"))?;
+            out.push((id, hash));
+        }
+        Ok(out)
+    }
+
     pub fn touch_host(&self, id: &str, now: i64) -> Result<()> {
         self.db().execute(
             "UPDATE hosts SET last_seen = ?2 WHERE id = ?1",
@@ -1807,9 +1828,9 @@ impl Store {
             "INSERT INTO leases(id, host_id, vault_id, vault_name, secret_key, name, mode, fields, hosts,
                                 reason, agent, created_at, expires_at, revoked_at, source_kind, generation,
                                 generator_revision, credential_expires_at, approval_order, credential_version,
-                                requested_generation)
+                                requested_generation, login)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                    ?15, ?16, ?17, ?18, ?19, ?20, ?21
+                    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?23
              WHERE NOT EXISTS (
                  SELECT 1 FROM gcloud_profiles WHERE unique_id = ?22 AND deletion_state != 0
              )",
@@ -1836,6 +1857,7 @@ impl Store {
                 sqlite_u64(l.credential_version, "credential version")?,
                 l.requested_generation.as_ref().map(serde_json::to_string).transpose()?,
                 issued_gcloud_uid(l.generation.as_ref()),
+                l.login.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
         if inserted != 1 {
@@ -1860,7 +1882,7 @@ impl Store {
         let sql = format!(
             "SELECT id, host_id, vault_id, vault_name, secret_key, name, mode, fields, hosts, reason, agent,
                     created_at, expires_at, revoked_at, source_kind, generation, generator_revision,
-                    credential_expires_at, approval_order, credential_version, requested_generation
+                    credential_expires_at, approval_order, credential_version, requested_generation, login
              FROM leases {filter} ORDER BY created_at, rowid"
         );
         let mut st = db.prepare(&sql)?;
@@ -1896,6 +1918,7 @@ impl Store {
                     r.get::<_, Option<i64>>(18)?,
                     r.get::<_, i64>(19)?,
                     r.get::<_, Option<String>>(20)?,
+                    r.get::<_, Option<String>>(21)?,
                 ),
             ))
         })?;
@@ -1907,7 +1930,7 @@ impl Store {
                 (fields, hosts, reason, agent),
                 t,
                 (source_kind, generation, generator_revision, credential_expires_at, approval_order,
-                 credential_version, requested_generation),
+                 credential_version, requested_generation, login),
             ) = row?;
             let lease = LeaseRecord {
                 id,
@@ -1935,6 +1958,7 @@ impl Store {
                     .map_err(|_| CoreError::internal("invalid persisted credential version"))?,
                 requested_generation: requested_generation
                     .map(|s| serde_json::from_str(&s)).transpose()?,
+                login: login.map(|s| serde_json::from_str(&s)).transpose()?,
             };
             validate_lease_generation(&lease)?;
             out.push(lease);
@@ -2251,6 +2275,7 @@ mod tests {
                 repositories: Some(vec!["acme/web".into()]),
                 permissions: Some([("metadata".into(), GithubPermission::Read)].into()),
             })),
+            login: None,
         }
     }
 
@@ -3358,6 +3383,7 @@ mod tests {
             approval_order: None,
             credential_version: 0,
             requested_generation: None,
+            login: None,
         };
         s.insert_lease(&l).unwrap();
         assert_eq!(s.active_leases(19).unwrap().len(), 1);

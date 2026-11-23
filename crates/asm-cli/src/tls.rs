@@ -132,10 +132,12 @@ pub fn manager_client(pin: Pin, timeout: Duration) -> Result<reqwest::blocking::
 }
 
 /// Blocking HTTP client that goes through `proxy_url` and trusts only the proxy CA
-/// (`ca_pem`), as an agent tool would after `asm proxy-info`.
+/// (`ca_pem`), as an agent tool would after `asm proxy-info`. `basic_auth` = (user,
+/// password) when the proxy requires per-host credentials.
 pub fn proxy_probe_client(
     proxy_url: &str,
     ca_pem: &[u8],
+    basic_auth: Option<(&str, &str)>,
 ) -> Result<reqwest::blocking::Client, String> {
     let mut roots = RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(ca_pem) {
@@ -152,8 +154,11 @@ pub fn proxy_probe_client(
         .expect("ring supports the default protocol versions")
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let proxy =
+    let mut proxy =
         reqwest::Proxy::all(proxy_url).map_err(|e| format!("proxy URL {proxy_url}: {e}"))?;
+    if let Some((user, password)) = basic_auth {
+        proxy = proxy.basic_auth(user, password);
+    }
     reqwest::blocking::Client::builder()
         .tls_backend_preconfigured(config)
         .proxy(proxy)

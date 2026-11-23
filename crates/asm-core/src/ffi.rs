@@ -860,6 +860,13 @@ pub enum Decision {
         vault_id: String,
         collection_id: Option<String>,
     },
+    /// `asm login`: open the sign-in browser. `fill_origins`: the request's origins the
+    /// broker may fill (the operator may remove extra ones; the requested site's origin
+    /// is always included). `duration_secs: None` = 1 hour.
+    ApproveLogin {
+        duration_secs: Option<u64>,
+        fill_origins: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -962,6 +969,12 @@ pub struct AddTarget {
     pub personal_allowed: bool,
 }
 
+/// The exact HTTPS form action a login grant is valid for.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LoginScopeInfo {
+    pub url: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum RequestDetail {
     Pair {
@@ -996,6 +1009,9 @@ pub enum RequestDetail {
         operator_selected_grant: bool,
         /// The requesting client can receive a managed Google grant for another project.
         operator_selected_gcloud_project: bool,
+        /// A single-use login grant for this form action (sentinel delivery, at most
+        /// one hour, routed through asm until it expires).
+        login: Option<LoginScopeInfo>,
     },
     Update {
         name: String,
@@ -1010,6 +1026,17 @@ pub enum RequestDetail {
         value: String,
         targets: Vec<AddTarget>,
     },
+    /// `asm login`: sign in on the Mac with this vault login; the agent receives the
+    /// site's cookies and `url`'s origin's localStorage.
+    Login {
+        name: String,
+        vault_name: String,
+        url: String,
+        /// The requested site's origin first, then extra origins the agent asked to fill.
+        fill_origins: Vec<String>,
+        reason: String,
+        has_totp: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -1018,6 +1045,7 @@ pub enum RequestKind {
     Get,
     Update,
     Add,
+    Login,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -1062,12 +1090,25 @@ pub struct RecentRequest {
     pub resolved_at: SystemTime,
 }
 
+/// An approved `asm login` whose sign-in browser is open.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct BrokerSessionInfo {
+    pub request_id: String,
+    pub url: String,
+    pub host_label: String,
+    pub started_at: SystemTime,
+    /// What the broker is doing (`paused: <origin> is not approved`, `filled …`).
+    pub status: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct Snapshot {
-    /// Oldest first.
+    /// Oldest first; approved sign-ins are listed in `broker_sessions` instead.
     pub pending: Vec<PendingRequest>,
     /// Last 10 resolved, newest first.
     pub recent: Vec<RecentRequest>,
+    /// Open sign-in browsers, oldest first.
+    pub broker_sessions: Vec<BrokerSessionInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -1299,6 +1340,8 @@ pub struct ProxySettings {
     pub metrics_port: u16,
     pub max_request_body_bytes: u64,
     pub allow_plain_http: bool,
+    /// Paired hosts sign in to the proxy with per-host credentials.
+    pub require_auth: bool,
 }
 
 /// Proxy health as the UI shows it.
@@ -1423,7 +1466,8 @@ pub struct ActivityEntry {
     pub at: SystemTime,
     pub category: String,
     /// Per category, e.g. requests: `requested`, `approved`, `reused`, `denied`, `failed`,
-    /// `expired`, `cancelled`; leases: `created`, `revoked`, `expired`, `suspended`,
+    /// `expired`, `cancelled`, `browser_opened` (an approved `asm login` opened its sign-in
+    /// browser); leases: `created`, `revoked`, `expired`, `suspended`,
     /// `resumed`; proxy: `substitution`, `rejected`, `started`, `restarted`, `crashed`
     /// (once per distinct cause per outage), `start_failed`, `reload_failed`, `down`,
     /// `unhealthy`, `recovered` (with the downtime), `orphan_killed`, `firewall_blocked`,
@@ -1548,6 +1592,16 @@ impl Manager {
 
     pub fn resolve_request(&self, id: String, decision: Decision) -> FfiResult<()> {
         Ok(self.core.resolve_request(&id, decision)?)
+    }
+
+    /// Export the sign-in browser's session to the requesting agent and close it.
+    pub fn broker_handover(&self, request_id: String) -> FfiResult<()> {
+        Ok(self.core.broker_handover(&request_id)?)
+    }
+
+    /// Close the sign-in browser; the request is denied with "sign-in cancelled".
+    pub fn broker_cancel(&self, request_id: String) -> FfiResult<()> {
+        Ok(self.core.broker_cancel(&request_id)?)
     }
 
     pub fn list_vaults(&self) -> Vec<VaultInfo> {

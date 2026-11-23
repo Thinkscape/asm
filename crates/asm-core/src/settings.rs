@@ -17,6 +17,7 @@ pub const PROXY_MGMT_PORT: &str = "proxy.mgmt_port";
 pub const PROXY_METRICS_PORT: &str = "proxy.metrics_port";
 pub const PROXY_MAX_BODY: &str = "proxy.max_body";
 pub const PROXY_ALLOW_PLAIN_HTTP: &str = "proxy.allow_plain_http";
+pub const PROXY_REQUIRE_AUTH: &str = "proxy.require_auth";
 /// Hidden (no UI): overrides the proxy's `upstream_deny_cidrs`; used by tests.
 pub const PROXY_UPSTREAM_DENY_CIDRS: &str = "proxy.upstream_deny_cidrs";
 pub const PROXY_HINTS: &str = "proxy.hints";
@@ -80,6 +81,7 @@ impl Settings {
                 metrics_port: get(store, PROXY_METRICS_PORT, p.metrics_port)?,
                 max_body: get(store, PROXY_MAX_BODY, p.max_body)?,
                 allow_plain_http: get(store, PROXY_ALLOW_PLAIN_HTTP, p.allow_plain_http)?,
+                require_auth: get(store, PROXY_REQUIRE_AUTH, p.require_auth)?,
                 upstream_deny_cidrs: get(store, PROXY_UPSTREAM_DENY_CIDRS, p.upstream_deny_cidrs)?,
             },
             proxy_hints: get(store, PROXY_HINTS, d.proxy_hints)?,
@@ -110,6 +112,7 @@ impl Settings {
         put(store, PROXY_METRICS_PORT, &p.metrics_port)?;
         put(store, PROXY_MAX_BODY, &p.max_body)?;
         put(store, PROXY_ALLOW_PLAIN_HTTP, &p.allow_plain_http)?;
+        put(store, PROXY_REQUIRE_AUTH, &p.require_auth)?;
         // `upstream_deny_cidrs` is hidden: only written when explicitly set (tests).
         if p.upstream_deny_cidrs.is_some() {
             put(store, PROXY_UPSTREAM_DENY_CIDRS, &p.upstream_deny_cidrs)?;
@@ -130,6 +133,7 @@ impl Settings {
             PROXY_METRICS_PORT,
             PROXY_MAX_BODY,
             PROXY_ALLOW_PLAIN_HTTP,
+            PROXY_REQUIRE_AUTH,
             PROXY_UPSTREAM_DENY_CIDRS,
             PROXY_HINTS,
             LEASE_DEFAULT_SECS,
@@ -175,6 +179,22 @@ mod tests {
         );
         assert_eq!(s.lease_default_secs, None);
         assert!(Settings::seed(&store, &[("nope".into(), serde_json::json!(1))]).is_err());
+        s.save(&store).unwrap();
+        assert_eq!(Settings::load(&store).unwrap(), s);
+    }
+
+    #[test]
+    fn require_auth_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("asm.db")).unwrap();
+        assert!(!Settings::load(&store).unwrap().proxy.require_auth, "off by default");
+        Settings::seed(&store, &[(PROXY_REQUIRE_AUTH.into(), serde_json::json!(true))]).unwrap();
+        let mut s = Settings::load(&store).unwrap();
+        assert!(s.proxy.require_auth);
+        s.proxy.require_auth = false;
+        s.save_proxy(&store).unwrap();
+        assert!(!Settings::load(&store).unwrap().proxy.require_auth);
+        s.proxy.require_auth = true;
         s.save(&store).unwrap();
         assert_eq!(Settings::load(&store).unwrap(), s);
     }

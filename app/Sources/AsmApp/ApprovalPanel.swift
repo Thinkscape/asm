@@ -173,3 +173,67 @@ final class ApprovalPanelController {
         panel.setFrameOrigin(NSPoint(x: visible.maxX - size.width - margin, y: visible.maxY - size.height - margin))
     }
 }
+
+/// Open `asm login` sign-in browsers, at the top of the approval panel: what each is
+/// doing, "Hand over session" (the agent receives the site's session) and "Cancel".
+struct BrokerSessionList: View {
+    let model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionLabel("Sign-in browsers")
+            ForEach(model.brokerSessions) { session in
+                BrokerSessionRow(session: session, error: model.brokerErrors[session.id]) {
+                    model.handOverBrokerSession(session.id)
+                } cancel: {
+                    model.cancelBrokerSession(session.id)
+                }
+            }
+        }
+    }
+}
+
+private struct BrokerSessionRow: View {
+    let session: BrokerSessionItem
+    let error: String?
+    let handOver: () -> Void
+    let cancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(verbatim: session.hostLabel).font(.system(size: 13, weight: .semibold))
+                Spacer(minLength: 8)
+                Text(session.startedAt, style: .relative)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text(verbatim: session.url)
+                .font(.system(size: 12).monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+            Text(verbatim: session.status)
+                .font(.callout)
+                .foregroundStyle(session.status.hasPrefix("paused") ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                .fixedSize(horizontal: false, vertical: true)
+            if let error {
+                Label {
+                    Text(verbatim: error).fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                }
+                .font(.callout)
+            }
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                Button("Cancel", action: cancel)
+                Button("Hand over session", action: handOver)
+                    .buttonStyle(.borderedProminent)
+            }
+            .controlSize(.large)
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}

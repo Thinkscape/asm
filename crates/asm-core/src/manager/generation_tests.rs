@@ -2367,7 +2367,7 @@ fn generation_google_pins_historical_legacy_project_without_rewriting_its_grant(
         })),
         generator_revision: Some(1), credential_expires_at: Some(f.start - 1),
         approval_order: Some(f.core.store.reserve_generator_approval_order().unwrap()),
-        credential_version: 1, requested_generation: None,
+        credential_version: 1, requested_generation: None, login: None,
     };
     f.core.store.insert_lease(&legacy).unwrap();
     let mut pinned = gcloud_conditional(&f, &legacy.id, 1);

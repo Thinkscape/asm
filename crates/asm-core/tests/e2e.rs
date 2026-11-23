@@ -123,6 +123,7 @@ impl AutoApprover {
                     let Some(target) = targets.first() else { continue };
                     Decision::ApproveWrite { vault_id: target.vault_id.clone(), collection_id: None }
                 }
+                RequestDetail::Login { .. } => Decision::Deny { reason: "e2e does not sign in".into() },
             };
             let deny = matches!(decision, Decision::Deny { .. });
             if m.resolve_request(p.id.clone(), decision).is_ok() && !deny {
@@ -2044,3 +2045,6 @@ printf 'structured-child-ok\n'"#;
 
 #[path = "e2e/gcloud.rs"]
 mod gcloud;
+
+#[path = "e2e/browser_login.rs"]
+mod browser_login;

@@ -142,6 +142,45 @@ wildcards are flagged. Substitution covers headers, paths, query and bodies up t
 Larger bodies receive 413; WebSockets are unsupported. Use hostnames, not IP addresses.
 Response redaction is best effort.
 
+## Browser logins
+
+Sign in to websites in a browser you drive (the user's Chrome, T3 Code preview tabs,
+OpenBot profiles) without ever seeing the password.
+
+**Setup**, once per machine where the browser runs (the operator may need to do it):
+`asm browser install chrome|t3code|openbot` (OpenBot also needs `--trust-user-wide`), then
+restart that browser. Run every browser-login `asm` command on that same machine.
+
+Already signed in? Do nothing. Otherwise:
+
+1. Read the login form's submit URL in the page:
+   `document.querySelector('input[type=password]').form.action`.
+2. `asm get --login-url <that URL> --reason "<why>"` (add the vault ITEM name only when
+   asked or when several logins match). It prints the username, a single-use password
+   sentinel and, when the item has an authenticator key, a one-time code.
+3. Open or reload the login page, type the username and the sentinel, submit **once**.
+4. At a one-time-code prompt, run `asm get <ITEM>::totp --reason "<why>"` (no popup while
+   the grant lasts) and type the code.
+5. A password field with `maxlength` under 44, or one input box per OTP digit: use
+   `asm login <URL> --reason "<why>"` instead. The operator signs in on the Mac and you
+   receive a storage-state file to load into your browser tool.
+
+| Error | Action |
+|---|---|
+| `403 login sentinel not valid for METHOD URL` | Re-request with that URL. |
+| `403 login sentinel must be an entire form or JSON value` | Type the sentinel alone into the password field. |
+| `403 login body must be …` or `one login grant per request` | Use `asm login`. |
+| `403 sentinel expired or revoked` | Already used or ended; request a new grant. |
+| `403 this login grant belongs to another machine` | Request it on the browser's machine. |
+| `503 login secret unavailable` | The vault is locked; tell the operator. |
+| `502 asm proxy-router: …` | Run `asm doctor`. |
+| Certificate error on the site | Run `asm browser status`; restart the browser after install. |
+| Every HTTPS page fails | The router is down; run `asm doctor`. |
+
+Diagnostics: `asm doctor`, `asm browser status`, and the router logs
+(`journalctl --user -u asm-proxy-router` on Linux, `~/Library/Logs/asm-proxy-router.log`
+on macOS).
+
 ## Outcomes and safety
 
 - Denial (exit 3): follow the operator's reason. Narrow hosts or improve the reason if

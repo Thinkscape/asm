@@ -281,6 +281,7 @@ fn lease(m: &Manager, host_id: &str) -> String {
                 hosts: vec!["api.example.com".into()],
                 reason: "repair test".into(),
                 agent: "test".into(),
+                login: None,
             },
         )
         .unwrap();
@@ -507,6 +508,7 @@ fn resolved_requests_link_to_their_activity_rows() {
                     client_capabilities: vec![],
                     hosts: vec!["api.example.com".into()],
                     reason: "recent link test".into(),
+                    login: None,
                     agent: "test".into(),
                 },
             )

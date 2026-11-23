@@ -87,13 +87,26 @@ final class CoreBridge: @unchecked Sendable {
 
     // MARK: Requests
 
-    func snapshot() throws -> (pending: [PendingItem], recent: [RecentItem]) {
+    func snapshot() throws -> (pending: [PendingItem], recent: [RecentItem], brokerSessions: [BrokerSessionItem]) {
         let snapshot = manager.snapshot()
-        return (snapshot.pending.map(PendingItem.init), snapshot.recent.map(RecentItem.init))
+        return (
+            snapshot.pending.map(PendingItem.init), snapshot.recent.map(RecentItem.init),
+            snapshot.brokerSessions.map(BrokerSessionItem.init)
+        )
     }
 
     func resolve(id: String, decision: DecisionItem) throws {
         try Self.mapped { try manager.resolveRequest(id: id, decision: Self.coreDecision(decision)) }
+    }
+
+    /// Exports the sign-in browser's session to the requesting agent and closes it.
+    func brokerHandover(requestID: String) throws {
+        try Self.mapped { try manager.brokerHandover(requestId: requestID) }
+    }
+
+    /// Closes the sign-in browser; the request is denied with "sign-in cancelled".
+    func brokerCancel(requestID: String) throws {
+        try Self.mapped { try manager.brokerCancel(requestId: requestID) }
     }
 
     private static func coreDecision(_ decision: DecisionItem) -> Decision {
@@ -104,6 +117,7 @@ final class CoreBridge: @unchecked Sendable {
             .approveGet(mode: raw ? .raw : .sentinel, durationSecs: durationSecs, hosts: hosts,
                         generation: generation.map(GenerationSelection.init))
         case let .approveWrite(vaultID, collectionID): .approveWrite(vaultId: vaultID, collectionId: collectionID)
+        case let .approveLogin(durationSecs, fillOrigins): .approveLogin(durationSecs: durationSecs, fillOrigins: fillOrigins)
         }
     }
 
@@ -402,6 +416,7 @@ private extension RequestKind {
         case .get: self = .get
         case .update: self = .update
         case .add: self = .add
+        case .login: self = .login
         }
     }
 }
@@ -427,7 +442,7 @@ private extension PendingItem {
         case let .get(name, vaultID, vaultName, _, fields, reason, rawRequested, requestedHosts,
                       initialHosts, suggestedHosts, defaultDurationSecs, isGenerated, generatorChoices,
                       requestedGeneration, sentinelRequired, hasSubstitutableFields, operatorSelectedGrant,
-                      operatorSelectedGcloudProject):
+                      operatorSelectedGcloudProject, login):
             .get(GetDetail(
                 name: name, vaultID: vaultID, vaultName: vaultName, fields: fields, reason: reason, rawRequested: rawRequested,
                 requestedHosts: requestedHosts,
@@ -438,7 +453,8 @@ private extension PendingItem {
                 generatorChoices: generatorChoices.map(GeneratorApprovalChoiceItem.init),
                 requestedGeneration: requestedGeneration.map(GenerationRequestItem.init),
                 sentinelRequired: sentinelRequired, hasSubstitutableFields: hasSubstitutableFields,
-                operatorSelectedGrant: operatorSelectedGrant, operatorSelectedGcloudProject: operatorSelectedGcloudProject
+                operatorSelectedGrant: operatorSelectedGrant, operatorSelectedGcloudProject: operatorSelectedGcloudProject,
+                login: login?.url
             ))
         case let .update(name, vaultId, vaultName, field, oldValue, newValue):
             .update(name: name, vaultID: vaultId, vaultName: vaultName, field: field, oldValue: oldValue, newValue: newValue)
@@ -449,6 +465,10 @@ private extension PendingItem {
                     collections: t.collections.map(CollectionItem.init), personalAllowed: t.personalAllowed
                 )
             })
+        case let .login(name, vaultName, url, fillOrigins, reason, hasTotp):
+            .login(LoginDetail(
+                name: name, vaultName: vaultName, url: url, fillOrigins: fillOrigins, reason: reason, hasTotp: hasTotp
+            ))
         }
         self.init(
             id: r.id, kind: RequestKind(r.kind), createdAt: r.createdAt, expiresAt: r.expiresAt,
@@ -470,6 +490,12 @@ private extension RecentItem {
             id: r.id, kind: RequestKind(r.kind), summary: r.summary, hostLabel: r.hostLabel,
             outcome: outcome, approved: r.outcome == .approved, resolvedAt: r.resolvedAt
         )
+    }
+}
+
+private extension BrokerSessionItem {
+    init(_ s: BrokerSessionInfo) {
+        self.init(requestID: s.requestId, url: s.url, hostLabel: s.hostLabel, startedAt: s.startedAt, status: s.status)
     }
 }
 
@@ -592,7 +618,8 @@ private extension ProxySettingsItem {
         self.init(
             bindAddress: s.bindAddress, port: Int(s.port), hints: s.hints, httpPort: Int(s.httpPort),
             httpsPort: Int(s.httpsPort), managementPort: Int(s.managementPort), metricsPort: Int(s.metricsPort),
-            maxRequestBodyBytes: Int(s.maxRequestBodyBytes), allowPlainHTTP: s.allowPlainHttp
+            maxRequestBodyBytes: Int(s.maxRequestBodyBytes), allowPlainHTTP: s.allowPlainHttp,
+            requireAuth: s.requireAuth
         )
     }
 }
@@ -608,7 +635,7 @@ private extension ProxySettings {
             httpsPort: try validPort(s.httpsPort, "Internal HTTPS port"),
             managementPort: try validPort(s.managementPort, "Management port"),
             metricsPort: try validPort(s.metricsPort, "Metrics port"),
-            maxRequestBodyBytes: maxBody, allowPlainHttp: s.allowPlainHTTP
+            maxRequestBodyBytes: maxBody, allowPlainHttp: s.allowPlainHTTP, requireAuth: s.requireAuth
         )
     }
 }

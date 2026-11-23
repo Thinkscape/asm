@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// `host` in URL authority form (IPv6 in brackets).
-fn authority(host: &str, port: u16) -> String {
+pub(crate) fn authority(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
@@ -53,14 +53,52 @@ fn refresh_ca(api: &Api, info: &ProxyInfo) -> Result<(), CliError> {
     state::write_ca_files(&pem)
 }
 
-/// Environment lines for the recommended proxy.
-fn exports(host: &HostState, proxy_http: &str) -> Result<Vec<(&'static str, String)>, CliError> {
+/// This host's proxy-authentication password: [`asm_proto::crypto::proxy_password`] of
+/// the SHA-256 of its bearer token.
+pub(crate) fn proxy_password(host: &HostState) -> String {
+    asm_proto::crypto::proxy_password(&asm_proto::crypto::sha256(host.token.as_bytes()))
+}
+
+/// `Proxy-Authorization` value with this host's proxy credentials (`Basic`).
+pub(crate) fn proxy_authorization(host: &HostState) -> String {
+    use base64::Engine as _;
+    let creds = format!("{}:{}", host.host_id, proxy_password(host));
+    format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(creds))
+}
+
+/// Percent-encode a URL userinfo component (everything but RFC 3986 unreserved).
+fn userinfo_escape(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            b => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// `scheme://authority`, with this host's credentials as userinfo when `auth` is set.
+fn proxy_url(scheme: &str, host: &HostState, authority: &str, auth: bool) -> String {
+    if auth {
+        format!(
+            "{scheme}://{}:{}@{authority}",
+            userinfo_escape(&host.host_id),
+            proxy_password(host)
+        )
+    } else {
+        format!("{scheme}://{authority}")
+    }
+}
+
+/// Environment lines for the recommended proxy (hint `i`); the proxy URL carries this
+/// host's credentials when the manager requires proxy authentication.
+fn exports(host: &HostState, r: &Resolved, i: usize) -> Result<Vec<(&'static str, String)>, CliError> {
+    let proxy_http = proxy_url("http", host, &authority(&r.info.hints[i], r.info.port), r.info.proxy_auth);
     let bundle = state::ca_bundle_path()?.to_string_lossy().into_owned();
     let ca = state::ca_path()?.to_string_lossy().into_owned();
     Ok(vec![
-        ("HTTPS_PROXY", proxy_http.to_owned()),
-        ("HTTP_PROXY", proxy_http.to_owned()),
-        ("ALL_PROXY", proxy_http.to_owned()),
+        ("HTTPS_PROXY", proxy_http.clone()),
+        ("HTTP_PROXY", proxy_http.clone()),
+        ("ALL_PROXY", proxy_http),
         ("NO_PROXY", host.manager_host()),
         ("SSL_CERT_FILE", bundle.clone()),
         ("REQUESTS_CA_BUNDLE", bundle.clone()),
@@ -86,6 +124,8 @@ struct JsonProxyInfo {
     ca_bundle_file: String,
     proxies: Vec<JsonProxy>,
     recommended: Option<String>,
+    /// The proxy requires per-host credentials (the URLs above carry none).
+    proxy_auth: bool,
 }
 
 /// Proxy addresses from the manager's hints; the CA files are refreshed on the way.
@@ -94,6 +134,19 @@ pub(crate) struct Resolved {
     info: ProxyInfo,
     proxies: Vec<JsonProxy>,
     recommended: Option<usize>,
+}
+
+impl Resolved {
+    /// The recommended proxy as (hint, port): the first hint accepting TCP.
+    pub(crate) fn recommended(&self) -> Result<(&str, u16), CliError> {
+        let i = self.recommended.ok_or_else(|| unreachable_error(self.info.port))?;
+        Ok((&self.info.hints[i], self.info.port))
+    }
+
+    /// The proxy requires per-host credentials ([`proxy_authorization`]).
+    pub(crate) fn proxy_auth(&self) -> bool {
+        self.info.proxy_auth
+    }
 }
 
 fn resolve() -> Result<(HostState, Resolved), CliError> {
@@ -136,7 +189,7 @@ pub(crate) fn resolve_for(api: &Api) -> Result<Resolved, CliError> {
 pub(crate) fn environment(host: &HostState, api: &Api) -> Result<Vec<(&'static str, String)>, CliError> {
     let r = resolve_for(api)?;
     let i = r.recommended.ok_or_else(|| unreachable_error(r.info.port))?;
-    exports(host, &r.proxies[i].http)
+    exports(host, &r, i)
 }
 
 fn unreachable_error(port: u16) -> CliError {
@@ -158,6 +211,7 @@ pub fn proxy_info(json: bool) -> Result<(), CliError> {
             ca_file: ca,
             ca_bundle_file: bundle,
             recommended: r.recommended.map(|i| r.proxies[i].http.clone()),
+            proxy_auth: r.info.proxy_auth,
             proxies: r.proxies,
         };
         println!("{}", serde_json::to_string_pretty(&j).expect("serializes"));
@@ -174,6 +228,9 @@ pub fn proxy_info(json: bool) -> Result<(), CliError> {
         println!("CA certificate: {ca}");
         println!("CA bundle (system roots + proxy CA): {bundle}");
         println!("CA SHA-256: {}", r.info.ca_sha256);
+        if r.info.proxy_auth {
+            println!("auth: per-host credentials (added by asm exec, asm proxy-env and the proxy router)");
+        }
         if r.recommended.is_some() {
             println!("to use it in this shell: eval \"$(asm proxy-env)\"");
         }
@@ -221,7 +278,7 @@ pub fn proxy_env(shell: Shell, unset: bool) -> Result<(), CliError> {
     let Some(i) = r.recommended else {
         return Err(unreachable_error(r.info.port));
     };
-    for (k, v) in exports(&host, &r.proxies[i].http)? {
+    for (k, v) in exports(&host, &r, i)? {
         match shell {
             Shell::Posix => println!("export {k}={}", shell_quote(&v)),
             Shell::Fish => println!("set -gx {k} {}", fish_quote(&v)),
@@ -393,6 +450,7 @@ pub fn doctor(probe_url: &str) -> Result<(), CliError> {
     }
 
     if host.is_none() {
+        browser_checks(&mut r, None);
         return finish(r);
     }
 
@@ -445,9 +503,13 @@ pub fn doctor(probe_url: &str) -> Result<(), CliError> {
 
     // 8. HTTPS probe through the recommended proxy, verified against ca.crt
     if let (Some(proxy), true) = (&recommended, ca_ok) {
+        let creds = match (&host, &info) {
+            (Some(h), Some(i)) if i.proxy_auth => Some((h.host_id.clone(), proxy_password(h))),
+            _ => None,
+        };
         match std::fs::read(&ca_path)
             .map_err(|e| e.to_string())
-            .and_then(|pem| proxy_probe_client(proxy, &pem))
+            .and_then(|pem| proxy_probe_client(proxy, &pem, creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()))))
         {
             Ok(client) => match client.get(probe_url).send() {
                 Ok(resp) => r.ok(
@@ -481,7 +543,19 @@ pub fn doctor(probe_url: &str) -> Result<(), CliError> {
             Err(e) => r.fail("probe", e),
         }
     }
+    browser_checks(&mut r, info.as_ref());
     finish(r)
+}
+
+/// The proxy router and the installed browsers (only when `asm browser install` ran).
+fn browser_checks(r: &mut Report, info: Option<&ProxyInfo>) {
+    for (level, check, detail) in crate::browser::doctor_checks(info) {
+        match level {
+            crate::browser::Level::Ok => r.ok(check, detail),
+            crate::browser::Level::Warn => r.warn(check, detail),
+            crate::browser::Level::Fail => r.fail(check, detail),
+        }
+    }
 }
 
 /// A connection that was accepted and then cut: CONNECT aborted, unexpected EOF, reset.
@@ -561,6 +635,34 @@ fn finish(r: Report) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_credentials_format() {
+        let host = HostState {
+            manager_url: "https://mac.ts.net:7411".into(),
+            cert_sha256: String::new(),
+            host_id: "h 1".into(),
+            token: "tok".into(),
+            paired_at: String::new(),
+        };
+        let password = asm_proto::crypto::proxy_password(&asm_proto::crypto::sha256(b"tok"));
+        assert_eq!(proxy_password(&host), password);
+        assert_eq!(password.len(), 64);
+        assert_eq!(
+            proxy_url("http", &host, "mac.ts.net:7412", true),
+            format!("http://h%201:{password}@mac.ts.net:7412")
+        );
+        assert_eq!(
+            proxy_url("socks5h", &host, "[fd00::1]:7412", true),
+            format!("socks5h://h%201:{password}@[fd00::1]:7412")
+        );
+        assert_eq!(proxy_url("http", &host, "mac.ts.net:7412", false), "http://mac.ts.net:7412");
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(proxy_authorization(&host).strip_prefix("Basic ").unwrap())
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), format!("h 1:{password}"));
+    }
 
     #[test]
     fn quoting_and_authority() {

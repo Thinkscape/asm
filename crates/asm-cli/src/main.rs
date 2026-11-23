@@ -2,15 +2,19 @@
 
 mod api;
 mod bindings;
+mod browser;
 mod delivery;
 mod error;
 mod exec;
 mod files;
 mod hostinfo;
+mod login;
 mod pair;
 mod proxy;
 mod reaper;
 mod requests;
+mod router;
+mod service;
 mod skill;
 mod state;
 mod tls;
@@ -92,6 +96,17 @@ enum Command {
         #[arg(long, default_value = "https://example.com/")]
         probe_url: String,
     },
+    /// Sign in to a website on the manager's Mac (the operator approves and the manager
+    /// fills the vault login there) and receive the browser storage state.
+    Login(login::LoginArgs),
+    /// Set up browsers for login grants: route their HTTPS through asm's proxy router and
+    /// trust the asm browser CA.
+    #[command(subcommand)]
+    Browser(browser::BrowserCommand),
+    /// Local HTTPS proxy for browsers: routes sites with an active login grant through
+    /// the manager's proxy (installed by asm browser install).
+    #[command(hide = true, name = "proxy-router", subcommand)]
+    ProxyRouter(router::RouterCommand),
     /// Install the agent skill shipped with this CLI into agents' skill folders.
     #[command(subcommand)]
     Skill(skill::SkillCommand),
@@ -128,6 +143,9 @@ fn main() {
         Command::Doctor { probe_url } => proxy::doctor(&probe_url),
         Command::Reap { dir } => reaper::run(dir),
         Command::Skill(cmd) => skill::run(cmd),
+        Command::ProxyRouter(cmd) => router::run(cmd),
+        Command::Login(args) => login::run(args),
+        Command::Browser(cmd) => browser::run(cmd),
     };
     if let Err(e) = result {
         if !e.message.is_empty() {

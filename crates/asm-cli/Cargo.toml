@@ -16,6 +16,11 @@ serde_json.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-no-provider"] }
 rustls = { workspace = true, features = ["ring", "std", "tls12"] }
 libc = "0.2"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+httparse = "1"
+base64 = "0.22"
+rusqlite.workspace = true
+ring = "0.17.14"
 
 [dev-dependencies]
 rcgen.workspace = true
