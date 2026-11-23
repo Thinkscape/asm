@@ -1447,6 +1447,20 @@ fn status_line(r: &Record, state: &State) -> String {
     format!("{} {}: {what}", r.target, r.key)
 }
 
+/// Status lines of browser installs that would not route a login grant right now
+/// (for example T3 downloaded a browser version asm has not wrapped). The CA is not
+/// compared with the manager's here; `asm browser status` does that.
+pub(crate) fn unready_installs() -> Vec<String> {
+    load_records()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| match check(r, None) {
+            State::Installed => None,
+            state => Some(status_line(r, &state)),
+        })
+        .collect()
+}
+
 /// What to do when the router is not running.
 fn router_fix(records: &[Record]) -> String {
     if service::service_installed().unwrap_or(false) {

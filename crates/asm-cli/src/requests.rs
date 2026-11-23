@@ -782,6 +782,9 @@ fn get_login(a: GetArgs, url: &str) -> Result<(), CliError> {
             "no asm proxy-router on this machine; the browser must run on this machine: asm browser install <target>",
         ));
     }
+    for line in crate::browser::unready_installs() {
+        eprintln!("warning: {line}; a browser set up this way sends the sentinel straight to the site, where it fails");
+    }
     let capabilities = crate::bindings::require_capabilities(&s.api, false, false, Some(CAPABILITY_LOGIN_GRANT_V1))?;
     s.sync_leases()?;
     let name = match &a.name {
