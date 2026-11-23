@@ -153,11 +153,18 @@ restart that browser. Run every browser-login `asm` command on that same machine
 
 Already signed in? Do nothing. Otherwise:
 
-1. Read the login form's submit URL in the page:
-   `document.querySelector('input[type=password]').form.action`.
-2. `asm get --login-url <that URL> --reason "<why>"` (add the vault ITEM name only when
-   asked or when several logins match). It prints the username, a single-use password
-   sentinel and, when the item has an authenticator key, a one-time code.
+1. Find the URL the credentials are posted to. For a plain HTML form it is
+   `document.querySelector('input[type=password]').form.action`. Most sites sign in with
+   JavaScript instead (the form has no `action`, or `form.action` is just the page URL): the
+   password then goes to an API URL, often on another host (for example
+   `https://clerk.example.com/v1/client/sign_ins?...`). Find it in your browser tool's
+   network log after submitting once with a made-up email address and password (never the
+   real username), and use that exact URL, query string included. The sentinel only works
+   at that URL; sent anywhere else it is wasted and the site sees a wrong password.
+2. `asm get --login-url <that URL> --reason "<why>"` (pass the vault ITEM name when asked,
+   when several logins match, or when the API host differs from the item's site). It prints
+   the username, a single-use password sentinel and, when the item has an authenticator
+   key, a one-time code.
 3. Open or reload the login page, type the username and the sentinel, submit **once**.
 4. At a one-time-code prompt, run `asm get <ITEM>::totp --reason "<why>"` (no popup while
    the grant lasts) and type the code.
