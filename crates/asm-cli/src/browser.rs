@@ -30,6 +30,13 @@ const RECORDS_LOCK: &str = "browsers.lock";
 const CHROME: &str = "chrome";
 const T3CODE: &str = "t3code";
 const OPENBOT: &str = "openbot";
+/// OpenBot's Shared browser session: partition `persist:openbot-browser`.
+const OPENBOT_SHARED: &str = "openbot-browser";
+/// An agent-only OpenBot session: `persist:openbot-browser-agent-<key>`.
+const OPENBOT_AGENT_PREFIX: &str = "openbot-browser-agent-";
+/// Present in an OpenBot data directory that hosts a server.
+const OPENBOT_DB: &str = "openbot.db";
+const OPENBOT_ROUTED: &str = "start OpenBot again. Its Shared and agent-only browsers now send HTTPS through asm's proxy router; named profiles keep OpenBot's own proxy setting.";
 /// Oldest Chrome whose `ServerCertificate` trust rows asm relies on.
 const MIN_CHROME_MAJOR: u32 = 134;
 /// `trust_settings` of a `ServerCertificate` row: trusted anchor.
@@ -83,11 +90,20 @@ pub enum InstallTarget {
         #[command(flatten)]
         router: RouterArgs,
     },
-    /// OpenBot (trusts only the OS certificate store).
+    /// OpenBot (trusts only the OS certificate store). Quit OpenBot first: install routes
+    /// its Shared and agent-only browsers through the proxy router.
     Openbot {
         /// Add the asm browser CA to your user's certificate trust store (required).
         #[arg(long)]
         trust_user_wide: bool,
+        /// An OpenBot server data directory (repeatable; default: OpenBot's on this
+        /// machine and its local servers).
+        #[arg(long = "data-dir", value_name = "DIR", conflicts_with = "ca_only")]
+        data_dir: Vec<PathBuf>,
+        /// Only trust the CA; leave OpenBot's browser sessions alone (point a named
+        /// browser profile at the router yourself).
+        #[arg(long)]
+        ca_only: bool,
         #[command(flatten)]
         router: RouterArgs,
     },
@@ -131,7 +147,9 @@ pub fn run(cmd: BrowserCommand) -> Result<(), CliError> {
         BrowserCommand::Install { target } => match target {
             InstallTarget::Chrome { location, router } => install_chrome(location, router),
             InstallTarget::T3code { trust_user_wide, router } => install_t3code(trust_user_wide, router),
-            InstallTarget::Openbot { trust_user_wide, router } => install_openbot(trust_user_wide, router),
+            InstallTarget::Openbot { trust_user_wide, data_dir, ca_only, router } => {
+                install_openbot(trust_user_wide, data_dir, ca_only, router)
+            }
         },
         BrowserCommand::Uninstall { target } => match target {
             UninstallTarget::Chrome { location } => uninstall_chrome(location),
@@ -171,6 +189,32 @@ struct Record {
     versions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trust_store: Option<TrustStore>,
+    /// openbot: the browser sessions asm routes, per server data directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sessions: Vec<OpenbotData>,
+    /// openbot: the `--data-dir` values of the install (empty: found automatically).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    data_dirs: Vec<String>,
+    /// openbot: installed with `--ca-only` and routes no sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ca_only: bool,
+}
+
+/// The OpenBot browser sessions asm routes in one server data directory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct OpenbotData {
+    /// The data directory (Electron `userData` of an OpenBot server).
+    dir: String,
+    partitions: Vec<RoutedPartition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RoutedPartition {
+    /// Directory name under `<dir>/Partitions`.
+    name: String,
+    /// The `proxy` preference before asm's first install (null = unset).
+    #[serde(default)]
+    original: Value,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -872,6 +916,9 @@ fn install_chrome(loc: ChromeLocation, r: RouterArgs) -> Result<(), CliError> {
             profile: Some(p.dir.clone()),
             versions: Vec::new(),
             trust_store: None,
+            sessions: Vec::new(),
+            data_dirs: Vec::new(),
+            ca_only: false,
         },
     );
     save_records(&records)?;
@@ -1227,6 +1274,9 @@ fn install_t3code(trust_user_wide_ok: bool, r: RouterArgs) -> Result<(), CliErro
             profile: None,
             versions: versions.clone(),
             trust_store: Some(store),
+            sessions: Vec::new(),
+            data_dirs: Vec::new(),
+            ca_only: false,
         },
     );
     save_records(&records)?;
@@ -1264,7 +1314,319 @@ fn uninstall_t3code() -> Result<(), CliError> {
 // openbot
 // ---------------------------------------------------------------------------
 
-fn install_openbot(trust_user_wide_ok: bool, r: RouterArgs) -> Result<(), CliError> {
+/// OpenBot's Electron `userData`: `~/Library/Application Support/OpenBot` (macOS),
+/// `${XDG_CONFIG_HOME:-~/.config}/OpenBot` (Linux).
+fn openbot_user_data() -> Result<PathBuf, CliError> {
+    let home = state::home_dir()?;
+    if cfg!(target_os = "macos") {
+        return Ok(home.join("Library/Application Support/OpenBot"));
+    }
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".config"));
+    Ok(config.join("OpenBot"))
+}
+
+/// The OpenBot server data directories to route: `explicit`, else `user_data` when it
+/// hosts a server plus each `<user_data>/local-servers/*` that does.
+fn openbot_data_dirs(user_data: &Path, explicit: &[PathBuf]) -> Result<Vec<PathBuf>, CliError> {
+    let mut dirs = Vec::new();
+    if explicit.is_empty() {
+        if user_data.join(OPENBOT_DB).is_file() {
+            dirs.push(user_data.to_path_buf());
+        }
+        let mut servers: Vec<PathBuf> = read_dirs(&user_data.join("local-servers"))
+            .into_iter()
+            .filter(|d| d.join(OPENBOT_DB).is_file())
+            .collect();
+        servers.sort();
+        dirs.extend(servers);
+    } else {
+        for d in explicit {
+            if !d.is_dir() {
+                return Err(CliError::failure(format!("no OpenBot data directory at {}", d.display())));
+            }
+            dirs.push(d.clone());
+        }
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        let d = fs::canonicalize(&d).unwrap_or(d);
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    Ok(out)
+}
+
+/// The pid of a running OpenBot using the data directory `dir` (for a local server,
+/// also the desktop app whose data directory contains it).
+fn openbot_pid(dir: &Path) -> Option<i32> {
+    running_pid(dir).or_else(|| {
+        let servers = dir.parent()?;
+        if servers.file_name()? != "local-servers" {
+            return None;
+        }
+        running_pid(servers.parent()?)
+    })
+}
+
+/// Refuse while OpenBot uses one of `dirs`: it ignores and later overwrites
+/// `Preferences` changed while it runs.
+fn refuse_openbot_running<P: AsRef<Path>>(dirs: &[P]) -> Result<(), CliError> {
+    match dirs.iter().find_map(|d| openbot_pid(d.as_ref())) {
+        Some(pid) => {
+            let hosted = if cfg!(target_os = "linux") { "; for a hosted server: sudo systemctl stop openbot" } else { "" };
+            Err(CliError::failure(format!("quit OpenBot first (pid {pid}), then re-run{hosted}")))
+        }
+        None => Ok(()),
+    }
+}
+
+/// The partition directory name of agent `id`'s own browser session
+/// (`<prefix><first 32 hex digits of sha256(id)>`).
+fn openbot_agent_partition(id: &str) -> String {
+    format!("{OPENBOT_AGENT_PREFIX}{}", &sha256_hex(id)[..32])
+}
+
+fn partition_prefs(dir: &Path, partition: &str) -> PathBuf {
+    dir.join("Partitions").join(partition).join("Preferences")
+}
+
+/// The `proxy` preference asm writes into an OpenBot session: HTTPS and WSS to the
+/// router (loopback too), HTTP and WS direct.
+fn openbot_proxy_pref(port: u16) -> Value {
+    json!({
+        "mode": "fixed_servers",
+        "server": format!("https=http://127.0.0.1:{port}"),
+        "bypass_list": "<-loopback>;ws://*",
+    })
+}
+
+/// Whether `v` is a `proxy` preference asm wrote into an OpenBot session (any port).
+fn is_asm_openbot_pref(v: &Value) -> bool {
+    v.get("server")
+        .and_then(Value::as_str)
+        .and_then(|s| s.strip_prefix("https=http://127.0.0.1:"))
+        .and_then(|p| p.parse::<u16>().ok())
+        .is_some_and(|p| *v == openbot_proxy_pref(p))
+}
+
+struct OpenbotAgent {
+    id: String,
+    name: String,
+    /// The agent uses a named browser profile (OpenBot sets that session's proxy).
+    named_profile: bool,
+}
+
+/// The agents in `<dir>/openbot.db` (OpenBot's private schema), read-only: works while
+/// OpenBot runs.
+fn openbot_agents(dir: &Path) -> Result<Vec<OpenbotAgent>, String> {
+    let path = dir.join(OPENBOT_DB);
+    if !path.is_file() {
+        return Err(format!("{} is missing", path.display()));
+    }
+    let db_err = |e: rusqlite::Error| format!("{}: {e}", path.display());
+    let conn = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(db_err)?;
+    let mut stmt = conn
+        .prepare("SELECT agent_id, agent_json FROM projection_agents ORDER BY agent_id")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))
+        .map_err(db_err)?;
+    let mut agents = Vec::new();
+    for row in rows {
+        let (id, agent_json) = row.map_err(db_err)?;
+        let v: Value = agent_json
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or(Value::Null);
+        let name = v
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&id)
+            .to_owned();
+        let named_profile = match v.get("browserProfileId") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(s)) => !s.is_empty(),
+            Some(_) => true,
+        };
+        agents.push(OpenbotAgent { id, name, named_profile });
+    }
+    Ok(agents)
+}
+
+/// One OpenBot browser session asm is about to route.
+struct SessionPlan {
+    /// Directory name under `Partitions`.
+    name: String,
+    /// "Shared", `agent "<name>"`, or the directory name.
+    label: String,
+    prefs_path: PathBuf,
+    prefs: serde_json::Map<String, Value>,
+    mode: Option<u32>,
+    current: Option<Value>,
+}
+
+struct DataPlan {
+    dir: PathBuf,
+    sessions: Vec<SessionPlan>,
+}
+
+/// The sessions to route in the data directory `dir`: Shared, every agent without a
+/// named browser profile (so switching one to its own session later is routed already)
+/// and every agent session that exists. Refuses a session with another proxy. Without
+/// a readable agent list, only the existing agent sessions.
+fn plan_openbot(dir: &Path) -> Result<DataPlan, CliError> {
+    let mut wanted: Vec<(String, String)> = vec![(OPENBOT_SHARED.to_owned(), "Shared".to_owned())];
+    let mut known: Vec<(String, String)> = Vec::new();
+    match openbot_agents(dir) {
+        Ok(agents) => {
+            for a in agents {
+                let partition = openbot_agent_partition(&a.id);
+                let label = format!("agent {:?}", a.name);
+                if a.named_profile {
+                    known.push((partition, label));
+                } else {
+                    wanted.push((partition, label));
+                }
+            }
+        }
+        Err(e) => eprintln!(
+            "warning: cannot read OpenBot's agents ({e}); routing the agent browser sessions that exist already"
+        ),
+    }
+    let mut existing: Vec<String> = read_dirs(&dir.join("Partitions"))
+        .iter()
+        .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
+        .filter(|n| n.starts_with(OPENBOT_AGENT_PREFIX))
+        .collect();
+    existing.sort();
+    for name in existing {
+        if !wanted.iter().any(|(n, _)| *n == name) {
+            let label = known.iter().find(|(n, _)| *n == name).map_or_else(|| name.clone(), |(_, l)| l.clone());
+            wanted.push((name, label));
+        }
+    }
+    let mut sessions = Vec::new();
+    for (name, label) in wanted {
+        let prefs_path = partition_prefs(dir, &name);
+        let (prefs, mode) = read_prefs(&prefs_path)?;
+        let current = prefs.get("proxy").cloned();
+        if let Some(v) = &current
+            && !is_asm_openbot_pref(v)
+            && *v != json!({"mode": "system"})
+        {
+            let mode = v.get("mode").and_then(Value::as_str).unwrap_or("custom");
+            return Err(existing_proxy(&format!(
+                "OpenBot {label} proxy setting in {}, mode {mode}",
+                prefs_path.display()
+            )));
+        }
+        sessions.push(SessionPlan { name, label, prefs_path, prefs, mode, current });
+    }
+    Ok(DataPlan { dir: dir.to_path_buf(), sessions })
+}
+
+/// Write asm's `proxy` into every planned session. Returns the sessions to record:
+/// `previous` plus the new ones (a session recorded before keeps its original).
+fn apply_openbot(plans: Vec<DataPlan>, port: u16, previous: &[OpenbotData]) -> Result<Vec<OpenbotData>, CliError> {
+    let mut out = previous.to_vec();
+    for plan in plans {
+        let key = plan.dir.to_string_lossy().into_owned();
+        let i = match out.iter().position(|d| d.dir == key) {
+            Some(i) => i,
+            None => {
+                out.push(OpenbotData { dir: key, partitions: Vec::new() });
+                out.len() - 1
+            }
+        };
+        for s in plan.sessions {
+            let parent = s.prefs_path.parent().expect("Preferences has a parent");
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|e| io_err("creating", parent, e))?;
+            let mut prefs = s.prefs;
+            prefs.insert("proxy".into(), openbot_proxy_pref(port));
+            write_prefs(&s.prefs_path, &prefs, s.mode)?;
+            if !out[i].partitions.iter().any(|p| p.name == s.name) {
+                let original = s.current.filter(|v| !is_asm_openbot_pref(v)).unwrap_or(Value::Null);
+                out[i].partitions.push(RoutedPartition { name: s.name, original });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Put back each recorded session's original `proxy` where it is still asm's (removing
+/// the key when there was none). Returns warnings for sessions changed since.
+fn restore_openbot(sessions: &[OpenbotData]) -> Result<Vec<String>, CliError> {
+    let mut warnings = Vec::new();
+    for d in sessions {
+        for p in &d.partitions {
+            let path = partition_prefs(Path::new(&d.dir), &p.name);
+            if !path.parent().is_some_and(Path::is_dir) {
+                continue; // OpenBot removed the session.
+            }
+            let (mut prefs, mode) = read_prefs(&path)?;
+            if prefs.get("proxy").is_some_and(is_asm_openbot_pref) {
+                match &p.original {
+                    Value::Null => prefs.remove("proxy"),
+                    v => prefs.insert("proxy".into(), v.clone()),
+                };
+                write_prefs(&path, &prefs, mode)?;
+            } else {
+                warnings.push(format!(
+                    "the proxy setting in {} was changed after install; left as is",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(warnings)
+}
+
+/// Why OpenBot's browsers are not all routed to `port`: a recorded session lost asm's
+/// proxy, or an agent without a named browser profile has an unrouted session (one
+/// created after install).
+fn openbot_unrouted(sessions: &[OpenbotData], port: u16) -> Option<String> {
+    let want = openbot_proxy_pref(port);
+    let routed = |path: &Path| read_prefs(path).is_ok_and(|(p, _)| p.get("proxy") == Some(&want));
+    for d in sessions {
+        let dir = Path::new(&d.dir);
+        if !dir.is_dir() {
+            continue;
+        }
+        for p in &d.partitions {
+            let path = partition_prefs(dir, &p.name);
+            if path.parent().is_some_and(Path::is_dir) && !routed(&path) {
+                return Some(format!("the proxy setting in {} is not asm's", path.display()));
+            }
+        }
+        let Ok(agents) = openbot_agents(dir) else {
+            continue;
+        };
+        if let Some(a) = agents
+            .iter()
+            .find(|a| !a.named_profile && !routed(&partition_prefs(dir, &openbot_agent_partition(&a.id))))
+        {
+            return Some(format!("OpenBot agent {:?} is not routed", a.name));
+        }
+    }
+    None
+}
+
+fn named_profile_hint(port: u16) {
+    println!(
+        "In OpenBot: create a named browser profile, set its proxy to http://127.0.0.1:{port}, assign it to your agents, and restart OpenBot. Without --ca-only, asm routes the Shared and agent-only browsers itself (quit OpenBot first)."
+    );
+}
+
+fn install_openbot(trust_user_wide_ok: bool, data_dirs: Vec<PathBuf>, ca_only: bool, r: RouterArgs) -> Result<(), CliError> {
     if !trust_user_wide_ok {
         return Err(trust_user_wide("OpenBot"));
     }
@@ -1279,6 +1641,11 @@ fn install_openbot(trust_user_wide_ok: bool, r: RouterArgs) -> Result<(), CliErr
     let key = store.location().to_owned();
     let port = router_port(&records, r.port, OPENBOT, &key)?;
     let existing = find(&records, OPENBOT, &key).map(|i| records[i].clone());
+    let user_data = openbot_user_data()?;
+    let dirs = if ca_only { Vec::new() } else { openbot_data_dirs(&user_data, &data_dirs)? };
+    // Everything that can refuse runs before anything is written.
+    refuse_openbot_running(&dirs)?;
+    let plans = dirs.iter().map(|d| plan_openbot(d)).collect::<Result<Vec<_>, _>>()?;
     let ca = fetch_ca()?;
     let service = ensure_router(port, r.no_service)?;
     store.add(&ca)?;
@@ -1286,6 +1653,22 @@ fn install_openbot(trust_user_wide_ok: bool, r: RouterArgs) -> Result<(), CliErr
         let old: Vec<String> = e.ca_shas.iter().filter(|s| **s != ca.sha).cloned().collect();
         remove_old(&store, &records, OPENBOT, &key, &old)?;
     }
+    // OpenBot may have started meanwhile.
+    refuse_openbot_running(&dirs)?;
+    let routed: Vec<(PathBuf, String)> = plans
+        .iter()
+        .map(|p| (p.dir.clone(), p.sessions.iter().map(|s| s.label.as_str()).collect::<Vec<_>>().join(", ")))
+        .collect();
+    let previous = existing.as_ref().map(|e| e.sessions.as_slice()).unwrap_or_default();
+    let sessions = apply_openbot(plans, port, previous)?;
+    let data_dirs = if ca_only {
+        existing.map(|e| e.data_dirs).unwrap_or_default()
+    } else {
+        data_dirs
+            .iter()
+            .map(|d| fs::canonicalize(d).unwrap_or_else(|_| d.clone()).to_string_lossy().into_owned())
+            .collect()
+    };
     upsert(
         &mut records,
         Record {
@@ -1302,13 +1685,26 @@ fn install_openbot(trust_user_wide_ok: bool, r: RouterArgs) -> Result<(), CliErr
             profile: None,
             versions: Vec::new(),
             trust_store: Some(store),
+            ca_only: ca_only && sessions.is_empty(),
+            sessions,
+            data_dirs,
         },
     );
     save_records(&records)?;
     no_service_hint(service, port);
-    println!(
-        "In OpenBot: create a named browser profile, set its proxy to http://127.0.0.1:{port}, assign it to your agents, and restart OpenBot. OpenBot can't put a proxy on the Shared or agent-only profiles; on a Linux server an auto_proxy setting on the OpenBot service routes those too (asm skill install --print-setup, section OpenBot)."
-    );
+    if ca_only {
+        named_profile_hint(port);
+    } else if routed.is_empty() {
+        println!(
+            "no OpenBot server data on this machine ({} has no {OPENBOT_DB}): OpenBot here is a client of a remote server, whose browsers run there; install on the server. Trusted the asm browser CA only.",
+            user_data.display()
+        );
+    } else {
+        for (dir, labels) in &routed {
+            println!("routed OpenBot browsers in {}: {labels}", dir.display());
+        }
+        println!("{OPENBOT_ROUTED}");
+    }
     Ok(())
 }
 
@@ -1319,13 +1715,28 @@ fn uninstall_openbot() -> Result<(), CliError> {
         .iter()
         .position(|r| r.target == OPENBOT)
         .ok_or_else(|| CliError::failure("asm browser install openbot is not installed on this machine"))?;
+    let sessions = records[i].sessions.clone();
+    if !sessions.is_empty() {
+        let dirs: Vec<&str> = sessions.iter().map(|d| d.dir.as_str()).collect();
+        refuse_openbot_running(&dirs)?;
+        for w in restore_openbot(&sessions)? {
+            eprintln!("warning: {w}");
+        }
+    }
     let rec = records.remove(i);
     if let Some(store) = &rec.trust_store {
         remove_old(store, &records, OPENBOT, &rec.key, &rec.ca_shas)?;
     }
     save_records(&records)?;
     finish_removal(&records)?;
-    println!("removed the asm browser CA from {}; restart OpenBot", rec.key);
+    if sessions.is_empty() {
+        println!("removed the asm browser CA from {}; restart OpenBot", rec.key);
+    } else {
+        println!(
+            "removed the asm browser CA from {} and restored OpenBot's browser proxy settings; start OpenBot again",
+            rec.key
+        );
+    }
     Ok(())
 }
 
@@ -1352,9 +1763,12 @@ impl State {
     }
 }
 
-/// The command that (re)installs `r`.
+/// The command that (re)installs `r` (for routed OpenBot sessions, after quitting OpenBot).
 fn fix_command(r: &Record) -> String {
     let mut cmd = String::new();
+    if r.target == OPENBOT && !r.sessions.is_empty() {
+        cmd.push_str("quit OpenBot, then ");
+    }
     if r.target == T3CODE
         && t3_base().is_ok_and(|b| b.to_string_lossy() != r.key)
     {
@@ -1372,6 +1786,14 @@ fn fix_command(r: &Record) -> String {
     }
     if r.target == OPENBOT || (r.target == T3CODE && matches!(r.trust_store, Some(TrustStore::Keychain { .. }))) {
         cmd.push_str(" --trust-user-wide");
+    }
+    if r.target == OPENBOT {
+        for d in &r.data_dirs {
+            cmd.push_str(&format!(" --data-dir {}", quote_arg(d)));
+        }
+        if r.ca_only {
+            cmd.push_str(" --ca-only");
+        }
     }
     if !r.service {
         cmd.push_str(" --no-service");
@@ -1430,7 +1852,10 @@ fn check(r: &Record, manager_sha: Option<&str>) -> State {
         }
         OPENBOT => match r.trust_store.as_ref().and_then(trusted) {
             Some(reason) => State::Incomplete(reason),
-            None => State::Installed,
+            None => match openbot_unrouted(&r.sessions, r.router_port) {
+                Some(reason) => State::Incomplete(reason),
+                None => State::Installed,
+            },
         },
         other => State::Incomplete(format!("unknown target {other}")),
     }
@@ -1818,6 +2243,9 @@ mod tests {
             profile: None,
             versions: vec![],
             trust_store: None,
+            sessions: Vec::new(),
+            data_dirs: Vec::new(),
+            ca_only: false,
         };
         assert_eq!(router_port(&[], None, CHROME, "/p").unwrap(), DEFAULT_PORT);
         assert_eq!(router_port(&[], Some(7500), CHROME, "/p").unwrap(), 7500);
@@ -1837,5 +2265,293 @@ mod tests {
             "asm browser install chrome --user-data-dir /u --profile 'Profile 1' --no-service --port 7500"
         );
         assert_eq!(fix_command(&rec(OPENBOT, "/db", 7418)), "asm browser install openbot --trust-user-wide");
+        let mut openbot = rec(OPENBOT, "/db", 7418);
+        openbot.ca_only = true;
+        assert_eq!(fix_command(&openbot), "asm browser install openbot --trust-user-wide --ca-only");
+        openbot.ca_only = false;
+        openbot.data_dirs = vec!["/srv/Open Bot".into()];
+        openbot.sessions = vec![OpenbotData { dir: "/srv/Open Bot".into(), partitions: Vec::new() }];
+        assert_eq!(
+            fix_command(&openbot),
+            "quit OpenBot, then asm browser install openbot --trust-user-wide --data-dir '/srv/Open Bot'"
+        );
+    }
+
+    /// An `openbot.db` with `projection_agents` rows (id, agent JSON), in WAL mode.
+    fn openbot_db(dir: &Path, agents: &[(&str, Value)]) {
+        fs::create_dir_all(dir).unwrap();
+        let conn = rusqlite::Connection::open(dir.join(OPENBOT_DB)).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS projection_agents(agent_id TEXT PRIMARY KEY, agent_json TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (id, v) in agents {
+            conn.execute(
+                "INSERT OR REPLACE INTO projection_agents(agent_id, agent_json) VALUES(?1, ?2)",
+                rusqlite::params![id, v.to_string()],
+            )
+            .unwrap();
+        }
+    }
+
+    fn prefs_at(dir: &Path, partition: &str) -> Value {
+        serde_json::from_slice(&fs::read(partition_prefs(dir, partition)).unwrap()).unwrap()
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    const AGENT_A: &str = "agent-eece6cee-2232-4171-960e-472e7ad22be9";
+
+    #[test]
+    fn openbot_agent_partition_key() {
+        // python3: hashlib.sha256(b'agent-eece6cee-2232-4171-960e-472e7ad22be9').hexdigest()[:32]
+        assert_eq!(openbot_agent_partition(AGENT_A), "openbot-browser-agent-702ef9a2c6c4974b289eda28814d5bb6");
+    }
+
+    #[test]
+    fn openbot_proxy_prefs() {
+        assert_eq!(
+            openbot_proxy_pref(7418),
+            json!({"mode": "fixed_servers", "server": "https=http://127.0.0.1:7418", "bypass_list": "<-loopback>;ws://*"})
+        );
+        assert!(is_asm_openbot_pref(&openbot_proxy_pref(7500)));
+        assert!(!is_asm_openbot_pref(&proxy_pref(7418)));
+        assert!(!is_asm_openbot_pref(&json!({"mode": "fixed_servers", "server": "https=http://127.0.0.1:7418"})));
+        assert!(!is_asm_openbot_pref(&json!({"mode": "system"})));
+    }
+
+    #[test]
+    fn openbot_seeds_shared_and_agent_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("OpenBot");
+        openbot_db(
+            &dir,
+            &[
+                (AGENT_A, json!({"name": "Researcher"})),
+                ("agent-own", json!({"name": "Own", "ownBrowserSession": true})),
+                ("agent-named", json!({"name": "Named", "browserProfileId": "prof-1"})),
+            ],
+        );
+        // Shared exists with other keys and mode 0644; an old agent session exists too.
+        let shared = partition_prefs(&dir, OPENBOT_SHARED);
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(&shared, r#"{"profile":{"exit_type":"Normal"},"proxy":{"mode":"system"}}"#).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o644)).unwrap();
+        let old = "openbot-browser-agent-0123456789abcdef0123456789abcdef";
+        fs::create_dir_all(dir.join("Partitions").join(old)).unwrap();
+
+        let plan = plan_openbot(&dir).unwrap();
+        let labels: Vec<&str> = plan.sessions.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["Shared", "agent \"Researcher\"", "agent \"Own\"", old]);
+        let recorded = apply_openbot(vec![plan], 7418, &[]).unwrap();
+
+        let want = json!({"mode": "fixed_servers", "server": "https=http://127.0.0.1:7418", "bypass_list": "<-loopback>;ws://*"});
+        assert_eq!(prefs_at(&dir, OPENBOT_SHARED), json!({"profile": {"exit_type": "Normal"}, "proxy": want}));
+        assert_eq!(mode_of(&shared), 0o644);
+        let a = openbot_agent_partition(AGENT_A);
+        let own = openbot_agent_partition("agent-own");
+        for p in [&a, &own, &old.to_owned()] {
+            assert_eq!(prefs_at(&dir, p), json!({"proxy": want}));
+            assert_eq!(mode_of(&partition_prefs(&dir, p)), 0o600);
+        }
+        assert_eq!(mode_of(&dir.join("Partitions").join(&a)), 0o700);
+        // The named-profile agent's session is OpenBot's to configure.
+        assert!(!dir.join("Partitions").join(openbot_agent_partition("agent-named")).exists());
+        assert_eq!(
+            recorded,
+            vec![OpenbotData {
+                dir: dir.to_string_lossy().into_owned(),
+                partitions: vec![
+                    RoutedPartition { name: OPENBOT_SHARED.into(), original: json!({"mode": "system"}) },
+                    RoutedPartition { name: a.clone(), original: Value::Null },
+                    RoutedPartition { name: own.clone(), original: Value::Null },
+                    RoutedPartition { name: old.into(), original: Value::Null },
+                ],
+            }]
+        );
+        assert_eq!(openbot_unrouted(&recorded, 7418), None);
+
+        // Reinstall on another port keeps the first originals.
+        let again = apply_openbot(vec![plan_openbot(&dir).unwrap()], 7500, &recorded).unwrap();
+        assert_eq!(again, recorded);
+        assert_eq!(prefs_at(&dir, OPENBOT_SHARED)["proxy"], openbot_proxy_pref(7500));
+    }
+
+    #[test]
+    fn openbot_refuses_another_proxy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("OpenBot");
+        openbot_db(&dir, &[(AGENT_A, json!({"name": "Researcher"}))]);
+        let a = partition_prefs(&dir, &openbot_agent_partition(AGENT_A));
+        fs::create_dir_all(a.parent().unwrap()).unwrap();
+        fs::write(&a, r#"{"proxy":{"mode":"fixed_servers","server":"corp:3128"}}"#).unwrap();
+        let Err(e) = plan_openbot(&dir) else { panic!("planned over another proxy") };
+        assert!(e.message.contains("already uses a proxy"), "{}", e.message);
+        assert!(e.message.contains("agent \"Researcher\""), "{}", e.message);
+        assert!(!partition_prefs(&dir, OPENBOT_SHARED).exists());
+    }
+
+    #[test]
+    fn openbot_refuses_while_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("OpenBot");
+        let child = dir.join("local-servers/srv-1");
+        fs::create_dir_all(&child).unwrap();
+        assert!(refuse_openbot_running(&[&dir, &child]).is_ok());
+        let pid = std::process::id();
+        std::os::unix::fs::symlink(format!("{}-{pid}", crate::hostinfo::hostname()), dir.join("SingletonLock")).unwrap();
+        // The desktop app holding the parent directory runs the local server too.
+        let e = refuse_openbot_running(&[&child]).unwrap_err();
+        assert!(e.message.starts_with(&format!("error: quit OpenBot first (pid {pid}), then re-run")), "{}", e.message);
+        assert!(refuse_openbot_running(&[&dir]).is_err());
+    }
+
+    #[test]
+    fn openbot_uninstall_restores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("OpenBot");
+        openbot_db(&dir, &[(AGENT_A, json!({"name": "Researcher"})), ("agent-b", json!({"name": "B"}))]);
+        let shared = partition_prefs(&dir, OPENBOT_SHARED);
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::write(&shared, r#"{"profile":{"exit_type":"Normal"}}"#).unwrap();
+        let b = openbot_agent_partition("agent-b");
+        fs::create_dir_all(dir.join("Partitions").join(&b)).unwrap();
+        fs::write(partition_prefs(&dir, &b), r#"{"proxy":{"mode":"system"}}"#).unwrap();
+        let recorded = apply_openbot(vec![plan_openbot(&dir).unwrap()], 7418, &[]).unwrap();
+
+        // Someone changed agent A's session since.
+        let a = openbot_agent_partition(AGENT_A);
+        fs::write(partition_prefs(&dir, &a), r#"{"proxy":{"mode":"direct"}}"#).unwrap();
+        let warnings = restore_openbot(&recorded).unwrap();
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "the proxy setting in {} was changed after install; left as is",
+                partition_prefs(&dir, &a).display()
+            )]
+        );
+        assert_eq!(prefs_at(&dir, OPENBOT_SHARED), json!({"profile": {"exit_type": "Normal"}}));
+        assert_eq!(prefs_at(&dir, &b), json!({"proxy": {"mode": "system"}}));
+        assert_eq!(prefs_at(&dir, &a), json!({"proxy": {"mode": "direct"}}));
+    }
+
+    #[test]
+    fn openbot_status_finds_unrouted_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("OpenBot");
+        openbot_db(&dir, &[(AGENT_A, json!({"name": "Researcher"}))]);
+        let recorded = apply_openbot(vec![plan_openbot(&dir).unwrap()], 7418, &[]).unwrap();
+        // OpenBot keeps a write connection open (WAL) while status reads.
+        let writer = rusqlite::Connection::open(dir.join(OPENBOT_DB)).unwrap();
+        writer
+            .execute(
+                "INSERT INTO projection_agents(agent_id, agent_json) VALUES('agent-new', ?1)",
+                [json!({"name": "Late"}).to_string()],
+            )
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO projection_agents(agent_id, agent_json) VALUES('agent-prof', ?1)",
+                [json!({"name": "Prof", "browserProfileId": "p"}).to_string()],
+            )
+            .unwrap();
+        let reason = openbot_unrouted(&recorded, 7418).unwrap();
+        assert_eq!(reason, "OpenBot agent \"Late\" is not routed");
+        let r = Record {
+            target: OPENBOT.into(),
+            key: "/k".into(),
+            original: Value::Null,
+            ca_shas: vec![],
+            current_sha: "ab".repeat(32),
+            router_port: 7418,
+            service: true,
+            installed_at: String::new(),
+            version: VERSION.into(),
+            user_data_dir: None,
+            profile: None,
+            versions: vec![],
+            trust_store: None,
+            sessions: recorded.clone(),
+            data_dirs: vec![],
+            ca_only: false,
+        };
+        assert_eq!(
+            status_line(&r, &State::Incomplete(reason)),
+            "openbot /k: incomplete OpenBot agent \"Late\" is not routed — fix: quit OpenBot, then asm browser install openbot --trust-user-wide"
+        );
+        // Routing it (the fix) makes the install complete; a changed session is reported.
+        let recorded = apply_openbot(vec![plan_openbot(&dir).unwrap()], 7418, &recorded).unwrap();
+        assert_eq!(openbot_unrouted(&recorded, 7418), None);
+        assert_eq!(openbot_unrouted(&recorded, 7500).unwrap(), format!(
+            "the proxy setting in {} is not asm's",
+            partition_prefs(&dir, OPENBOT_SHARED).display()
+        ));
+        drop(writer);
+    }
+
+    #[test]
+    fn openbot_without_agent_list_uses_existing_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No openbot.db at all.
+        let dir = tmp.path().join("NoDb");
+        let existing = "openbot-browser-agent-0123456789abcdef0123456789abcdef";
+        fs::create_dir_all(dir.join("Partitions").join(existing)).unwrap();
+        fs::create_dir_all(dir.join("Partitions/openbot-browser-profile-x")).unwrap();
+        let names = |d: &Path| plan_openbot(d).unwrap().sessions.into_iter().map(|s| s.name).collect::<Vec<_>>();
+        assert_eq!(names(&dir), [OPENBOT_SHARED, existing]);
+
+        // A table of another shape.
+        let odd = tmp.path().join("Odd");
+        fs::create_dir_all(odd.join("Partitions").join(existing)).unwrap();
+        let conn = rusqlite::Connection::open(odd.join(OPENBOT_DB)).unwrap();
+        conn.execute_batch("CREATE TABLE projection_agents(id TEXT, data TEXT); INSERT INTO projection_agents VALUES('a', '{}');")
+            .unwrap();
+        assert_eq!(names(&odd), [OPENBOT_SHARED, existing]);
+        let recorded = apply_openbot(vec![plan_openbot(&odd).unwrap()], 7418, &[]).unwrap();
+        assert_eq!(openbot_unrouted(&recorded, 7418), None);
+
+        // Malformed agent JSON still routes that agent under its id.
+        let bad = tmp.path().join("Bad");
+        fs::create_dir_all(&bad).unwrap();
+        let conn = rusqlite::Connection::open(bad.join(OPENBOT_DB)).unwrap();
+        conn.execute_batch("CREATE TABLE projection_agents(agent_id TEXT PRIMARY KEY, agent_json TEXT); INSERT INTO projection_agents VALUES('agent-x', 'not json');")
+            .unwrap();
+        let plan = plan_openbot(&bad).unwrap();
+        assert_eq!(plan.sessions[1].label, "agent \"agent-x\"");
+    }
+
+    #[test]
+    fn openbot_data_dir_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ud = fs::canonicalize(tmp.path()).unwrap().join("OpenBot");
+        // A client of a remote server: no server data.
+        fs::create_dir_all(&ud).unwrap();
+        assert!(openbot_data_dirs(&ud, &[]).unwrap().is_empty());
+        assert!(openbot_data_dirs(&tmp.path().join("missing"), &[]).unwrap().is_empty());
+        openbot_db(&ud.join("local-servers/b"), &[]);
+        fs::create_dir_all(ud.join("local-servers/empty")).unwrap();
+        assert_eq!(openbot_data_dirs(&ud, &[]).unwrap(), vec![ud.join("local-servers/b")]);
+        openbot_db(&ud, &[]);
+        openbot_db(&ud.join("local-servers/a"), &[]);
+        assert_eq!(
+            openbot_data_dirs(&ud, &[]).unwrap(),
+            vec![ud.clone(), ud.join("local-servers/a"), ud.join("local-servers/b")]
+        );
+        // --data-dir replaces discovery.
+        let srv = ud.join("local-servers/empty");
+        assert_eq!(openbot_data_dirs(&ud, std::slice::from_ref(&srv)).unwrap(), vec![srv.clone()]);
+        assert!(openbot_data_dirs(&ud, &[ud.join("nope")]).is_err());
+    }
+
+    #[test]
+    fn old_records_load() {
+        let old = r#"{"records":[{"target":"openbot","key":"/k","original":null,"ca_shas":["ab"],"current_sha":"ab","router_port":7418,"service":true,"installed_at":"t","version":"0.1.0","trust_store":{"kind":"keychain","path":"/k"}}]}"#;
+        let f: RecordsFile = serde_json::from_str(old).unwrap();
+        assert!(f.records[0].sessions.is_empty() && f.records[0].data_dirs.is_empty() && !f.records[0].ca_only);
+        let out = serde_json::to_string(&f).unwrap();
+        assert!(!out.contains("sessions") && !out.contains("data_dirs") && !out.contains("ca_only"), "{out}");
     }
 }

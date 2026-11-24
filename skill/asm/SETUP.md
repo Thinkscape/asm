@@ -86,39 +86,55 @@ trusted user-wide: `~/.pki/nssdb` (else `~/.local/share/pki/nssdb`) on Linux, th
 keychain on macOS.
 
 ```bash
+# Quit OpenBot first (hosted server: sudo systemctl stop openbot); install refuses while it runs.
 asm browser install openbot --trust-user-wide
+asm browser install openbot --trust-user-wide --data-dir DIR   # another server data dir (repeatable)
 ```
 
-Then route OpenBot's browser through the router, in one of two ways:
+Then start OpenBot again. The install routes the **Shared** and **agent-only** browser
+sessions itself (macOS and Linux):
 
-- **A named browser profile (any OS):** in OpenBot, **Settings → Browser profiles**:
-  1. Add the proxy `http://127.0.0.1:7418`.
-  2. Create a profile using it.
-  3. Assign it to the agent (agent settings → Advanced → Browser profile).
-  4. Restart OpenBot.
+- It finds the server data directories: OpenBot's own (`~/Library/Application
+  Support/OpenBot` on macOS, `${XDG_CONFIG_HOME:-~/.config}/OpenBot` on Linux) when it has
+  an `openbot.db`, plus each local server under its `local-servers/`. `--data-dir` replaces
+  that search. No server data means this machine is only a client of a remote OpenBot
+  server: install on the server; the run then only trusts the CA.
+- In each, it writes a `proxy` preference (HTTPS and WSS to the router, HTTP and WS direct)
+  into the `Preferences` of the Shared session and of every agent without a named browser
+  profile (also agents that don't use their own session yet), keeping all other settings.
+- Refused when one of those sessions already has another proxy.
+- **Agents created after the install are not routed** until you quit OpenBot and run the
+  install again; `asm browser status`, `asm doctor` and `asm get --login-url` say
+  `OpenBot agent "<name>" is not routed`.
+- **Named browser profiles** keep OpenBot's own proxy setting. To route one, in OpenBot,
+  **Settings → Browser profiles**: add the proxy `http://127.0.0.1:7418`, use it in the
+  profile, assign the profile to the agent (agent settings → Advanced → Browser profile)
+  and restart OpenBot.
 
-  OpenBot can't put a proxy on the Shared or agent-only profiles. Switching an agent to the
-  new profile leaves its existing site sign-ins behind.
-- **The Shared and agent-only profiles (Linux server):** OpenBot leaves those profiles on
-  the system proxy, which Chromium reads from the `auto_proxy` environment variable. Give
-  the OpenBot service the asm PAC, then restart it. This covers every OpenBot browser on
-  that server that has no proxy of its own; command-line tools ignore `auto_proxy`.
+`--ca-only` only trusts the CA and leaves OpenBot's sessions alone (route a named profile as
+above, or use the drop-in below).
 
-  ```bash
-  PAC='function FindProxyForURL(url, host) {
-    if (url.substring(0, 6) == "https:" || url.substring(0, 4) == "wss:") return "PROXY 127.0.0.1:7418";
-    return "DIRECT";
-  }'
-  sudo mkdir -p /etc/systemd/system/openbot.service.d
-  printf '[Service]\nEnvironment="auto_proxy=data:application/x-ns-proxy-autoconfig;base64,%s"\n' \
-    "$(printf %s "$PAC" | base64 -w0)" | sudo tee /etc/systemd/system/openbot.service.d/asm-proxy.conf
-  sudo systemctl daemon-reload && sudo systemctl restart openbot
-  ```
+**Linux server alternative, without stopping OpenBot for each new agent:** OpenBot leaves
+the Shared and agent-only sessions on the system proxy, which Chromium reads from the
+`auto_proxy` environment variable. Give the OpenBot service the asm PAC and restart it; this
+covers every OpenBot browser on that server without a proxy of its own, agents created later
+included. Install with `--ca-only` then. Command-line tools ignore `auto_proxy`.
+
+```bash
+PAC='function FindProxyForURL(url, host) {
+  if (url.substring(0, 6) == "https:" || url.substring(0, 4) == "wss:") return "PROXY 127.0.0.1:7418";
+  return "DIRECT";
+}'
+sudo mkdir -p /etc/systemd/system/openbot.service.d
+printf '[Service]\nEnvironment="auto_proxy=data:application/x-ns-proxy-autoconfig;base64,%s"\n' \
+  "$(printf %s "$PAC" | base64 -w0)" | sudo tee /etc/systemd/system/openbot.service.d/asm-proxy.conf
+sudo systemctl daemon-reload && sudo systemctl restart openbot
+```
 
 **Hosted servers:** the service user usually has no login session. Pair and install as that
 user with `sudo -u openbot -H asm pair <manager-host>` and
-`sudo -u openbot -H asm browser install openbot --trust-user-wide --no-service`. Then run the
-router as a system service (section 4).
+`sudo -u openbot -H asm browser install openbot --trust-user-wide --no-service` (with
+`openbot.service` stopped). Then run the router as a system service (section 4).
 
 ## 4. The proxy router
 
@@ -159,6 +175,7 @@ Start with `asm doctor` and `asm browser status` on the browser's machine.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `asm get --login-url`: `no asm proxy-router on this machine` | Not installed here, or the router is stopped | Install (section 3) or restart the router (section 4) |
+| `asm get --login-url`: `no browser on this machine has sent HOST through the asm proxy router` | The browser hasn't loaded the login page in the last 30 minutes, or it bypasses the router (not set up, T3 updated its browser, a new OpenBot agent) | Load the login page in that browser, then retry; still failing: `asm browser status` and the fix it shows |
 | `warning: … T3 updated its browser to <v>` | T3 runs a new, unwrapped browser | `asm browser install t3code` |
 | Every HTTPS page fails (`ERR_PROXY_CONNECTION_FAILED`) | Router down | Restart it (section 4) |
 | `ERR_TUNNEL_CONNECTION_FAILED` for one host | The router could not reach it directly: blocked by DNS (for example a `0.0.0.0` ad-block answer), offline, or refused | Same result as without asm; nothing to fix in asm. Check with `getent hosts <host>` |
@@ -167,6 +184,7 @@ Start with `asm doctor` and `asm browser status` on the browser's machine.
 | Certificate error on a granted site | The browser doesn't trust the asm browser CA yet | Restart the browser; `asm browser status`; reinstall |
 | `stale CA` in `asm browser status` | The manager's browser CA changed | `asm browser install <target>` |
 | `incomplete …` in `asm browser status` | A setting asm wrote was changed or removed | Run the `fix:` command shown |
+| `incomplete OpenBot agent "<name>" is not routed` | The agent was created after `asm browser install openbot` | Quit OpenBot, run the install again, start OpenBot |
 | `403 login sentinel not valid for METHOD URL` | The page posts somewhere other than the granted URL | Request a grant for that exact URL |
 | The site reports a wrong password, and the manager's Activity Log has no substitution | The sentinel went straight to the site: wrong URL, or the browser isn't routed | Check the URL in the network log and `asm browser status`; request a new grant |
 | The page shows "Sign in not loaded yet" or similar | Submitted before the page's sign-in script loaded | Wait until the page has fully loaded, then submit once |
@@ -178,7 +196,7 @@ Start with `asm doctor` and `asm browser status` on the browser's machine.
 ```bash
 asm browser uninstall chrome [--profile NAME] [--user-data-dir DIR]
 asm browser uninstall t3code
-asm browser uninstall openbot
+asm browser uninstall openbot                     # quit OpenBot first
 ```
 
 Uninstall restores what asm replaced, unless it changed since (then it says so and leaves
