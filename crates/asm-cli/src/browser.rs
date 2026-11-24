@@ -18,11 +18,13 @@ use asm_proto::wire::ProxyInfo;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RECORDS_NAME: &str = "browsers.json";
@@ -90,8 +92,9 @@ pub enum InstallTarget {
         #[command(flatten)]
         router: RouterArgs,
     },
-    /// OpenBot (trusts only the OS certificate store). Quit OpenBot first: install routes
-    /// its Shared and agent-only browsers through the proxy router.
+    /// OpenBot (trusts only the OS certificate store). Routes its Shared and agent-only
+    /// browsers through the proxy router; OpenBot must be stopped meanwhile (asm offers to
+    /// quit and restart it).
     Openbot {
         /// Add the asm browser CA to your user's certificate trust store (required).
         #[arg(long)]
@@ -104,6 +107,9 @@ pub enum InstallTarget {
         /// browser profile at the router yourself).
         #[arg(long)]
         ca_only: bool,
+        /// When OpenBot runs, quit it and start it again without asking.
+        #[arg(long, conflicts_with = "ca_only")]
+        restart: bool,
         #[command(flatten)]
         router: RouterArgs,
     },
@@ -118,8 +124,12 @@ pub enum UninstallTarget {
     },
     /// T3 Code's preview browser.
     T3code,
-    /// OpenBot.
-    Openbot,
+    /// OpenBot. OpenBot must be stopped while asm restores its browser settings.
+    Openbot {
+        /// When OpenBot runs, quit it and start it again without asking.
+        #[arg(long)]
+        restart: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -147,14 +157,14 @@ pub fn run(cmd: BrowserCommand) -> Result<(), CliError> {
         BrowserCommand::Install { target } => match target {
             InstallTarget::Chrome { location, router } => install_chrome(location, router),
             InstallTarget::T3code { trust_user_wide, router } => install_t3code(trust_user_wide, router),
-            InstallTarget::Openbot { trust_user_wide, data_dir, ca_only, router } => {
-                install_openbot(trust_user_wide, data_dir, ca_only, router)
+            InstallTarget::Openbot { trust_user_wide, data_dir, ca_only, restart, router } => {
+                install_openbot(trust_user_wide, data_dir, ca_only, restart, router)
             }
         },
         BrowserCommand::Uninstall { target } => match target {
             UninstallTarget::Chrome { location } => uninstall_chrome(location),
             UninstallTarget::T3code => uninstall_t3code(),
-            UninstallTarget::Openbot => uninstall_openbot(),
+            UninstallTarget::Openbot { restart } => uninstall_openbot(restart),
         },
         BrowserCommand::Status { json } => status(json),
     }
@@ -734,10 +744,12 @@ fn running_pid(udd: &Path) -> Option<i32> {
     if host != crate::hostinfo::hostname() {
         return None;
     }
+    pid_alive(pid).then_some(pid)
+}
+
+fn pid_alive(pid: i32) -> bool {
     // SAFETY: kill with signal 0 only checks for the process.
-    let alive = unsafe { libc::kill(pid, 0) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    alive.then_some(pid)
+    (unsafe { libc::kill(pid, 0) }) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn refuse_running(p: &ChromeProfile) -> Result<(), CliError> {
@@ -1372,15 +1384,390 @@ fn openbot_pid(dir: &Path) -> Option<i32> {
     })
 }
 
-/// Refuse while OpenBot uses one of `dirs`: it ignores and later overwrites
-/// `Preferences` changed while it runs.
-fn refuse_openbot_running<P: AsRef<Path>>(dirs: &[P]) -> Result<(), CliError> {
-    match dirs.iter().find_map(|d| openbot_pid(d.as_ref())) {
-        Some(pid) => {
-            let hosted = if cfg!(target_os = "linux") { "; for a hosted server: sudo systemctl stop openbot" } else { "" };
-            Err(CliError::failure(format!("quit OpenBot first (pid {pid}), then re-run{hosted}")))
+/// How a running OpenBot was started: whether asm may stop it and how to start it again.
+#[derive(Debug, Clone, PartialEq)]
+enum Runner {
+    /// asm itself runs inside it (an OpenBot agent's shell).
+    Inside,
+    /// A systemd system service, which asm (not root) can't stop.
+    Service { unit: String },
+    /// A desktop app asm can quit and start again.
+    App(Launch),
+    /// asm can't tell how to start it again.
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Launch {
+    /// macOS: `open <bundle>`.
+    Bundle(PathBuf),
+    /// Linux: the executable with its argv, working directory and environment.
+    Exec {
+        exe: PathBuf,
+        argv: Vec<OsString>,
+        cwd: Option<PathBuf>,
+        env: Option<Vec<(OsString, OsString)>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Running {
+    pid: i32,
+    runner: Runner,
+}
+
+/// What to do about a running OpenBot.
+#[derive(Debug, PartialEq)]
+enum Flow {
+    /// Ask whether asm may quit and restart it.
+    Ask,
+    /// Quit it, write, start it again.
+    Restart,
+    /// Wait until the user stops it, write, ask them to start it again.
+    Wait,
+    Fail(String),
+}
+
+/// Whether OpenBot came back after asm wrote its settings.
+#[derive(Debug, PartialEq)]
+enum Restarted {
+    /// OpenBot wasn't running.
+    NotRunning,
+    /// A new OpenBot (this pid) uses the data directory.
+    Running(i32),
+    /// It didn't start again in time.
+    NotStarted,
+}
+
+/// How asm deals with a running OpenBot (timeouts and process access injectable for tests).
+struct Control<'a> {
+    interactive: bool,
+    /// `--restart`.
+    restart: bool,
+    quit_timeout: Duration,
+    start_timeout: Duration,
+    /// Time OpenBot gets after starting before asm re-reads its settings.
+    settle: Duration,
+    classify: &'a dyn Fn(i32) -> Runner,
+    launch: &'a mut dyn FnMut(&Launch) -> Result<(), CliError>,
+}
+
+const OPENBOT_TIMEOUT: Duration = Duration::from_secs(60);
+const OPENBOT_SETTLE: Duration = Duration::from_secs(3);
+const POLL: Duration = Duration::from_millis(250);
+
+/// The command line is interactive: stdin and stderr are terminals.
+fn interactive() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// The parent of `pid` (`/proc/<pid>/stat` on Linux, `ps` elsewhere).
+fn parent_pid(pid: i32) -> Option<i32> {
+    if cfg!(target_os = "linux") {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        return stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok();
+    }
+    let out = Command::new("ps").args(["-o", "ppid=", "-p", &pid.to_string()]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Whether `pid` is `ancestor` or one of its descendants.
+fn is_descendant(pid: i32, ancestor: i32) -> bool {
+    let mut cur = pid;
+    for _ in 0..256 {
+        if cur == ancestor {
+            return true;
         }
-        None => Ok(()),
+        if cur <= 1 {
+            return false;
+        }
+        match parent_pid(cur) {
+            Some(p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The outermost `.app` bundle containing the executable `exe`.
+fn app_bundle(exe: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    let mut components = exe.components().peekable();
+    while let Some(c) = components.next() {
+        out.push(c);
+        if components.peek().is_some() && c.as_os_str().to_str().is_some_and(|s| s.ends_with(".app")) {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// The systemd system service a process belongs to, from its `/proc/<pid>/cgroup`.
+fn systemd_unit(cgroup: &str) -> Option<String> {
+    cgroup.lines().find_map(|line| {
+        let path = line.splitn(3, ':').nth(2)?;
+        let mut parts = path.split('/').filter(|p| !p.is_empty());
+        if parts.next()? != "system.slice" {
+            return None;
+        }
+        parts.next().filter(|u| u.ends_with(".service")).map(str::to_owned)
+    })
+}
+
+/// Linux: how to start process `pid` again, from `/proc`.
+fn exec_launch(pid: i32) -> Option<Launch> {
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    let mut exe = fs::read_link(proc.join("exe")).ok()?;
+    if let Some(s) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        exe = PathBuf::from(s); // Replaced by an update: start the new one.
+    }
+    if !exe.is_file() {
+        return None;
+    }
+    let nul_split = |b: Vec<u8>| -> Vec<OsString> {
+        use std::os::unix::ffi::OsStringExt;
+        b.split(|c| *c == 0).filter(|s| !s.is_empty()).map(|s| OsString::from_vec(s.to_vec())).collect()
+    };
+    let argv = nul_split(fs::read(proc.join("cmdline")).ok()?);
+    let cwd = fs::read_link(proc.join("cwd")).ok();
+    let env = fs::read(proc.join("environ")).ok().map(|b| {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        nul_split(b)
+            .into_iter()
+            .filter_map(|kv| {
+                let bytes = kv.as_bytes();
+                let eq = bytes.iter().position(|c| *c == b'=')?;
+                Some((OsString::from_vec(bytes[..eq].to_vec()), OsString::from_vec(bytes[eq + 1..].to_vec())))
+            })
+            .collect()
+    });
+    Some(Launch::Exec { exe, argv, cwd, env })
+}
+
+/// Who runs OpenBot process `pid`.
+fn classify_openbot(pid: i32) -> Runner {
+    if is_descendant(std::process::id() as i32, pid) {
+        return Runner::Inside;
+    }
+    if cfg!(target_os = "linux") {
+        if let Some(unit) = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok().as_deref().and_then(systemd_unit) {
+            return Runner::Service { unit };
+        }
+        return exec_launch(pid).map_or(Runner::Unknown, Runner::App);
+    }
+    Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| app_bundle(Path::new(String::from_utf8_lossy(&o.stdout).trim())))
+        .map_or(Runner::Unknown, |b| Runner::App(Launch::Bundle(b)))
+}
+
+/// Start OpenBot again, detached from asm.
+fn launch_openbot(l: &Launch) -> Result<(), CliError> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    match l {
+        Launch::Bundle(bundle) => run_cmd(Command::new("open").arg(bundle)).map(|_| ()),
+        Launch::Exec { exe, argv, cwd, env } => {
+            let mut cmd = Command::new(exe);
+            if let Some((arg0, rest)) = argv.split_first() {
+                cmd.arg0(arg0).args(rest);
+            }
+            if let Some(cwd) = cwd {
+                cmd.current_dir(cwd);
+            }
+            if let Some(env) = env {
+                cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+            }
+            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            // SAFETY: setsid is async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            cmd.spawn()
+                .map(drop)
+                .map_err(|e| CliError::failure(format!("starting {}: {e}", exe.display())))
+        }
+    }
+}
+
+/// The OpenBot processes using `dirs` (a process started by another one listed is left
+/// out: it goes with its parent).
+fn running_openbot(dirs: &[PathBuf], classify: &dyn Fn(i32) -> Runner) -> Vec<Running> {
+    let mut pids: Vec<i32> = Vec::new();
+    for d in dirs {
+        if let Some(p) = openbot_pid(d)
+            && !pids.contains(&p)
+        {
+            pids.push(p);
+        }
+    }
+    let top: Vec<i32> = pids
+        .iter()
+        .copied()
+        .filter(|p| !pids.iter().any(|q| q != p && is_descendant(*p, *q)))
+        .collect();
+    top.into_iter().map(|pid| Running { pid, runner: classify(pid) }).collect()
+}
+
+/// The running OpenBot that limits what asm may do most.
+fn worst(running: &[Running]) -> Option<&Running> {
+    running.iter().min_by_key(|r| match r.runner {
+        Runner::Inside => 0,
+        Runner::Service { .. } => 1,
+        Runner::Unknown => 2,
+        Runner::App(_) => 3,
+    })
+}
+
+fn decide(runner: &Runner, pid: i32, interactive: bool, restart: bool) -> Flow {
+    match runner {
+        Runner::Inside => Flow::Fail(format!(
+            "this command runs inside OpenBot (pid {pid}), which must be stopped while asm writes its browser settings; run it in a terminal instead"
+        )),
+        Runner::Service { .. } | Runner::Unknown if interactive => Flow::Wait,
+        Runner::Service { unit } => Flow::Fail(format!(
+            "OpenBot is running as the system service {unit} (pid {pid}): run sudo systemctl stop {unit}, run this again, then sudo systemctl start {unit}"
+        )),
+        Runner::Unknown => Flow::Fail(format!(
+            "OpenBot is running (pid {pid}) and asm can't tell how to start it again: quit it and run this again"
+        )),
+        Runner::App(_) if restart => Flow::Restart,
+        Runner::App(_) if interactive => Flow::Ask,
+        Runner::App(_) => Flow::Fail(format!(
+            "OpenBot is running (pid {pid}): quit it and run this again, or add --restart to let asm quit and restart it"
+        )),
+    }
+}
+
+/// Refuse now what [`while_openbot_stopped`] would refuse, before asm changes anything.
+fn precheck_openbot(dirs: &[PathBuf], ctl: &Control) -> Result<(), CliError> {
+    let running = running_openbot(dirs, ctl.classify);
+    if let Some(w) = worst(&running)
+        && let Flow::Fail(m) = decide(&w.runner, w.pid, ctl.interactive, ctl.restart)
+    {
+        return Err(CliError::failure(m));
+    }
+    Ok(())
+}
+
+fn ask_restart(pid: i32) -> Result<bool, CliError> {
+    eprintln!("OpenBot is running (pid {pid}). asm changes its browser settings while it is stopped.");
+    eprint!("Quit OpenBot now and start it again afterwards? [Y/n] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let n = std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| CliError::failure(format!("reading the answer: {e}")))?;
+    if n == 0 {
+        return Err(CliError::failure("no answer; OpenBot's browser settings are unchanged"));
+    }
+    let a = line.trim().to_ascii_lowercase();
+    Ok(a.is_empty() || a == "y" || a == "yes")
+}
+
+/// Poll `done` every 250 ms until it holds (true) or `timeout` passes (false).
+fn wait_until(timeout: Option<Duration>, mut done: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    loop {
+        if done() {
+            return true;
+        }
+        if timeout.is_some_and(|t| start.elapsed() >= t) {
+            return false;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Run `write` while no OpenBot uses `dirs` (OpenBot ignores and later overwrites
+/// `Preferences` changed while it runs). A running OpenBot is quit and started again,
+/// or the user is asked to, as `ctl` and [`decide`] say; then asm waits until it runs again.
+fn while_openbot_stopped<T>(
+    dirs: &[PathBuf],
+    ctl: &mut Control,
+    write: impl FnOnce() -> Result<T, CliError>,
+) -> Result<(T, Restarted), CliError> {
+    let running = running_openbot(dirs, ctl.classify);
+    let Some(w) = worst(&running) else {
+        return Ok((write()?, Restarted::NotRunning));
+    };
+    let restart = match decide(&w.runner, w.pid, ctl.interactive, ctl.restart) {
+        Flow::Fail(m) => return Err(CliError::failure(m)),
+        Flow::Ask => ask_restart(w.pid)?,
+        Flow::Restart => true,
+        Flow::Wait => false,
+    };
+    let unit = match &w.runner {
+        Runner::Service { unit } => Some(unit.clone()),
+        _ => None,
+    };
+    let old: Vec<i32> = running.iter().map(|r| r.pid).collect();
+    let watch = dirs.iter().find(|d| openbot_pid(d).is_some()).or(dirs.first()).cloned();
+    let stopped = || old.iter().all(|p| !pid_alive(*p)) && dirs.iter().all(|d| openbot_pid(d).is_none());
+    if restart {
+        for r in &running {
+            // SAFETY: plain signal delivery; Electron quits gracefully on SIGTERM.
+            unsafe { libc::kill(r.pid, libc::SIGTERM) };
+        }
+        println!("quitting OpenBot…");
+        if !wait_until(Some(ctl.quit_timeout), stopped) {
+            return Err(CliError::failure(format!(
+                "OpenBot didn't quit within {} s; quit it yourself and run this again",
+                ctl.quit_timeout.as_secs()
+            )));
+        }
+    } else {
+        match &unit {
+            Some(u) => println!("Waiting for OpenBot to stop: run sudo systemctl stop {u}"),
+            None => println!("Waiting for OpenBot to quit (quit it from its menu; Ctrl-C to stop)…"),
+        }
+        wait_until(None, stopped);
+    }
+    let written = write();
+    let mut launched = !restart;
+    if restart {
+        println!("starting OpenBot again…");
+        for r in &running {
+            if let Runner::App(l) = &r.runner {
+                match (ctl.launch)(l) {
+                    Ok(()) => launched = true,
+                    Err(e) => eprintln!("warning: {}", e.message.trim_start_matches("error: ")),
+                }
+            }
+        }
+    } else {
+        match &unit {
+            Some(u) => println!("start it again: sudo systemctl start {u}"),
+            None => println!("Start OpenBot again"),
+        }
+    }
+    let written = written?;
+    let mut new_pid = None;
+    let started = launched
+        && watch.is_some_and(|d| {
+            wait_until(restart.then_some(ctl.start_timeout), || {
+                new_pid = openbot_pid(&d).filter(|p| !old.contains(p));
+                new_pid.is_some()
+            })
+        });
+    match new_pid {
+        Some(pid) if started => {
+            std::thread::sleep(ctl.settle);
+            Ok((written, Restarted::Running(pid)))
+        }
+        _ => {
+            eprintln!(
+                "warning: OpenBot didn't start again within {} s; start it yourself",
+                ctl.start_timeout.as_secs()
+            );
+            Ok((written, Restarted::NotStarted))
+        }
     }
 }
 
@@ -1626,7 +2013,73 @@ fn named_profile_hint(port: u16) {
     );
 }
 
-fn install_openbot(trust_user_wide_ok: bool, data_dirs: Vec<PathBuf>, ca_only: bool, r: RouterArgs) -> Result<(), CliError> {
+fn openbot_control<'a>(restart: bool, launch: &'a mut dyn FnMut(&Launch) -> Result<(), CliError>) -> Control<'a> {
+    Control {
+        interactive: interactive(),
+        restart,
+        quit_timeout: OPENBOT_TIMEOUT,
+        start_timeout: OPENBOT_TIMEOUT,
+        settle: OPENBOT_SETTLE,
+        classify: &classify_openbot,
+        launch,
+    }
+}
+
+/// Route the sessions in `dirs` while OpenBot is stopped, `save` the sessions to record
+/// right after writing, and confirm a restarted OpenBot kept asm's settings.
+fn route_openbot(
+    dirs: &[PathBuf],
+    port: u16,
+    previous: &[OpenbotData],
+    ctl: &mut Control,
+    save: &mut dyn FnMut(&[OpenbotData]) -> Result<(), CliError>,
+) -> Result<(Vec<OpenbotData>, Restarted), CliError> {
+    let ((sessions, labels, written), restarted) = while_openbot_stopped(dirs, ctl, || {
+        // Read again: OpenBot rewrites Preferences when it quits.
+        let plans = dirs.iter().map(|d| plan_openbot(d)).collect::<Result<Vec<_>, _>>()?;
+        let routed: Vec<(PathBuf, Vec<String>)> = plans
+            .iter()
+            .map(|p| (p.dir.clone(), p.sessions.iter().map(|s| s.label.clone()).collect()))
+            .collect();
+        let written: Vec<PathBuf> = plans.iter().flat_map(|p| p.sessions.iter().map(|s| s.prefs_path.clone())).collect();
+        let sessions = apply_openbot(plans, port, previous)?;
+        save(&sessions)?;
+        for (dir, labels) in &routed {
+            println!("routed OpenBot browsers in {}: {}", dir.display(), labels.join(", "));
+        }
+        let labels: Vec<String> = routed.into_iter().flat_map(|(_, l)| l).collect();
+        Ok((sessions, labels, written))
+    })?;
+    match restarted {
+        Restarted::NotRunning => println!("{OPENBOT_ROUTED}"),
+        Restarted::NotStarted => {}
+        Restarted::Running(pid) => {
+            let want = openbot_proxy_pref(port);
+            if let Some(p) = written
+                .iter()
+                .find(|p| !read_prefs(p).is_ok_and(|(m, _)| m.get("proxy") == Some(&want)))
+            {
+                return Err(CliError::failure(format!(
+                    "OpenBot replaced asm's proxy setting in {}; that browser session doesn't use asm's proxy router (asm browser status)",
+                    p.display()
+                )));
+            }
+            println!(
+                "OpenBot is running again (pid {pid}) with asm's browser settings: {} route HTTPS through asm's proxy router.",
+                labels.join(", ")
+            );
+        }
+    }
+    Ok((sessions, restarted))
+}
+
+fn install_openbot(
+    trust_user_wide_ok: bool,
+    data_dirs: Vec<PathBuf>,
+    ca_only: bool,
+    restart: bool,
+    r: RouterArgs,
+) -> Result<(), CliError> {
     if !trust_user_wide_ok {
         return Err(trust_user_wide("OpenBot"));
     }
@@ -1643,99 +2096,106 @@ fn install_openbot(trust_user_wide_ok: bool, data_dirs: Vec<PathBuf>, ca_only: b
     let existing = find(&records, OPENBOT, &key).map(|i| records[i].clone());
     let user_data = openbot_user_data()?;
     let dirs = if ca_only { Vec::new() } else { openbot_data_dirs(&user_data, &data_dirs)? };
-    // Everything that can refuse runs before anything is written.
-    refuse_openbot_running(&dirs)?;
-    let plans = dirs.iter().map(|d| plan_openbot(d)).collect::<Result<Vec<_>, _>>()?;
+    let mut launch = launch_openbot;
+    let mut ctl = openbot_control(restart, &mut launch);
+    // Refusals that need no answer come before anything changes.
+    for d in &dirs {
+        plan_openbot(d)?;
+    }
+    precheck_openbot(&dirs, &ctl)?;
     let ca = fetch_ca()?;
     let service = ensure_router(port, r.no_service)?;
-    store.add(&ca)?;
+    // Adding it again would ask for the login password again on macOS.
+    if !matches!(store.has(&ca.sha), Ok(true)) {
+        store.add(&ca)?;
+    }
     if let Some(e) = &existing {
         let old: Vec<String> = e.ca_shas.iter().filter(|s| **s != ca.sha).cloned().collect();
         remove_old(&store, &records, OPENBOT, &key, &old)?;
     }
-    // OpenBot may have started meanwhile.
-    refuse_openbot_running(&dirs)?;
-    let routed: Vec<(PathBuf, String)> = plans
-        .iter()
-        .map(|p| (p.dir.clone(), p.sessions.iter().map(|s| s.label.as_str()).collect::<Vec<_>>().join(", ")))
-        .collect();
-    let previous = existing.as_ref().map(|e| e.sessions.as_slice()).unwrap_or_default();
-    let sessions = apply_openbot(plans, port, previous)?;
     let data_dirs = if ca_only {
-        existing.map(|e| e.data_dirs).unwrap_or_default()
+        existing.as_ref().map(|e| e.data_dirs.clone()).unwrap_or_default()
     } else {
         data_dirs
             .iter()
             .map(|d| fs::canonicalize(d).unwrap_or_else(|_| d.clone()).to_string_lossy().into_owned())
             .collect()
     };
-    upsert(
-        &mut records,
-        Record {
-            target: OPENBOT.into(),
-            key,
-            original: Value::Null,
-            ca_shas: vec![ca.sha.clone()],
-            current_sha: ca.sha,
-            router_port: port,
-            service,
-            installed_at: asm_proto::time::now_rfc3339(),
-            version: VERSION.into(),
-            user_data_dir: None,
-            profile: None,
-            versions: Vec::new(),
-            trust_store: Some(store),
-            ca_only: ca_only && sessions.is_empty(),
-            sessions,
-            data_dirs,
-        },
-    );
+    let record = |sessions: Vec<OpenbotData>| Record {
+        target: OPENBOT.into(),
+        key: key.clone(),
+        original: Value::Null,
+        ca_shas: vec![ca.sha.clone()],
+        current_sha: ca.sha.clone(),
+        router_port: port,
+        service,
+        installed_at: asm_proto::time::now_rfc3339(),
+        version: VERSION.into(),
+        user_data_dir: None,
+        profile: None,
+        versions: Vec::new(),
+        trust_store: Some(store.clone()),
+        ca_only: ca_only && sessions.is_empty(),
+        sessions,
+        data_dirs: data_dirs.clone(),
+    };
+    // Record the trusted CA now: dealing with OpenBot may fail or be interrupted.
+    let previous = existing.map(|e| e.sessions).unwrap_or_default();
+    upsert(&mut records, record(previous.clone()));
     save_records(&records)?;
     no_service_hint(service, port);
     if ca_only {
         named_profile_hint(port);
-    } else if routed.is_empty() {
+        return Ok(());
+    }
+    if dirs.is_empty() {
         println!(
             "no OpenBot server data on this machine ({} has no {OPENBOT_DB}): OpenBot here is a client of a remote server, whose browsers run there; install on the server. Trusted the asm browser CA only.",
             user_data.display()
         );
-    } else {
-        for (dir, labels) in &routed {
-            println!("routed OpenBot browsers in {}: {labels}", dir.display());
-        }
-        println!("{OPENBOT_ROUTED}");
+        return Ok(());
     }
+    route_openbot(&dirs, port, &previous, &mut ctl, &mut |sessions| {
+        upsert(&mut records, record(sessions.to_vec()));
+        save_records(&records)
+    })?;
     Ok(())
 }
 
-fn uninstall_openbot() -> Result<(), CliError> {
+fn uninstall_openbot(restart: bool) -> Result<(), CliError> {
     let _lock = lock_records()?;
     let mut records = load_records()?;
     let i = records
         .iter()
         .position(|r| r.target == OPENBOT)
         .ok_or_else(|| CliError::failure("asm browser install openbot is not installed on this machine"))?;
-    let sessions = records[i].sessions.clone();
-    if !sessions.is_empty() {
-        let dirs: Vec<&str> = sessions.iter().map(|d| d.dir.as_str()).collect();
-        refuse_openbot_running(&dirs)?;
-        for w in restore_openbot(&sessions)? {
-            eprintln!("warning: {w}");
-        }
-    }
-    let rec = records.remove(i);
+    let rec = records[i].clone();
+    let dirs: Vec<PathBuf> = rec.sessions.iter().map(|d| PathBuf::from(&d.dir)).filter(|d| d.is_dir()).collect();
+    let mut launch = launch_openbot;
+    let mut ctl = openbot_control(restart, &mut launch);
+    precheck_openbot(&dirs, &ctl)?;
     if let Some(store) = &rec.trust_store {
         remove_old(store, &records, OPENBOT, &rec.key, &rec.ca_shas)?;
     }
-    save_records(&records)?;
-    finish_removal(&records)?;
-    if sessions.is_empty() {
-        println!("removed the asm browser CA from {}; restart OpenBot", rec.key);
-    } else {
-        println!(
-            "removed the asm browser CA from {} and restored OpenBot's browser proxy settings; start OpenBot again",
-            rec.key
-        );
+    let ((), restarted) = while_openbot_stopped(&dirs, &mut ctl, || {
+        for w in restore_openbot(&rec.sessions)? {
+            eprintln!("warning: {w}");
+        }
+        records.remove(i);
+        save_records(&records)?;
+        finish_removal(&records)?;
+        if rec.sessions.is_empty() {
+            println!("removed the asm browser CA from {}; restart OpenBot", rec.key);
+        } else {
+            println!("removed the asm browser CA from {} and restored OpenBot's browser proxy settings", rec.key);
+        }
+        Ok(())
+    })?;
+    match restarted {
+        Restarted::NotRunning if rec.sessions.is_empty() => {}
+        Restarted::NotRunning => println!("start OpenBot again"),
+        Restarted::Running(pid) => println!("OpenBot is running again (pid {pid}) without asm's browser settings."),
+        Restarted::NotStarted => {}
     }
     Ok(())
 }
@@ -1763,12 +2223,9 @@ impl State {
     }
 }
 
-/// The command that (re)installs `r` (for routed OpenBot sessions, after quitting OpenBot).
+/// The command that (re)installs `r`.
 fn fix_command(r: &Record) -> String {
     let mut cmd = String::new();
-    if r.target == OPENBOT && !r.sessions.is_empty() {
-        cmd.push_str("quit OpenBot, then ");
-    }
     if r.target == T3CODE
         && t3_base().is_ok_and(|b| b.to_string_lossy() != r.key)
     {
@@ -2273,7 +2730,7 @@ mod tests {
         openbot.sessions = vec![OpenbotData { dir: "/srv/Open Bot".into(), partitions: Vec::new() }];
         assert_eq!(
             fix_command(&openbot),
-            "quit OpenBot, then asm browser install openbot --trust-user-wide --data-dir '/srv/Open Bot'"
+            "asm browser install openbot --trust-user-wide --data-dir '/srv/Open Bot'"
         );
     }
 
@@ -2394,19 +2851,250 @@ mod tests {
         assert!(!partition_prefs(&dir, OPENBOT_SHARED).exists());
     }
 
+    const BUNDLE: &str = "/Applications/OpenBot.app";
+
+    fn fake_app(_: i32) -> Runner {
+        Runner::App(Launch::Bundle(BUNDLE.into()))
+    }
+
+    fn fake_inside(_: i32) -> Runner {
+        Runner::Inside
+    }
+
+    fn no_launch(_: &Launch) -> Result<(), CliError> {
+        panic!("launched OpenBot")
+    }
+
+    fn test_ctl<'a>(
+        classify: &'a dyn Fn(i32) -> Runner,
+        launch: &'a mut dyn FnMut(&Launch) -> Result<(), CliError>,
+        quit_timeout: Duration,
+    ) -> Control<'a> {
+        Control {
+            interactive: false,
+            restart: true,
+            quit_timeout,
+            start_timeout: Duration::from_secs(10),
+            settle: Duration::ZERO,
+            classify,
+            launch,
+        }
+    }
+
+    /// A process standing in for OpenBot: `<dir>/SingletonLock` names it. The handle
+    /// reaps it (so it doesn't linger as a zombie) and returns how it ended.
+    fn fake_openbot(dir: &Path, mut cmd: Command) -> (i32, std::thread::JoinHandle<std::process::ExitStatus>) {
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id() as i32;
+        let lock = dir.join("SingletonLock");
+        let _ = fs::remove_file(&lock);
+        std::os::unix::fs::symlink(format!("{}-{pid}", crate::hostinfo::hostname()), &lock).unwrap();
+        (pid, std::thread::spawn(move || child.wait().unwrap()))
+    }
+
+    fn sleeper() -> Command {
+        let mut c = Command::new("sleep");
+        c.arg("30");
+        c
+    }
+
+    fn kill_fake(pid: i32, h: std::thread::JoinHandle<std::process::ExitStatus>) {
+        // SAFETY: a child this test started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        h.join().unwrap();
+    }
+
     #[test]
-    fn openbot_refuses_while_running() {
+    fn openbot_running_decisions() {
+        let app = Runner::App(Launch::Bundle(BUNDLE.into()));
+        let svc = Runner::Service { unit: "openbot.service".into() };
+        let inside = "this command runs inside OpenBot (pid 7), which must be stopped while asm writes its browser settings; run it in a terminal instead";
+        for (interactive, restart) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(decide(&Runner::Inside, 7, interactive, restart), Flow::Fail(inside.into()));
+        }
+        assert_eq!(decide(&app, 7, true, false), Flow::Ask);
+        assert_eq!(decide(&app, 7, true, true), Flow::Restart);
+        assert_eq!(decide(&app, 7, false, true), Flow::Restart);
+        assert_eq!(
+            decide(&app, 7, false, false),
+            Flow::Fail("OpenBot is running (pid 7): quit it and run this again, or add --restart to let asm quit and restart it".into())
+        );
+        let svc_fail = Flow::Fail("OpenBot is running as the system service openbot.service (pid 7): run sudo systemctl stop openbot.service, run this again, then sudo systemctl start openbot.service".into());
+        assert_eq!(decide(&svc, 7, false, false), svc_fail);
+        assert_eq!(decide(&svc, 7, false, true), svc_fail);
+        assert_eq!(decide(&svc, 7, true, false), Flow::Wait);
+        assert_eq!(decide(&svc, 7, true, true), Flow::Wait);
+        assert_eq!(decide(&Runner::Unknown, 7, true, true), Flow::Wait);
+        assert!(matches!(decide(&Runner::Unknown, 7, false, true), Flow::Fail(m) if m.contains("can't tell how to start it again")));
+        // The most limiting process decides.
+        let running = [Running { pid: 1, runner: app.clone() }, Running { pid: 2, runner: svc.clone() }];
+        assert_eq!(worst(&running).unwrap().pid, 2);
+    }
+
+    #[test]
+    fn openbot_process_helpers() {
+        assert_eq!(
+            app_bundle(Path::new("/Applications/OpenBot.app/Contents/MacOS/OpenBot")),
+            Some(PathBuf::from("/Applications/OpenBot.app"))
+        );
+        assert_eq!(
+            app_bundle(Path::new(
+                "/Users/u/Applications/OpenBot.app/Contents/Frameworks/OpenBot Helper.app/Contents/MacOS/OpenBot Helper"
+            )),
+            Some(PathBuf::from("/Users/u/Applications/OpenBot.app"))
+        );
+        assert_eq!(app_bundle(Path::new("/usr/local/bin/node")), None);
+        assert_eq!(app_bundle(Path::new("/opt/Weird.app")), None);
+
+        assert_eq!(systemd_unit("0::/system.slice/openbot.service\n").as_deref(), Some("openbot.service"));
+        assert_eq!(
+            systemd_unit("12:pids:/system.slice/openbot.service\n1:name=systemd:/system.slice/openbot.service\n").as_deref(),
+            Some("openbot.service")
+        );
+        assert_eq!(
+            systemd_unit("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-openbot-42.scope\n"),
+            None
+        );
+        assert_eq!(systemd_unit("0::/system.slice/cron.scope\n0::/init.scope\n"), None);
+
+        let me = std::process::id() as i32;
+        let parent = std::os::unix::process::parent_id() as i32;
+        assert!(is_descendant(me, parent));
+        assert!(is_descendant(me, me));
+        let (child, h) = {
+            let tmp = tempfile::tempdir().unwrap();
+            fake_openbot(tmp.path(), sleeper())
+        };
+        assert!(!is_descendant(me, child));
+        assert!(is_descendant(child, me));
+        kill_fake(child, h);
+        assert!(!is_descendant(me, i32::MAX - 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openbot_exec_launch_from_proc() {
+        let Some(Launch::Exec { exe, argv, cwd, env }) = exec_launch(std::process::id() as i32) else {
+            panic!("no launch for this process")
+        };
+        assert_eq!(exe, std::env::current_exe().unwrap());
+        assert_eq!(argv, std::env::args_os().collect::<Vec<_>>());
+        assert_eq!(cwd, Some(std::env::current_dir().unwrap()));
+        assert!(env.unwrap().iter().any(|(k, _)| k == "PATH"));
+    }
+
+    #[test]
+    fn openbot_precheck_refuses_without_touching_openbot() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("OpenBot");
         let child = dir.join("local-servers/srv-1");
         fs::create_dir_all(&child).unwrap();
-        assert!(refuse_openbot_running(&[&dir, &child]).is_ok());
+        let mut launch = no_launch;
+        let ctl = test_ctl(&fake_inside, &mut launch, Duration::from_secs(1));
+        assert!(precheck_openbot(&[dir.clone(), child.clone()], &ctl).is_ok());
+        // This test process stands in for an OpenBot running asm.
         let pid = std::process::id();
         std::os::unix::fs::symlink(format!("{}-{pid}", crate::hostinfo::hostname()), dir.join("SingletonLock")).unwrap();
         // The desktop app holding the parent directory runs the local server too.
-        let e = refuse_openbot_running(&[&child]).unwrap_err();
-        assert!(e.message.starts_with(&format!("error: quit OpenBot first (pid {pid}), then re-run")), "{}", e.message);
-        assert!(refuse_openbot_running(&[&dir]).is_err());
+        assert_eq!(running_openbot(std::slice::from_ref(&child), &fake_app), vec![Running {
+            pid: pid as i32,
+            runner: fake_app(0)
+        }]);
+        let e = precheck_openbot(std::slice::from_ref(&child), &ctl).unwrap_err();
+        assert!(e.message.contains(&format!("runs inside OpenBot (pid {pid})")), "{}", e.message);
+        let mut launch = no_launch;
+        let mut ctl = test_ctl(&fake_app, &mut launch, Duration::from_secs(1));
+        ctl.restart = false;
+        let e = precheck_openbot(&[dir], &ctl).unwrap_err();
+        assert!(e.message.contains("add --restart"), "{}", e.message);
+    }
+
+    #[test]
+    fn openbot_restart_flow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("OpenBot");
+        openbot_db(&dir, &[(AGENT_A, json!({"name": "Researcher"}))]);
+        let (old, old_h) = fake_openbot(&dir, sleeper());
+        let mut started = Vec::new();
+        let mut saved = Vec::new();
+        let (sessions, restarted) = {
+            let mut launch = |l: &Launch| {
+                assert_eq!(*l, Launch::Bundle(BUNDLE.into()));
+                // The old OpenBot is gone and its settings are written before it starts again.
+                assert!(!pid_alive(old));
+                assert_eq!(prefs_at(&dir, OPENBOT_SHARED)["proxy"], openbot_proxy_pref(7418));
+                started.push(fake_openbot(&dir, sleeper()));
+                Ok(())
+            };
+            let mut ctl = test_ctl(&fake_app, &mut launch, Duration::from_secs(10));
+            route_openbot(std::slice::from_ref(&dir), 7418, &[], &mut ctl, &mut |s| {
+                saved.push(s.to_vec());
+                Ok(())
+            })
+            .unwrap()
+        };
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(old_h.join().unwrap().signal(), Some(libc::SIGTERM));
+        let [(new, new_h)] = <[_; 1]>::try_from(started).unwrap();
+        assert_eq!(restarted, Restarted::Running(new));
+        assert_eq!(saved, vec![sessions.clone()]);
+        assert_eq!(sessions[0].partitions.len(), 2);
+        assert_eq!(prefs_at(&dir, &openbot_agent_partition(AGENT_A))["proxy"], openbot_proxy_pref(7418));
+        kill_fake(new, new_h);
+    }
+
+    #[test]
+    fn openbot_restart_flow_reports_replaced_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("OpenBot");
+        openbot_db(&dir, &[]);
+        let (_, old_h) = fake_openbot(&dir, sleeper());
+        let mut started = Vec::new();
+        let e = {
+            let mut launch = |_: &Launch| {
+                // An OpenBot that writes its own proxy setting on start.
+                fs::write(partition_prefs(&dir, OPENBOT_SHARED), r#"{"proxy":{"mode":"direct"}}"#).unwrap();
+                started.push(fake_openbot(&dir, sleeper()));
+                Ok(())
+            };
+            let mut ctl = test_ctl(&fake_app, &mut launch, Duration::from_secs(10));
+            route_openbot(std::slice::from_ref(&dir), 7418, &[], &mut ctl, &mut |_| Ok(())).unwrap_err()
+        };
+        old_h.join().unwrap();
+        assert_eq!(
+            e.message,
+            format!(
+                "error: OpenBot replaced asm's proxy setting in {}; that browser session doesn't use asm's proxy router (asm browser status)",
+                partition_prefs(&dir, OPENBOT_SHARED).display()
+            )
+        );
+        for (pid, h) in started {
+            kill_fake(pid, h);
+        }
+    }
+
+    #[test]
+    fn openbot_that_wont_quit_is_left_alone() {
+        use std::io::BufRead;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("OpenBot");
+        openbot_db(&dir, &[]);
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "trap '' TERM; echo ready; exec sleep 30"]).stdout(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id() as i32;
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+        std::os::unix::fs::symlink(format!("{}-{pid}", crate::hostinfo::hostname()), dir.join("SingletonLock")).unwrap();
+        let h = std::thread::spawn(move || child.wait().unwrap());
+        let mut launch = no_launch;
+        let mut ctl = test_ctl(&fake_app, &mut launch, Duration::from_secs(1));
+        let e = route_openbot(std::slice::from_ref(&dir), 7418, &[], &mut ctl, &mut |_| panic!("saved")).unwrap_err();
+        assert_eq!(e.message, "error: OpenBot didn't quit within 1 s; quit it yourself and run this again");
+        assert!(pid_alive(pid));
+        assert!(!dir.join("Partitions").exists());
+        kill_fake(pid, h);
     }
 
     #[test]
@@ -2480,7 +3168,7 @@ mod tests {
         };
         assert_eq!(
             status_line(&r, &State::Incomplete(reason)),
-            "openbot /k: incomplete OpenBot agent \"Late\" is not routed — fix: quit OpenBot, then asm browser install openbot --trust-user-wide"
+            "openbot /k: incomplete OpenBot agent \"Late\" is not routed — fix: asm browser install openbot --trust-user-wide"
         );
         // Routing it (the fix) makes the install complete; a changed session is reported.
         let recorded = apply_openbot(vec![plan_openbot(&dir).unwrap()], 7418, &recorded).unwrap();

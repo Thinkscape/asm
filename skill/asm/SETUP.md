@@ -86,13 +86,32 @@ trusted user-wide: `~/.pki/nssdb` (else `~/.local/share/pki/nssdb`) on Linux, th
 keychain on macOS.
 
 ```bash
-# Quit OpenBot first (hosted server: sudo systemctl stop openbot); install refuses while it runs.
-asm browser install openbot --trust-user-wide
+asm browser install openbot --trust-user-wide              # run it in a terminal
+asm browser install openbot --trust-user-wide --restart    # scripts: quit and restart OpenBot without asking
 asm browser install openbot --trust-user-wide --data-dir DIR   # another server data dir (repeatable)
 ```
 
-Then start OpenBot again. The install routes the **Shared** and **agent-only** browser
-sessions itself (macOS and Linux):
+The install routes the **Shared** and **agent-only** browser sessions itself (macOS and
+Linux). OpenBot ignores and later overwrites these settings when they change while it runs,
+so asm writes them while OpenBot is stopped:
+
+- **OpenBot desktop app running:** in a terminal asm asks `Quit OpenBot now and start it
+  again afterwards? [Y/n]`. Yes: asm quits it (OpenBot stops its agents first), writes the
+  settings and starts it again. No: asm waits until you quit OpenBot, writes, and asks you to
+  start it again. Without a terminal, add `--restart`, or the install refuses
+  (`OpenBot is running (pid N): quit it and run this again, or add --restart …`).
+- **OpenBot as a system service (Linux):** asm waits while you run
+  `sudo systemctl stop openbot.service` in another shell, writes, and asks you to run
+  `sudo systemctl start openbot.service`. Without a terminal it refuses with those commands.
+- **From an OpenBot agent's shell:** refused (`this command runs inside OpenBot …; run it in
+  a terminal instead`): quitting OpenBot would end the command itself.
+- After OpenBot is back, asm re-reads the settings and confirms: `OpenBot is running again
+  (pid N) with asm's browser settings: Shared, agent "…" route HTTPS through asm's proxy
+  router.` If OpenBot isn't back within 60 s after `--restart`/Yes, asm says so; start it
+  yourself.
+- Refusals (another proxy, no terminal) come before asm changes anything.
+
+What the install routes:
 
 - It finds the server data directories: OpenBot's own (`~/Library/Application
   Support/OpenBot` on macOS, `${XDG_CONFIG_HOME:-~/.config}/OpenBot` on Linux) when it has
@@ -103,8 +122,8 @@ sessions itself (macOS and Linux):
   into the `Preferences` of the Shared session and of every agent without a named browser
   profile (also agents that don't use their own session yet), keeping all other settings.
 - Refused when one of those sessions already has another proxy.
-- **Agents created after the install are not routed** until you quit OpenBot and run the
-  install again; `asm browser status`, `asm doctor` and `asm get --login-url` say
+- **Agents created after the install are not routed** until you run the install again;
+  `asm browser status`, `asm doctor` and `asm get --login-url` say
   `OpenBot agent "<name>" is not routed`.
 - **Named browser profiles** keep OpenBot's own proxy setting. To route one, in OpenBot,
   **Settings → Browser profiles**: add the proxy `http://127.0.0.1:7418`, use it in the
@@ -133,8 +152,8 @@ sudo systemctl daemon-reload && sudo systemctl restart openbot
 
 **Hosted servers:** the service user usually has no login session. Pair and install as that
 user with `sudo -u openbot -H asm pair <manager-host>` and
-`sudo -u openbot -H asm browser install openbot --trust-user-wide --no-service` (with
-`openbot.service` stopped). Then run the router as a system service (section 4).
+`sudo -u openbot -H asm browser install openbot --trust-user-wide --no-service` (it waits
+while you stop `openbot.service`). Then run the router as a system service (section 4).
 
 ## 4. The proxy router
 
@@ -184,7 +203,7 @@ Start with `asm doctor` and `asm browser status` on the browser's machine.
 | Certificate error on a granted site | The browser doesn't trust the asm browser CA yet | Restart the browser; `asm browser status`; reinstall |
 | `stale CA` in `asm browser status` | The manager's browser CA changed | `asm browser install <target>` |
 | `incomplete …` in `asm browser status` | A setting asm wrote was changed or removed | Run the `fix:` command shown |
-| `incomplete OpenBot agent "<name>" is not routed` | The agent was created after `asm browser install openbot` | Quit OpenBot, run the install again, start OpenBot |
+| `incomplete OpenBot agent "<name>" is not routed` | The agent was created after `asm browser install openbot` | Run the install again in a terminal; it offers to restart OpenBot |
 | `403 login sentinel not valid for METHOD URL` | The page posts somewhere other than the granted URL | Request a grant for that exact URL |
 | The site reports a wrong password, and the manager's Activity Log has no substitution | The sentinel went straight to the site: wrong URL, or the browser isn't routed | Check the URL in the network log and `asm browser status`; request a new grant |
 | The page shows "Sign in not loaded yet" or similar | Submitted before the page's sign-in script loaded | Wait until the page has fully loaded, then submit once |
@@ -196,7 +215,7 @@ Start with `asm doctor` and `asm browser status` on the browser's machine.
 ```bash
 asm browser uninstall chrome [--profile NAME] [--user-data-dir DIR]
 asm browser uninstall t3code
-asm browser uninstall openbot                     # quit OpenBot first
+asm browser uninstall openbot [--restart]         # restarts OpenBot like the install
 ```
 
 Uninstall restores what asm replaced, unless it changed since (then it says so and leaves
