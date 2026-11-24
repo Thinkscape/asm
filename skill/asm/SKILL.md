@@ -165,9 +165,10 @@ Already signed in? Do nothing. Otherwise:
    real username), and use that exact URL, query string included. The sentinel only works
    at that URL; sent anywhere else it is wasted and the site sees a wrong password.
 2. `asm get --login-url <that URL> --reason "<why>"` (pass the vault ITEM name when asked,
-   when several logins match, or when the API host differs from the item's site). It prints
-   the username, a single-use password sentinel and, when the item has an authenticator
-   key, a one-time code.
+   when several logins match, or when the API host differs from the item's site). It first
+   checks that the URL's host went through this machine's asm proxy router in the last 30
+   minutes, which step 1 does when the browser is set up. It prints the username, a
+   single-use password sentinel and, when the item has an authenticator key, a one-time code.
 3. Open or reload the login page, type the username and the sentinel, submit **once**.
 4. At a one-time-code prompt, run `asm get <ITEM>::totp --reason "<why>"` (no popup while
    the grant lasts) and type the code.
@@ -180,6 +181,7 @@ Already signed in? Do nothing. Otherwise:
 
 | Error | Action |
 |---|---|
+| `no browser on this machine has sent HOST through the asm proxy router` | Do step 1 in the browser you will sign in with, then retry. Still failing: that browser isn't set up (`asm browser status`, `SETUP.md`). |
 | `403 login sentinel not valid for METHOD URL` | Re-request with that URL. |
 | `403 login sentinel must be an entire form or JSON value` | Type the sentinel alone into the password field. |
 | `403 login body must be …` or `one login grant per request` | Use `asm login`. |

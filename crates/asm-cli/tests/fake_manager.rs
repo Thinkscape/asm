@@ -2686,7 +2686,19 @@ fn login_fixture_item(
 }
 
 /// `asm proxy-router run` in the test's configuration directory, killed on drop.
-struct RouterProcess(std::process::Child);
+struct RouterProcess(std::process::Child, u16);
+
+impl RouterProcess {
+    /// What a routed browser does when it loads a page: a CONNECT for `authority`
+    /// through the router (the router may answer 502 when it can't reach it).
+    fn visit(&self, authority: &str) {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", self.1)).unwrap();
+        s.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes()).unwrap();
+        let mut line = String::new();
+        BufReader::new(s).read_line(&mut line).unwrap();
+        assert!(line.starts_with("HTTP/1.1 "), "{line}");
+    }
+}
 
 impl Drop for RouterProcess {
     fn drop(&mut self) {
@@ -2707,7 +2719,7 @@ fn start_router(e: &Env) -> RouterProcess {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let router = RouterProcess(child);
+    let router = RouterProcess(child, port);
     let sock = e.cfg.join("asm/router.sock");
     assert!(
         wait_for(Duration::from_secs(10), || std::os::unix::net::UnixStream::connect(&sock).is_ok()),
@@ -2786,9 +2798,30 @@ fn get_login_url_requires_a_local_router() {
 }
 
 #[test]
+fn get_login_url_requires_the_browser_to_go_through_the_router() {
+    let (f, e, _, _) = login_fixture(LOGIN_URL, "200 Connection established");
+    let router = start_router(&e);
+    // A browser that bypasses the router never shows the sign-in host to it.
+    router.visit("other.example.test:443");
+    router.visit("login.example.test:8443");
+    let out = asm(&e, &["get", "--login-url", LOGIN_URL, "--reason", "sign in"], "");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("no browser on this machine has sent login.example.test:443 through the asm proxy router"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(posted(&f).is_empty(), "no approval is requested");
+    router.visit("Login.Example.test:443");
+    let out = asm(&e, &["get", "--login-url", LOGIN_URL, "--reason", "sign in"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+#[test]
 fn get_login_url_grants_routes_and_prints_the_login() {
     let (f, e, proxy_port, heads) = login_fixture(LOGIN_URL, "200 Connection established");
-    let _router = start_router(&e);
+    let router = start_router(&e);
+    router.visit("login.example.test:443");
     let out = asm(
         &e,
         &["get", "--json", "--login-url", "https://Login.Example.test:443/session", "--reason", "sign in"],
@@ -2837,7 +2870,8 @@ fn get_login_url_grants_routes_and_prints_the_login() {
 fn get_login_url_totp_hint_uses_the_leased_item_name() {
     let (_f, e, _, _) =
         login_fixture_item(LOGIN_URL, "200 Connection established", "work/GitHub (work): a=b", "work/GitHub__work___a_b");
-    let _router = start_router(&e);
+    let router = start_router(&e);
+    router.visit("login.example.test:443");
     let out = asm(&e, &["get", "--login-url", LOGIN_URL, "--reason", "sign in"], "");
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(e.secrets.join("work/GitHub__work___a_b.totp").exists());
@@ -2854,7 +2888,8 @@ fn get_login_url_totp_hint_uses_the_leased_item_name() {
 #[test]
 fn get_login_url_refuses_a_different_grant() {
     let (_f, e, _, _) = login_fixture("https://login.example.test/other", "200 Connection established");
-    let _router = start_router(&e);
+    let router = start_router(&e);
+    router.visit("login.example.test:443");
     let out = asm(&e, &["get", "--login-url", LOGIN_URL, "work/Site", "sign in"], "");
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
@@ -2868,7 +2903,8 @@ fn get_login_url_refuses_a_different_grant() {
 #[test]
 fn get_login_url_writes_files_even_when_the_route_does_not_activate() {
     let (_f, e, _, heads) = login_fixture(LOGIN_URL, "403 Forbidden");
-    let _router = start_router(&e);
+    let router = start_router(&e);
+    router.visit("login.example.test:443");
     let out = asm(&e, &["get", "--login-url", LOGIN_URL, "--reason", "sign in"], "");
     assert_eq!(out.status.code(), Some(1));
     let stderr = text(&out.stderr);

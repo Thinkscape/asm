@@ -341,8 +341,12 @@ fn browser_login_grant_end_to_end() {
         std::os::unix::net::UnixStream::connect(env.config.join("asm/router.sock")).is_ok()
     });
 
-    // 1. A login grant for host A: one approval, a Proxied 15-minute lease bound to
-    // the form action, and the route is live on the proxy and pushed to the router.
+    // 1. The browser loads the login page through the router (login.test doesn't resolve,
+    // so the router answers 502), which the CLI's routing check requires. Then a login
+    // grant for host A: one approval, a Proxied 15-minute lease bound to the form action,
+    // and the route is live on the proxy and pushed to the router.
+    let (_, status, _) = connect(router_port, "login.test:443", false, None);
+    assert_eq!(status, 502);
     let grant = login_get(&env, "sign in to login.test");
     assert!(approver.errors.lock().unwrap().is_empty(), "{:?}", approver.errors.lock().unwrap());
     {

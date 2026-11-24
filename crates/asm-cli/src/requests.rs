@@ -785,6 +785,31 @@ fn get_login(a: GetArgs, url: &str) -> Result<(), CliError> {
     for line in crate::browser::unready_installs() {
         eprintln!("warning: {line}; a browser set up this way sends the sentinel straight to the site, where it fails");
     }
+    // Routing check: a browser on this machine must have sent the sign-in host through the
+    // router recently (loading the login page does), or the sentinel would go straight to
+    // the site and the approval would be wasted.
+    let authority = crate::proxy::authority(&target.host, target.port);
+    match crate::router::seen(&target.host, target.port)? {
+        crate::router::Seen::Recently => {}
+        crate::router::Seen::NotRecently => {
+            return Err(CliError::failure(format!(
+                "no browser on this machine has sent {authority} through the asm proxy router in the last {} minutes. \
+                 Open the login page in the browser you will sign in with (for a JavaScript sign-in, also submit once \
+                 with a made-up address), then run this again. If it keeps failing, that browser is not set up: \
+                 asm browser status",
+                crate::router::SEEN_SECS / 60
+            )));
+        }
+        crate::router::Seen::Unsupported => eprintln!(
+            "warning: the running asm proxy-router is older than this CLI and can't confirm the browser is routed; \
+             restart it (asm doctor shows how)"
+        ),
+        crate::router::Seen::NoRouter => {
+            return Err(CliError::failure(
+                "no asm proxy-router on this machine; the browser must run on this machine: asm browser install <target>",
+            ));
+        }
+    }
     let capabilities = crate::bindings::require_capabilities(&s.api, false, false, Some(CAPABILITY_LOGIN_GRANT_V1))?;
     s.sync_leases()?;
     let name = match &a.name {

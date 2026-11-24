@@ -39,6 +39,10 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Reading the body of an error response from the manager's proxy.
 const BODY_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the router remembers that a browser sent a host through it (the routing check
+/// of `asm get --login-url`), and how many hosts at most.
+pub(crate) const SEEN_SECS: i64 = 30 * 60;
+const MAX_SEEN: usize = 4096;
 /// The manager's proxy refused the route: no grant covers this (host, port) now.
 const NO_GRANT: &[u8] = b"no active login grant";
 const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -165,8 +169,53 @@ fn decode_status(body: &[u8]) -> Result<RouterStatus, CliError> {
         .map_err(|e| CliError::failure(format!("the proxy router sent an invalid status: {e}")))
 }
 
+/// Whether a browser on this machine recently sent `host:port` through the router (any
+/// CONNECT, routed or direct, within [`SEEN_SECS`]).
+pub(crate) enum Seen {
+    /// Within the last SEEN_SECS.
+    Recently,
+    NotRecently,
+    /// No router is running.
+    NoRouter,
+    /// The running router predates this check.
+    Unsupported,
+}
+
+pub(crate) fn seen(host: &str, port: u16) -> Result<Seen, CliError> {
+    let path = format!("/seen?host={}&port={port}", host.to_ascii_lowercase());
+    match admin_request("GET", &path, None)? {
+        None => Ok(Seen::NoRouter),
+        Some((404, _)) => Ok(Seen::Unsupported),
+        Some((200, body)) => {
+            let v: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|e| CliError::failure(format!("the proxy router sent an invalid answer: {e}")))?;
+            Ok(match v.get("seconds_ago").and_then(serde_json::Value::as_i64) {
+                Some(_) => Seen::Recently,
+                None => Seen::NotRecently,
+            })
+        }
+        Some((code, body)) => Err(CliError::failure(format!(
+            "the proxy router answered {code}: {}",
+            String::from_utf8_lossy(&body).trim()
+        ))),
+    }
+}
+
 /// One HTTP/1.1 request over the admin socket; `Ok(None)` when nothing listens.
 fn admin_call(method: &str, path: &str, body: Option<&[u8]>) -> Result<Option<Vec<u8>>, CliError> {
+    match admin_request(method, path, body)? {
+        None => Ok(None),
+        Some((200, body)) => Ok(Some(body)),
+        Some((code, body)) => Err(CliError::failure(format!(
+            "the proxy router answered {code}: {}",
+            String::from_utf8_lossy(&body).trim()
+        ))),
+    }
+}
+
+/// One HTTP/1.1 request over the admin socket: status code and body; `Ok(None)` when
+/// nothing listens.
+fn admin_request(method: &str, path: &str, body: Option<&[u8]>) -> Result<Option<(u16, Vec<u8>)>, CliError> {
     let sock = socket_path()?;
     let fail = |e: std::io::Error| {
         CliError::failure(format!("talking to the proxy router at {}: {e}", sock.display()))
@@ -203,14 +252,7 @@ fn admin_call(method: &str, path: &str, body: Option<&[u8]>) -> Result<Option<Ve
         return Err(invalid());
     }
     let code = parsed.code.ok_or_else(invalid)?;
-    let body = resp[end..].to_vec();
-    if code != 200 {
-        return Err(CliError::failure(format!(
-            "the proxy router answered {code}: {}",
-            String::from_utf8_lossy(&body).trim()
-        )));
-    }
-    Ok(Some(body))
+    Ok(Some((code, resp[end..].to_vec())))
 }
 
 /// `asm proxy-router status`.
@@ -267,6 +309,8 @@ struct Router {
     state: RwLock<RouteState>,
     tunnels: Mutex<HashMap<u64, Tunnel>>,
     next_id: AtomicU64,
+    /// `(host, port)` → unix time of the last CONNECT for it.
+    seen: Mutex<HashMap<(String, u16), i64>>,
 }
 
 /// Removes its tunnel from the registry when the connection ends.
@@ -289,6 +333,25 @@ fn live_route<'a>(routes: &'a [Route], host: &str, port: u16, now: i64) -> Optio
 }
 
 impl Router {
+    /// Remember that a browser sent `host:port` through the router just now.
+    fn note_seen(&self, host: &str, port: u16) {
+        let now = unix_now();
+        let mut seen = self.seen.lock().unwrap();
+        if seen.len() >= MAX_SEEN {
+            seen.retain(|_, at| now - *at < SEEN_SECS);
+            if seen.len() >= MAX_SEEN {
+                seen.clear();
+            }
+        }
+        seen.insert((host.to_owned(), port), now);
+    }
+
+    /// Seconds since `host:port` was last sent through the router, within [`SEEN_SECS`].
+    fn seen_ago(&self, host: &str, port: u16) -> Option<i64> {
+        let ago = unix_now() - *self.seen.lock().unwrap().get(&(host.to_owned(), port))?;
+        (ago < SEEN_SECS).then_some(ago)
+    }
+
     fn current_route(&self, host: &str, port: u16) -> Option<Route> {
         let st = self.state.read().unwrap();
         live_route(&st.routes, host, port, unix_now()).cloned()
@@ -448,6 +511,7 @@ async fn serve_async(port: u16, dir: PathBuf, host: HostState) -> Result<(), Cli
         state: RwLock::new(RouteState::default()),
         tunnels: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(0),
+        seen: Mutex::new(HashMap::new()),
     });
     // Persists the reloaded set (expired routes dropped) when it differs from the file.
     router.update(|r| *r = routes);
@@ -812,6 +876,23 @@ async fn admin_conn(router: Arc<Router>, mut s: UnixStream) {
     };
     let reply = match (head.method.as_str(), head.target.as_str()) {
         ("GET", "/status") => json(200, &serde_json::to_value(router.status()).expect("status serializes")),
+        ("GET", target) if target.starts_with("/seen?") => {
+            let mut host = None;
+            let mut port = None;
+            for pair in target["/seen?".len()..].split('&') {
+                match pair.split_once('=') {
+                    Some(("host", h)) => host = Some(h.to_ascii_lowercase()),
+                    Some(("port", p)) => port = p.parse::<u16>().ok(),
+                    _ => {}
+                }
+            }
+            match (host, port) {
+                (Some(host), Some(port)) => json(200, &serde_json::json!({
+                    "host": host, "port": port, "seconds_ago": router.seen_ago(&host, port),
+                })),
+                _ => error(400, "GET /seen needs host and port"),
+            }
+        }
         ("POST", "/routes") => {
             let len = head
                 .values("content-length")
@@ -911,6 +992,7 @@ async fn proxy_conn(router: Arc<Router>, mut client: TcpStream) {
 }
 
 async fn connect(router: Arc<Router>, mut client: TcpStream, host: String, port: u16, extra: Vec<u8>) {
+    router.note_seen(&host, port);
     if let Some(route) = router.current_route(&host, port) {
         return routed(router, client, host, port, route, extra).await;
     }
