@@ -93,8 +93,8 @@ fn parse_os_release(text: &str) -> String {
     }
 }
 
-/// The passwd entry (name, home) of the effective user.
-fn passwd_entry() -> Option<(String, PathBuf)> {
+/// The passwd entry (name, home, login shell) of the effective user.
+fn passwd_entry() -> Option<(String, PathBuf, String)> {
     use std::os::unix::ffi::OsStrExt;
     // SAFETY: getpwuid_r writes into our buffers only; pointers are checked before use.
     unsafe {
@@ -119,18 +119,28 @@ fn passwd_entry() -> Option<(String, PathBuf)> {
                 CStr::from_ptr(pw.pw_dir).to_bytes(),
             ))
         };
-        Some((name, home))
+        let shell = if pw.pw_shell.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(pw.pw_shell).to_string_lossy().into_owned()
+        };
+        Some((name, home, shell))
     }
 }
 
 /// Home directory from the passwd database.
 pub fn passwd_home() -> Option<PathBuf> {
-    passwd_entry().map(|(_, h)| h).filter(|h| h.is_absolute())
+    passwd_entry().map(|(_, h, _)| h).filter(|h| h.is_absolute())
+}
+
+/// Login shell from the passwd database.
+pub fn passwd_shell() -> Option<String> {
+    passwd_entry().map(|(_, _, s)| s).filter(|s| s.starts_with('/'))
 }
 
 fn username() -> String {
     passwd_entry()
-        .map(|(n, _)| n)
+        .map(|(n, _, _)| n)
         .or_else(|| std::env::var("USER").ok())
         .or_else(|| std::env::var("LOGNAME").ok())
         .unwrap_or_default()

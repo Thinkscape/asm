@@ -118,6 +118,32 @@ pub fn write_file_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<PathBuf,
     result.map(|()| target)
 }
 
+/// Replace `path` atomically with an executable (0755) holding `data`: a temp file
+/// created with `O_CREAT|O_EXCL|O_NOFOLLOW` beside it, then renamed over the target.
+pub fn write_exec_atomic(path: &Path, data: &[u8]) -> Result<(), CliError> {
+    let dir = path.parent().expect("executables have a parent");
+    let name = path.file_name().expect("executables have a name").to_string_lossy();
+    let tmp = dir.join(format!(".{name}.asm-{}", hex_encode(&random_bytes::<6>())));
+    let result = (|| {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&tmp)
+            .map_err(|e| io_err("creating", &tmp, e))?;
+        f.write_all(data).map_err(|e| io_err("writing", &tmp, e))?;
+        f.set_permissions(fs::Permissions::from_mode(0o755))
+            .map_err(|e| io_err("setting permissions of", &tmp, e))?;
+        f.sync_all().map_err(|e| io_err("syncing", &tmp, e))?;
+        fs::rename(&tmp, path).map_err(|e| io_err("renaming to", path, e))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// A stable local view of an authorized field. `requested_path` is the caller's
 /// unsuffixed destination; `path` is its permanently reserved collision-safe path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

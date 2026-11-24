@@ -186,12 +186,26 @@ pub(crate) fn submit(
     body: &RequestBody,
     deadline: Option<Instant>,
 ) -> Result<(RequestResult, bool), CliError> {
+    submit_with(api, body, deadline, true)
+}
+
+/// [`submit`]; with `poll == false` a request the manager leaves pending fails with
+/// [`CliError::pending`] at once instead of being polled (callers that must not wait).
+pub(crate) fn submit_with(
+    api: &Api,
+    body: &RequestBody,
+    deadline: Option<Instant>,
+    poll: bool,
+) -> Result<(RequestResult, bool), CliError> {
     let started = Instant::now();
     let mut state: RequestState = api.post_until("/requests", body, deadline)?;
     if !asm_proto::crypto::is_uuid(&state.request_id) {
         return Err(CliError::failure("the manager sent an invalid request id"));
     }
     let was_pending = state.status == RequestStatus::Pending;
+    if was_pending && !poll {
+        return Err(CliError::pending());
+    }
     let lifetime = state.pending_lifetime_secs;
     let expected = started
         + pending_window(
@@ -267,7 +281,15 @@ pub(crate) fn submit_get(
     api: &Api, body: &RequestBody, deadline: Option<Instant>, pinned: Option<&LeaseInfo>,
     capabilities: crate::bindings::GetCapabilities,
 ) -> Result<GetResult, CliError> {
-    let (result, was_pending) = submit(api, body, deadline)?;
+    submit_get_with(api, body, deadline, true, pinned, capabilities)
+}
+
+/// [`submit_get`]; `poll` as in [`submit_with`].
+pub(crate) fn submit_get_with(
+    api: &Api, body: &RequestBody, deadline: Option<Instant>, poll: bool, pinned: Option<&LeaseInfo>,
+    capabilities: crate::bindings::GetCapabilities,
+) -> Result<GetResult, CliError> {
+    let (result, was_pending) = submit_with(api, body, deadline, poll)?;
     let result = match result {
         RequestResult::Get(result) => result,
         RequestResult::Write(_) => return Err(CliError::failure("the manager sent a write result for a get")),

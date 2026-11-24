@@ -38,7 +38,7 @@ pub(crate) fn log_file() -> Result<PathBuf, CliError> {
 /// Install and start the router service on `port`, then wait up to 5 s for its
 /// `/status`. An error means the router is not known to be running.
 pub(crate) fn install_service(port: u16) -> Result<(), CliError> {
-    let exe = router_exe()?;
+    let exe = stable_exe()?;
     let xdg = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string_lossy().into_owned());
@@ -77,7 +77,7 @@ fn remove_file(path: &Path) -> Result<(), CliError> {
 
 /// The first `asm` on `PATH` that is this executable (a stable path across upgrades),
 /// else this executable's path.
-fn router_exe() -> Result<PathBuf, CliError> {
+pub(crate) fn stable_exe() -> Result<PathBuf, CliError> {
     let current = std::env::current_exe()
         .map_err(|e| CliError::failure(format!("locating the asm executable: {e}")))?;
     let canonical = std::fs::canonicalize(&current).unwrap_or_else(|_| current.clone());

@@ -7,7 +7,7 @@
 
 use crate::api::Api;
 use crate::error::CliError;
-use crate::files::{ensure_private_dir, lock_file, write_file_atomic};
+use crate::files::{ensure_private_dir, lock_file, write_exec_atomic, write_file_atomic};
 use crate::router::{self, DEFAULT_PORT, RouterStatus};
 use crate::service;
 use crate::state;
@@ -19,9 +19,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -1091,31 +1091,6 @@ fn link_copy(src: &Path, dst: &Path) -> Result<(), CliError> {
         }
     }
     Ok(())
-}
-
-/// Replace `path` atomically with an executable (0755) holding `data`.
-fn write_exec_atomic(path: &Path, data: &[u8]) -> Result<(), CliError> {
-    let dir = path.parent().expect("executables have a parent");
-    let name = path.file_name().expect("executables have a name").to_string_lossy();
-    let tmp = dir.join(format!(".{name}.asm-{}", hex_encode(&random_bytes::<6>())));
-    let result = (|| {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o755)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&tmp)
-            .map_err(|e| io_err("creating", &tmp, e))?;
-        f.write_all(data).map_err(|e| io_err("writing", &tmp, e))?;
-        f.set_permissions(fs::Permissions::from_mode(0o755))
-            .map_err(|e| io_err("setting permissions of", &tmp, e))?;
-        f.sync_all().map_err(|e| io_err("syncing", &tmp, e))?;
-        fs::rename(&tmp, path).map_err(|e| io_err("renaming to", path, e))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
 }
 
 /// Move `from` over `to` (a copy and rename across file systems).

@@ -14,8 +14,9 @@ asm doctor                    # every line ok? Fix FAIL lines first
 asm skill install             # refresh this skill after upgrading asm
 ```
 
-`asm doctor` checks pairing, the manager, the proxy and, after `asm browser install`, the
-proxy router and each installed browser. Each FAIL line ends with `fix: <command>`.
+`asm doctor` checks pairing, the manager, the clock against the manager, the proxy and, after
+`asm browser install`, the proxy router and each installed browser. Each FAIL line ends with
+`fix: <command>`; `FAIL clock` or `warn clock` means: enable time sync on both machines.
 
 ## 2. How browser logins fit together
 
@@ -209,6 +210,11 @@ Start with `asm doctor` and `asm browser status` on the browser's machine.
 | The page shows "Sign in not loaded yet" or similar | Submitted before the page's sign-in script loaded | Wait until the page has fully loaded, then submit once |
 | A handed-over `asm login` session signs out at once | The site keeps its session on a separate sign-in host (Clerk, Auth0) | `asm login … --fill-origin https://<sign-in host>` |
 | `407` or `proxy authorization required` from older tools | Proxy authentication is on | Use `asm exec` or `eval "$(asm proxy-env)"` from a current CLI |
+| `gh`: `please run: gh auth login`, or T3 Code: `No GitHub credential on the server` | The `asm gh` shim is not first on `PATH`, or no repository was added | `asm gh status`, then `asm gh install` or `asm gh repo add OWNER/REPO` (section 7) |
+| `asm gh: … waiting for the operator's approval` | The owner's lease ended, or its repositories or permissions changed | Approve on the Mac, then rerun |
+| `asm gh: the operator denied …` | Denied within the last hour | `asm gh repo add OWNER/REPO` asks again |
+| `gh`: `HTTP 403 … Resource not accessible by integration` | The approved permissions or repositories don't cover the call | `asm gh repo add OWNER/REPO --permissions KEY=LEVEL` |
+| `FAIL clock` or `warn clock` in `asm doctor` | This machine's clock and the manager's differ | Enable time sync on both (`timedatectl set-ntp true`; macOS: Date & Time settings) |
 
 ## 6. Remove
 
@@ -216,9 +222,37 @@ Start with `asm doctor` and `asm browser status` on the browser's machine.
 asm browser uninstall chrome [--profile NAME] [--user-data-dir DIR]
 asm browser uninstall t3code
 asm browser uninstall openbot [--restart]         # restarts OpenBot like the install
+asm gh uninstall [--dir DIR]                      # the gh shim, its repository list and cached tokens
 ```
 
 Uninstall restores what asm replaced, unless it changed since (then it says so and leaves
 it). The last uninstall also removes the router service and its routes. Remove extra pieces
 yourself: an OpenBot proxy or profile, the `openbot.service` drop-in, or a system router
 unit.
+
+## 7. GitHub CLI (`asm gh`)
+
+```bash
+asm gh install                    # ~/.local/bin/gh, a shim that runs the real gh through asm
+asm gh repo add OWNER/REPO        # the operator approves; choose a long lease duration
+asm gh status                     # shim, repositories, lease, cached token
+bash -ilc 'command -v gh'         # must print the shim: T3 Code builds its PATH this way
+```
+
+- Install as the user that runs `gh` (for T3 Code, the user of its service). The shim must
+  come before the real `gh` in the login shell's `PATH`; `~/.local/bin` does on most Linux
+  systems (`~/.profile` adds it when it exists at login). `--dir DIR` installs elsewhere.
+  `asm gh install` reports what the login shell finds.
+- Repositories are saved per owner (one GitHub App installation). One token covers all of an
+  owner's repositories with one permission set: by default read access to actions, checks,
+  contents, issues, metadata, pull_requests and statuses. `--permissions KEY=LEVEL` changes
+  a level for all of them. Every change needs one approval of the owner's whole set.
+- The manager renews the approved lease without asking until it ends; then the next `gh`
+  command asks the operator again. Agents' commands wait up to 120 s for that approval
+  (`ASM_GH_WAIT`); `gh auth token` never waits.
+- **T3 Code**: its PR panel reads `gh auth token --hostname github.com`. After installing the
+  shim and adding a repository it should pick the token up on its next `gh` call (restart
+  T3 if the panel still reports no credential). The panel covers the default owner
+  (`asm gh repo add … --default`). A `GH_TOKEN`/`GITHUB_TOKEN` in T3's service environment
+  or a token saved in T3's settings takes precedence over `gh`: remove them.
+- `git fetch`/`git push` are not covered; they use git's own credential helper.

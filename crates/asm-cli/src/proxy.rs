@@ -12,7 +12,7 @@ use asm_proto::wire::{HealthResponse, MANAGER_NAME, ProxyInfo};
 use serde::Serialize;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// `host` in URL authority form (IPv6 in brackets).
 pub(crate) fn authority(host: &str, port: u16) -> String {
@@ -310,6 +310,141 @@ impl Report {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Level {
+    Ok,
+    Warn,
+    Fail,
+}
+
+/// Grades clock offset between this machine and the manager from the
+/// manager's `Date` header. `sent` is the local time the request was sent and
+/// `rtt` the time until the response arrived.
+fn clock_skew(date: Option<&str>, sent: SystemTime, rtt: Duration) -> (Level, String) {
+    if rtt > Duration::from_secs(2) {
+        return (
+            Level::Warn,
+            format!(
+                "round trip took {:.1}s; clock skew not measured",
+                rtt.as_secs_f64()
+            ),
+        );
+    }
+    let Some(d) = date.and_then(parse_imf_fixdate) else {
+        return (
+            Level::Warn,
+            "the manager sent no usable Date header; clock skew not checked".into(),
+        );
+    };
+    let t0 = match sent.duration_since(UNIX_EPOCH) {
+        Ok(since) => since.as_secs_f64(),
+        Err(e) => -e.duration().as_secs_f64(),
+    };
+    let t1 = t0 + rtt.as_secs_f64();
+    let d = d as f64;
+    // Manager time lies in [d, d+1) while the request was in flight [t0, t1],
+    // so the offset (manager minus host) lies in [lo, hi].
+    let lo = d - t1;
+    let hi = d + 1.0 - t0;
+    let estimate = (lo + hi) / 2.0;
+    let graded = if lo <= 0.0 && hi >= 0.0 {
+        0.0
+    } else {
+        lo.abs().min(hi.abs())
+    };
+    let n = estimate.abs().round() as u64;
+    if graded <= 5.0 {
+        return (Level::Ok, format!("within {n}s of the manager"));
+    }
+    let direction = if estimate < 0.0 { "ahead of" } else { "behind" };
+    let amount = fmt_skew(n);
+    if graded <= 60.0 {
+        (
+            Level::Warn,
+            format!(
+                "this machine is {amount} {direction} the manager; generated-token renewal checks can fail near expiry. Enable time sync on both machines (Linux: timedatectl set-ntp true)"
+            ),
+        )
+    } else {
+        (
+            Level::Fail,
+            format!(
+                "this machine is {amount} {direction} the manager; lease and token expiry checks are unreliable. Fix time sync here or on the manager's Mac"
+            ),
+        )
+    }
+}
+
+/// `42s`, `14m`, `2h 5m`.
+fn fmt_skew(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h {}m", secs / 3600, secs % 3600 / 60)
+    }
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let m = i64::from(m);
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Parses an RFC 9110 IMF-fixdate (`Mon, 23 Nov 2026 22:11:17 GMT`) to Unix
+/// seconds. Any other format is rejected.
+fn parse_imf_fixdate(s: &str) -> Option<i64> {
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    if s.len() != 29 || !s.is_ascii() {
+        return None;
+    }
+    let b = s.as_bytes();
+    let num = |range: std::ops::Range<usize>| -> Option<u32> {
+        let part = &s[range];
+        if !part.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        part.parse().ok()
+    };
+    if !DAYS.contains(&&s[0..3])
+        || &s[3..5] != ", "
+        || b[7] != b' '
+        || b[11] != b' '
+        || b[16] != b' '
+        || b[19] != b':'
+        || b[22] != b':'
+        || &s[25..29] != " GMT"
+    {
+        return None;
+    }
+    let day = num(5..7)?;
+    let month = MONTHS.iter().position(|m| *m == &s[8..11])? as u32 + 1;
+    let year = num(12..16)?;
+    let (hour, min, sec) = (num(17..19)?, num(20..22)?, num(23..25)?);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day == 0 || day > month_days || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    let days = days_from_civil(i64::from(year), month, day);
+    Some(days * 86_400 + i64::from(hour) * 3600 + i64::from(min) * 60 + i64::from(sec))
+}
+
 pub fn doctor(probe_url: &str) -> Result<(), CliError> {
     let mut r = Report { failed: false };
 
@@ -353,27 +488,42 @@ pub fn doctor(probe_url: &str) -> Result<(), CliError> {
                 Pin::Fixed(h.pin().expect("checked")),
                 None,
             );
+            let sent = SystemTime::now();
+            let started = Instant::now();
             match unauth.as_ref().map(|a| a.try_get("/health")) {
-                Ok(Ok(resp)) => match resp.json::<HealthResponse>() {
-                    Ok(hr) if hr.name == MANAGER_NAME => {
-                        r.ok(
-                            "manager",
-                            format!(
-                                "{} reachable, certificate matches the pin (version {})",
-                                api.base(),
-                                hr.version
-                            ),
-                        );
-                        true
+                Ok(Ok(resp)) => {
+                    let rtt = started.elapsed();
+                    let date = resp
+                        .headers()
+                        .get(reqwest::header::DATE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    match resp.json::<HealthResponse>() {
+                        Ok(hr) if hr.name == MANAGER_NAME => {
+                            r.ok(
+                                "manager",
+                                format!(
+                                    "{} reachable, certificate matches the pin (version {})",
+                                    api.base(),
+                                    hr.version
+                                ),
+                            );
+                            match clock_skew(date.as_deref(), sent, rtt) {
+                                (Level::Ok, msg) => r.ok("clock", msg),
+                                (Level::Warn, msg) => r.warn("clock", msg),
+                                (Level::Fail, msg) => r.fail("clock", msg),
+                            }
+                            true
+                        }
+                        _ => {
+                            r.fail(
+                                "manager",
+                                format!("{} does not answer like an asm manager", api.base()),
+                            );
+                            false
+                        }
                     }
-                    _ => {
-                        r.fail(
-                            "manager",
-                            format!("{} does not answer like an asm manager", api.base()),
-                        );
-                        false
-                    }
-                },
+                }
                 Ok(Err(e)) if is_tls_error(&e) => {
                     r.fail(
                         "manager",
@@ -684,5 +834,90 @@ mod tests {
             "client error (Connect): dns error: failed to lookup address information"
         ));
         assert!(!looks_aborted("operation timed out"));
+    }
+
+    #[test]
+    fn imf_fixdate_parsing() {
+        assert_eq!(parse_imf_fixdate("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        assert_eq!(days_from_civil(2026, 11, 23), 20_780);
+        assert_eq!(
+            parse_imf_fixdate("Mon, 23 Nov 2026 22:11:17 GMT"),
+            Some(20_780 * 86_400 + 22 * 3600 + 11 * 60 + 17)
+        );
+        assert_eq!(parse_imf_fixdate("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777));
+        assert_eq!(parse_imf_fixdate("Thu, 29 Feb 2024 00:00:00 GMT"), Some(1_709_164_800));
+        for bad in [
+            "",
+            "Mon, 23 Nov 2026 22:11:17 UTC",
+            "Mon, 23 Foo 2026 22:11:17 GMT",
+            "Mon, 32 Nov 2026 22:11:17 GMT",
+            "Thu, 29 Feb 2023 00:00:00 GMT",
+            "Mon, 23 Nov 2026 24:00:00 GMT",
+            "Mon, 23 Nov 2026 22:61:17 GMT",
+            "Xyz, 23 Nov 2026 22:11:17 GMT",
+            "Mon, 23 Nov 2026 22:11:17 GMT ",
+            "Monday, 23-Nov-26 22:11:17 GMT",
+            "Mon, +3 Nov 2026 22:11:17 GMT",
+        ] {
+            assert_eq!(parse_imf_fixdate(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn clock_skew_grading() {
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let date = |t: i64| {
+            // IMF-fixdate for 2026-11-23 00:00:00 GMT + t.
+            assert!((0..86_400).contains(&t));
+            let s = format!(
+                "Mon, 23 Nov 2026 {:02}:{:02}:{:02} GMT",
+                t / 3600,
+                t % 3600 / 60,
+                t % 60
+            );
+            assert_eq!(
+                parse_imf_fixdate(&s),
+                Some(days_from_civil(2026, 11, 23) * 86_400 + t)
+            );
+            s
+        };
+        let base = days_from_civil(2026, 11, 23) as u64 * 86_400;
+        let rtt = Duration::from_millis(100);
+        let noon = 12 * 3600;
+
+        let (level, msg) = clock_skew(Some(&date(noon)), at(base + noon as u64), rtt);
+        assert_eq!(level, Level::Ok);
+        assert_eq!(msg, "within 0s of the manager");
+
+        let (level, msg) = clock_skew(Some(&date(noon + 30)), at(base + noon as u64), rtt);
+        assert_eq!(level, Level::Warn);
+        assert!(msg.starts_with("this machine is 30s behind the manager;"), "{msg}");
+
+        let (level, msg) = clock_skew(Some(&date(noon - 30)), at(base + noon as u64), rtt);
+        assert_eq!(level, Level::Warn);
+        assert!(msg.starts_with("this machine is 30s ahead of the manager;"), "{msg}");
+
+        let (level, msg) = clock_skew(Some(&date(noon + 600)), at(base + noon as u64), rtt);
+        assert_eq!(level, Level::Fail);
+        assert!(msg.starts_with("this machine is 10m behind the manager;"), "{msg}");
+
+        let (level, msg) = clock_skew(
+            Some(&date(noon)),
+            at(base + noon as u64),
+            Duration::from_millis(2500),
+        );
+        assert_eq!(level, Level::Warn);
+        assert_eq!(msg, "round trip took 2.5s; clock skew not measured");
+
+        let (level, msg) = clock_skew(None, at(base + noon as u64), rtt);
+        assert_eq!(level, Level::Warn);
+        assert_eq!(msg, "the manager sent no usable Date header; clock skew not checked");
+        let (level, _) = clock_skew(Some("garbage"), at(base + noon as u64), rtt);
+        assert_eq!(level, Level::Warn);
+
+        assert_eq!(fmt_skew(42), "42s");
+        assert_eq!(fmt_skew(14 * 60 + 5), "14m");
+        assert_eq!(fmt_skew(2 * 3600 + 5 * 60), "2h 5m");
     }
 }

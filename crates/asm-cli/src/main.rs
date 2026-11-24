@@ -7,6 +7,7 @@ mod delivery;
 mod error;
 mod exec;
 mod files;
+mod gh;
 mod hostinfo;
 mod login;
 mod pair;
@@ -107,6 +108,10 @@ enum Command {
     /// the manager's proxy (installed by asm browser install).
     #[command(hide = true, name = "proxy-router", subcommand)]
     ProxyRouter(router::RouterCommand),
+    /// Use the GitHub CLI (gh) through the manager: a gh shim that adds GitHub App tokens
+    /// for the repositories you add.
+    #[command(subcommand)]
+    Gh(gh::GhCommand),
     /// Install the agent skill shipped with this CLI into agents' skill folders.
     #[command(subcommand)]
     Skill(skill::SkillCommand),
@@ -146,6 +151,7 @@ fn main() {
         Command::ProxyRouter(cmd) => router::run(cmd),
         Command::Login(args) => login::run(args),
         Command::Browser(cmd) => browser::run(cmd),
+        Command::Gh(cmd) => gh::run(cmd),
     };
     if let Err(e) = result {
         if !e.message.is_empty() {

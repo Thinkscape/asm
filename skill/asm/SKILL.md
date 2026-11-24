@@ -127,6 +127,23 @@ Exec's `--wait` is one acquisition deadline across requests and launch-time leas
 Discovery, proxy/CA preparation and child runtime are outside that budget. A failed
 acquisition starts no child; approvals already granted remain.
 
+## GitHub CLI (`asm gh`)
+
+On a machine where `asm gh install` put its `gh` shim first on `PATH` (`asm gh status` shows
+it), plain `gh` works for the repositories the operator added with `asm gh repo add`: the
+shim attaches that owner's approved GitHub App token. Don't wrap those commands in `asm exec`.
+
+- `asm gh status` lists the repositories and permissions. For another repository or more
+  permissions, run `asm gh repo add OWNER/REPO [--permissions KEY=LEVEL]` (the operator
+  approves the owner's whole set), or use `asm exec … GH_TOKEN -- gh …` for a one-off task.
+  A command run with `GH_TOKEN` already set goes to the real `gh` unchanged.
+- `asm gh: … waiting for the operator's approval` (exit 4): the lease ended or was never
+  approved. Ask the operator to approve it, then rerun; don't loop.
+- `asm gh: the operator denied …` (exit 3): don't retry; tell the user.
+- `HTTP 403 … Resource not accessible by integration`: the token lacks that permission or
+  repository. It is not a sign-in problem; never run `gh auth login`.
+- `gh auth token` prints a live token: never print, log or paste it.
+
 ## Sentinel use outside exec
 
 ```bash

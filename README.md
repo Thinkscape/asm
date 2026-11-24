@@ -30,6 +30,8 @@ Static secrets default to **sentinel** delivery (`asm_` + 40 random characters):
 
 See [Browser logins](#browser-logins).
 
+**GitHub CLI**: `asm gh install` puts a `gh` shim first on `PATH`, and `asm gh repo add OWNER/REPO` chooses the repositories. Plain `gh` commands, and tools that ask `gh auth token` (such as T3 Code's PR panel), then get a GitHub App token for exactly those repositories; the manager renews it without asking until the lease ends. See [GitHub CLI](#github-cli-asm-gh).
+
 ## Security model
 
 - **A sentinel is a bearer capability.** By default the proxy has no authentication, so anyone who can reach the proxy and knows a sentinel can use it, but only with the hosts approved for that lease and only until the lease ends. Keep the proxy on a trusted network (LAN, Tailscale). **Settings → Proxy → Require proxy authentication** makes every paired host sign in to the proxy with its own credentials; login grants then only work from the machine that requested them.
@@ -156,7 +158,7 @@ Tarballs are `asm-linux-x86_64`, `asm-linux-aarch64` and `asm-macos-universal`. 
 
 ### The agent skill
 
-The skill that teaches agents the asm workflow ([`skill/asm/SKILL.md`](skill/asm/SKILL.md)) and its setup and troubleshooting guide ([`skill/asm/SETUP.md`](skill/asm/SETUP.md): pairing, `asm browser install` per browser, the proxy router, a symptom → fix table) are built into the `asm` binary, so the installed skill always matches the CLI version, however the CLI was installed:
+The skill that teaches agents the asm workflow ([`skill/asm/SKILL.md`](skill/asm/SKILL.md)) and its setup and troubleshooting guide ([`skill/asm/SETUP.md`](skill/asm/SETUP.md): pairing, `asm browser install` per browser, the proxy router, `asm gh`, a symptom → fix table) are built into the `asm` binary, so the installed skill always matches the CLI version, however the CLI was installed:
 
 ```sh
 asm skill install                                          # ~/.agents/skills/asm/SKILL.md and SETUP.md
@@ -284,6 +286,27 @@ The router sends HTTPS for a site with an active login grant through the manager
 
 Where a sentinel can't work (a password field with a short `maxlength`, one box per OTP digit), use `asm login <URL> [ITEM] --reason "…"`. After approval the manager opens Chrome on the Mac and fills the vault login (it never submits). The operator signs in and clicks **Hand over session**; the agent receives a Playwright storage state with the site's cookies and its origin's localStorage. For a site that signs in through a separate service host (Clerk, Auth0), add `--fill-origin https://<that host>` so that host's cookies come along.
 
+### GitHub CLI (`asm gh`)
+
+`asm gh` makes the real `gh` work through the manager, without `gh auth login`, a `GH_TOKEN` in your environment or `asm exec` around each command:
+
+```sh
+asm gh install                             # ~/.local/bin/gh: a shim, first on PATH
+asm gh repo add AnswerShiftAI/platform     # the operator approves; repeat per repository
+asm gh status
+gh pr view 616 -R AnswerShiftAI/platform   # plain gh
+```
+
+- **The shim**: `asm gh install` writes `~/.local/bin/gh` (`--dir DIR` elsewhere), a two-line script that runs `asm gh shim` with the `asm` that installed it. The real `gh` stays where its package put it. Install checks that your login shell (`$SHELL -ilc 'command -v gh'`) finds the shim first. It refuses to replace a `gh` it did not write unless you pass `--force`, and never replaces a program; `asm gh uninstall` removes only its own script.
+- **Repositories and permissions** are saved per owner (one GitHub App installation) in `~/.config/asm/gh.json`. One token covers all of an owner's repositories with one permission set: by default `actions`, `checks`, `contents`, `issues`, `metadata`, `pull_requests` and `statuses`, all read. `--permissions pull_requests=write` sets a level for all of that owner's repositories. Each `repo add` asks the operator at once to approve the owner's new set and saves it only after approval.
+- **Requests**: the shim asks for the saved repositories and permissions exactly, as agent `asm-gh`, without broader lease reuse and without edits in the popup. The manager either renews the lease approved for exactly that set (silently until the lease ends) or asks the operator again; a shim request never receives another agent's broader lease. Choose a long lease duration in the popup: the manager's default is 1 hour.
+- **Which commands get a token**: every command that talks to GitHub. Local commands (`--version`, `help`, `completion`, `config`, `alias`, `--help`, `auth` other than `token` and `status`) and any command run with `GH_TOKEN` or `GITHUB_TOKEN` already set (`asm exec … GH_TOKEN -- gh …`) go to the real `gh` unchanged. With several owners, a command uses the owner it names (`-R`/`--repo`, `GH_REPO`, `repo … OWNER/REPO`, `api repos/OWNER/…`, a github.com URL), else the owner of the current directory's `upstream`, `github` or `origin` remote, else the default owner (the first one added, or `repo add --default`).
+- **Waiting**: `gh auth token` prints the default owner's token (`--user OWNER` picks another configured owner) and never waits: while an approval is pending it exits 4 at once. `gh auth status` runs the real `gh` with that token when one is available. Other commands wait up to 120 s for an approval (`ASM_GH_WAIT=<seconds>`; `0` does not wait). After a denial the shim stops asking for that owner for an hour, or until the next `asm gh repo add`.
+- **Cache**: tokens are cached per owner in `$XDG_RUNTIME_DIR/asm/gh/` (mode 0600, only when that directory is a tmpfs). A cached token is used without asking the manager for a minute. After that the shim asks again and uses the cached token only while the manager is unreachable. A token with 7 minutes or less left is never handed out.
+- **Who can use it**: like any lease of a paired host, the approved grant serves every process of this user on this machine, agents included. `gh` can write only where you approved write permissions; for anything else use `asm exec` with the permissions needed.
+- **T3 Code**: T3's PR panel asks `gh auth token --hostname github.com`, so it works once the shim is installed and a repository added. T3 builds its `PATH` from your login shell, so `~/.local/bin` must come before the real `gh` there (`asm gh install` checks this). T3 keeps one token per host: its panel covers the default owner's repositories.
+- **git** is not covered: `git fetch`/`git push` use git's own credential helper.
+
 ### When a lease ends
 
 A lease ends when it expires or the operator revokes it (also when its host is revoked, and raw leases when the secret is updated). Within about a second of that, the proxy answers any request that still carries the lease's sentinel, to any host, with `403` and the body `asm: sentinel expired or revoked; run asm get again`. Run `asm get` again for a new lease.
@@ -342,6 +365,7 @@ Commands:
   doctor      Check pairing, connectivity, files and the proxy
   login       Sign in to a website on the manager's Mac (the operator approves and the manager fills the vault login there) and receive the browser storage state
   browser     Set up browsers for login grants: route their HTTPS through asm's proxy router and trust the asm browser CA
+  gh          Use the GitHub CLI (gh) through the manager: a gh shim that adds GitHub App tokens for the repositories you add
   skill       Install the agent skill shipped with this CLI into agents' skill folders
 ```
 
@@ -356,7 +380,7 @@ Commands:
 |`asm add <NAME>`|`--wait <WAIT>`|Reads the value from stdin. The operator picks the vault. Prints `added <name> to <vault>; run asm get to use it`.|
 |`asm proxy-info`|`--json`|Proxy URLs (`http://` and `socks5h://` per hostname hint, the first reachable one marked `(recommended)`), CA certificate and CA bundle paths. Refreshes the CA files. When the manager requires proxy authentication, prints `auth: per-host credentials (added by asm exec, asm proxy-env and the proxy router)`; the URLs shown carry no credentials.|
 |`asm proxy-env`|`--shell <posix\|fish>`: output syntax (default `posix`)<br>`--unset`: print code that removes the variables instead|Sets `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` (the manager host), `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO` (system roots + proxy CA) and `NODE_EXTRA_CA_CERTS` (proxy CA). With proxy authentication on, the proxy URLs include this host's credentials.|
-|`asm doctor`|`--probe-url <PROBE_URL>`: HTTPS URL fetched through the proxy (default `https://example.com/`)|One `ok` / `warn` / `FAIL` line per check: pairing, manager reachable and pin matches, token accepted, secrets directory, CA files, proxy addresses, the manager's macOS Firewall (managers that report it), an HTTPS request through the proxy. After `asm browser install`, also the proxy router (running, port, version, `last_error`, Linux lingering) and one line per installed browser, each failure with a `fix:` command.|
+|`asm doctor`|`--probe-url <PROBE_URL>`: HTTPS URL fetched through the proxy (default `https://example.com/`)|One `ok` / `warn` / `FAIL` line per check: pairing, manager reachable and pin matches, the clock against the manager (from the `Date` of its health response: `ok` within 5 s, `warn` up to 60 s, `FAIL` beyond; a slow round trip or a missing `Date` only warns), token accepted, secrets directory, CA files, proxy addresses, the manager's macOS Firewall (managers that report it), an HTTPS request through the proxy. After `asm browser install`, also the proxy router (running, port, version, `last_error`, Linux lingering) and one line per installed browser, each failure with a `fix:` command.|
 |`asm browser install chrome`|`--profile <NAME>` (directory or display name; default `Default`), `--user-data-dir <DIR>`, `--no-service`, `--port <PORT>` (default 7418)|Chrome must be closed and at least version 134. Adds the browser CA to the profile and sets a PAC that sends `https:`/`wss:` to the router. Prints `restart Chrome once. HTTPS pages need asm's proxy router; asm doctor checks it.`|
 |`asm browser install t3code`|`--trust-user-wide` (required on macOS), `--no-service`, `--port <PORT>`|Wraps every version of T3's `chrome-headless-shell` under `$T3CODE_HOME` or `~/.t3` (real binaries move to `tools/chrome-headless-shell/asm-real/<version>/`). Rerun after T3 updates its browser; `asm browser status` says when.|
 |`asm browser install openbot --trust-user-wide`|`--data-dir <DIR>` (repeatable; default: OpenBot's data directory and its local servers), `--restart`, `--ca-only`, `--no-service`, `--port <PORT>`|Trusts the CA user-wide (without the flag: explains that and exits 2) and routes the Shared and agent-only browser sessions; named profiles keep OpenBot's proxy setting. A running OpenBot must stop meanwhile: in a terminal asm asks `Quit OpenBot now and start it again afterwards? [Y/n]` (no: waits until you quit it), `--restart` skips the question and is required without a terminal, and for a system service asm waits for `sudo systemctl stop <unit>`. Refused from inside OpenBot and when a session already has another proxy. After a restart confirms `OpenBot is running again (pid N) with asm's browser settings: …`. `--ca-only`: trust the CA only.|
@@ -364,6 +388,11 @@ Commands:
 |`asm browser status`|`--json`|One line per install: `installed`, `incomplete <reason> — fix: <command>` or `stale CA — fix: …`, plus the router line.|
 |`asm proxy-router run` / `status`|`run`: `--port <PORT>` (default 7418); `status`: `--json`|The local HTTPS proxy that `asm browser install` runs as a user service (not listed in `asm --help`). `run` stays in the foreground and exits 0 at once when one already runs; `status` shows whether it runs, its routes and its last error.|
 |`asm login <URL> [ITEM] --reason <REASON>`|`--fill-origin <https://host[:port]>` (repeatable, at most 5), `--wait <SECS>` (default 900), `--json`|[Sign-in on the manager's Mac](#sign-in-on-the-mac). Writes a Playwright storage state as a raw lease file and prints its path, cookie domains and expiry. It holds the cookies valid for the URL's host and for each approved `--fill-origin` host, and the URL origin's localStorage.|
+|`asm gh install`|`--dir <DIR>` (default `~/.local/bin`), `--force`: replace a script or symlink asm did not write (never a program)|Writes `DIR/gh`, a script that runs `asm gh shim` with this `asm` (the first `asm` on `PATH` that is this binary). Prints `installed: …` or `up to date: …`, the real `gh` it found, whether your login shell finds the shim first, and `next: asm gh repo add OWNER/REPO`. See [GitHub CLI](#github-cli-asm-gh).|
+|`asm gh repo add <OWNER/REPO>`|`--permissions <KEY=LEVEL>` (repeatable or comma-separated; for all of the owner's repositories), `--default`, `--wait <SECS>`|Asks the operator now to approve the owner's repositories and permissions (exit 3 denied, 4 still pending) and saves them only after approval. Prints `added <repo>: gh uses lease <id> for <owner> (<n> repositories), approved until <time>`.|
+|`asm gh repo remove <OWNER/REPO>`||Removes it from the owner's set; the next `gh` command for that owner asks the operator to approve the remaining repositories.|
+|`asm gh status`|`--json`|The shim (`installed`, `outdated`, `foreign` or `missing`), the first `gh` on `PATH`, the real `gh`, and per owner its repositories, permissions, the active lease for exactly that set with its deadlines, a cached token, or a denial backoff. Issues no token.|
+|`asm gh uninstall`|`--dir <DIR>`|Removes the shim when asm wrote it, `gh.json`, `gh-state.json` and the cached tokens, and lists the leases that stay active until they end or the operator revokes them.|
 |`asm skill install`|`--dir <DIR>` (repeatable; default `~/.agents/skills`)<br>`--force`: replace a skill not installed by asm, or an `asm` symlink<br>`--print`: print the embedded `SKILL.md` instead<br>`--print-setup`: print the embedded `SETUP.md` instead|Writes `<DIR>/asm/SKILL.md` and `<DIR>/asm/SETUP.md` (folders 0755, files 0644). Prints `installed: …`, `updated: …`, `updated (asm-version only): …` or `up to date: …` per folder; refusals go to stderr and make the exit code 1. See [The agent skill](#the-agent-skill).|
 |`asm skill uninstall`|`--dir <DIR>` (repeatable)|Removes `<DIR>/asm/SKILL.md` and its `SETUP.md` only when asm installed the skill, then the `asm` folder when empty. Prints `removed: …`, `not installed: …` or `left alone (…): …`; exit 0.|
 |`asm skill status`|`--dir <DIR>` (repeatable)<br>`--json`|One line per folder: `installed (current)` or `installed (outdated)` with the installed `asm-version`, `foreign`, `symlink` or `missing`. `--json` adds `installed_version` and this CLI's `version`. Exit 0.|
@@ -392,10 +421,13 @@ Files on the agent machine:
 |`${XDG_CONFIG_HOME:-~/.config}/asm/browsers.json`, `browsers.lock`, `browser/ca-<sha8>.crt`|`asm browser install` records (target, location, the setting asm replaced, CA fingerprints, router port) and the saved browser CA; Linux t3code also keeps a private NSS database under `browser/t3code/`|
 |`${XDG_CONFIG_HOME:-~/.config}/asm/router.sock`, `router-routes.json`, `router.lock`|the proxy router's admin socket and its active routes (both 0600), and its single-instance lock|
 |`~/.config/systemd/user/asm-proxy-router.service` (Linux), `~/Library/LaunchAgents/com.thinkscape.asm.proxy-router.plist` and `~/Library/Logs/asm-proxy-router.log` (macOS)|the proxy router service (logs on Linux: `journalctl --user -u asm-proxy-router`)|
+|`${XDG_CONFIG_HOME:-~/.config}/asm/gh.json`, `gh-state.json`, `gh.lock`|`asm gh` repositories and permissions per owner (0600), the denial backoff, and the lock of `asm gh repo` changes|
+|`$XDG_RUNTIME_DIR/asm/gh/<owner>.json`|`asm gh` cached tokens (0600; only when `$XDG_RUNTIME_DIR` is a tmpfs)|
+|`~/.local/bin/gh`|the `asm gh` shim (`asm gh install --dir` puts it elsewhere)|
 
 File-based commands start one detached `asm reap` per secrets directory, held single by `.reaper.lock`. It removes material at lease expiry or raw generated-token expiry and polls revocations about once a minute. Generated token cleanup retains bindings/version reservations until authorization ends. `--no-reaper` or `ASM_NO_REAPER=1` leaves cleanup to later file-aware commands. File-free exec does not read/write secret manifests, clean secret files or start the reaper.
 
-Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets directory), `ASM_AGENT` (agent label shown to the operator; defaults to the CLI's parent process name), `ASM_NO_REAPER=1` (no background cleanup) and `ASM_REAPER_LOG` (a file the background cleanup logs to, for debugging).
+Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets directory), `ASM_AGENT` (agent label shown to the operator; defaults to the CLI's parent process name; `asm gh` always uses `asm-gh`), `ASM_NO_REAPER=1` (no background cleanup), `ASM_REAPER_LOG` (a file the background cleanup logs to, for debugging) and `ASM_GH_WAIT` (seconds a `gh` command waits for an approval; default 120, `0` does not wait).
 
 ## The manager app
 
@@ -455,7 +487,7 @@ Pushing a tag `vX.Y.Z` (matching the version in `Cargo.toml` and `app/Bundle/Inf
 |---|---|
 |`crates/asm-proto`|Wire types and shared rules (host patterns, names, pairing codes)|
 |`crates/asm-core`|Manager core (macOS only): API server, pairing, requests, leases, vault providers, proxy supervisor, login broker; UniFFI exports|
-|`crates/asm-cli`|The `asm` CLI, including browser setup and the proxy router|
+|`crates/asm-cli`|The `asm` CLI, including browser setup, the proxy router and the `gh` shim|
 |`crates/uniffi-bindgen-swift`|Swift binding generator used by `just core`|
 |`app/`|SwiftUI menu-bar app (SwiftPM package)|
 |`third_party/iron-proxy`|iron-proxy v0.56.0 (git subtree) with the asm patch|

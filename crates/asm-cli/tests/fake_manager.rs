@@ -3706,3 +3706,325 @@ fn login_validates_arguments_before_posting() {
     assert_eq!(out.status.code(), Some(2));
     assert!(f.log.lock().unwrap().is_empty());
 }
+
+// --- asm gh -------------------------------------------------------------------------
+
+const GH_LEASE: &str = "44444444-2222-4333-8444-555555555555";
+const GH_TOKEN_VALUE: &str = "ghs_fixture_token";
+
+/// A manager for `asm gh`. Each POST /requests takes the next outcome (the last one
+/// repeats): "approve"; "approve-write" (grants pull_requests=write besides the request);
+/// "approve-short" (a token with five minutes left); "pending" (the next poll approves);
+/// "deny".
+fn gh_fixture(outcomes: &[&'static str]) -> (Fake, Env) {
+    let queue = Mutex::new(outcomes.to_vec());
+    let approved = Mutex::new(Value::Null);
+    let f = start(Arc::new(move |method, path, body| match (method, path) {
+        ("GET", "/v1/health") => (
+            200,
+            json!({"name":"asm-manager","version":"0.1.0","capabilities":["generated_credentials_v1","secret_fields_v1",
+                "github_explicit_scope_v1","operator_selected_grant_v1","broader_lease_reuse_v1"]}),
+        ),
+        ("GET", "/v1/secrets") => (200, generator_catalog()),
+        ("GET", "/v1/leases") => (200, json!({"leases":[]})),
+        ("POST", "/v1/requests") => {
+            let outcome = {
+                let mut q = queue.lock().unwrap();
+                if q.len() > 1 { q.remove(0) } else { q[0] }
+            };
+            let scope = &body["generation"]["scope"];
+            let mut permissions = scope["permissions"].clone();
+            if outcome == "approve-write" {
+                permissions["pull_requests"] = json!("write");
+            }
+            let repositories: Vec<Value> = scope["repositories"].as_array().unwrap().iter().enumerate()
+                .map(|(i, name)| json!({"id": i + 1, "full_name": name}))
+                .collect();
+            let left = if outcome == "approve-short" { 300 } else { 3600 };
+            let result = json!({"lease_id":GH_LEASE,"mode":"raw","hosts":[],"expires_at":"2999-01-01T00:00:00Z",
+                "files":[{"field":"value","relative_path":"GH_TOKEN","content":GH_TOKEN_VALUE,"substituted":false}],
+                "generation":{"generator_id":"app-a","generator_revision":1,"grant":{"provider":"github_app","scope":{
+                    "installation_id":7,"repositories":repositories,"permissions":permissions}}},
+                "credential_expires_at":asm_proto::time::fmt_unix(unix_now() + left),"credential_version":1,
+                "generator_name":"release-bot"});
+            match outcome {
+                "pending" => {
+                    *approved.lock().unwrap() = result;
+                    (202, json!({"request_id":REQ,"kind":"get","status":"pending","deny_reason":null,"result":null,
+                        "expires_at":asm_proto::time::fmt_unix(unix_now() + 600),"pending_lifetime_secs":600}))
+                }
+                "deny" => (200, json!({"request_id":REQ,"kind":"get","status":"denied","deny_reason":"not now","result":null})),
+                _ => (200, json!({"request_id":REQ,"kind":"get","status":"approved","deny_reason":null,"result":result})),
+            }
+        }
+        ("GET", p) if p.starts_with(&format!("/v1/requests/{REQ}?wait=")) => (
+            200,
+            json!({"request_id":REQ,"kind":"get","status":"approved","deny_reason":null,"result":approved.lock().unwrap().clone()}),
+        ),
+        _ => (404, json!({"error":{"code":"not_found","message":format!("{method} {path}")}})),
+    }));
+    let e = env();
+    write_host_json(&e, &f);
+    (f, e)
+}
+
+/// `gh.json` with `acme/web` and the default read permissions.
+fn write_gh_config(e: &Env) {
+    std::fs::create_dir_all(e.cfg.join("asm")).unwrap();
+    let config = json!({"default_owner":"acme","owners":{"acme":{"source":"GH_TOKEN","repositories":["acme/web"],
+        "permissions":{"metadata":"read","pull_requests":"read"}}}});
+    std::fs::write(e.cfg.join("asm/gh.json"), config.to_string()).unwrap();
+}
+
+/// A stand-in for the real GitHub CLI that prints its arguments and token.
+fn fake_gh(e: &Env) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = e.cfg.parent().unwrap().join("real-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(&gh, "#!/bin/sh\nprintf 'argv:%s\\n' \"$*\"\nprintf 'token:%s\\n' \"${GH_TOKEN:-none}\"\n[ \"$GH_TOKEN\" = \"$GITHUB_TOKEN\" ] && echo same\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+fn gh_shim(e: &Env, args: &[&str], vars: &[(&str, &str)]) -> Output {
+    let mut all = vec!["gh", "shim", "--"];
+    all.extend_from_slice(args);
+    let mut env = vec![("ASM_NO_REAPER", "1")];
+    env.extend_from_slice(vars);
+    asm_env(e, &all, "", &env)
+}
+
+#[test]
+fn gh_repo_add_requests_exactly_the_saved_scope_without_reuse_or_edits() {
+    let (f, e) = gh_fixture(&["approve"]);
+    let out = asm(&e, &["gh", "repo", "add", "Acme/Web"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("added acme/web"), "{}", text(&out.stdout));
+    let read = json!({"actions":"read","checks":"read","contents":"read","issues":"read","metadata":"read",
+        "pull_requests":"read","statuses":"read"});
+    let sent = posted(&f);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["name"], "GH_TOKEN");
+    assert_eq!(sent[0]["agent"], "asm-gh");
+    assert_eq!(sent[0]["raw"], true);
+    assert!(sent[0]["lease_id"].is_null());
+    assert_eq!(sent[0]["new_lease"], false);
+    // Neither broader-lease reuse nor operator edits: exactly this scope, or a prompt.
+    assert_eq!(sent[0]["client_capabilities"], json!(["generated_credentials_v1", "github_explicit_scope_v1"]));
+    assert_eq!(sent[0]["generation"], json!({"provider":"github_app","scope":{"repositories":["acme/web"],"permissions":read}}));
+    let config: Value = serde_json::from_slice(&std::fs::read(e.cfg.join("asm/gh.json")).unwrap()).unwrap();
+    assert_eq!(config["default_owner"], "acme");
+    assert_eq!(config["owners"]["acme"]["repositories"], json!(["acme/web"]));
+
+    let out = asm(&e, &["gh", "repo", "add", "acme/api", "--permissions", "pull_requests=write"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let mut widened = read.clone();
+    widened["pull_requests"] = json!("write");
+    assert_eq!(posted(&f)[1]["generation"], json!({"provider":"github_app","scope":{
+        "repositories":["acme/api","acme/web"],"permissions":widened}}));
+    // The same owner keeps one reason and agent, so its requests share one approval.
+    assert_eq!(posted(&f)[1]["reason"], sent[0]["reason"]);
+}
+
+#[test]
+fn gh_repo_add_saves_nothing_when_the_approval_differs_from_the_request() {
+    let (f, e) = gh_fixture(&["approve-write"]);
+    let out = asm(&e, &["gh", "repo", "add", "acme/web"], "");
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("did not approve the exact requested grant"), "{}", text(&out.stderr));
+    assert_eq!(posted(&f).len(), 1);
+    assert!(!e.cfg.join("asm/gh.json").exists());
+}
+
+#[test]
+fn gh_shim_auth_token_never_waits_and_prints_only_the_token() {
+    let (f, e) = gh_fixture(&["pending", "approve"]);
+    write_gh_config(&e);
+    let started = Instant::now();
+    let out = gh_shim(&e, &["auth", "token", "--hostname", "github.com"], &[]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(out.stdout.is_empty());
+    assert!(text(&out.stderr).contains("waiting for the operator's approval"), "{}", text(&out.stderr));
+    // T3 Code polls: a pending request is reported at once, never polled.
+    assert!(!f.log.lock().unwrap().iter().any(|(_, p, _)| p.starts_with("/v1/requests/")));
+    let out = gh_shim(&e, &["auth", "token", "--hostname", "github.com", "--user", "ACME"], &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("{GH_TOKEN_VALUE}\n"));
+    let sent = posted(&f);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["generation"]["scope"]["repositories"], json!(["acme/web"]));
+}
+
+#[test]
+fn gh_shim_adds_tokens_to_github_commands_and_passes_the_rest_through() {
+    let (f, e) = gh_fixture(&["approve"]);
+    let bin = fake_gh(&e);
+    let path = bin.to_str().unwrap();
+    // Without a configuration everything passes through untouched.
+    let out = gh_shim(&e, &["pr", "list"], &[("PATH", path)]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "argv:pr list\ntoken:none\nsame\n");
+    write_gh_config(&e);
+    for local in [vec!["--version"], vec!["config", "get", "http_unix_socket"], vec!["auth", "login"], vec!["pr", "list", "--help"]] {
+        let out = gh_shim(&e, &local, &[("PATH", path)]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(text(&out.stdout), format!("argv:{}\ntoken:none\nsame\n", local.join(" ")));
+    }
+    assert!(posted(&f).is_empty(), "local commands must not ask the manager");
+    let out = gh_shim(&e, &["pr", "view", "616", "-R", "acme/web"], &[("PATH", path)]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("argv:pr view 616 -R acme/web\ntoken:{GH_TOKEN_VALUE}\nsame\n"));
+    assert_eq!(posted(&f).len(), 1);
+    // An explicit token (asm exec … GH_TOKEN -- gh …) is never replaced.
+    let out = gh_shim(&e, &["pr", "merge"], &[("PATH", path), ("GH_TOKEN", "explicit"), ("GITHUB_TOKEN", "explicit")]);
+    assert_eq!(text(&out.stdout), "argv:pr merge\ntoken:explicit\nsame\n");
+    assert_eq!(posted(&f).len(), 1);
+    // Without a real gh besides the shim, the shim says so.
+    let out = gh_shim(&e, &["--version"], &[("PATH", "/nonexistent")]);
+    assert_eq!(out.status.code(), Some(127));
+    assert!(text(&out.stderr).contains("no GitHub CLI (gh) on PATH"));
+}
+
+#[test]
+fn gh_shim_refuses_other_grants_and_tokens_that_expire_too_soon() {
+    for (outcome, message) in [
+        ("approve-write", "did not approve the exact requested grant"),
+        ("approve-short", "expires too soon"),
+    ] {
+        let (f, e) = gh_fixture(&[outcome]);
+        write_gh_config(&e);
+        let out = gh_shim(&e, &["auth", "token"], &[]);
+        assert_eq!(out.status.code(), Some(1), "{outcome}: {}", text(&out.stderr));
+        assert!(out.stdout.is_empty(), "{outcome}");
+        assert!(text(&out.stderr).contains(message), "{outcome}: {}", text(&out.stderr));
+        assert_eq!(posted(&f).len(), 1);
+    }
+}
+
+#[test]
+fn gh_shim_backs_off_after_a_denial_until_repo_add() {
+    let (f, e) = gh_fixture(&["deny", "approve"]);
+    write_gh_config(&e);
+    let out = gh_shim(&e, &["auth", "token"], &[]);
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    let out = gh_shim(&e, &["auth", "token"], &[]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(text(&out.stderr).contains("the operator denied GitHub access for acme"), "{}", text(&out.stderr));
+    assert_eq!(posted(&f).len(), 1, "no new prompt while backing off");
+    let out = asm(&e, &["gh", "repo", "add", "acme/web"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = gh_shim(&e, &["auth", "token"], &[]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("{GH_TOKEN_VALUE}\n"));
+}
+
+/// A private directory on a tmpfs (the token cache refuses disk-backed directories).
+#[cfg(target_os = "linux")]
+fn tmpfs_dir() -> Option<tempfile::TempDir> {
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    mounts.lines().any(|l| l.split_whitespace().nth(1) == Some("/dev/shm") && l.contains(" tmpfs "))
+        .then(|| tempfile::tempdir_in("/dev/shm").ok())
+        .flatten()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gh_shim_caches_tokens_on_tmpfs_and_uses_them_while_the_manager_is_away() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(runtime) = tmpfs_dir() else {
+        eprintln!("skipped: no tmpfs at /dev/shm");
+        return;
+    };
+    let rt = runtime.path().to_str().unwrap();
+    let (f, e) = gh_fixture(&["approve"]);
+    write_gh_config(&e);
+    for _ in 0..2 {
+        let out = gh_shim(&e, &["auth", "token"], &[("XDG_RUNTIME_DIR", rt)]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert_eq!(text(&out.stdout), format!("{GH_TOKEN_VALUE}\n"));
+    }
+    assert_eq!(posted(&f).len(), 1, "a token confirmed within a minute is reused");
+    let cached = runtime.path().join("asm/gh/acme.json");
+    assert_eq!(std::fs::metadata(&cached).unwrap().permissions().mode() & 0o777, 0o600);
+    // Older than a minute and the manager is unreachable: the cached token still serves.
+    let mut entry: Value = serde_json::from_slice(&std::fs::read(&cached).unwrap()).unwrap();
+    entry["checked_at"] = json!(unix_now() - 120);
+    std::fs::write(&cached, entry.to_string()).unwrap();
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut host: Value = serde_json::from_slice(&std::fs::read(e.cfg.join("asm/host.json")).unwrap()).unwrap();
+    host["manager_url"] = json!(format!("https://127.0.0.1:{closed}"));
+    std::fs::write(e.cfg.join("asm/host.json"), host.to_string()).unwrap();
+    let out = gh_shim(&e, &["auth", "token"], &[("XDG_RUNTIME_DIR", rt)]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("{GH_TOKEN_VALUE}\n"));
+    // A token too close to expiry is never served from the cache.
+    entry["expires_at"] = json!(unix_now() + 60);
+    std::fs::write(&cached, entry.to_string()).unwrap();
+    let out = gh_shim(&e, &["auth", "token"], &[("XDG_RUNTIME_DIR", rt)]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn gh_install_writes_an_updatable_shim_and_uninstall_removes_only_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_f, e) = gh_fixture(&["approve"]);
+    let real = fake_gh(&e);
+    let bin = e.cfg.parent().unwrap().join("bin");
+    let dir = bin.to_str().unwrap();
+    // A login shell that answers `command -v gh` with $FOUND (T3 Code reads PATH this way).
+    let shell = e.cfg.parent().unwrap().join("login-shell");
+    std::fs::write(&shell, "#!/bin/sh\necho \"$FOUND\"\n").unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let shim_path = format!("{dir}/gh");
+    let install = |dir: &str, extra: &[&str], found: &str| {
+        let mut args = vec!["gh", "install", "--dir", dir];
+        args.extend_from_slice(extra);
+        asm_env(&e, &args, "", &[("SHELL", shell.to_str().unwrap()), ("FOUND", found)])
+    };
+    let out = install(dir, &[], &shim_path);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).starts_with(&format!("installed: {shim_path}")), "{}", text(&out.stdout));
+    assert!(text(&out.stdout).contains("login shell: finds the shim first"), "{}", text(&out.stdout));
+    let shim = bin.join("gh");
+    let script = std::fs::read_to_string(&shim).unwrap();
+    assert!(script.starts_with("#!/bin/sh\n# asm gh shim "), "{script}");
+    assert!(script.ends_with(" gh shim -- \"$@\"\n"), "{script}");
+    assert_eq!(std::fs::metadata(&shim).unwrap().permissions().mode() & 0o777, 0o755);
+    let out = install(dir, &[], "/usr/bin/gh");
+    assert!(text(&out.stdout).starts_with("up to date:"), "{}", text(&out.stdout));
+    assert!(text(&out.stderr).contains("your login shell finds gh at /usr/bin/gh before the shim"), "{}", text(&out.stderr));
+    // The installed script runs the real gh found after it on PATH.
+    write_gh_config(&e);
+    let out = Command::new(&shim)
+        .arg("--version")
+        .env_clear()
+        .env("HOME", e.cfg.parent().unwrap())
+        .env("XDG_CONFIG_HOME", &e.cfg)
+        .env("PATH", format!("{dir}:{}", real.display()))
+        .output()
+        .unwrap();
+    assert_eq!(text(&out.stdout), "argv:--version\ntoken:none\nsame\n", "{}", text(&out.stderr));
+    // Someone else's gh is replaced only with --force, and a program never.
+    let mine = e.cfg.parent().unwrap().join("mine");
+    std::fs::create_dir_all(&mine).unwrap();
+    std::fs::write(mine.join("gh"), "#!/bin/sh\necho mine\n").unwrap();
+    let out = install(mine.to_str().unwrap(), &[], "");
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read_to_string(mine.join("gh")).unwrap(), "#!/bin/sh\necho mine\n");
+    let out = install(mine.to_str().unwrap(), &["--force"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    std::fs::write(mine.join("gh"), b"\x7fELF binary").unwrap();
+    let out = install(mine.to_str().unwrap(), &["--force"], "");
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(std::fs::read(mine.join("gh")).unwrap(), b"\x7fELF binary");
+    let out = asm(&e, &["gh", "uninstall", "--dir", dir], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!shim.exists());
+    assert!(!e.cfg.join("asm/gh.json").exists());
+    let out = asm(&e, &["gh", "uninstall", "--dir", mine.to_str().unwrap()], "");
+    assert!(text(&out.stdout).contains("left alone (not installed by asm gh)"), "{}", text(&out.stdout));
+    assert!(mine.join("gh").exists());
+}
