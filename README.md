@@ -41,6 +41,7 @@ See [Browser logins](#browser-logins).
 - **Raw delivery exposes the value to the consumer.** `get` writes private files; `exec` uses child memory/environment without credential files or argv. Generated GitHub tokens support provider revocation, but failed revocation or a manager crash can leave delivered copies usable until provider expiry. Static raw values cannot be recalled. Static raw requests require approval each time; generated raw leases allow reuse and renewal.
 - **Google tokens cannot be individually revoked.** Ending a lease stops ASM delivery and substitution. Copies remain usable until credential expiry. IAM grants may change outside ASM; the project and selected OAuth scopes are not an exclusive service or resource boundary.
 - **Same-user processes on the Mac can read vault data.** Run agents as another user, in a VM or in a container.
+- **`asm gh` grants are standing and host-wide.** After approval, an owner's GitHub token serves every `gh` call of that user on that machine until the lease ends, renewed without asking. Tokens are cached on a tmpfs for at most their provider lifetime. Revoking the lease stops renewal and revokes the known tokens at GitHub; a copy survives only where that revocation fails.
 - **Host authorization, not agent isolation.** Pairing is the authorization boundary. Agent labels provide attribution and routing affinity; separate hostile agents need separate paired hosts.
 
 ## Architecture
@@ -209,6 +210,10 @@ asm list --json
 asm exec --repositories acme/web --permissions pull_requests=read GH_TOKEN -- gh pr list --repo acme/web
 # ASM uses the repo to select an installation; gh uses --repo to select the PR list.
 # Both GH_TOKEN and GITHUB_TOKEN are injected with the same value; no token files.
+
+# or, once per machine, make plain gh work through the manager:
+asm gh install
+asm gh repo add acme/web    # the operator approves; then: gh pr list --repo acme/web
 ```
 
 For GitHub, `get` and `exec` require `--repositories OWNER/REPO[,OWNER/REPO...]` unless `get --lease ID` pins an existing grant. Permissions default to `metadata=read`; request additional access with `--permissions contents=read,pull_requests=write`. The popup marks what the agent requested. The operator can remove or add repositories and change permission levels within **one configured installation’s limits**. Installations cannot be combined in one token. Raw GitHub tokens need no proxy.
@@ -454,6 +459,8 @@ Data lives in `~/Library/Application Support/asm/`. Vault credentials are kept i
 - **"Another Agents Secrets Manager is already running"**: quit the other copy (menu bar → **Quit**) first; check with `pgrep -fl AsmApp`.
 - **Proxy health by hand**: `curl -s http://127.0.0.1:7416/healthz` prints `OK`; the full proxy log is `~/Library/Application Support/asm/logs/proxy.log`.
 - **Every HTTPS page fails in a browser set up with `asm browser install`**: the proxy router on that machine is down; `asm doctor` names it and prints the restart command. For certificate errors, `502 asm proxy-router: …` pages, refused login grants and other browser-login symptoms, see the table in [`SETUP.md`](skill/asm/SETUP.md#5-diagnose-and-fix).
+- **`gh` asks for `gh auth login`, or T3 Code reports no GitHub credential**: run `asm gh status`. The shim must come first on the login shell's `PATH`, and the repository must have been added with `asm gh repo add`. The `SETUP.md` table lists the other `asm gh` messages.
+- **`FAIL clock` or `warn clock` in `asm doctor`**: this machine's clock and the manager's differ, which breaks generated-token expiry checks. Enable time sync on both.
 - **"macOS Firewall blocks iron-proxy"** (red dot, orange banner, a notification once per incident; `asm doctor` on agents prints `FAIL firewall`): agents connect over TCP, but every CONNECT is cut off before it reaches the proxy, and nothing shows in its log. Allow incoming connections for `iron-proxy` (and for Agents Secrets Manager) in **System Settings → Network → Firewall → Options**, or run the command **How to Fix…** shows: `sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "<path to iron-proxy>"`. The app only reads the firewall (`socketfilterfw --listapps`, no sudo) every 60 s, on wake and after listener changes; it never changes it. A proxy bound to `127.0.0.1` serves this Mac only and is never reported. No rule yet means macOS asks the first time another machine connects. The Activity Log records `firewall_blocked` / `firewall_allowed`.
 
 ## Building from source

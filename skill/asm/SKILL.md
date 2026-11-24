@@ -24,6 +24,9 @@ reinstalling and fixing failures are covered in `SETUP.md` next to this file.
    asm exec --repositories acme/web 'GH_TOKEN,OTHER_SECRET' -- my-command
    ```
 
+   Where `asm gh status` shows the asm `gh` shim, plain `gh` already works for the
+   configured repositories (see [GitHub CLI](#github-cli-asm-gh) below).
+
    GitHub Apps expose `GH_TOKEN` and `GITHUB_TOKEN` as aliases of one credential. Bare
    shorthand replaces both inherited variables together; requesting both acquires once.
    For generated GitHub tokens, pass `--repositories OWNER/REPO` to `exec` and `get`,
