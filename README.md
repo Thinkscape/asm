@@ -10,20 +10,31 @@
 [![CI](https://github.com/Thinkscape/asm/actions/workflows/ci.yml/badge.svg)](https://github.com/Thinkscape/asm/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Thinkscape/asm)](https://github.com/Thinkscape/asm/releases/latest)
 
-Coding agents need API keys and passwords. asm provides operator-approved access through static vaults and scoped dynamic credentials:
+Coding agents need API keys and passwords. asm provides operator-approved access through static vaults, scoped dynamic credentials and browser logins:
 
 - a **macOS menu-bar app** (the *manager*) reads static vaults (Bitwarden/Vaultwarden, `.env` files, the macOS login keychain), issues GitHub App and Google service-account tokens, and approves access;
-- the **`asm` CLI** runs on agent machines (Linux or macOS), pairs with the manager and requests secrets;
+- the **`asm` CLI** runs on agent machines (Linux or macOS), pairs with the manager, requests secrets and sets up browsers for logins;
 - a **patched [iron-proxy](https://github.com/paradigmxyz/iron-proxy)**, run by the manager, puts the real value into requests on the way out;
-- an **agent skill** ([`skill/asm/SKILL.md`](skill/asm/SKILL.md)) teaches agents the workflow.
+- an **agent skill** ([`skill/asm/SKILL.md`](skill/asm/SKILL.md), with a setup and troubleshooting guide, [`SETUP.md`](skill/asm/SETUP.md)) teaches agents the workflow.
 
 Static secrets default to **sentinel** delivery (`asm_` + 40 random characters): the proxy substitutes the real value only on approved HTTPS hosts. New GitHub App and Google Cloud token grants are **raw only**. `asm exec` injects them directly into the child environment without token files or ASM proxy setup.
+
+**Browser logins** let an agent sign in to a website in the browser it drives, without the password reaching the model or the browser's machine:
+
+- **Login grants**: `asm get --login-url URL` gives, on one approval, the username, a single-use password sentinel and the current one-time code. The proxy substitutes the password only in a post to exactly that HTTPS URL, which also covers JavaScript sign-ins that post to an API (Clerk and similar).
+- **One-time codes**: Bitwarden/Vaultwarden logins with an authenticator key get a `totp` field; the key never leaves the manager. While a login grant lasts, `asm get ITEM::totp` returns fresh codes without a popup.
+- **Browser setup**: `asm browser install chrome|t3code|openbot` covers Chrome and Chromium profiles, T3 Code preview tabs and OpenBot's browser sessions. A local proxy router sends only HTTPS to a granted site through the manager's proxy; a dedicated browser CA is used only for those sites.
+- **Login broker**: `asm login URL` covers sites where a sentinel can't work. The manager fills the login in Chrome on the Mac, the operator signs in and hands the session (cookies, localStorage) to the agent.
+- **Proxy authentication** (opt-in): each paired host gets its own proxy credentials; login grants then work only from the requesting machine.
+- **Diagnostics**: `asm doctor` checks the router and each installed browser and prints a `fix:` command per failure; `SETUP.md` covers setup and troubleshooting per environment.
+
+See [Browser logins](#browser-logins).
 
 ## Security model
 
 - **A sentinel is a bearer capability.** By default the proxy has no authentication, so anyone who can reach the proxy and knows a sentinel can use it, but only with the hosts approved for that lease and only until the lease ends. Keep the proxy on a trusted network (LAN, Tailscale). **Settings → Proxy → Require proxy authentication** makes every paired host sign in to the proxy with its own credentials; login grants then only work from the machine that requested them.
 - **Bound to approved hosts and HTTPS.** A sentinel is replaced only when the destination matches the approved host patterns and the request uses TLS. A request that carries a sentinel in a header, the URL path, the query string or a scanned body to any other host, or over plain HTTP, is refused with `403 asm: sentinel not valid for this host or scheme`. Sentinels are never replaced in WebSocket upgrades, because the proxy cannot redact WebSocket frames (403).
-- **Browser logins trust a dedicated CA.** `asm browser install` adds the manager's browser CA to one browser (for OpenBot, opt-in, to the user's trust store). The proxy issues certificates from it only for the site of an active login grant, routed by that machine's `asm proxy-router`. Whoever holds the browser CA key on the Mac could impersonate any site to those browsers, the same risk class as the proxy CA key. A site that echoes the field holding a login sentinel can return the password to the page; response redaction is best effort.
+- **Browser logins trust a dedicated CA.** `asm browser install` adds the manager's browser CA to one browser or, with `--trust-user-wide` (OpenBot, and T3 Code on macOS), to the user's trust store. The proxy issues certificates from it only for the site of an active login grant, routed by that machine's `asm proxy-router`. Whoever holds the browser CA key on the Mac could impersonate any site to those browsers (with user-wide trust, to every app that uses the store), the same risk class as the proxy CA key. A site that echoes the field holding a login sentinel can return the password to the page; response redaction is best effort.
 - **Redaction is best effort.** If an upstream response echoes a real value (raw, URL-escaped, JSON-escaped, base64 or hex), the proxy replaces it with the sentinel in headers, trailers and the body. Values of other leases become `asm_redacted`. Values shorter than 8 bytes are not redacted. A host you approved can still return the value in some other form. Approving "Any host" amounts to giving the agent the value.
 - **Raw delivery exposes the value to the consumer.** `get` writes private files; `exec` uses child memory/environment without credential files or argv. Generated GitHub tokens support provider revocation, but failed revocation or a manager crash can leave delivered copies usable until provider expiry. Static raw values cannot be recalled. Static raw requests require approval each time; generated raw leases allow reuse and renewal.
 - **Google tokens cannot be individually revoked.** Ending a lease stops ASM delivery and substitution. Copies remain usable until credential expiry. IAM grants may change outside ASM; the project and selected OAuth scopes are not an exclusive service or resource boundary.
@@ -40,6 +51,9 @@ flowchart LR
         client["agent HTTP clients<br/>curl, git, SDKs"]
         cli -- writes --> files
         files -. read by .-> client
+        browser["browsers<br/>(asm browser install)"]
+        router["asm proxy-router<br/>127.0.0.1:7418"]
+        browser -- HTTPS --> router
     end
 
     subgraph mac["Operator's Mac"]
@@ -64,6 +78,7 @@ flowchart LR
 
     cli -- "pair · list · get · update · add" --> api
     client -- "requests with sentinels<br/>(HTTPS via MITM CA)" --> proxy
+    router -- "sites with a login grant<br/>(browser CA)" --> proxy
     proxy -- "real value, approved hosts only" --> upstream
     upstream -- "response, echoes redacted" --> proxy
 ```
@@ -72,6 +87,7 @@ flowchart LR
 2. `asm get BINDING "reason"` or `asm exec BINDINGS -- command args...` requests access. Compatible leases may be reused; fresh approvals choose fields, mode, duration and hosts. Generated credentials also require an identity and grant: GitHub repositories and permissions, or Google OAuth scopes.
 3. Get writes files and prints paths; exec obtains all bindings before replacing itself with the child, passing argv directly without a shell. No credential values are printed by ASM.
 4. Exec configures proxy/CA environment for substituted fields automatically. File-based sentinel consumers use `eval "$(asm proxy-env)"`.
+5. For [browser logins](#browser-logins), a browser set up with `asm browser install` sends its HTTPS to `asm proxy-router` on the same machine, which forwards only sites with an active login grant to the proxy.
 
 Default ports (changeable in the app): manager API `7411`, proxy `7412`, iron-proxy's internal loopback listeners `7413`–`7416`. On machines set up with `asm browser install`, the proxy router listens on `127.0.0.1:7418`.
 
@@ -100,7 +116,7 @@ The script detects the OS and architecture, downloads the matching tarball from 
 
 ### CLI as a Linux package
 
-The Linux binaries are static (musl), so the same package works on any distribution version. Packages install `/usr/bin/asm` and a copy of the skill at `/usr/share/asm/skill/asm/SKILL.md`; they do not touch home directories. Use `x86_64` or `aarch64` in the file name to match `uname -m`, then run `asm skill install` as each user whose agents need the skill:
+The Linux binaries are static (musl), so the same package works on any distribution version. Packages install `/usr/bin/asm` and a copy of the skill in `/usr/share/asm/skill/asm/`; they do not touch home directories. Use `x86_64` or `aarch64` in the file name to match `uname -m`, then run `asm skill install` as each user whose agents need the skill:
 
 ```sh
 base=https://github.com/Thinkscape/asm/releases/latest/download
@@ -136,7 +152,7 @@ install -m 0755 asm-linux-x86_64/asm ~/.local/bin/asm
 asm skill install
 ```
 
-Tarballs are `asm-linux-x86_64`, `asm-linux-aarch64` and `asm-macos-universal`. Each contains `asm`, `README.md`, `LICENSE` and `skill/asm/SKILL.md`.
+Tarballs are `asm-linux-x86_64`, `asm-linux-aarch64` and `asm-macos-universal`. Each contains `asm`, `README.md`, `LICENSE` and `skill/asm/` (`SKILL.md`, `SETUP.md`).
 
 ### The agent skill
 
@@ -237,24 +253,36 @@ To teach an agent the workflow, install the skill with `asm skill install` (see 
 
 ### Browser logins
 
-Agents can sign in to websites in the browsers they drive (the user's Chrome, T3 Code preview tabs, OpenBot profiles) with a vault login, without the password reaching the model or the browser's machine. Set up each machine where such a browser runs once:
+Agents can sign in to websites in the browsers they drive (the user's Chrome, T3 Code preview tabs, OpenBot's browser sessions) with a vault login, without the password reaching the model or the browser's machine. Run the commands below on the machine where the browser runs. [`SETUP.md`](skill/asm/SETUP.md) has the exact steps per environment and a symptom → fix table.
+
+#### Set up a browser
 
 ```sh
-asm browser install chrome            # quit Chrome first; --profile NAME, --user-data-dir DIR for other Chromium browsers
+asm browser install chrome            # quit Chrome first; --profile NAME, or --user-data-dir DIR for other Chromium browsers
 asm browser install t3code            # Linux; on macOS add --trust-user-wide
 asm browser install openbot --trust-user-wide   # in a terminal: offers to quit and restart OpenBot
 asm browser status
 ```
 
-Install saves the manager's **browser CA** (`/proxy-info`), installs `asm proxy-router` as a user service (systemd user unit `asm-proxy-router.service` on Linux, LaunchAgent `com.thinkscape.asm.proxy-router` on macOS; `--no-service` to supervise `asm proxy-router run` yourself) and points the browser's HTTPS traffic at it (`127.0.0.1:7418`):
+Every install saves the manager's **browser CA**, points the browser's HTTPS at `asm proxy-router` (`127.0.0.1:7418`) and installs that router as a user service (systemd user unit `asm-proxy-router.service` on Linux, LaunchAgent `com.thinkscape.asm.proxy-router` on macOS; with `--no-service`, run `asm proxy-router run` under your own supervisor).
 
-- **chrome**: a CA row in the profile's `ServerCertificate` database and a PAC `proxy` preference. Restart Chrome once.
-- **t3code**: wraps each version of T3's `chrome-headless-shell` with `--proxy-server`; on Linux the CA goes into a private NSS database (needs `certutil`: `libnss3-tools` / `nss-tools`), on macOS into the login keychain. Takes effect the next time T3 starts its browser. When T3 downloads a newer browser, run the install again; `asm browser status`, `asm doctor` and `asm get --login-url` say so.
-- **openbot**: the CA goes into the user's trust store (`~/.pki/nssdb`, else `~/.local/share/pki/nssdb`, on Linux; the login keychain on macOS). On macOS and Linux the install also routes OpenBot's **Shared** and **agent-only** browser sessions: it writes a `proxy` preference (HTTPS and WSS to the router) into the `Preferences` of the Shared session and of every agent without a named browser profile, in each OpenBot server data directory on the machine (OpenBot's own and its `local-servers/*`, or `--data-dir DIR`). OpenBot must be stopped while asm writes them: when the desktop app runs, the install asks `Quit OpenBot now and start it again afterwards? [Y/n]` (yes: asm quits it, writes and starts it again; no: it waits until you quit it), `--restart` does that without asking (needed without a terminal), and for an `openbot.service` system service it waits while you run `sudo systemctl stop`/`start`. It refuses from inside OpenBot (an OpenBot agent's shell), since quitting OpenBot would end the command. Once OpenBot runs again, asm re-reads the settings and prints `OpenBot is running again (pid N) with asm's browser settings: …`. Agents created later are routed by running the install again; `asm browser status`, `asm doctor` and `asm get --login-url` name them. Named browser profiles keep OpenBot's own proxy setting (set it to `http://127.0.0.1:7418` to route one). `--ca-only` only trusts the CA, as before; on a Linux server an `auto_proxy=<asm PAC>` environment variable on `openbot.service` is the alternative that needs no OpenBot stop and covers agents created later too. OpenBot's browsers run where its server runs: a machine with no server data (a client of a remote server) only gets the CA; install on the server instead, as the server's user (for example `sudo -u openbot -H asm pair …` and `asm browser install openbot --trust-user-wide --no-service`) and run `asm proxy-router run --port 7418` as that user under a system service, since such users have no systemd user session. [`SETUP.md`](skill/asm/SETUP.md) has the exact commands.
+- **chrome**: one profile of Chrome 134 or later, or of another Chromium user data directory. Restart the browser once afterwards.
+- **t3code**: wraps every downloaded version of T3 Code's preview browser and applies the next time T3 starts it. Linux needs `certutil` (`libnss3-tools` / `nss-tools`); on macOS the CA goes into the login keychain. Run the install again when T3 downloads a newer browser.
+- **openbot**: trusts the CA in the user's trust store and routes OpenBot's **Shared** and **agent-only** browser sessions, in every OpenBot server data directory on the machine. OpenBot must be stopped while asm writes the settings: in a terminal asm offers to quit and restart it (`--restart`: without asking), then confirms that the running OpenBot uses them. Run the install again for agents created later. Named browser profiles keep OpenBot's own proxy setting. Install where the OpenBot server runs, as its user; `SETUP.md` covers hosted servers and the alternatives (`--ca-only`, a systemd drop-in).
 
-The router sends only HTTPS to sites with an active login grant through the manager's proxy (marked with `Asm-Browser-Route: 1`) and everything else directly; HTTP always goes direct. While the router is down, HTTPS pages in configured browsers fail rather than bypass it. The proxy issues browser-CA certificates only for a granted site. Install refuses a browser that already uses another proxy. `asm browser uninstall <target>` restores the previous setting when nobody changed it since, and removes the router with the last install.
+The router sends HTTPS for a site with an active login grant through the manager's proxy, which issues browser-CA certificates only for that site. All other HTTPS goes straight to the site, and plain HTTP never uses the router. While the router is down, HTTPS pages in a set-up browser fail rather than bypass it. Install refuses a browser that already uses another proxy. `asm browser status` and `asm doctor` report the router and each install, with a `fix:` command when one needs repeating. `asm browser uninstall <target>` restores the previous setting unless it changed since, and removes the router with the last install.
 
-An agent then finds the URL the login posts the password to (the form's action, or for JavaScript sign-ins the API request in the browser's network log) and runs `asm get --login-url <URL> --reason "…"` on that machine. The operator approves one **sign-in** (Proxied only, at most 1 hour, default 15 minutes). The agent types the username and the password sentinel into the page and submits once: the proxy substitutes the real password only as the whole form or JSON value posted to exactly that URL, then the sentinel is spent. One-time codes come with the grant and from `asm get ITEM::totp` without a popup while it lasts. Sites the sentinel can't reach this way (short `maxlength`, one box per OTP digit) use `asm login`: the manager opens Chrome on the Mac, fills the form (never submits), and on **Hand over session** gives the agent a Playwright storage state with the cookies of that site and of any approved sign-in service host, and the origin's localStorage.
+#### Sign in with a login grant
+
+1. The agent finds the URL the login posts the password to: the form's `action`, or for a JavaScript sign-in the API request in the browser's network log (often on another host, such as Clerk's), query string included.
+2. It runs `asm get --login-url <URL> [ITEM] --reason "…"`. The item defaults to the vault login whose URI matches the host. The command refuses, before the operator is asked, unless a browser on that machine sent the host through the router in the last 30 minutes (loading the login page does), so an unrouted browser can't waste an approval.
+3. The operator approves one **sign-in**: Proxied only, 15 minutes by default, at most 1 hour.
+4. The agent types the username and the password sentinel into the page and submits once. The proxy substitutes the real password only as a whole form or JSON value posted to exactly that URL; then the sentinel is spent.
+5. When the item has an authenticator key, the grant includes the current one-time code, and `asm get ITEM::totp` returns fresh codes without a popup while the grant lasts.
+
+#### Sign in on the Mac
+
+Where a sentinel can't work (a password field with a short `maxlength`, one box per OTP digit), use `asm login <URL> [ITEM] --reason "…"`. After approval the manager opens Chrome on the Mac and fills the vault login (it never submits). The operator signs in and clicks **Hand over session**; the agent receives a Playwright storage state with the site's cookies and its origin's localStorage. For a site that signs in through a separate service host (Clerk, Auth0), add `--fill-origin https://<that host>` so that host's cookies come along.
 
 ### When a lease ends
 
@@ -322,7 +350,7 @@ Commands:
 |`asm pair <MANAGER> [PAIRING_CODE]`|`--force`: pair again although the current pairing still works|`MANAGER` is `<hostname>[:port]`. `PAIRING_CODE` (`asm-…`) is the unattended code; it is also read from `$ASM_PAIRING_CODE`. Without a code the CLI prints `verification code: 123 456` and waits for approval. Prints `paired: <host id>`, or `already paired with …` (exit 0) when the manager still accepts this machine's pairing. See [Pairing the same machine again](#pairing-the-same-machine-again).|
 |`asm list`|`--json`: print structured catalog entries|One name per line. Names are vault-prefixed (`work/GITHUB_TOKEN`) when two vaults share a name. Provider lock state and diagnostics stay in the manager.|
 |`asm get <BINDING> <REASON>`|`--raw` / `--sentinel`, `--hosts`, `--reason`, `--wait`, `--json`, `--no-reaper`; generated grant and lease options in `asm get --help`|Prints paths and nonsecret lease/grant/version metadata. The receipt on stderr identifies each file as a real value or a sentinel; JSON includes `files[].delivery`. `[DEST=]SOURCE[::FIELD]` selects fields and local file views. The reason may also be given with `--reason`. Static raw requests always need approval.|
-|`asm get --login-url <URL> [ITEM] --reason <REASON>`|`--wait`, `--json`, `--no-reaper`|Single-use login grant for the one HTTPS URL the login posts the password to (`form.action`, or the API request of a JavaScript sign-in, query included). ITEM is inferred from the vault logins whose URI matches the host when omitted. Writes the username, a password sentinel the proxy substitutes once, only as a whole form or JSON value posted to exactly that URL, and the current one-time code when the item has an authenticator key. Later `asm get ITEM::totp` requests get fresh codes without a popup until the grant ends (at most 1 hour, default 15 min). Needs `asm browser install` on this machine; the browser must run here. Prints `login: <url> (single use; routed through asm until <expires>)`.|
+|`asm get --login-url <URL> [ITEM] --reason <REASON>`|`--wait`, `--json`, `--no-reaper`|Single-use [login grant](#sign-in-with-a-login-grant) for the one HTTPS URL the login posts the password to (query included). Without ITEM, the vault login whose URI matches the host (`several vault logins match …; pass ITEM` otherwise). Writes the username, the password sentinel and, when the item has an authenticator key, the current one-time code. Run it where the browser runs: it fails, before the operator is asked, with `no asm proxy-router on this machine …` or `no browser on this machine has sent <host> through the asm proxy router in the last 30 minutes …`. Prints `login: <url> (single use; routed through asm until <expires>)`.|
 |`asm exec <BINDINGS> -- <COMMAND> [ARG...]`|`--raw` / `--sentinel`, `--hosts`, `--repositories`, `--permissions`, `--reason`, `--wait`|Reports delivery per environment variable on stderr before launch. For sentinels it configures the child’s proxy and CA automatically; for file-based clients use `eval "$(asm proxy-env)"`. Sequential acquisitions share one wait deadline; any failure prevents launch. No token files, reaper or in-process renewal.|
 |`asm update <NAME>`|`--field <FIELD>`: field to change (default: `password` for logins, the only field otherwise)<br>`--wait <WAIT>`|Reads the new value from stdin. Prints `updated <name> in <vault>`. Raw leases on that secret are revoked.|
 |`asm add <NAME>`|`--wait <WAIT>`|Reads the value from stdin. The operator picks the vault. Prints `added <name> to <vault>; run asm get to use it`.|
@@ -331,12 +359,13 @@ Commands:
 |`asm doctor`|`--probe-url <PROBE_URL>`: HTTPS URL fetched through the proxy (default `https://example.com/`)|One `ok` / `warn` / `FAIL` line per check: pairing, manager reachable and pin matches, token accepted, secrets directory, CA files, proxy addresses, the manager's macOS Firewall (managers that report it), an HTTPS request through the proxy. After `asm browser install`, also the proxy router (running, port, version, `last_error`, Linux lingering) and one line per installed browser, each failure with a `fix:` command.|
 |`asm browser install chrome`|`--profile <NAME>` (directory or display name; default `Default`), `--user-data-dir <DIR>`, `--no-service`, `--port <PORT>` (default 7418)|Chrome must be closed and at least version 134. Adds the browser CA to the profile and sets a PAC that sends `https:`/`wss:` to the router. Prints `restart Chrome once. HTTPS pages need asm's proxy router; asm doctor checks it.`|
 |`asm browser install t3code`|`--trust-user-wide` (required on macOS), `--no-service`, `--port <PORT>`|Wraps every version of T3's `chrome-headless-shell` under `$T3CODE_HOME` or `~/.t3` (real binaries move to `tools/chrome-headless-shell/asm-real/<version>/`). Rerun after T3 updates its browser; `asm browser status` says when.|
-|`asm browser install openbot --trust-user-wide`|`--data-dir <DIR>` (repeatable; default: OpenBot's data directory and its local servers), `--restart`: quit and restart a running OpenBot without asking, `--ca-only`, `--no-service`, `--port <PORT>`|Without `--trust-user-wide` explains the user-wide trust and exits 2. Refuses when a session already has another proxy. When OpenBot runs: in a terminal asks `Quit OpenBot now and start it again afterwards? [Y/n]` (no: waits until you quit it); without a terminal needs `--restart` (`OpenBot is running (pid N): quit it and run this again, or add --restart …`); a system service: waits for `sudo systemctl stop <unit>`; inside OpenBot: `this command runs inside OpenBot (pid N) …; run it in a terminal instead`. Routes the Shared and agent-only browser sessions and prints them; after a restart confirms `OpenBot is running again (pid N) with asm's browser settings: …`, else prints `start OpenBot again. …`. Named profiles keep OpenBot's proxy setting. `--ca-only`: trust the CA only and print how to point a named profile at the router.|
+|`asm browser install openbot --trust-user-wide`|`--data-dir <DIR>` (repeatable; default: OpenBot's data directory and its local servers), `--restart`, `--ca-only`, `--no-service`, `--port <PORT>`|Trusts the CA user-wide (without the flag: explains that and exits 2) and routes the Shared and agent-only browser sessions; named profiles keep OpenBot's proxy setting. A running OpenBot must stop meanwhile: in a terminal asm asks `Quit OpenBot now and start it again afterwards? [Y/n]` (no: waits until you quit it), `--restart` skips the question and is required without a terminal, and for a system service asm waits for `sudo systemctl stop <unit>`. Refused from inside OpenBot and when a session already has another proxy. After a restart confirms `OpenBot is running again (pid N) with asm's browser settings: …`. `--ca-only`: trust the CA only.|
 |`asm browser uninstall <chrome\|t3code\|openbot>`|chrome: `--profile`, `--user-data-dir`; openbot: `--restart`|Restores the setting asm replaced, unless it changed since (then `… was changed after install; left as is`). Chrome must be quit first; OpenBot with routed sessions is handled like the install. Removing the last install removes the router service and its routes.|
 |`asm browser status`|`--json`|One line per install: `installed`, `incomplete <reason> — fix: <command>` or `stale CA — fix: …`, plus the router line.|
-|`asm login <URL> [ITEM] --reason <REASON>`|`--fill-origin <https://host[:port]>` (repeatable, at most 5), `--wait <SECS>` (default 900), `--json`|The operator approves, the manager opens Chrome on the Mac and fills the vault login (never submits); the operator signs in and clicks **Hand over session**. Writes a Playwright storage state (cookies valid for the URL's host and for each approved `--fill-origin` host, so a separate sign-in service such as `clerk.example.com` keeps its session; the URL origin's localStorage) as a raw lease file and prints its path and cookie domains.|
+|`asm proxy-router run` / `status`|`run`: `--port <PORT>` (default 7418); `status`: `--json`|The local HTTPS proxy that `asm browser install` runs as a user service (not listed in `asm --help`). `run` stays in the foreground and exits 0 at once when one already runs; `status` shows whether it runs, its routes and its last error.|
+|`asm login <URL> [ITEM] --reason <REASON>`|`--fill-origin <https://host[:port]>` (repeatable, at most 5), `--wait <SECS>` (default 900), `--json`|[Sign-in on the manager's Mac](#sign-in-on-the-mac). Writes a Playwright storage state as a raw lease file and prints its path, cookie domains and expiry. It holds the cookies valid for the URL's host and for each approved `--fill-origin` host, and the URL origin's localStorage.|
 |`asm skill install`|`--dir <DIR>` (repeatable; default `~/.agents/skills`)<br>`--force`: replace a skill not installed by asm, or an `asm` symlink<br>`--print`: print the embedded `SKILL.md` instead<br>`--print-setup`: print the embedded `SETUP.md` instead|Writes `<DIR>/asm/SKILL.md` and `<DIR>/asm/SETUP.md` (folders 0755, files 0644). Prints `installed: …`, `updated: …`, `updated (asm-version only): …` or `up to date: …` per folder; refusals go to stderr and make the exit code 1. See [The agent skill](#the-agent-skill).|
-|`asm skill uninstall`|`--dir <DIR>` (repeatable)|Removes `<DIR>/asm/SKILL.md` only when asm installed it, then the `asm` folder when empty. Prints `removed: …`, `not installed: …` or `left alone (…): …`; exit 0.|
+|`asm skill uninstall`|`--dir <DIR>` (repeatable)|Removes `<DIR>/asm/SKILL.md` and its `SETUP.md` only when asm installed the skill, then the `asm` folder when empty. Prints `removed: …`, `not installed: …` or `left alone (…): …`; exit 0.|
 |`asm skill status`|`--dir <DIR>` (repeatable)<br>`--json`|One line per folder: `installed (current)` or `installed (outdated)` with the installed `asm-version`, `foreign`, `symlink` or `missing`. `--json` adds `installed_version` and this CLI's `version`. Exit 0.|
 
 Host patterns follow iron-proxy's rules: case-insensitive, `*` matches any host, `*.example.com` matches `example.com` and every subdomain, and any other `*` is a glob. Patterns have no scheme and no port.
@@ -373,13 +402,13 @@ Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets
 - **Menu bar**: pending requests (click one to open its approval popup), recent decisions, locked vaults to unlock, **Settings…**, **Show Log…** and **Quit**. While the proxy is down (or running but not answering its health check for over 10 s) the icon gets a red dot and the panel a red banner with the cause, **Restart** and **Details…**. While the macOS Firewall blocks the proxy (or the manager API) and it listens for other machines, the icon gets the same red dot and the panel an orange banner with **Firewall Settings**, **How to Fix…** and **Details…**.
 - **Approval popup**: generated-token requests show the requester, reason, scope, and lease duration; **Generate token** releases the real value. There is no proxy option or host selector. Static vault requests still offer delivery and proxy-host controls. A **sign-in** (`asm get --login-url`) shows the form URL and what is delivered (username, single-use password, one-time codes); it is always Proxied, has no host selector, and lasts 5 minutes, 15 minutes (default) or 1 hour. An `asm login` request shows the URL, the origins where the login may be filled (removable), the item and the exported cookies; after **Allow**, the panel lists the running sign-in session with **Hand over session** and **Cancel**. Generated-token popups can be captured in screenshots; pairing and secret-value dialogs request capture protection.
 - **Settings window**:
-  - **Vaults**: Bitwarden/Vaultwarden (server, API key, exposed collections, personal vault; master password held in memory only), `.env` files (every key is exposed), the macOS login keychain (generic and internet passwords, secure notes).
+  - **Vaults**: Bitwarden/Vaultwarden (server, API key, exposed collections, personal vault; master password held in memory only; logins with an authenticator key get a `totp` field that yields the current code), `.env` files (every key is exposed), the macOS login keychain (generic and internet passwords, secure notes).
     The table sizes **Name** to the longest vault name (150pt minimum), keeps **Kind**, **Status** and **Secrets** compact, and gives **Details** the remaining width for the Bitwarden server URL or `.env` file path.
   - **Generators**: configure a GitHub App’s client ID and private key once. Add each installation by account or ID and choose its allowed repositories and permissions. Adding it in ASM does not install it on GitHub. Agents request `GH_TOKEN` / `GITHUB_TOKEN`; the popup identifies the installation, and the operator chooses when several match. Qualify the source (`release-bot/GH_TOKEN`) to request a particular app. Google Cloud connections share `CLOUDSDK_AUTH_ACCESS_TOKEN` and can also be qualified (`gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN`).
     In **Edit Limits**, **Select all** and **Deselect all** change the current installation’s draft limits. In the approval popup, repository checkboxes and permission menus change only the proposed lease, not the saved installation limits. A GitHub token can include at most 500 repositories.
   - **Hosts and Agents**: paired machines (OS, addresses, agents seen, active leases), renaming and revocation; pairing codes.
   - **Leases**: active and ended grants with host, source, mode, fields and hosts; generated details show the identity, approved grant, authorization deadline and provider-token deadline.
-  - **Proxy**: status (running, starting, not running with the cause and since when, not responding), failed starts, health and CA expiry; network access (whether the proxy and the API listen for other machines, and what the macOS Firewall does to iron-proxy and the app); listener address and port; hostname hints; advanced ports, request body limit and plain-HTTP substitution (off by default); **Require proxy authentication** (off by default: each paired host then signs in to the proxy with its own credentials, login grants work only from the requesting machine, and CLIs older than this release can no longer use the proxy); the CA certificate; the proxy log. The sidebar marks **Proxy** while it is down or blocked by the firewall.
+  - **Proxy**: status (running, starting, not running with the cause and since when, not responding), failed starts, health and CA expiry; network access (whether the proxy and the API listen for other machines, and what the macOS Firewall does to iron-proxy and the app); listener address and port; hostname hints; advanced ports, request body limit and plain-HTTP substitution (off by default); **Require proxy authentication** (off by default: each paired host then signs in to the proxy with its own credentials, login grants work only from the requesting machine, and asm CLIs older than 0.8.0 can no longer use the proxy); the CA certificate; the proxy log. The sidebar marks **Proxy** while it is down or blocked by the firewall.
   - **Settings**: manager API address and port, default lease duration, pending request lifetime, launch at login, the `bw` path, version.
 - **Activity Log** (Window ▸ Show Activity Log, ⌘L): a persistent audit trail of pairing, requests, leases, proxy substitutions, vault and generator events, filterable by category. Generator events contain grant metadata and sanitized status, never keys or tokens.
 
@@ -392,7 +421,7 @@ Data lives in `~/Library/Application Support/asm/`. Vault credentials are kept i
 - **Leftover iron-proxy processes**: the bundled iron-proxy exits within about a second when the app dies (`IRON_PARENT_PID` parent watch), and on start the app kills any iron-proxy started with this data directory's config. `pgrep -fl iron-proxy` lists them.
 - **"Another Agents Secrets Manager is already running"**: quit the other copy (menu bar → **Quit**) first; check with `pgrep -fl AsmApp`.
 - **Proxy health by hand**: `curl -s http://127.0.0.1:7416/healthz` prints `OK`; the full proxy log is `~/Library/Application Support/asm/logs/proxy.log`.
-- **Every HTTPS page fails in a browser set up with `asm browser install`**: the proxy router on that machine is down; `asm doctor` names it and prints the restart command (`systemctl --user restart asm-proxy-router` or `launchctl kickstart -k gui/$UID/com.thinkscape.asm.proxy-router`). A certificate error on a site means the browser has not picked up the browser CA yet (restart it) or the CA changed (`asm browser status`). A `502 asm proxy-router: …` page means the router could not reach the manager's proxy or the manager rejected this host's proxy credentials.
+- **Every HTTPS page fails in a browser set up with `asm browser install`**: the proxy router on that machine is down; `asm doctor` names it and prints the restart command. For certificate errors, `502 asm proxy-router: …` pages, refused login grants and other browser-login symptoms, see the table in [`SETUP.md`](skill/asm/SETUP.md#5-diagnose-and-fix).
 - **"macOS Firewall blocks iron-proxy"** (red dot, orange banner, a notification once per incident; `asm doctor` on agents prints `FAIL firewall`): agents connect over TCP, but every CONNECT is cut off before it reaches the proxy, and nothing shows in its log. Allow incoming connections for `iron-proxy` (and for Agents Secrets Manager) in **System Settings → Network → Firewall → Options**, or run the command **How to Fix…** shows: `sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "<path to iron-proxy>"`. The app only reads the firewall (`socketfilterfw --listapps`, no sudo) every 60 s, on wake and after listener changes; it never changes it. A proxy bound to `127.0.0.1` serves this Mac only and is never reported. No rule yet means macOS asks the first time another machine connects. The Activity Log records `firewall_blocked` / `firewall_allowed`.
 
 ## Building from source
@@ -425,12 +454,12 @@ Pushing a tag `vX.Y.Z` (matching the version in `Cargo.toml` and `app/Bundle/Inf
 |Path|What|
 |---|---|
 |`crates/asm-proto`|Wire types and shared rules (host patterns, names, pairing codes)|
-|`crates/asm-core`|Manager core (macOS only): API server, pairing, requests, leases, vault providers, proxy supervisor; UniFFI exports|
-|`crates/asm-cli`|The `asm` CLI|
+|`crates/asm-core`|Manager core (macOS only): API server, pairing, requests, leases, vault providers, proxy supervisor, login broker; UniFFI exports|
+|`crates/asm-cli`|The `asm` CLI, including browser setup and the proxy router|
 |`crates/uniffi-bindgen-swift`|Swift binding generator used by `just core`|
 |`app/`|SwiftUI menu-bar app (SwiftPM package)|
 |`third_party/iron-proxy`|iron-proxy v0.56.0 (git subtree) with the asm patch|
-|`skill/asm/SKILL.md`|Agent skill|
+|`skill/asm/`|Agent skill (`SKILL.md`) and its setup and troubleshooting guide (`SETUP.md`)|
 |`packaging/`|nfpm config, release packaging script, Homebrew formula and cask templates|
 |`scripts/install.sh`|CLI install script|
 |`.github/workflows`|CI and release|

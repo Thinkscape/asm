@@ -70,7 +70,7 @@ struct ProxyPane: View {
                         .foregroundStyle(.orange)
                 }
                 Toggle("Require proxy authentication", isOn: $draft.requireAuth)
-                Text("Each paired host signs in to the proxy with its own credentials, and login grants only work from the machine that requested them. Hosts running an asm CLI older than this release can no longer use the proxy.")
+                Text("Each paired host signs in to the proxy with its own credentials, and login grants only work from the machine that requested them. Hosts running an asm CLI older than 0.8.0 can no longer use the proxy.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
