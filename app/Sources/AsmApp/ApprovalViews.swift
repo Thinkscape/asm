@@ -2053,7 +2053,11 @@ private struct GeneratorApprovalSection: View {
                         Text("Select at least one repository.").font(.callout).foregroundStyle(.secondary)
                     }
                 } else if case let .githubApp(grant)? = approvedGrant {
-                    ReadOnlyApprovalScope(grant: grant)
+                    GithubClaimsEditor(ceiling: grant, selection: .constant(GithubClaimsSelection(ceiling: grant)),
+                                       request: githubRequest)
+                        .disabled(true)
+                    Text("The requester accepts only this exact scope. To change it, deny and have the requester ask for a different scope.")
+                        .font(.callout).foregroundStyle(.secondary)
                 } else {
                     if let selected {
                         if selected.scopeIssues.isEmpty {
@@ -2096,23 +2100,6 @@ private struct GeneratorApprovalSection: View {
             case nil:
                 EmptyView()
             }
-        }
-    }
-}
-
-private struct ReadOnlyApprovalScope: View {
-    let grant: GithubGrantItem
-
-    var body: some View {
-        Group {
-            if let owner = grant.repositoryOwner {
-                LabeledContent("Repository owner", value: owner)
-            }
-            LabeledContent("Selected installation ID", value: String(grant.installationID))
-            ScopeSummaryHeading("Scope to approve")
-            GrantScopeSummary(grant: grant)
-            Text("A GitHub token is issued for exactly the requested scope, from one installation.")
-                .font(.callout).foregroundStyle(.secondary)
         }
     }
 }
