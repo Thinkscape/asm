@@ -134,14 +134,27 @@ private struct SettingsDetail: View {
 
     var body: some View {
         VStack {
-            switch pane {
-            case .vaults: VaultsPane(model: model)
-            case .generators: GeneratorsPane(model: model)
-            case .sshTargets: SshTargetsPane(model: model)
-            case .hosts: HostsPane(model: model)
-            case .leases: LeasesPane(model: model)
-            case .proxy: ProxyPane(model: model)
-            case .settings: GeneralPane(model: model)
+            if let startError = model.startError {
+                Label {
+                    Text(verbatim: startError)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if !model.started {
+                // Empty panes would read as lost state while the core is still starting.
+                ProgressView("Starting the manager…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                switch pane {
+                case .vaults: VaultsPane(model: model)
+                case .generators: GeneratorsPane(model: model)
+                case .sshTargets: SshTargetsPane(model: model)
+                case .hosts: HostsPane(model: model)
+                case .leases: LeasesPane(model: model)
+                case .proxy: ProxyPane(model: model)
+                case .settings: GeneralPane(model: model)
+                }
             }
         }
         .navigationTitle(pane.title)

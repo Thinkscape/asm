@@ -16,6 +16,8 @@ struct AppError: LocalizedError {
 @Observable
 final class AppModel {
     private(set) var startError: String?
+    /// True once the core is running and every topic has loaded; until then the
+    /// model's lists are empty placeholders, not the stored state.
     private(set) var started = false
 
     private(set) var pending: [PendingItem] = []
@@ -94,7 +96,6 @@ final class AppModel {
                 try CoreBridge.start(dataDir: dataDir.path, binDir: binDir.path, onChange: onChange)
             }.value
             self.bridge = bridge
-            started = true
             startError = nil
         } catch let error as AppError where error.code == "exists" {
             // Another copy owns the data directory (and the proxy ports).
@@ -117,6 +118,7 @@ final class AppModel {
         for topic in CoreBridge.topics {
             await refresh(topic)
         }
+        started = true
     }
 
     /// Called from `applicationWillTerminate`; stops the API, the proxy and `bw serve`.
