@@ -282,12 +282,14 @@ impl GcloudHttp {
                     .json(&json!({"options": {"requestedPolicyVersion": 3}})),
             ),
             PolicyTarget::Account(account) => {
-                // Unlike Resource Manager, IAM v1 expects a query and no body.
+                // Unlike Resource Manager, IAM v1 expects a query and no body. Google's
+                // front end answers a bodyless POST without Content-Length with HTTP 411.
                 url.query_pairs_mut().append_pair("options.requestedPolicyVersion", "3");
                 (
                     GET_ACCOUNT_POLICY,
                     "iam.serviceAccounts.getIamPolicy",
-                    self.management(Method::POST, url, token, account.project_id),
+                    self.management(Method::POST, url, token, account.project_id)
+                        .header(reqwest::header::CONTENT_LENGTH, 0),
                 )
             }
         };

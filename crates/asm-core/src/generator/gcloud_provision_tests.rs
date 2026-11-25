@@ -129,7 +129,7 @@ fn exchange_request(exchange: &Exchange, stream: &mut TcpStream) {
     let mut words = line.split_ascii_whitespace();
     assert_eq!(words.next(), Some(exchange.method));
     assert_eq!(words.next(), Some(exchange.path));
-    let mut content_length = 0;
+    let mut content_length = None;
     let mut bearer = false;
     let mut quota = false;
     loop {
@@ -146,18 +146,21 @@ fn exchange_request(exchange: &Exchange, stream: &mut TcpStream) {
                 assert_eq!(value.trim(), PROJECT);
                 quota = true;
             }
-            "content-length" => content_length = value.trim().parse::<usize>().unwrap(),
+            "content-length" => content_length = Some(value.trim().parse::<usize>().unwrap()),
             _ => {}
         }
     }
     assert!(bearer);
     assert_eq!(quota, exchange.path != USERINFO_PATH);
     if let Some(expected) = &exchange.body {
-        let mut bytes = vec![0; content_length];
+        let mut bytes = vec![0; content_length.unwrap()];
         reader.read_exact(&mut bytes).unwrap();
         assert_eq!(&serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
+    } else if exchange.method == "POST" {
+        // Google's front end rejects a bodyless POST without Content-Length (HTTP 411).
+        assert_eq!(content_length, Some(0), "POST {} must send Content-Length: 0", exchange.path);
     } else {
-        assert_eq!(content_length, 0);
+        assert_eq!(content_length.unwrap_or(0), 0);
     }
 }
 
