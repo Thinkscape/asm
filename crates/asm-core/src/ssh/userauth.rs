@@ -22,33 +22,33 @@ pub(crate) struct Userauth<'a> {
 pub(crate) fn parse_userauth(data: &[u8]) -> Result<Userauth<'_>, &'static str> {
     const NOT: &str = "not an SSH user authentication request";
     let mut r = Reader::new(data);
-    let session_id = r.string().map_err(|_| NOT)?;
+    let session_id = r.string().ok_or(NOT)?;
     if session_id.is_empty() || session_id.len() > 64 {
         return Err(NOT);
     }
-    if r.u8().map_err(|_| NOT)? != USERAUTH_REQUEST {
+    if r.u8().ok_or(NOT)? != USERAUTH_REQUEST {
         return Err(NOT);
     }
-    let user = std::str::from_utf8(r.string().map_err(|_| NOT)?).map_err(|_| "invalid login name")?;
+    let user = std::str::from_utf8(r.string().ok_or(NOT)?).map_err(|_| "invalid login name")?;
     if user != RESTRICTED_LOGIN && user != PRIVILEGED_LOGIN {
         return Err("invalid login name");
     }
-    if r.string().map_err(|_| NOT)? != SERVICE {
+    if r.string().ok_or(NOT)? != SERVICE {
         return Err("unexpected SSH service");
     }
-    let method = r.string().map_err(|_| NOT)?;
+    let method = r.string().ok_or(NOT)?;
     let hostbound = match method {
         PUBLICKEY => false,
         PUBLICKEY_HOSTBOUND => true,
         _ => return Err("unexpected authentication method"),
     };
-    if !r.bool().map_err(|_| NOT)? {
+    if !r.bool().ok_or(NOT)? {
         return Err("not a signature request");
     }
-    let alg = std::str::from_utf8(r.string().map_err(|_| NOT)?).map_err(|_| "invalid key algorithm")?;
-    let key_blob = r.string().map_err(|_| NOT)?;
+    let alg = std::str::from_utf8(r.string().ok_or(NOT)?).map_err(|_| "invalid key algorithm")?;
+    let key_blob = r.string().ok_or(NOT)?;
     let host_key = if hostbound {
-        let key = r.string().map_err(|_| NOT)?;
+        let key = r.string().ok_or(NOT)?;
         if key.is_empty() {
             return Err("missing host key");
         }

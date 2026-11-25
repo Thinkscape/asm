@@ -1,8 +1,9 @@
 #!/bin/sh
 # asm-end-lease: records the sessions of asm SSH leases, and ends them.
-#   register LEASE UNTIL TTY  asm-dispatch and asm-shell run this through sudo before a
-#                             lease session does anything. It records the caller's
-#                             systemd-logind session, and refuses an ended lease.
+#   register LEASE UNTIL TTY [USER]  asm-dispatch and asm-shell run this through sudo
+#                             before a lease session does anything. It records the
+#                             caller's systemd-logind session, refuses an ended lease and,
+#                             for a login as USER, an account that changed since enrollment.
 #   (no arguments)            asm-dispatch runs this through sudo for the manager's cleanup
 #                             login. Reads one line: "end LEASE VALID_BEFORE" or "check".
 #   --sweep                   asm-end-lease.timer: ends sessions past their lease's end or
@@ -24,6 +25,7 @@ fail() { echo "asm-end-error $1 $2"; exit 3; }
 [ "$(id -u)" = 0 ] || fail not-root "asm-end-lease must run as root"
 [ -f "$STATE/manifest" ] || fail not-enrolled "asm is not installed on this host"
 mf() { sed -n "s/^$1=//p" "$STATE/manifest" | head -n 1; }
+ops=$(mf ops_uid); priv=$(mf priv_uid)
 MODE=${1:-stdin}
 case "$MODE" in register|stdin|--sweep|--all) ;; *) fail usage "unknown mode $MODE" ;; esac
 NOW=$(date +%s)
@@ -34,19 +36,33 @@ prop() { loginctl show-session "$1" -p "$2" --value 2>/dev/null; }
 # own_session: the logind session of this process; sudo keeps the caller's session.
 own_session() { sed -n 's|.*/session-\([A-Za-z0-9][A-Za-z0-9]*\)\.scope$|\1|p' /proc/$$/cgroup | head -n 1; }
 is_ended() { grep -q "^$1 " "$RUN/ended" 2>/dev/null; }
+@@ADMIN@@
 
 if [ "$MODE" = register ]; then
-  [ "$#" -eq 4 ] || fail usage "asm-end-lease register LEASE UNTIL TTY"
-  lease=$2; until=$3; tty=$4
+  { [ "$#" -eq 4 ] || [ "$#" -eq 5 ]; } || fail usage "asm-end-lease register LEASE UNTIL TTY [USER]"
+  lease=$2; until=$3; tty=$4; as=${5:-}
   printf '%s\n' "$lease" | grep -Eqx "$UUID" || fail usage "invalid lease id"
   printf '%s\n' "$until" | grep -Eqx '[0-9]{1,12}' || fail usage "invalid end time"
-  ops=$(mf ops_uid); priv=$(mf priv_uid)
   [ -n "${SUDO_UID:-}" ] && { [ "$SUDO_UID" = "$ops" ] || [ "$SUDO_UID" = "$priv" ]; } \
     || fail usage "only asm-ops and asm-priv record sessions"
   user=$(getent passwd "$SUDO_UID" | cut -d: -f1)
   s=$(own_session)
   [ -n "$s" ] && [ "$(prop "$s" Name)" = "$user" ] && [ "$(prop "$s" Service)" = sshd ] \
     || fail no-session "this login has no systemd-logind session of $user"
+  # A login as another user: the account must be the one enrollment recorded (user=
+  # NAME:UID:ADMIN), and it may become root only if the operator chose it knowing that.
+  if [ -n "$as" ]; then
+    [ "$SUDO_UID" = "$priv" ] || fail usage "only asm-priv logs in as another user"
+    printf '%s\n' "$as" | grep -Eqx '[a-z_][a-z0-9_-]{0,31}' || fail usage "invalid user"
+    rec=$(sed -n 's/^user=//p' "$STATE/manifest" | awk -F: -v u="$as" '$1 == u' | head -n 1)
+    [ -n "$rec" ] || fail user "this host does not allow access as $as"
+    uid=${rec#*:}; uid=${uid%%:*}
+    [ "$(id -u "$as" 2>/dev/null)" = "$uid" ] || fail user-changed "$as is not the account asm enrolled; the operator must enroll the target again"
+    if [ "${rec##*:}" != 1 ]; then
+      why=$(admin_why "$as")
+      [ -z "$why" ] || fail user-admin "$as can now become root ($why); the operator must enroll the target again"
+    fi
+  fi
   case "$tty" in
     -) ;;
     /dev/pts/[0-9]*) [ "$(stat -c %u "$tty" 2>/dev/null)" = "$SUDO_UID" ] || tty=- ;;
@@ -56,7 +72,10 @@ if [ "$MODE" = register ]; then
   if [ -f "$RUN/sessions/$s" ]; then
     grep -qx "lease=$lease" "$RUN/sessions/$s" || fail conflict "this session belongs to another lease"
   else
-    printf 'lease=%s\nuser=%s\nmono=%s\ntty=%s\n' "$lease" "$user" "$(prop "$s" TimestampMonotonic)" "$tty" \
+    # The session's start tells it apart from a later session logind gives the same id.
+    mono=$(prop "$s" TimestampMonotonic)
+    printf '%s\n' "$mono" | grep -Eqx '[0-9]+' || fail logind "systemd-logind did not describe this session"
+    printf 'lease=%s\nuser=%s\nmono=%s\ntty=%s\n' "$lease" "$user" "$mono" "$tty" \
       > "$RUN/sessions/.$s" && mv -f "$RUN/sessions/.$s" "$RUN/sessions/$s" || fail io "cannot record the session"
   fi
   old=$(cat "$RUN/leases/$lease" 2>/dev/null) || old=0
@@ -69,7 +88,7 @@ fi
 
 if [ "$MODE" = stdin ]; then
   [ "$#" -eq 0 ] || fail usage "unknown mode $1"
-  ops=$(mf ops_uid); s=$(own_session)
+  s=$(own_session)
   [ -n "${SUDO_UID:-}" ] && [ "$SUDO_UID" = "$ops" ] || fail usage "only asm's cleanup login runs this"
   [ -n "$s" ] && [ ! -e "$RUN/sessions/$s" ] || fail usage "a lease session cannot end leases"
   set -- $(head -c 200 | head -n 1)
@@ -92,6 +111,8 @@ warn() {
   if [ "$rem" -le 120 ]; then t=2; else t=10; fi
   tty=$(sed -n 's/^tty=//p' "$1")
   case "$tty" in /dev/pts/[0-9]*) ;; *) return 0 ;; esac
+  # A terminal the session closed may now belong to another login.
+  o=$(stat -c %u "$tty" 2>/dev/null) && { [ "$o" = "$ops" ] || [ "$o" = "$priv" ]; } || return 0
   ! grep -qx "warned=$4:$t" "$1" || return 0
   timeout 2 sh -c 'printf "\r\nasm: this SSH lease ends at %s (in about %s minutes). To keep running processes, run on the agent machine: asm ssh extend %s \"<reason>\"\r\n" "$1" "$2" "$3" > "$4"' \
     asm-warn "$(date -u -d "@$4" '+%Y-%m-%d %H:%M UTC')" $(((rem + 59) / 60)) "$3" "$tty" 2>/dev/null
@@ -101,22 +122,27 @@ warn() {
 # live: print the ids of the sessions logind lists; a failed listing is an error.
 live() { l=$(loginctl list-sessions --no-legend 2>/dev/null) && printf '%s\n' "$l" | awk '{ print $1 }'; }
 LIVE=$(live) || fail logind "cannot list logind sessions"
-kill=
+kill=; unknown=0
 set +f; RECORDS=$(printf '%s\n' "$RUN"/sessions/[A-Za-z0-9]*); set -f
 for f in $RECORDS; do
   [ -f "$f" ] || continue
   s=${f##*/}
   lease=$(sed -n 's/^lease=//p' "$f")
-  # A record whose session is gone, or whose id logind gave to a newer session, is stale.
-  if ! printf '%s\n' "$LIVE" | grep -qx "$s" || [ "$(prop "$s" TimestampMonotonic)" != "$(sed -n 's/^mono=//p' "$f")" ]; then
-    rm -f "$f"; continue
+  # A record whose session logind no longer lists is stale.
+  printf '%s\n' "$LIVE" | grep -qx "$s" || { rm -f "$f"; continue; }
+  [ "$MODE" != stdin ] || [ "$lease" = "$LEASE" ] || continue
+  # A listed session logind doesn't describe stays recorded: the next run tries again,
+  # and ending a lease reports it as not ended.
+  mono=$(prop "$s" TimestampMonotonic)
+  if [ -z "$mono" ]; then
+    unknown=$((unknown + 1)); echo "unknown $s"; continue
   fi
-  case "$MODE" in
-    stdin) [ "$lease" = "$LEASE" ] || continue ;;
-    --sweep)
-      dl=$(cat "$RUN/leases/$lease" 2>/dev/null) || dl=0
-      if [ "$dl" -gt "$NOW" ] && ! is_ended "$lease"; then warn "$f" "$s" "$lease" "$dl"; continue; fi ;;
-  esac
+  # logind gave the id to a newer session: the recorded one is gone.
+  [ "$mono" = "$(sed -n 's/^mono=//p' "$f")" ] || { rm -f "$f"; continue; }
+  if [ "$MODE" = --sweep ]; then
+    dl=$(cat "$RUN/leases/$lease" 2>/dev/null) || dl=0
+    if [ "$dl" -gt "$NOW" ] && ! is_ended "$lease"; then warn "$f" "$s" "$lease" "$dl"; continue; fi
+  fi
   kill="$kill $s"; echo "ending $s $(sed -n 's/^user=//p' "$f") $lease"
 done
 if [ "$MODE" = --sweep ]; then
@@ -147,7 +173,9 @@ if [ -n "$LEFT" ]; then
   i=0; left
   while [ -n "$LEFT" ] && [ "$i" -lt 10 ]; do sleep 0.5; i=$((i + 1)); left; done
 fi
-ended=0; failed=0
+# The sweep tries undescribed sessions again next minute; ending a lease or removing asm
+# can't say they ended.
+ended=0; failed=0; [ "$MODE" = --sweep ] || failed=$unknown
 for s in $kill; do
   case " $LEFT " in
     *" $s "*) failed=$((failed + 1)); echo "failed $s" ;;

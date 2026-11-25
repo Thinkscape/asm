@@ -32,12 +32,14 @@ struct Call {
     cert: Option<String>,
 }
 
-/// Answers from `handler` when set, else from `answers`, else `asm-end-ok 0`.
+/// Answers from `handler` when set, else from `answers`, else `asm-end-ok 0`. A
+/// `route` error refuses every target's route.
 #[derive(Default)]
 struct FakeRemote {
     calls: Mutex<Vec<Call>>,
     answers: Mutex<VecDeque<Answer>>,
     handler: Mutex<Option<Handler>>,
+    route: Mutex<Option<RemoteError>>,
 }
 
 impl FakeRemote {
@@ -63,6 +65,10 @@ impl SshRemote for FakeRemote {
             return handler(&call);
         }
         lock(&self.answers).pop_front().unwrap_or_else(|| out(0, "asm-end-ok 0\n", ""))
+    }
+
+    fn check_route(&self, _target: &SshTargetRecord, _dir: &Path) -> std::result::Result<(), RemoteError> {
+        lock(&self.route).clone().map_or(Ok(()), Err)
     }
 }
 
@@ -340,6 +346,49 @@ fn signing_rechecks_the_token() {
     f.sign(&result.lease_id, &data).unwrap();
     f.core.revoke_host(&f.host.id).unwrap();
     assert_eq!(f.sign(&result.lease_id, &data).unwrap_err().code, ErrorCode::Unauthorized);
+}
+
+#[test]
+fn only_the_owner_of_a_lease_uses_its_signing_budget() {
+    let f = Fixture::new();
+    let result = f.lease();
+    let cert = certificate_blob(&result.certificate).unwrap();
+    let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
+    let other = HostRecord { id: new_uuid_v4(), ..f.host.clone() };
+    let other_token = asm_proto::crypto::sha256(other.id.as_bytes());
+    f.core.store.insert_host(&other, &other_token).unwrap();
+    for _ in 0..40 {
+        let error = f.core.ssh_sign(&other, &other_token,
+            SshSignRequest { lease_id: result.lease_id.clone(), data: b64_encode(&data) }).unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotFound);
+        assert_eq!(f.sign("no-such-lease", &data).unwrap_err().code, ErrorCode::NotFound);
+    }
+    for _ in 0..30 {
+        f.sign(&result.lease_id, &data).unwrap();
+    }
+    assert_eq!(f.sign(&result.lease_id, &data).unwrap_err().code, ErrorCode::RateLimited);
+}
+
+#[test]
+fn signing_stops_when_a_lease_target_changes_or_goes() {
+    let f = Fixture::new();
+    let result = f.lease();
+    let cert = certificate_blob(&result.certificate).unwrap();
+    let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
+    f.sign(&result.lease_id, &data).unwrap();
+    // A change that did not end the lease still stops it signing.
+    let target = f.core.store.get_ssh_target(&f.target_id).unwrap().unwrap();
+    f.core.store.update_ssh_target(&f.target_id, &target.name, &target.config, target.revision).unwrap();
+    assert!(f.core.store.get_ssh_lease(&result.lease_id).unwrap().unwrap().is_active(f.now()));
+    assert_eq!(f.sign(&result.lease_id, &data).unwrap_err().message, "the SSH target changed; request a new lease");
+
+    f.core.install_ssh_target_enrollment(&f.target_id).unwrap();
+    let result = f.lease();
+    let cert = certificate_blob(&result.certificate).unwrap();
+    let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
+    f.sign(&result.lease_id, &data).unwrap();
+    assert!(f.core.store.delete_ssh_target(&f.target_id).unwrap());
+    assert_eq!(f.sign(&result.lease_id, &data).unwrap_err().message, "the SSH target changed; request a new lease");
 }
 
 #[test]
@@ -759,6 +808,54 @@ fn enrollment_reports_host_errors() {
     assert_eq!(f.remote.calls().len(), 1);
 }
 
+#[test]
+fn enrollment_refuses_an_unusable_route_before_changing_the_host() {
+    let f = Fixture::new();
+    let lease = f.lease();
+    let revision = f.core.list_ssh_targets().unwrap()[0].revision;
+    let message = "asm cannot use the ProxyCommand of web.example.com for unattended runs: it uses %n, %r, %k or %C";
+    *lock(&f.remote.route) = Some(RemoteError::Local(message.into()));
+    assert_eq!(f.core.enroll_ssh_target(&f.target_id, revision).unwrap_err().message, message);
+    assert!(f.remote.calls().is_empty());
+    assert_eq!(f.core.list_ssh_targets().unwrap()[0].state, ffi::SshTargetState::Enrolled);
+    assert!(f.core.store.get_ssh_lease(&lease.lease_id).unwrap().unwrap().is_active(f.now()));
+}
+
+#[test]
+fn enrolling_again_ends_the_targets_leases() {
+    let f = Fixture::new();
+    let result = f.lease();
+    let cert = certificate_blob(&result.certificate).unwrap();
+    let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
+    let revision = f.core.list_ssh_targets().unwrap()[0].revision;
+    f.remote.answer(out(3, "asm-enroll-error sshd sshd refused the configuration\n", ""));
+    f.core.enroll_ssh_target(&f.target_id, revision).unwrap_err();
+    assert_eq!(f.core.list_ssh_targets().unwrap()[0].state, ffi::SshTargetState::Failed);
+    assert!(f.core.store.get_ssh_lease(&result.lease_id).unwrap().unwrap().revoked_at.is_some());
+    assert!(f.sign(&result.lease_id, &data).unwrap_err().message.contains("SSH lease has ended"));
+    let done = f.wait_settled(&result.lease_id);
+    assert_eq!((done.state, done.detail.as_str()), (SshCleanupState::Done, "host reported: ended 0 sessions"));
+}
+
+#[test]
+fn removing_a_failed_target_ends_its_leases() {
+    let f = Fixture::new();
+    let result = f.lease();
+    let cert = certificate_blob(&result.certificate).unwrap();
+    let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
+    // As after an interrupted removal: the target failed with the lease still active.
+    assert!(f.core.store.set_ssh_enrollment(&f.target_id, &[SshEnrollState::Enrolled], SshEnrollState::Failed,
+        None, None, Some("interrupted; run it again"), f.now()).unwrap());
+    f.sign(&result.lease_id, &data).unwrap();
+    f.core.remove_ssh_target(&f.target_id).unwrap();
+    assert!(f.core.list_ssh_targets().unwrap().is_empty());
+    assert!(f.core.store.get_ssh_lease(&result.lease_id).unwrap().unwrap().revoked_at.is_some());
+    assert!(f.sign(&result.lease_id, &data).unwrap_err().message.contains("SSH lease has ended"));
+    let failed = f.wait_settled(&result.lease_id);
+    assert_eq!((failed.state, failed.detail.as_str()), (SshCleanupState::Failed, "the target was removed from asm"));
+    assert!(f.remote.calls().is_empty());
+}
+
 // ---- pure helpers ----
 
 #[test]
@@ -810,6 +907,11 @@ fn certificate_configs_use_only_the_certificate() {
         assert_eq!(proxy(refused).unwrap_err().message,
             "asm cannot use the ProxyJump/ProxyCommand of web for unattended cleanup", "{refused}");
     }
+    let tokens = "asm cannot use the ProxyCommand of web for unattended runs: it uses %n, %r, %k or %C";
+    for refused in ["proxycommand nc %r %h", "proxycommand nc %n", "proxycommand x %k", "proxycommand x %C", "proxycommand x %%%r"] {
+        assert_eq!(proxy(refused).unwrap_err().message, tokens, "{refused}");
+    }
+    assert_eq!(proxy("proxycommand nc %%r %h %p").unwrap(), "  ProxyCommand nc %%r %h %p");
 
     let route = parse_route("hostname web\nport 22\nproxyjump bastion\n").unwrap();
     let config = certificate_config(&route, known_hosts, "0123abcd", "asm-priv", run_dir,
@@ -890,7 +992,6 @@ fn host_check_failures_are_told_apart() {
 #[test]
 fn a_changed_host_key_is_flagged_until_new_keys_are_pinned() {
     let f = Fixture::new();
-    let lease = f.lease();
     let revision = f.core.list_ssh_targets().unwrap()[0].revision;
     f.remote.answer(out(255, "", &format!(
         "Host key for asm-target-{} has changed and you have requested strict checking.\nHost key verification failed.\n",
@@ -905,11 +1006,19 @@ fn a_changed_host_key_is_flagged_until_new_keys_are_pinned() {
     assert!(f.core.replace_ssh_host_keys(&f.target_id, revision, vec![other_key]).unwrap_err().message
         .contains("already pinned for SSH target db.example.com"));
 
-    // Pinning reviewed keys clears the mark and ends the target's leases, like a saved change.
+    // Pinning reviewed keys clears the mark.
     let new_key = host_key();
     let info = f.core.replace_ssh_host_keys(&f.target_id, revision, vec![new_key.clone()]).unwrap();
     assert!(!info.host_key_changed);
     assert_eq!(info.revision, revision + 1);
     assert_eq!(info.host_keys.iter().map(|k| k.line.as_str()).collect::<Vec<_>>(), [new_key.as_str()]);
-    assert!(f.core.store.get_ssh_lease(&lease.lease_id).unwrap().unwrap().ended_at.is_some());
+}
+
+#[test]
+fn replacing_host_keys_ends_the_targets_leases() {
+    let f = Fixture::new();
+    let lease = f.lease();
+    let revision = f.core.list_ssh_targets().unwrap()[0].revision;
+    f.core.replace_ssh_host_keys(&f.target_id, revision, vec![host_key()]).unwrap();
+    assert!(f.core.store.get_ssh_lease(&lease.lease_id).unwrap().unwrap().revoked_at.is_some());
 }

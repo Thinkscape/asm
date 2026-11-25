@@ -526,10 +526,10 @@ impl RequestBody {
             grants.sort_unstable();
             grants.dedup();
         }
-        if let Self::SshExtend { lease_id, .. } = self {
-            if !crate::crypto::is_uuid(lease_id) {
-                return Err(ApiError::invalid("lease_id must be an SSH lease id"));
-            }
+        if let Self::SshExtend { lease_id, .. } = self
+            && !crate::crypto::is_uuid(lease_id)
+        {
+            return Err(ApiError::invalid("lease_id must be an SSH lease id"));
         }
         Ok(())
     }

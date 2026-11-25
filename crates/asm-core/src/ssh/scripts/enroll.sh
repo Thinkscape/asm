@@ -30,8 +30,9 @@ if [ "$PRIV_TRUST" = 1 ]; then
   shell_ok "$PRIV_SHELL" || fail no-shell "user $PRIV has no login shell"
 fi
 # Each user must be what the operator saw when choosing it: an account that can become
-# root needs privileged access to be allowed.
-NAMES=
+# root needs privileged access to be allowed. The manifest records each user's UID and
+# whether it could become root, so asm-end-lease can check both at every login.
+NAMES=; USER_RECORDS=
 for u in $USERS; do
   n=${u%%:*}; chosen_admin=${u#*:}
   getent passwd "$n" >/dev/null || fail no-user "user $n does not exist"
@@ -43,11 +44,15 @@ for u in $USERS; do
   else
     [ "$chosen_admin" = 0 ] || fail user-changed "$n can no longer become root; choose the target's users again"
   fi
-  NAMES="$NAMES $n"
+  NAMES="$NAMES $n"; USER_RECORDS="$USER_RECORDS $n:$(id -u "$n"):$chosen_admin"
 done
 # asm-priv runs shells as the privileged login and as each user.
 PRIV_ACCT=0; { [ "$PRIV_TRUST" = 1 ] || [ -n "$NAMES" ]; } && PRIV_ACCT=1
+if [ -e "$STATE" ] || [ -L "$STATE" ]; then
+  root_only "$STATE" || fail unsafe-path "$STATE is not a root-only directory"
+fi
 if [ -f "$STATE/manifest" ]; then
+  root_file "$STATE/manifest" || fail unsafe-path "$STATE/manifest is not a root-only file"
   [ "$(mf tid | head -n 1)" = "$TID" ] || fail other-target "this host is enrolled as another SSH target; remove that one first"
 else
   for f in "$STATE" "$LIB" /var/lib/asm-ops /var/lib/asm-priv /etc/sudoers.d/asm-ssh \
@@ -65,7 +70,8 @@ done
 ADDRS="127.0.0.1 $(getent ahosts "$AGENT_HOST" 2>/dev/null | awk '{ print $1 }' | sort -u | head -n 8)"
 ACCOUNTS=asm-ops; [ "$PRIV_ACCT" = 0 ] || ACCOUNTS="asm-ops asm-priv"
 # check_sshd: every asm account, at every agent-facing address, gets settings that keep
-# asm's forced commands in charge. Sets OPS_AK and PRIV_AK.
+# asm's forced commands in charge and accept no credentials but asm's certificates.
+# Sets OPS_AK and PRIV_AK.
 check_sshd() {
   OPS_AK=; PRIV_AK=
   for acct in $ACCOUNTS; do
@@ -79,14 +85,30 @@ check_sshd() {
       [ "$(val permituserenvironment)" = no ] || fail user-environment "PermitUserEnvironment must be no for $acct"
       bad=$(val acceptenv | tr ' ' '\n' | grep -vxE 'LANG|LC_\*|COLORTERM|NO_COLOR|' | head -n 1)
       [ -z "$bad" ] || fail accept-env "AcceptEnv $bad lets clients set environment variables for $acct; allow only LANG LC_* COLORTERM NO_COLOR"
+      # A login without asm's certificate has no forced command, so asm-shell would take
+      # the client's command as one. sshd builds without GSSAPI or Kerberos omit those.
+      for k in AuthorizedKeysCommand:none AuthorizedPrincipalsCommand:none TrustedUserCAKeys:none \
+          HostbasedAuthentication:no GSSAPIAuthentication:no KerberosAuthentication:no; do
+        v=$(val "$(printf '%s\n' "${k%%:*}" | tr 'A-Z' 'a-z')")
+        [ -z "$v" ] || [ "$v" = "${k#*:}" ] \
+          || fail auth-path "sshd_config sets ${k%%:*} for $acct, so other credentials could log in to it; set ${k%%:*} ${k#*:} in a Match User asm-ops,asm-priv block"
+      done
       akfile "$acct" "/var/lib/$acct" || fail keys-file "$WHY"
-      [ -z "$first" ] || [ "$AK" = "$first" ] || fail keys-file "AuthorizedKeysFile for $acct depends on the address"
-      first=$AK
+      [ -z "$first" ] || [ "$AK$EXTRA" = "$first" ] || fail keys-file "AuthorizedKeysFile for $acct depends on the address"
+      first=$AK$EXTRA
     done
     d=$(dirname "$AK"); while [ ! -e "$d" ]; do d=$(dirname "$d"); done
     root_only "$d" || fail unsafe-path "$d is not a root-only directory"
     { [ ! -L "$AK" ] && { [ ! -e "$AK" ] || [ -f "$AK" ]; }; } || fail unsafe-path "$AK is not a regular file"
     [ ! -e "$AK" ] || ours "$AK" || fail foreign-keys "$AK has lines asm did not write; remove them, then try again"
+    # sshd also reads the other AuthorizedKeysFile entries: they must not exist, and only
+    # root may create them.
+    for x in $EXTRA; do
+      [ ! -e "$x" ] && [ ! -L "$x" ] \
+        || fail keys-file "sshd also reads $x for $acct; remove it, or set one AuthorizedKeysFile in a Match User asm-ops,asm-priv block"
+      d=$(dirname "$x"); while [ ! -e "$d" ]; do d=$(dirname "$d"); done
+      root_only "$d" || fail unsafe-path "$d is not a root-only directory"
+    done
     if [ "$acct" = asm-ops ]; then OPS_AK=$AK; else PRIV_AK=$AK; fi
   done
   [ "$PRIV_ACCT" = 0 ] || [ "$OPS_AK" != "$PRIV_AK" ] || fail keys-file "asm-ops and asm-priv would share $OPS_AK"
@@ -102,7 +124,7 @@ manifest() {
   {
     printf 'tid=%s\nca=%s\npriv_login=%s\npriv_trust=%s\nport=%s\nops_uid=%s\npriv_uid=%s\nstate=%s\n' \
       "$TID" "$CA_FP" "$PRIV" "$PRIV_TRUST" "$PORT" "$OPS_UID" "$PRIV_UID" "$1"
-    for n in $NAMES; do echo "user=$n"; done
+    for r in $USER_RECORDS; do echo "user=$r"; done
     { echo "$OPS_AK"; [ "$1" = enrolled ] || echo "$OLD_OPS_AK"; } | sed '/^$/d' | sort -u | sed 's/^/ops_ak=/'
     { echo "$PRIV_AK"; [ "$1" = enrolled ] || echo "$OLD_PRIV_AK"; } | sed '/^$/d' | sort -u | sed 's/^/priv_ak=/'
   } > "$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$STATE/manifest" || { rm -f "$tmp"; fail io "cannot write $STATE/manifest"; }
@@ -148,7 +170,6 @@ fi
 tmp=; tmp=$(mktemp /etc/sudoers.d/.asm-ssh.XXXXXX) || fail io "cannot write /etc/sudoers.d"
 {
   echo "# Installed by asm for SSH target $TID; $LIB/asm-remove removes it."
-  echo 'Defaults:asm-ops !requiretty'
   echo "asm-ops ALL=(root) NOPASSWD: $LIB/asm-end-lease register *"
   echo "asm-ops ALL=(root) NOPASSWD: $LIB/asm-end-lease \"\""
   for u in $LOG_UNITS; do echo "asm-ops ALL=(root) NOPASSWD: $LIB/asm-logs $u *"; done
@@ -156,7 +177,6 @@ tmp=; tmp=$(mktemp /etc/sudoers.d/.asm-ssh.XXXXXX) || fail io "cannot write /etc
   if [ "$PRIV_ACCT" = 1 ]; then
     RUNAS=; [ "$PRIV_TRUST" = 0 ] || RUNAS=$PRIV
     for n in $NAMES; do RUNAS="${RUNAS:+$RUNAS, }$n"; done
-    echo 'Defaults:asm-priv !requiretty'
     echo "asm-priv ALL=(root) NOPASSWD: $LIB/asm-end-lease register *"
     echo "asm-priv ALL=($RUNAS) NOPASSWD: ALL"
   fi
@@ -221,6 +241,11 @@ if [ "$PRIV_ACCT" = 1 ]; then
 fi
 for f in $OLD_OPS_AK; do [ "$f" = "$OPS_AK" ] || drop_keys "$f"; done
 for f in $OLD_PRIV_AK; do [ "$f" = "$PRIV_AK" ] || drop_keys "$f"; done
-command -v restorecon >/dev/null 2>&1 && restorecon -R /var/lib/asm-ops /var/lib/asm-priv "$(dirname "$OPS_AK")" >/dev/null 2>&1
+# SELinux labels for exactly what asm created, nothing below or beside it.
+if command -v restorecon >/dev/null 2>&1; then
+  set -- /var/lib/asm-ops "$(dirname "$OPS_AK")" "$OPS_AK"
+  [ "$PRIV_ACCT" = 0 ] || set -- "$@" /var/lib/asm-priv "$(dirname "$PRIV_AK")" "$PRIV_AK"
+  restorecon "$@" >/dev/null 2>&1
+fi
 manifest enrolled
 echo "asm-enroll-ok"

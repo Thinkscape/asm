@@ -54,12 +54,12 @@ type Identities = Arc<RwLock<Vec<Identity>>>;
 /// loaded while missing, `None` before the first load.
 type Stamp = Option<Option<(SystemTime, u64, u64)>>;
 
-/// What every connection shares.
+/// What every connection shares. The API client is built per sign request, so a new
+/// `asm pair` takes effect without restarting the agent.
 struct Shared {
     dir: PathBuf,
     identities: Identities,
     loaded: Mutex<Stamp>,
-    api: Api,
 }
 
 /// Start an agent for `dir` unless one holds the lock, then wait until its socket
@@ -115,7 +115,6 @@ fn serve_dir(dir: &Path) -> Result<(), CliError> {
         dir: dir.to_owned(),
         identities: Arc::new(RwLock::new(Vec::new())),
         loaded: Mutex::new(None),
-        api: Api::for_host(&state::require()?)?,
     });
     let sock = dir.join(AGENT_SOCK);
     match std::fs::remove_file(&sock) {
@@ -286,10 +285,10 @@ fn sign(body: &[u8], shared: &Shared) -> Result<Vec<u8>, String> {
         let key = r.string()?;
         let data = r.string()?;
         r.u32()?;
-        Ok::<_, ()>((key, data))
+        Some((key, data))
     })();
     let (key, data) = match parsed {
-        Ok(v) if r.is_empty() => v,
+        Some(v) if r.is_empty() => v,
         _ => return Err("malformed sign request".into()),
     };
     if data.len() > MAX_SIGN_DATA {
@@ -304,7 +303,10 @@ fn sign(body: &[u8], shared: &Shared) -> Result<Vec<u8>, String> {
         .find(|i| i.expires_at > now && i.blob == key)
         .map(|i| i.lease_id.clone())
         .ok_or("no unexpired lease has this key")?;
-    let resp: SshSignResponse = match shared.api.post_until(
+    let api = state::require()
+        .and_then(|host| Api::for_host(&host))
+        .map_err(|e| format!("lease {lease_id}: {}", e.message))?;
+    let resp: SshSignResponse = match api.post_until(
         "/ssh/sign",
         &SshSignRequest {
             lease_id: lease_id.clone(),

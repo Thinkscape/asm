@@ -425,6 +425,10 @@ private struct SshTargetSheet: View {
     /// Agent port last filled in from a host keys lookup; a value typed over it is kept.
     @State private var filledPort: Int?
     @State private var confirmation: HostKeyConfirmation?
+    /// The pending unknown-host confirmation was asked by Choose Users, not by saving.
+    @State private var trustingForUsers = false
+    /// The operator trusted the keys for Choose Users; the picker opens once the confirmation closes.
+    @State private var usersAfterTrust = false
     /// How ssh reaches the destination the keys were read for: through these ProxyJump
     /// hops, or through a ProxyCommand.
     @State private var proxyJump: String?
@@ -453,6 +457,9 @@ private struct SshTargetSheet: View {
         guard let target else { return false }
         return target.state != .notEnrolled
     }
+
+    /// Keys fetched from the host that the operator hasn't confirmed yet.
+    private var keysNeedTrust: Bool { keySource == .host && trustedKeys != hostKeys.map(\.line) }
 
     /// The host or the login changed, so saving logs in to the host first.
     private var needsHostCheck: Bool {
@@ -496,12 +503,14 @@ private struct SshTargetSheet: View {
         guard unreachable == effectiveDestination, error != nil else { return nil }
         let title = target == nil ? Text("Add Without Checking") : Text("Save Without Checking")
         return SheetAction(title: title) {
+            guard problem == nil, !saving, !checking else { return }
             Task { await saveDraft() }
         }
     }
 
     private func confirmTitle(_ pending: HostKeyConfirmation) -> Text {
         if case .changedKeys = pending { return Text("Use the New Keys and \(saveTitle)") }
+        if trustingForUsers { return Text("Trust and Choose Users") }
         return Text("Trust and \(saveTitle)")
     }
 
@@ -599,7 +608,7 @@ private struct SshTargetSheet: View {
                             .accessibilityLabel(Text("Remove \(user.name)"))
                         }
                     }
-                    Button("Choose Users…") { choosingUsers = true }
+                    Button("Choose Users…", action: chooseUsers)
                         .disabled(!keysCurrent || hostKeys.isEmpty || trimmedLogin.isEmpty)
                 } header: {
                     Text("Other users")
@@ -625,6 +634,7 @@ private struct SshTargetSheet: View {
                 }
             }
             .formStyle(.grouped)
+            .disabled(checking || saving)
             .sheet(isPresented: $choosingUsers) {
                 SshUserPicker(
                     model: model, destination: effectiveDestination, login: trimmedLogin,
@@ -648,7 +658,13 @@ private struct SshTargetSheet: View {
         .onChange(of: focus) { old, _ in
             if old != nil { Task { await lookUp() } }
         }
-        .sheet(item: $confirmation) { pending in
+        .sheet(item: $confirmation, onDismiss: {
+            trustingForUsers = false
+            if usersAfterTrust {
+                usersAfterTrust = false
+                choosingUsers = true
+            }
+        }) { pending in
             HostKeyConfirmationView(confirmation: pending, confirmTitle: confirmTitle(pending), note: nil) {
                 confirmation = nil
             } confirm: {
@@ -661,7 +677,12 @@ private struct SshTargetSheet: View {
                     keySource = .host
                     trustedKeys = presented.map(\.line)
                 }
-                Task { await checkThenSave() }
+                if trustingForUsers {
+                    // The picker is a sheet too: it opens once this one has closed.
+                    usersAfterTrust = true
+                } else {
+                    Task { await checkThenSave() }
+                }
             }
         }
     }
@@ -815,6 +836,16 @@ private struct SshTargetSheet: View {
         }
     }
 
+    /// The picker logs in with the host keys, so keys fetched from the host are confirmed first.
+    private func chooseUsers() {
+        if keysNeedTrust {
+            trustingForUsers = true
+            confirmation = .unknownHost(destination: effectiveDestination, keys: hostKeys)
+        } else {
+            choosingUsers = true
+        }
+    }
+
     private func save() {
         guard problem == nil, !saving, !checking else { return }
         error = nil
@@ -823,7 +854,8 @@ private struct SshTargetSheet: View {
             Task { await saveDraft() }
             return
         }
-        if keySource == .host, trustedKeys != hostKeys.map(\.line) {
+        if keysNeedTrust {
+            trustingForUsers = false
             confirmation = .unknownHost(destination: effectiveDestination, keys: hostKeys)
         } else {
             Task { await checkThenSave() }
@@ -854,6 +886,10 @@ private struct SshTargetSheet: View {
     }
 
     private func saveDraft() async {
+        guard let port = UInt16(exactly: agentPort), port != 0 else {
+            error = String(localized: "The agent port must be 1–65535.")
+            return
+        }
         saving = true
         let draft = SshTargetDraftItem(
             id: target?.id,
@@ -861,7 +897,7 @@ private struct SshTargetSheet: View {
             name: trimmedName,
             destination: override(destination),
             agentHostname: override(agentHostname),
-            agentPort: UInt16(agentPort),
+            agentPort: port,
             privilegedLogin: trimmedLogin,
             hostKeys: hostKeys.map(\.line),
             allowPrivileged: allowPrivileged,
@@ -1115,7 +1151,6 @@ private struct SshEnrollReview: View {
         let tail = "asm managed CA <CA fp> asm-ca-\(tid)"
         let keysOwner = String(localized: "root 0644 in a root-only directory chain")
         var rules = [
-            "Defaults:asm-ops !requiretty",
             "asm-ops ALL=(root) NOPASSWD: /usr/lib/asm-ssh/asm-end-lease register *",
             "asm-ops ALL=(root) NOPASSWD: /usr/lib/asm-ssh/asm-end-lease \"\"",
         ]
@@ -1125,7 +1160,6 @@ private struct SshEnrollReview: View {
         let runAs = (target.allowPrivileged ? [target.privilegedLogin] : []) + target.users.map(\.name)
         if !runAs.isEmpty {
             rules += [
-                "Defaults:asm-priv !requiretty",
                 "asm-priv ALL=(root) NOPASSWD: /usr/lib/asm-ssh/asm-end-lease register *",
                 "asm-priv ALL=(\(runAs.joined(separator: ", "))) NOPASSWD: ALL",
             ]

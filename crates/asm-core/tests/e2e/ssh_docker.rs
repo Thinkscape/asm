@@ -8,7 +8,8 @@ use asm_core::store::SshTargetRecord;
 use std::process::{Child, ChildStdin};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const BASES: [&str; 2] = ["debian:12", "debian:13"];
+/// Base images and their sudo package: classic sudo on Debian, sudo-rs on Ubuntu 26.04.
+const BASES: [(&str, &str); 3] = [("debian:12", "sudo"), ("debian:13", "sudo"), ("ubuntu:26.04", "sudo-rs")];
 
 fn docker(args: &[&str], stdin: Option<&[u8]>) -> Out {
     let mut child = Command::new("docker")
@@ -269,18 +270,18 @@ fn ssh_host_scripts_on_linux() {
         return;
     }
     let cli = build_cli();
-    for base in BASES {
-        eprintln!("== {base}");
-        host_scripts_on(base, &cli, &bin_dir);
+    for (base, sudo) in BASES {
+        eprintln!("== {base} ({sudo})");
+        host_scripts_on(base, sudo, &cli, &bin_dir);
     }
 }
 
-fn host_scripts_on(base: &str, cli: &Path, bin_dir: &Path) {
+fn host_scripts_on(base: &str, sudo: &str, cli: &Path, bin_dir: &Path) {
     // ---- Setup ----
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ssh-target");
     let image = format!("asm-ssh-target:{}", base.replace(':', "-"));
-    let built = docker(&["build", "-q", "--build-arg", &format!("BASE={base}"), "-t", &image,
-        fixture.to_str().unwrap()], None);
+    let built = docker(&["build", "-q", "--build-arg", &format!("BASE={base}"), "--build-arg", &format!("SUDO={sudo}"),
+        "-t", &image, fixture.to_str().unwrap()], None);
     assert_eq!(built.code, 0, "docker build {image}: {}", built.stderr);
     let started = docker(&["run", "-d", "--privileged", "--cgroupns=host", "-v", "/sys/fs/cgroup:/sys/fs/cgroup:rw",
         "--tmpfs", "/run", "--tmpfs", "/run/lock", "-p", "127.0.0.1::22", &image], None);
@@ -398,6 +399,14 @@ fn host_scripts_on(base: &str, cli: &Path, bin_dir: &Path) {
     c.ok("test ! -e /var/lib/asm-ssh && test ! -e /usr/lib/asm-ssh");
     c.ok("userdel asm-ops");
 
+    // ---- 1b. Other ways sshd could let someone in as an asm account are refused. ----
+    c.ok("ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/other-ca && echo 'TrustedUserCAKeys /etc/ssh/other-ca.pub' > /etc/ssh/sshd_config.d/asm-test-ca.conf");
+    let revision = manager.list_ssh_targets().unwrap().into_iter().find(|i| i.id == tid).unwrap().revision;
+    let refused = manager.enroll_ssh_target(tid.clone(), revision).expect_err("enrolled with a host-wide user CA");
+    assert!(refused.to_string().contains("auth-path") && refused.to_string().contains("TrustedUserCAKeys"), "{refused}");
+    c.ok("test ! -e /var/lib/asm-ssh && test ! -e /usr/lib/asm-ssh");
+    c.ok("printf 'Match User asm-ops,asm-priv\\n    TrustedUserCAKeys none\\n' >> /etc/ssh/sshd_config.d/asm-test-ca.conf");
+
     // ---- 2. Enroll. ----
     let revision = manager.list_ssh_targets().unwrap().into_iter().find(|i| i.id == tid).unwrap().revision;
     let enrolled = manager.enroll_ssh_target(tid.clone(), revision).expect("enroll");
@@ -415,7 +424,8 @@ fn host_scripts_on(base: &str, cli: &Path, bin_dir: &Path) {
     assert_eq!(c.ok("sha256sum /root/.ssh/authorized_keys"), root_keys);
     let priv_rules = c.ok("sudo -l -U asm-priv");
     assert!(priv_rules.contains("(root, deploy, ops, www-data) NOPASSWD: ALL"), "{priv_rules}");
-    assert_eq!(c.ok("sed -n 's/^user=//p' /var/lib/asm-ssh/manifest"), "deploy\nops\nwww-data");
+    assert_eq!(c.ok("sed -n 's/^user=//p' /var/lib/asm-ssh/manifest | cut -d: -f1,3"), "deploy:0\nops:1\nwww-data:0");
+    assert_eq!(c.ok("sed -n 's/^user=www-data://p' /var/lib/asm-ssh/manifest"), "33:0");
     assert_eq!(c.ok(&format!("grep -c '{marker}' /var/lib/asm-priv/.ssh/authorized_keys")), "2");
 
     // ---- 3. Privileged command, sftp, and plain ssh through the Include. ----
@@ -447,11 +457,29 @@ fn host_scripts_on(base: &str, cli: &Path, bin_dir: &Path) {
     let refused = asm.run(&["ssh", "request", "lin", "u3", "--as", "games", "--", "id", "-un"]);
     assert_eq!(refused.code, 2, "{}", refused.stderr);
     assert!(refused.stderr.contains("does not allow access as games"), "{}", refused.stderr);
+    // deploy joins sudo after enrollment: its logins are refused until the target is
+    // enrolled again, which refuses it too.
     c.ok("usermod -aG sudo deploy");
+    let drift = asm.run(&["ssh", "request", "lin", "u1", "--as", "deploy", "--", "id", "-un"]);
+    assert_eq!(drift.code, 126, "{}{}", drift.stdout, drift.stderr);
+    assert!(drift.stderr.contains("deploy can now become root (in group sudo)"), "{}", drift.stderr);
     let changed = manager.enroll_ssh_target(tid.clone(), revision).expect_err("enrolled a user that became root");
     assert!(changed.to_string().contains("deploy can now become root (in group sudo)"), "{changed}");
+    // Enrolling ended the target's leases; their cleanup finishes before enrolling again
+    // (until the cleanup thread lets go of the target, enrolling asks to try again).
+    for reason in ["r1", "u1", "u2"] {
+        wait_cleanup(manager, reason, 60, |state, _| matches!(state, Some(SshCleanupState::Done)));
+    }
     c.ok("gpasswd -d deploy sudo >/dev/null");
-    let again = manager.enroll_ssh_target(tid.clone(), revision).expect("enroll again");
+    let mut again = None;
+    wait_for("the target to be free to enroll", 30, || match manager.enroll_ssh_target(tid.clone(), revision) {
+        Err(e) if e.to_string().contains("try again in a moment") => false,
+        other => {
+            again = Some(other);
+            true
+        }
+    });
+    let again = again.unwrap().expect("enroll again");
     assert_eq!(again.state, SshTargetState::Enrolled, "{:?}", again.error);
 
     // ---- 4. Logs. ----

@@ -197,14 +197,20 @@ pub fn config_path(path: &Path) -> Result<String, CliError> {
     }
 }
 
-/// The `Host` block of one target of one lease. Names and addresses were validated, so
-/// they hold no whitespace, quotes or pattern characters.
-pub fn render_block(dir: &Path, lease: &LocalSshLease, t: &SshTargetAccess) -> Result<String, CliError> {
+/// The `Host` block of one target of one lease, matching its name and, when `alias`,
+/// its address. Names and addresses were validated, so they hold no whitespace, quotes
+/// or pattern characters.
+pub fn render_block(
+    dir: &Path,
+    lease: &LocalSshLease,
+    t: &SshTargetAccess,
+    alias: bool,
+) -> Result<String, CliError> {
     let ldir = lease_dir(dir, &lease.lease_id);
     let known_hosts = config_path(&ldir.join(KNOWN_HOSTS_FILE))?;
     let agent = config_path(&dir.join(AGENT_SOCK))?;
     let identity = config_path(&ldir.join(CERT_FILE))?;
-    let also = if t.hostname != t.name {
+    let also = if alias {
         format!(" {}", t.hostname)
     } else {
         String::new()
@@ -219,11 +225,20 @@ pub fn render_block(dir: &Path, lease: &LocalSshLease, t: &SshTargetAccess) -> R
     ))
 }
 
+/// Whether `t`'s address can be a `Host` alias in a file with blocks for `targets`
+/// (`t` among them): ssh uses the first block that matches, so the alias must not be
+/// a target's name or another target's address.
+fn address_alias(t: &SshTargetAccess, targets: &[&SshTargetAccess]) -> bool {
+    !targets.iter().any(|o| o.name == t.hostname)
+        && targets.iter().filter(|o| o.hostname == t.hostname).count() == 1
+}
+
 /// `<lease dir>/config`.
 pub fn render_config(dir: &Path, lease: &LocalSshLease) -> Result<String, CliError> {
+    let targets: Vec<&SshTargetAccess> = lease.targets.iter().collect();
     let mut out = format!("# Written by asm ssh for lease {}.\n", lease.lease_id);
     for t in &lease.targets {
-        let _ = write!(out, "\n{}", render_block(dir, lease, t)?);
+        let _ = write!(out, "\n{}", render_block(dir, lease, t, address_alias(t, &targets))?);
     }
     Ok(out)
 }
@@ -241,9 +256,10 @@ pub fn render_hosts_conf(dir: &Path, leases: &[LocalSshLease]) -> Result<String,
             }
         }
     }
+    let targets: Vec<&SshTargetAccess> = newest.values().map(|(_, t)| *t).collect();
     let mut out = String::from(HOSTS_CONF_HEADER);
-    for (l, t) in newest.into_values() {
-        let _ = write!(out, "\n{}", render_block(dir, l, t)?);
+    for (l, t) in newest.values() {
+        let _ = write!(out, "\n{}", render_block(dir, l, t, address_alias(t, &targets))?);
     }
     Ok(out)
 }
@@ -316,6 +332,32 @@ pub(super) mod tests {
         assert!(conf.contains(&format!("/d/{A}/cert.pub")), "{conf}");
         a.expires_at = now - 1;
         assert_eq!(render_hosts_conf(Path::new("/d"), &[a, b]).unwrap(), HOSTS_CONF_HEADER);
+    }
+
+    #[test]
+    fn address_aliases_never_shadow_another_block() {
+        let now = unix_now();
+        // db's address is web's name: only web's block may match `web`.
+        let mut a = lease(A, now + 100, "db");
+        a.targets[0].hostname = "web".into();
+        let mut b = lease(B, now + 100, "web");
+        b.targets[0].hostname = "web.example.com".into();
+        let conf = render_hosts_conf(Path::new("/d"), &[a.clone(), b.clone()]).unwrap();
+        assert!(conf.contains("\nHost db\n  HostName web\n"), "{conf}");
+        assert!(conf.contains("\nHost web web.example.com\n"), "{conf}");
+        // Two targets at one address: neither block takes it.
+        a.targets[0].hostname = "10.0.0.5".into();
+        b.targets[0].hostname = "10.0.0.5".into();
+        let conf = render_hosts_conf(Path::new("/d"), &[a.clone(), b]).unwrap();
+        assert!(conf.contains("\nHost db\n") && conf.contains("\nHost web\n"), "{conf}");
+        // The same within one lease's config.
+        let web = SshTargetAccess {
+            name: "web".into(),
+            ..a.targets[0].clone()
+        };
+        a.targets.push(web);
+        let config = render_config(Path::new("/d"), &a).unwrap();
+        assert!(config.contains("\nHost db\n") && config.contains("\nHost web\n"), "{config}");
     }
 
     #[test]

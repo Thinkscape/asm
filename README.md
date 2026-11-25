@@ -361,7 +361,7 @@ Agents can log in to SSH hosts without ever holding a reusable key. The manager 
 
    The Mac's ssh destination and the address agents connect to default to the host name. Set them only for exceptions such as split DNS. The sheet takes the host keys from your `known_hosts` as you type; asm never writes to it. If it has no key for the destination (check for a typo), **Get Keys from Host** asks the host without logging in. **Add** then logs in as the privileged login, the way enrollment will, pinned to those keys (with `sudo -n` unless the login is root). Keys that came from the host, or a host that proves none of the expected keys, need a separate confirmation first: compare a fingerprint with the host's console (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), because a mismatch can mean someone is intercepting the connection. If the host can't be reached, **Add Without Checking** saves it anyway; enrollment checks it later.
 
-   A host behind a jump host works as your ssh config sets it up (`ProxyJump`, `ProxyCommand`), and the sheet shows the route. Every ssh run asm starts uses its own config, which includes yours but checks every host strictly: jump hosts must already be in your `known_hosts`, and asm never adds them.
+   A host behind a jump host works as your ssh config sets it up (`ProxyJump`, `ProxyCommand`), and the sheet shows the route. Every ssh run asm starts uses its own config, which includes yours but checks every host strictly: jump hosts must already be in your `known_hosts`, and asm never adds them. A `ProxyCommand` that uses `%n`, `%r`, `%k` or `%C` is refused before enrollment changes the host, because asm's unattended runs use their own host alias and login.
 2. **Enroll** runs a reviewed script as root over your own ssh. No existing account or file changes, no global sshd setting changes, and sshd is not reloaded. It installs:
    - `/usr/lib/asm-ssh/` (`asm-dispatch`, `asm-shell`, `asm-end-lease`, `asm-logs`, `asm-remove`);
    - `/var/lib/asm-ssh/manifest`, a record of everything asm installed;
@@ -374,12 +374,18 @@ Agents can log in to SSH hosts without ever holding a reusable key. The manager 
 
    If a run on the host (enroll, removal or cleanup) finds that it no longer proves its pinned host key, the target shows **Host key changed** and asm opens the review: the expected keys next to the ones the host sent. **Review Host Key** does the same at any time. **Use the New Keys** pins them after the same fingerprint check, ends the target's leases and asks for enrolling again.
 
-   **Other users.** **Choose Users…** logs in as the privileged login and lists the host's accounts in three groups: users, accounts that can become root (uid 0, a group such as `sudo`, `wheel`, `docker` or `lxd`, or any sudo rule), and system accounts. Access as an account that can become root is privileged access, so choosing one needs **Allow privileged access**. Accounts without a login shell (such as `www-data`) get `/bin/sh`. Enrollment checks each user again and fails when one gained or lost a way to become root since you chose it; choose the users again. Changing the users ends the target's leases, and enrolling again applies them.
+   **Other users.** **Choose Users…** logs in as the privileged login and lists the host's accounts in three groups: users, accounts that can become root (uid 0, a group such as `sudo`, `wheel`, `docker` or `lxd`, or any sudo rule), and system accounts. Access as an account that can become root is privileged access, so choosing one needs **Allow privileged access**. Accounts without a login shell (such as `www-data`) get `/bin/sh`. Enrollment checks each user again and fails when one gained or lost a way to become root since you chose it; choose the users again. Every login as a user checks the same: an account that isn't the one enrolled (another UID), or that gained a way to become root you didn't choose, is refused until you enroll the target again. Changing the users ends the target's leases, and enrolling again applies them.
 
    Requirements:
-   - Linux with systemd, and ssh logins registered with systemd-logind (`UsePAM yes` with `pam_systemd`);
-   - sudo, and a per-account `AuthorizedKeysFile` inside root-owned directories;
-   - for the asm accounts: `PermitTunnel no`, no `ForceCommand`, `PermitUserEnvironment no`, and no `AcceptEnv` beyond `LANG LC_* COLORTERM NO_COLOR`.
+   - Linux with systemd, and ssh logins registered with systemd-logind (`UsePAM yes` with `pam_systemd`); tested on Debian 12 and 13 and Ubuntu 24.04 and 26.04 (sudo-rs); hosts with SELinux enforcing are untested;
+   - sudo or sudo-rs, and a per-account `AuthorizedKeysFile` inside root-owned directories; sshd's other `AuthorizedKeysFile` entries (such as the default `.ssh/authorized_keys2`) must not exist;
+   - for the asm accounts: `PermitTunnel no`, no `ForceCommand`, `PermitUserEnvironment no`, and no `AcceptEnv` beyond `LANG LC_* COLORTERM NO_COLOR`;
+   - for the asm accounts, no other way in: `AuthorizedKeysCommand`, `AuthorizedPrincipalsCommand` and `TrustedUserCAKeys` set to `none`, and `HostbasedAuthentication`, `GSSAPIAuthentication` and `KerberosAuthentication` set to `no`. On a host that uses them (an organization SSH CA, EC2 Instance Connect, Kerberos), turn them off for asm's accounts only:
+     ```
+     Match User asm-ops,asm-priv
+         TrustedUserCAKeys none
+         AuthorizedKeysCommand none
+     ```
 
 **On the agent machine:**
 ```sh
@@ -413,7 +419,7 @@ Each lease prints one connect line per host: `ssh <host>` after `asm ssh install
 **Ending a lease** stops new logins at once (the manager refuses to sign).
 - The manager then ends the lease's sessions on each host, logging in with a 5-minute certificate as `asm-ops`. Your own keys and ssh settings never reach the host; only a jump host uses them.
 - Each host's timer also ends sessions at the lease's expiry, even while the Mac is asleep or offline.
-- **Leases** shows the outcome per host, as reported by the host. A host the Mac can't reach is retried for 24 hours; a privileged lease whose cleanup fails also raises a notification. **Retry Cleanup** runs a failed cleanup again.
+- **Leases** shows the outcome per host, as reported by the host. A host the Mac can't reach is retried for 24 hours; a privileged lease or a lease as a user whose cleanup fails also raises a notification. **Retry Cleanup** runs a failed cleanup again.
 
 **Limits.**
 - A privileged login can keep access after the lease, for example by adding its own key. The lease ends only the route in, so prefer restricted grants.

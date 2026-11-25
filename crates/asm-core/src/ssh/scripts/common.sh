@@ -33,15 +33,24 @@ snap() {
 }
 # val KEY: every value of KEY in SNAP, one per line.
 val() { printf '%s\n' "$SNAP" | awk -v k="$1" '$1 == k { $1 = ""; sub(/^ /, ""); print }'; }
-# akfile ACCOUNT HOME: set AK to ACCOUNT's first AuthorizedKeysFile (from SNAP) as an
-# absolute path. Returns 1 with the reason in WHY.
+# akfile ACCOUNT HOME: set AK to ACCOUNT's first AuthorizedKeysFile (from SNAP) and EXTRA
+# to the others, as absolute paths. Returns 1 with the reason in WHY.
 akfile() {
-  AK=$(val authorizedkeysfile | awk '{ print $1 }'); WHY=
-  case "$AK" in ''|none) WHY="sshd reads no authorized_keys file for $1"; return 1 ;; esac
-  case "$AK" in *%U*) WHY="AuthorizedKeysFile $AK uses %U; use %h or %u"; return 1 ;; esac
-  case "$AK" in /*%h*|/*%u*|[!/]*) ;; *) WHY="AuthorizedKeysFile $AK is one file for every account; asm needs a per-account file"; return 1 ;; esac
-  AK=$(printf '%s\n' "$AK" | sed -e "s|%h|$2|g" -e "s|%u|$1|g")
-  case "$AK" in *%*|*/../*|*/./*) WHY="unsupported AuthorizedKeysFile $AK"; return 1 ;; /*) ;; *) AK="$2/$AK" ;; esac
+  AK=; EXTRA=; WHY=
+  for f in $(val authorizedkeysfile); do
+    [ "$f" != none ] || continue
+    case "$f" in *%U*) WHY="AuthorizedKeysFile $f uses %U; use %h or %u"; return 1 ;; esac
+    case "$f" in /*%h*|/*%u*|[!/]*) ;; *) WHY="AuthorizedKeysFile $f is one file for every account; asm needs a per-account file"; return 1 ;; esac
+    f=$(printf '%s\n' "$f" | sed -e "s|%h|$2|g" -e "s|%u|$1|g")
+    case "$f" in *%*|*/../*|*/./*) WHY="unsupported AuthorizedKeysFile $f"; return 1 ;; /*) ;; *) f="$2/$f" ;; esac
+    if [ -z "$AK" ]; then AK=$f; elif [ "$f" != "$AK" ]; then EXTRA="$EXTRA $f"; fi
+  done
+  [ -n "$AK" ] || { WHY="sshd reads no authorized_keys file for $1"; return 1; }
+}
+# root_file FILE: FILE is a regular file owned by root and not writable by group or others.
+root_file() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %u "$1")" = 0 ] || return 1
+  case "$(stat -c %A "$1")" in ?????w????|????????w?) return 1 ;; esac
 }
 # ours FILE: every line of FILE is one asm wrote for this target (an I/O error is not).
 ours() { grep -qv " $MARK\$" "$1"; [ "$?" -eq 1 ]; }
@@ -70,19 +79,6 @@ drop_account() {
   done
   userdel "$1" || fail userdel "userdel $1 failed"
   if [ -d "/var/lib/$1" ] && root_only "/var/lib/$1"; then rm -rf "/var/lib/$1"; fi
-}
-# admin_why USER: why USER can become root ("uid 0", "in group docker", "has sudo rules");
-# nothing when asm finds no way. Groups that grant root through a daemon or the disk count.
-# Needs root, for sudo -l -U.
-admin_why() {
-  [ "$(id -u "$1" 2>/dev/null)" != 0 ] || { echo "uid 0"; return 0; }
-  for g in $(id -Gn "$1" 2>/dev/null); do
-    case "$g" in root|sudo|wheel|admin|docker|lxd|incus-admin|libvirt|disk) echo "in group $g"; return 0 ;; esac
-  done
-  case "$(LC_ALL=C timeout 10 sudo -n -l -U "$1" 2>&1)" in
-    *"is not allowed to run sudo"*) ;;
-    *) echo "has sudo rules" ;;
-  esac
 }
 # shell_ok SHELL: SHELL can run a login session (asm-shell uses /bin/sh otherwise).
 shell_ok() {

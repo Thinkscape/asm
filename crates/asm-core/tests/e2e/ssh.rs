@@ -280,7 +280,7 @@ fn jump_hosts_are_checked_but_never_added_to_known_hosts() {
 
     let known = format!("[127.0.0.1]:{port} {host_key}\n");
     std::fs::write(&operator_known_hosts, &known).unwrap();
-    assert_eq!(fetch_host_keys("via-jump", Some(&config), &run_dir("fetch-known")).unwrap(), [host_key.clone()]);
+    assert_eq!(fetch_host_keys("via-jump", Some(&config), &run_dir("fetch-known")).unwrap(), std::slice::from_ref(&host_key));
     match check_destination("via-jump", &me, std::slice::from_ref(&host_key), Some(&config), &run_dir("check-known")) {
         Ok(HostCheck::Verified) => {}
         Err(e) => assert!(e.message.contains("needs passwordless sudo"), "{}", e.message),

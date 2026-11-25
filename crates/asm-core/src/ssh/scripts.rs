@@ -7,6 +7,8 @@ use crate::error::{CoreError, Result};
 
 /// Shared helpers, prepended to `ENROLL` and `REMOVE`.
 pub(crate) const COMMON: &str = include_str!("scripts/common.sh");
+/// `admin_why`, after `COMMON` in `ENROLL` and `USERS` and inside the installed `END_LEASE`.
+pub(crate) const ADMIN: &str = include_str!("scripts/admin.sh");
 pub(crate) const ENROLL: &str = include_str!("scripts/enroll.sh");
 pub(crate) const REMOVE: &str = include_str!("scripts/remove.sh");
 /// `asm-dispatch`, the login shell of `asm-ops`.
@@ -15,8 +17,13 @@ pub(crate) const DISPATCH: &str = include_str!("scripts/dispatch.sh");
 pub(crate) const SHELL: &str = include_str!("scripts/shell.sh");
 pub(crate) const LOGS: &str = include_str!("scripts/logs.sh");
 pub(crate) const END_LEASE: &str = include_str!("scripts/end-lease.sh");
-/// Lists the accounts of a host agents could log in as (after `COMMON`).
+/// Lists the accounts of a host agents could log in as (after `COMMON` and `ADMIN`).
 pub(crate) const USERS: &str = include_str!("scripts/users.sh");
+
+/// `asm-end-lease` as enrollment installs it, with `admin_why` in place.
+fn end_lease() -> String {
+    END_LEASE.replace("@@ADMIN@@\n", ADMIN)
+}
 
 pub(crate) struct EnrollParams<'a> {
     pub target_id: &'a str,
@@ -82,10 +89,10 @@ pub(crate) fn render_enroll(p: &EnrollParams<'_>) -> Result<String> {
         return Err(CoreError::internal("invalid agent port"));
     }
     let remove = format!("{COMMON}{REMOVE}");
-    Ok(format!("{COMMON}{ENROLL}")
+    Ok(format!("{COMMON}{ADMIN}{ENROLL}")
         .replace("@@DISPATCH@@", DISPATCH.trim_end_matches('\n'))
         .replace("@@SHELL@@", SHELL.trim_end_matches('\n'))
-        .replace("@@END_LEASE@@", END_LEASE.trim_end_matches('\n'))
+        .replace("@@END_LEASE@@", end_lease().trim_end_matches('\n'))
         .replace("@@LOGS@@", LOGS.trim_end_matches('\n'))
         .replace("@@REMOVE@@", remove.trim_end_matches('\n'))
         .replace("@@TID@@", p.target_id)
@@ -112,7 +119,7 @@ pub(crate) fn render_remove(target_id: &str) -> Result<String> {
 /// (`users.sh`).
 pub(crate) fn render_users(privileged_login: &str) -> Result<String> {
     validate_login(privileged_login).map_err(|e| CoreError::internal(e.message))?;
-    Ok(format!("{COMMON}{USERS}").replace("@@PRIV@@", privileged_login))
+    Ok(format!("{COMMON}{ADMIN}{USERS}").replace("@@PRIV@@", privileged_login))
 }
 
 /// Stdin for the cleanup login: end one lease and its recorded sessions.
@@ -168,12 +175,14 @@ mod tests {
     #[test]
     fn scripts_parse_and_installed_scripts_have_no_heredoc_terminator() {
         let remove = format!("{COMMON}{REMOVE}");
-        for script in [&format!("{COMMON}{ENROLL}"), &remove, &format!("{COMMON}{USERS}"), DISPATCH, SHELL, LOGS,
-            END_LEASE]
+        let end_lease = end_lease();
+        assert!(!end_lease.contains("@@"));
+        for script in [&format!("{COMMON}{ADMIN}{ENROLL}"), &remove, &format!("{COMMON}{ADMIN}{USERS}"), DISPATCH,
+            SHELL, LOGS, &end_lease]
         {
             assert!(sh_syntax_ok(script), "{script}");
         }
-        for script in [DISPATCH, SHELL, END_LEASE, LOGS, &remove] {
+        for script in [DISPATCH, SHELL, &end_lease, LOGS, &remove] {
             assert!(!script.lines().any(|l| l == "ASM_EOF"), "{script}");
         }
     }
@@ -293,7 +302,7 @@ mod tests {
         }
         // SAFETY: geteuid has no preconditions.
         if unsafe { libc::geteuid() } != 0 {
-            let (code, out, _) = run(END_LEASE, "asm-end-lease", &[], None);
+            let (code, out, _) = run(&end_lease(), "asm-end-lease", &[], None);
             assert_eq!(code, 3);
             assert!(out.starts_with("asm-end-error not-root "), "{out}");
         }

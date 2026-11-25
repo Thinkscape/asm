@@ -125,7 +125,7 @@ pub fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// Reads SSH wire values; every read fails on truncated input.
+/// Reads SSH wire values; every read is `None` on truncated input.
 pub struct Reader<'a> {
     data: &'a [u8],
 }
@@ -135,32 +135,32 @@ impl<'a> Reader<'a> {
         Self { data }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], ()> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         if self.data.len() < n {
-            return Err(());
+            return None;
         }
         let (head, rest) = self.data.split_at(n);
         self.data = rest;
-        Ok(head)
+        Some(head)
     }
 
-    pub fn u8(&mut self) -> Result<u8, ()> {
-        Ok(self.take(1)?[0])
+    pub fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
     }
 
-    pub fn u32(&mut self) -> Result<u32, ()> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| ())?))
+    pub fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
     }
 
-    pub fn u64(&mut self) -> Result<u64, ()> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().map_err(|_| ())?))
+    pub fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
     }
 
-    pub fn bool(&mut self) -> Result<bool, ()> {
-        Ok(self.u8()? != 0)
+    pub fn bool(&mut self) -> Option<bool> {
+        Some(self.u8()? != 0)
     }
 
-    pub fn string(&mut self) -> Result<&'a [u8], ()> {
+    pub fn string(&mut self) -> Option<&'a [u8]> {
         let n = self.u32()? as usize;
         self.take(n)
     }
@@ -309,15 +309,15 @@ mod tests {
         put_string(&mut out, b"hello");
         out.push(1);
         let mut r = Reader::new(&out);
-        assert_eq!(r.u8(), Ok(7));
-        assert_eq!(r.u32(), Ok(0xdead_beef));
-        assert_eq!(r.u64(), Ok(u64::MAX - 1));
-        assert_eq!(r.string(), Ok(&b"hello"[..]));
-        assert_eq!(r.bool(), Ok(true));
+        assert_eq!(r.u8(), Some(7));
+        assert_eq!(r.u32(), Some(0xdead_beef));
+        assert_eq!(r.u64(), Some(u64::MAX - 1));
+        assert_eq!(r.string(), Some(&b"hello"[..]));
+        assert_eq!(r.bool(), Some(true));
         assert!(r.is_empty());
-        assert!(r.u8().is_err());
+        assert!(r.u8().is_none());
         let mut short = Reader::new(&[0, 0, 0, 9, 1, 2]);
-        assert!(short.string().is_err());
+        assert!(short.string().is_none());
         assert_eq!(b64_decode(&b64_encode(b"\x00\xffabc")), Some(b"\x00\xffabc".to_vec()));
         assert_eq!(b64_decode("not base64!"), None);
     }

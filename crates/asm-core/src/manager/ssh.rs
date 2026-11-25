@@ -157,6 +157,12 @@ impl From<RemoteError> for CoreError {
 pub trait SshRemote: Send + Sync {
     fn run(&self, target: &SshTargetRecord, auth: &RemoteAuth, stdin: &str, timeout: Duration)
         -> std::result::Result<RemoteOutput, RemoteError>;
+
+    /// Checks that certificate runs on `target` can use the operator's route to it,
+    /// without connecting; `dir` is a private directory for the run.
+    fn check_route(&self, _target: &SshTargetRecord, _dir: &Path) -> std::result::Result<(), RemoteError> {
+        Ok(())
+    }
 }
 
 #[doc(hidden)]
@@ -179,9 +185,11 @@ impl OpenSshRemote {
         operator_ssh(&wrapper, &self.known_hosts, &target.id, &c.privileged_login, &c.destination)
     }
 
-    fn certificate_command(
-        &self, target: &SshTargetRecord, login: &str, dir: &Path, command: Option<&str>,
-    ) -> std::result::Result<Command, RemoteError> {
+    /// asm's config for a certificate run on `target` as `login`, from what `ssh -G`
+    /// says of the operator's route.
+    fn certificate_route_config(&self, target: &SshTargetRecord, login: &str, dir: &Path)
+        -> std::result::Result<String, RemoteError>
+    {
         let destination = &target.config.destination;
         let wrapper = write_wrapper_config(dir, self.config.as_deref()).map_err(|e| RemoteError::Local(e.message))?;
         let mut g = Command::new(SSH);
@@ -192,10 +200,16 @@ impl OpenSshRemote {
             return Err(RemoteError::Local(format!("could not read your ssh settings for {destination}: {why}")));
         }
         let route = parse_route(&stdout).map_err(|e| RemoteError::Local(e.message))?;
-        let text = render_certificate_config(&route, &self.known_hosts, &target.id, login, dir,
-            Some(&wrapper), destination).map_err(|e| RemoteError::Local(e.message))?;
-        write_private_atomic(dir, "config", text.as_bytes())
-            .map_err(|e| RemoteError::Local(format!("could not write the ssh config for {destination}: {e}")))?;
+        render_certificate_config(&route, &self.known_hosts, &target.id, login, dir, Some(&wrapper), destination)
+            .map_err(|e| RemoteError::Local(e.message))
+    }
+
+    fn certificate_command(
+        &self, target: &SshTargetRecord, login: &str, dir: &Path, command: Option<&str>,
+    ) -> std::result::Result<Command, RemoteError> {
+        let text = self.certificate_route_config(target, login, dir)?;
+        write_private_atomic(dir, "config", text.as_bytes()).map_err(|e| RemoteError::Local(
+            format!("could not write the ssh config for {}: {e}", target.config.destination)))?;
         let mut run = Command::new(SSH);
         run.arg("-F").arg(dir.join("config")).args(["-T", "asm-target"]);
         if let Some(command) = command {
@@ -216,6 +230,10 @@ impl SshRemote for OpenSshRemote {
         let (status, stdout, stderr) = run_local(command, Some(stdin), timeout)
             .map_err(|e| RemoteError::Unreachable(e.message))?;
         Ok(RemoteOutput { status, stdout, stderr })
+    }
+
+    fn check_route(&self, target: &SshTargetRecord, dir: &Path) -> std::result::Result<(), RemoteError> {
+        self.certificate_route_config(target, RESTRICTED_LOGIN, dir).map(drop)
     }
 }
 
@@ -317,6 +335,10 @@ fn render_certificate_config(
             if command.trim().is_empty() || command.chars().any(char::is_control) {
                 return Err(refused());
             }
+            if uses_login_tokens(command) {
+                return Err(CoreError::invalid(format!(
+                    "asm cannot use the ProxyCommand of {destination} for unattended runs: it uses %n, %r, %k or %C")));
+            }
             Some(command.clone())
         }
         (None, Some(spec)) => {
@@ -356,6 +378,19 @@ fn render_certificate_config(
         text.push_str(&format!("  ProxyCommand {proxy}\n"));
     }
     Ok(text)
+}
+
+/// Whether `command` uses a `%` token for the original host name, the login, the host
+/// key alias or their hash: asm runs it under its own `Host asm-target` and logins.
+fn uses_login_tokens(command: &str) -> bool {
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        // `%%` is a literal `%`, so the character after it is not a token.
+        if c == '%' && matches!(chars.next(), Some('n' | 'r' | 'k' | 'C')) {
+            return true;
+        }
+    }
+    false
 }
 
 /// asm's ssh config for runs over the operator's route. It is given with `-F`, and ssh
@@ -426,7 +461,9 @@ fn connection_error(target: &SshTargetRecord, stderr: &str) -> RemoteError {
 /// jump hosts and proxies included) without authenticating. Each key type gets one
 /// connection that records the offered key in a throwaway `known_hosts` in `run_dir`
 /// (`StrictHostKeyChecking=accept-new`) and then fails authentication, since every
-/// method is off. The keys are unverified: whoever answers at that address chooses them.
+/// method is off. ssh records the key before it checks the key exchange signature, so a
+/// run's key counts only when the run got as far as `Permission denied`. The keys are
+/// unverified: whoever answers at that address chooses them.
 /// `config` is the operator's ssh config asm's own config includes (tests; `None` in use).
 #[doc(hidden)]
 pub fn fetch_host_keys(destination: &str, config: Option<&Path>, run_dir: &Path) -> Result<Vec<String>> {
@@ -453,6 +490,9 @@ pub fn fetch_host_keys(destination: &str, config: Option<&Path>, run_dir: &Path)
                 }
                 command.args(["--", destination, "true"]);
                 let (_, _, stderr) = run_local(command, None, SCAN_TIMEOUT)?;
+                if !stderr.contains("Permission denied") {
+                    return Ok((Vec::new(), stderr));
+                }
                 let text = match std::fs::read_to_string(&file) {
                     Ok(text) => text,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -1305,8 +1345,8 @@ impl Core {
         config.validate()?;
         self.refuse_pinned_elsewhere(Some(id), &config.host_keys)?;
         let revision = self.store.update_ssh_target(id, &target.name, &config, expected_revision)?;
-        self.write_ssh_known_hosts()?;
         self.end_target_leases(id, "target host keys replaced")?;
+        self.write_ssh_known_hosts()?;
         drop(busy);
         self.kick_ssh_cleanup();
         self.mark_host_key(id, false);
@@ -1437,10 +1477,10 @@ impl Core {
                 (id, revision)
             }
         };
-        self.write_ssh_known_hosts()?;
         if revision > 1 {
             self.end_target_leases(&id, "target changed")?;
         }
+        self.write_ssh_known_hosts()?;
         drop(_busy);
         if revision > 1 {
             self.kick_ssh_cleanup();
@@ -1452,14 +1492,16 @@ impl Core {
     }
 
     pub fn remove_ssh_target(&self, id: &str) -> Result<()> {
+        let busy = self.claim_ssh_target(id)?;
         let target = self.store.get_ssh_target(id)?.ok_or_else(|| CoreError::not_found("no such SSH target"))?;
-        if matches!(target.enroll_state, SshEnrollState::Enrolled | SshEnrollState::Enrolling | SshEnrollState::Removing)
-            || lock(&self.ssh.busy).contains(id)
-        {
+        if matches!(target.enroll_state, SshEnrollState::Enrolled | SshEnrollState::Enrolling | SshEnrollState::Removing) {
             return Err(CoreError::invalid("remove asm from the host first"));
         }
+        self.end_target_leases(id, "target removed from asm")?;
         self.store.delete_ssh_target(id)?;
         self.write_ssh_known_hosts()?;
+        drop(busy);
+        self.kick_ssh_cleanup();
         self.log(ssh_event("target_removed", format!("SSH target {} removed", target.name))
             .detail(json!({ "target_id": id, "name": target.name })));
         self.notify(TOPIC_SSH_TARGETS);
@@ -1581,13 +1623,15 @@ impl Core {
     }
 
     pub fn enroll_ssh_target(&self, id: &str, expected_revision: u64) -> Result<ffi::SshTargetInfo> {
-        let _busy = self.claim_ssh_target(id)?;
+        let busy = self.claim_ssh_target(id)?;
         let target = self.store.get_ssh_target(id)?.ok_or_else(|| CoreError::not_found("no such SSH target"))?;
         if target.revision != expected_revision {
             return Err(CoreError::invalid("SSH target changed; reload it"));
         }
         let script = self.render_target_enroll(&target)?;
         let ca = self.ssh_ca()?.fingerprint();
+        // A route certificate runs refuse must fail enrollment before the host is changed.
+        self.remote().check_route(&target, &self.ssh_run_dir()?.0)?;
         if !self.store.set_ssh_enrollment(id, &[SshEnrollState::NotEnrolled, SshEnrollState::Failed, SshEnrollState::Enrolled],
             SshEnrollState::Enrolling, None, None, None, self.generation_now())?
         {
@@ -1597,9 +1641,13 @@ impl Core {
         self.log(ssh_event("enroll_started", format!("{}: host may be partly changed until enrollment finishes", target.name))
             .detail(json!({ "target_id": id, "name": target.name, "destination": target.config.destination,
                 "revision": target.revision })));
-        let outcome = self.operator_run(&target, &script, ENROLL_TIMEOUT)
-            .and_then(|out| self.track_host_key(&target, host_result(&target, out, "asm-enroll-ok", "asm-enroll-error", 0)))
-            .map_err(|e| e.to_string())
+        let ended = self.end_target_leases(id, "target enrolled again")
+            .map_err(|e| format!("could not end the target's active leases: {}", e.message));
+        self.kick_ssh_cleanup();
+        let outcome = ended
+            .and_then(|()| self.operator_run(&target, &script, ENROLL_TIMEOUT)
+                .and_then(|out| self.track_host_key(&target, host_result(&target, out, "asm-enroll-ok", "asm-enroll-error", 0)))
+                .map_err(|e| e.to_string()))
             .and_then(|_| self.check_enrollment(&target)
                 .map_err(|(login, e)| format!("enrolled, but a test login as {login} failed: {e}")));
         let t = self.generation_now();
@@ -1620,6 +1668,8 @@ impl Core {
             }
         };
         self.notify(TOPIC_SSH_TARGETS);
+        drop(busy);
+        self.kick_ssh_cleanup();
         result?;
         self.ssh_target_info_by_id(id)
     }
@@ -2050,15 +2100,6 @@ impl Core {
 
     pub fn ssh_sign(&self, host: &HostRecord, token_hash: &[u8; 32], req: SshSignRequest) -> Result<SshSignResponse> {
         let now = self.generation_now();
-        {
-            let mut windows = lock(&self.ssh.sign_window);
-            windows.retain(|_, (start, _)| now - *start < SIGN_WINDOW);
-            let (_, count) = windows.entry(req.lease_id.clone()).or_insert((now, 0));
-            if *count >= SIGN_LIMIT {
-                return Err(CoreError::rate_limited("too many SSH sign requests for this lease; wait a minute"));
-            }
-            *count += 1;
-        }
         let outcome = {
             let _authority = lock(&self.authorization);
             self.ssh_sign_locked(host, token_hash, &req, now)
@@ -2096,6 +2137,15 @@ impl Core {
         if !lease.is_active(now) {
             return Err(CoreError::not_found("SSH lease has ended").into());
         }
+        {
+            let mut windows = lock(&self.ssh.sign_window);
+            windows.retain(|_, (start, _)| now - *start < SIGN_WINDOW);
+            let (_, count) = windows.entry(lease.id.clone()).or_insert((now, 0));
+            if *count >= SIGN_LIMIT {
+                return Err(CoreError::rate_limited("too many SSH sign requests for this lease; wait a minute").into());
+            }
+            *count += 1;
+        }
         let data = b64_decode(&req.data).ok_or_else(|| CoreError::invalid("invalid sign data"))?;
         if data.len() > MAX_SIGN_DATA {
             return Err(CoreError::invalid("sign data is too large").into());
@@ -2117,6 +2167,11 @@ impl Core {
         let logins: Vec<&SshGrantTarget> = lease.grant.targets.iter().filter(|t| t.login == auth.user).collect();
         if logins.is_empty() {
             return Err(refuse(&format!("login {} is not part of this lease", auth.user)));
+        }
+        for target in &logins {
+            if self.store.get_ssh_target(&target.target_id)?.is_none_or(|t| t.revision != target.revision) {
+                return Err(refuse("the SSH target changed; request a new lease"));
+            }
         }
         if let Some(host_key) = auth.host_key
             && !logins.iter().any(|t| t.host_keys.iter().any(|k| host_key_blob(k).as_deref() == Some(host_key)))

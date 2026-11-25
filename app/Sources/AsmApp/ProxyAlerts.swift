@@ -99,13 +99,13 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
         Task { await post(id: Self.firewallRequestID, category: Self.firewallCategory, title: title, body: body) }
     }
 
-    /// Feed every new lease list: one notification per target of a privileged SSH lease
-    /// whose session cleanup is retrying or failed. The first call only records the
-    /// problems that already exist.
+    /// Feed every new lease list: one notification per target of a privileged or
+    /// another-user SSH lease whose session cleanup is retrying or failed. The first call
+    /// only records the problems that already exist.
     func updateSshCleanup(_ leases: [LeaseItem]) {
         var problems: [(key: String, leaseID: String, target: SshLeaseTargetItem)] = []
         for lease in leases {
-            guard let ssh = lease.ssh, ssh.access == .privileged else { continue }
+            guard let ssh = lease.ssh, ssh.access != .restricted else { continue }
             for target in ssh.targets where target.cleanup == .retrying || target.cleanup == .failed {
                 problems.append(("\(lease.id)/\(target.name)", lease.id, target))
             }
@@ -116,7 +116,7 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
         }
         for problem in problems where seen.insert(problem.key).inserted {
             let title = "Ending SSH sessions on \(problem.target.name) failed"
-            let body = "\(problem.target.cleanupDetail). Sessions of this privileged lease may stay open; the host ends them when the lease expires."
+            let body = "\(problem.target.cleanupDetail). Sessions of this lease may stay open; the host ends them when the lease expires."
             let id = "ssh-cleanup-\(problem.leaseID)-\(problem.target.name)"
             Task { await post(id: id, category: "", title: title, body: body) }
         }

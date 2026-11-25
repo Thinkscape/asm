@@ -689,7 +689,11 @@ impl Core {
                     tokens.extend(self.evict_generated_locked(&lease, &authority));
                 }
             }
-            let ssh_ended = self.end_host_ssh_leases_locked(host_id, &authority)?;
+            // The host is already revoked: an SSH store error must not skip what follows.
+            let ssh_ended = self.end_host_ssh_leases_locked(host_id, &authority).unwrap_or_else(|error| {
+                log::error!("ending SSH leases of revoked host {host_id}: {}", error.message);
+                false
+            });
             (tokens, ssh_ended)
         };
         self.sync_proxy_auth();
