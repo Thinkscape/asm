@@ -255,6 +255,45 @@ fn token_failures_are_redacted_and_never_fall_back_to_parent() {
 }
 
 #[test]
+fn child_token_retries_refused_impersonation_and_reports_gclouds_error() {
+    // IAM propagation: the first refusal clears on retry.
+    let fixture = Fixture::new(r#"
+        attempts="${0%/*}/attempts"
+        printf x >> "$attempts"
+        if [ "$(cat "$attempts")" = x ]; then
+            printf '%s\n' 'ERROR: (gcloud.auth.application-default.print-access-token) Failed to impersonate [1234]: PERMISSION_DENIED' >&2
+            exit 1
+        fi
+        printf '%s\n' test-child-token
+    "#);
+    let adc = AuthorizedUser::parse(ADC).unwrap();
+    assert_eq!(fixture.runner.child_token(&fixture.sdk, &adc, "scope-test", "1234", &[STORAGE_SCOPE.into()]).unwrap(), "test-child-token");
+    assert_eq!(fs::read_to_string(fixture.root.path().join("attempts")).unwrap(), "xx");
+    fixture.assert_clean();
+
+    // A lasting refusal stops after the schedule, keeps gcloud's ERROR text on one
+    // line, drops warnings, and never echoes the SDK's credential.
+    let fixture = Fixture::new(r#"
+        printf x >> "${0%/*}/attempts"
+        printf '%s\n' 'WARNING: impersonating' 'ERROR: (gcloud) refused for fixture-refresh' '  PERMISSION_DENIED: iam.serviceAccounts.getAccessToken' 'WARNING: later' >&2
+        exit 1
+    "#);
+    let err = fixture.runner.child_token(&fixture.sdk, &adc, "scope-test", "1234", &[STORAGE_SCOPE.into()]).unwrap_err();
+    assert_eq!(err.code, asm_proto::error::ErrorCode::VaultUnavailable);
+    assert_eq!(fs::read_to_string(fixture.root.path().join("attempts")).unwrap().len(), 1 + CHILD_TOKEN_RETRIES.len());
+    assert!(err.message.contains("(gcloud ERROR: (gcloud) refused for [redacted] PERMISSION_DENIED: iam.serviceAccounts.getAccessToken)"), "{}", err.message);
+    assert!(err.message.contains("[retried for"), "{}", err.message);
+    assert!(!err.message.contains("fixture-refresh") && !err.message.contains("WARNING"));
+    fixture.assert_clean();
+
+    // Sign-in failures are not propagation and are never retried.
+    let fixture = Fixture::new(r#"printf x >> "${0%/*}/attempts"; printf 'invalid_grant\n' >&2; exit 1"#);
+    assert_eq!(fixture.runner.child_token(&fixture.sdk, &adc, "scope-test", "1234", &[STORAGE_SCOPE.into()]).unwrap_err().code,
+        asm_proto::error::ErrorCode::Unauthorized);
+    assert_eq!(fs::read_to_string(fixture.root.path().join("attempts")).unwrap(), "x");
+}
+
+#[test]
 fn strictly_limits_and_rejects_untrusted_login_files() {
     for body in [
         format!(r#"ln -s "${{0%/*}}/gcloud" "$CLOUDSDK_CONFIG/{ADC_NAME}""#),

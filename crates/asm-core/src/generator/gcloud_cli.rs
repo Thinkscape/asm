@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use asm_proto::generators::{validate_gcloud_project_id, validate_gcloud_scope};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
@@ -38,6 +38,17 @@ const GCLOUD_OUTPUT: OutputErrors = OutputErrors {
 const ADC_LIMIT: usize = 1024 * 1024;
 const ADC_NAME: &str = "application_default_credentials.json";
 const NOFOLLOW: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+const TOKEN_FAILED: &str = "Google Cloud CLI could not obtain the access token";
+/// IAM grants on a just-created service account can take minutes to reach the
+/// token service, so a refused impersonation is retried on this schedule (~90 s).
+#[cfg(not(test))]
+const CHILD_TOKEN_RETRIES: &[Duration] = &[
+    Duration::from_secs(2), Duration::from_secs(4), Duration::from_secs(8), Duration::from_secs(15),
+    Duration::from_secs(15), Duration::from_secs(15), Duration::from_secs(15), Duration::from_secs(15),
+];
+#[cfg(test)]
+const CHILD_TOKEN_RETRIES: &[Duration] = &[Duration::from_millis(10), Duration::from_millis(10)];
+const CLI_ERROR_CHARS: usize = 500;
 
 #[derive(Debug, Clone)]
 pub(crate) struct GcloudSdk {
@@ -126,6 +137,14 @@ impl AuthorizedUser {
         })
         .map_err(|_| CoreError::internal("Could not encode the private Google credential"))
     }
+
+    /// CLI diagnostics must never carry the credential the SDK was given.
+    fn redact(&self, mut error: CoreError) -> CoreError {
+        for secret in [&self.refresh_token, &self.client_secret] {
+            error.message = error.message.replace(secret.as_str(), "[redacted]");
+        }
+        error
+    }
 }
 
 fn invalid_adc() -> CoreError {
@@ -170,6 +189,21 @@ impl GcloudRunner {
         self.inner.stopped.store(true, Ordering::Release);
         while *active != 0 {
             active = self.inner.idle.wait(active).unwrap();
+        }
+    }
+
+    /// Sleeps between retries, but gives up as soon as shutdown begins.
+    fn pause(&self, delay: Duration) -> Result<()> {
+        let deadline = Instant::now() + delay;
+        loop {
+            if self.inner.stopped.load(Ordering::Acquire) {
+                return Err(cancelled_error());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(250)));
         }
     }
 
@@ -268,12 +302,27 @@ impl GcloudRunner {
         let mut scopes: Vec<_> = scopes.iter().map(String::as_str).collect();
         scopes.sort_unstable();
         scopes.dedup();
-        self.token(sdk_path, adc, &[
-            &format!("--impersonate-service-account={unique_id}"),
-            &format!("--scopes={}", scopes.join(",")),
-            "--lifetime=3600s",
-            &format!("--project={project_id}"),
-        ], Some(project_id), None)
+        let impersonate = format!("--impersonate-service-account={unique_id}");
+        let scopes = format!("--scopes={}", scopes.join(","));
+        let project = format!("--project={project_id}");
+        let args = [impersonate.as_str(), scopes.as_str(), "--lifetime=3600s", project.as_str()];
+        let mut retries = CHILD_TOKEN_RETRIES.iter();
+        loop {
+            match self.token(sdk_path, adc, &args, Some(project_id), None) {
+                Err(error) if error.message.starts_with(TOKEN_FAILED) => {
+                    let Some(delay) = retries.next() else {
+                        let waited: Duration = CHILD_TOKEN_RETRIES.iter().sum();
+                        return Err(CoreError::new(error.code, format!(
+                            "{} [retried for {} s; new Google IAM grants can take several minutes to take effect]",
+                            error.message, waited.as_secs(),
+                        )));
+                    };
+                    log::info!("Google Cloud token attempt failed; retrying in {} s: {}", delay.as_secs(), error.message);
+                    self.pause(*delay)?;
+                }
+                result => return result,
+            }
+        }
     }
 
     fn token(
@@ -296,7 +345,8 @@ impl GcloudRunner {
         drop(file);
         let mut args = vec!["auth", "application-default", "print-access-token", "--format=value(token)", "--quiet"];
         args.extend_from_slice(extra_args);
-        let output = operation.run(&sdk.path, &workspace, &config, &args, Some(TokenInput { path: &path, project }), SdkCall::Token)?;
+        let output = operation.run(&sdk.path, &workspace, &config, &args, Some(TokenInput { path: &path, project }), SdkCall::Token)
+            .map_err(|error| adc.redact(error))?;
         fs::remove_file(path).map_err(|_| workspace_error())?;
         operation.check_cancelled()?;
         parse_token(output)
@@ -346,25 +396,46 @@ impl SdkCall {
     }
 
     fn failed(self, stderr: &[u8]) -> CoreError {
+        let detail = cli_error(stderr);
         match self {
             Self::Version if contains(stderr, b"Install a compatible version of Python")
                 || contains(stderr, b"Could not find a valid Python") => CoreError::vault_unavailable(
                     "Google Cloud CLI needs a compatible, trusted Python installation. Install Python 3.10–3.14 from python.org, then check again",
                 ),
-            Self::Version => CoreError::vault_unavailable(
-                "Could not run Google Cloud CLI. Check its Python installation (for example, Python 3.10–3.14 from python.org) or update and locate gcloud again",
-            ),
-            Self::Login => CoreError::vault_unavailable(
-                "Google sign-in did not complete. Use the Mac’s local browser, complete Google consent, and try again",
-            ),
+            Self::Version => CoreError::vault_unavailable(format!(
+                "Could not run Google Cloud CLI. Check its Python installation (for example, Python 3.10–3.14 from python.org) or update and locate gcloud again{detail}",
+            )),
+            Self::Login => CoreError::vault_unavailable(format!(
+                "Google sign-in did not complete. Use the Mac’s local browser, complete Google consent, and try again{detail}",
+            )),
             Self::Token if contains(stderr, b"invalid_grant")
                 || contains(stderr, b"Token has been expired or revoked")
                 || contains(stderr, b"reauth is required.") => super::gcloud::sign_in_again(),
-            Self::Token => CoreError::vault_unavailable(
-                "Google Cloud CLI could not obtain the access token. Check the selected project, IAM Credentials API, and service-account impersonation permission, or sign in again if authorization expired",
-            ),
+            Self::Token => CoreError::vault_unavailable(format!(
+                "{TOKEN_FAILED}. Check the selected project, IAM Credentials API, and service-account impersonation permission, or sign in again if authorization expired{detail}",
+            )),
         }
     }
+}
+
+/// gcloud's own error, from its first `ERROR:` line to the end (minus warnings),
+/// on one line and capped. Operator diagnostics only: `VaultUnavailable`
+/// messages never reach manager API clients.
+fn cli_error(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let Some(start) = text.lines().position(|line| line.trim_start().starts_with("ERROR:")) else {
+        return String::new();
+    };
+    let joined = text.lines().skip(start)
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("WARNING:"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let joined: String = joined.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(CLI_ERROR_CHARS)
+        .collect();
+    format!(" (gcloud {})", joined.trim())
 }
 
 fn contains(value: &[u8], needle: &[u8]) -> bool {
