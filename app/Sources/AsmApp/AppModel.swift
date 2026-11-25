@@ -27,6 +27,7 @@ final class AppModel {
     private(set) var vaults: [VaultItem] = []
     private(set) var generators: [GeneratorItem] = []
     private(set) var hasRecordedGcloudAccounts = false
+    private(set) var sshTargets: [SshTargetItem] = []
     private(set) var hosts: [HostItem] = []
     private(set) var pairingCodes: [PairingCodeItem] = []
     private(set) var leases: [LeaseItem] = []
@@ -46,6 +47,8 @@ final class AppModel {
     var activityFocus: ActivityFocus?
     /// Set to show a pane in the Settings window (consumed by `SettingsView`).
     var settingsPaneRequest: SettingsPane?
+    /// Set by an approval panel's target link; the SSH Targets pane selects that target.
+    var sshTargetFocus: String?
     /// Opens a window scene by id; registered by the always-present menu bar label (SwiftUI
     /// hands `openWindow` to views only).
     @ObservationIgnored var openWindow: ((String) -> Void)?
@@ -154,7 +157,10 @@ final class AppModel {
             case "leases":
                 gcloudOwnedAccountsRevision &+= 1
                 leases = try await call { try $0.listLeases() }
+                proxyAlerts.updateSshCleanup(leases)
                 hosts = try await call { try $0.listHosts() }
+                // Hosts and SSH targets show how many active leases they have.
+                sshTargets = try await call { try $0.listSshTargets() }
             case "hosts":
                 gcloudOwnedAccountsRevision &+= 1
                 hosts = try await call { try $0.listHosts() }
@@ -172,6 +178,12 @@ final class AppModel {
                 // Journal rows are retained for audit, so only promote false to true.
                 if !hasRecordedGcloudAccounts, try await call({ try $0.hasRecordedGcloudAccounts() }) {
                     hasRecordedGcloudAccounts = true
+                }
+            case "ssh_targets":
+                sshTargets = try await call { try $0.listSshTargets() }
+                // A pending SSH request shows each target's current readiness.
+                if pending.contains(where: { $0.kind == .ssh }) {
+                    try await refreshRequests()
                 }
             case "proxy":
                 await refreshProxy()
@@ -443,6 +455,74 @@ final class AppModel {
         return error
     }
 
+    // MARK: SSH targets
+
+    func lookupSshHostKeys(_ destination: String) async throws -> SshHostKeyLookupItem {
+        try await call { try $0.lookupSshHostKeys(destination) }
+    }
+
+    func fetchSshHostKeys(_ destination: String) async throws -> SshHostKeyLookupItem {
+        try await call { try $0.fetchSshHostKeys(destination) }
+    }
+
+    /// Logs in as enrollment will; takes up to 30 s.
+    func checkSshDestination(_ destination: String, login: String, hostKeys: [String]) async throws -> SshHostCheckItem {
+        try await call { try $0.checkSshDestination(destination, login: login, hostKeys: hostKeys) }
+    }
+
+    /// Lists the host's accounts as the privileged login; takes up to 30 s.
+    func listSshHostUsers(_ destination: String, login: String, hostKeys: [String]) async throws -> [SshHostUserItem] {
+        try await call { try $0.listSshHostUsers(destination, login: login, hostKeys: hostKeys) }
+    }
+
+    /// Asks a target for its host keys and compares them with the pinned ones; the target
+    /// list then shows the result.
+    func reviewSshHostKeys(_ id: String) async throws -> SshHostCheckItem {
+        let result = try await call { try $0.reviewSshHostKeys(id) }
+        await refresh("ssh_targets")
+        return result
+    }
+
+    /// Pins host keys the operator reviewed; ends the target's leases.
+    func replaceSshHostKeys(_ id: String, expectedRevision: UInt64, keys: [String]) async -> String? {
+        let error = await perform { _ = try $0.replaceSshHostKeys(id, expectedRevision: expectedRevision, keys: keys) }
+        await refresh("ssh_targets")
+        await refresh("leases")
+        return error
+    }
+
+    func saveSshTarget(_ draft: SshTargetDraftItem) async -> String? {
+        let error = await perform { _ = try $0.saveSshTarget(draft) }
+        await refresh("ssh_targets")
+        await refresh("leases")
+        return error
+    }
+
+    func removeSshTarget(_ id: String) async -> String? {
+        let error = await perform { try $0.removeSshTarget(id) }
+        await refresh("ssh_targets")
+        return error
+    }
+
+    /// Runs the enrollment script over the operator's ssh; takes up to two minutes.
+    func enrollSshTarget(_ id: String, expectedRevision: UInt64) async -> String? {
+        let error = await perform { try $0.enrollSshTarget(id, expectedRevision: expectedRevision) }
+        await refresh("ssh_targets")
+        return error
+    }
+
+    /// Ends the target's leases and removes asm from the host over the operator's ssh.
+    func unenrollSshTarget(_ id: String) async -> String? {
+        let error = await perform { try $0.unenrollSshTarget(id) }
+        await refresh("ssh_targets")
+        await refresh("leases")
+        return error
+    }
+
+    func sshEnrollScript(_ id: String) async throws -> String {
+        try await call { try $0.sshEnrollScript(id) }
+    }
+
     // MARK: Hosts and pairing codes
 
     func revokeHost(_ id: String) async -> String? {
@@ -487,6 +567,12 @@ final class AppModel {
         return firstError
     }
 
+    func retrySshCleanup(_ leaseID: String) async -> String? {
+        let error = await perform { try $0.retrySshCleanup(leaseID) }
+        await refresh("leases")
+        return error
+    }
+
     // MARK: Activity log
 
     func listActivity(_ query: ActivityQueryItem) async throws -> [ActivityItem] {
@@ -524,7 +610,17 @@ final class AppModel {
 
     /// Opens Settings → Proxy (notification click, banner "Details…").
     func showProxyDetails() {
-        settingsPaneRequest = .proxy
+        showSettings(.proxy)
+    }
+
+    /// Opens Settings → SSH Targets with one target selected (approval panel link).
+    func showSshTarget(_ id: String) {
+        sshTargetFocus = id
+        showSettings(.sshTargets)
+    }
+
+    private func showSettings(_ pane: SettingsPane) {
+        settingsPaneRequest = pane
         guard let openWindow else {
             ProxyAlerts.openMenuBarPanel()
             return

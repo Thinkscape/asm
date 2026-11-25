@@ -8,6 +8,7 @@ pub mod generators;
 pub mod names;
 pub mod pairing;
 pub mod rules;
+pub mod ssh;
 pub mod time;
 pub mod wire;
 

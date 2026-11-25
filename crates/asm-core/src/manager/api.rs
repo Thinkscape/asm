@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use asm_proto::{ApiError, ErrorCode};
 use asm_proto::generators::{GenerationSelection, SourceKind};
+use asm_proto::ssh::{SshSignRequest, SshSignResponse, SshTargetsResponse};
 use asm_proto::wire::{
     CAPABILITY_BROADER_LEASE_REUSE_V1, CAPABILITY_LOGIN_BROKER_V1, CAPABILITY_LOGIN_GRANT_V1,
+    CAPABILITY_SSH_LEASES_V1,
     CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1,
     CAPABILITY_OPERATOR_SELECTED_GRANT_V1, CAPABILITY_OPERATOR_SELECTED_PROJECT_V1,
     CAPABILITY_SECRET_FIELDS_V1, HealthResponse, LeaseBrief,
@@ -88,7 +90,9 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/requests", post(create_request))
         .route("/requests/{id}", get(get_request).delete(cancel_request))
         .route("/leases", get(leases))
-        .route("/proxy-info", get(proxy_info));
+        .route("/proxy-info", get(proxy_info))
+        .route("/ssh/sign", post(ssh_sign))
+        .route("/ssh/targets", get(ssh_targets));
     Router::new()
         .nest(asm_proto::wire::API_PREFIX, v1)
         .fallback(|| async { ApiErr(CoreError::not_found("no such endpoint")) })
@@ -171,6 +175,7 @@ async fn health() -> Json<HealthResponse> {
             CAPABILITY_BROADER_LEASE_REUSE_V1.into(),
             CAPABILITY_LOGIN_GRANT_V1.into(),
             CAPABILITY_LOGIN_BROKER_V1.into(),
+            CAPABILITY_SSH_LEASES_V1.into(),
         ],
     })
 }
@@ -386,4 +391,20 @@ async fn proxy_info(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<P
     })
     .await?;
     Ok(Json(r))
+}
+
+async fn ssh_sign(
+    State(core): Shared,
+    headers: HeaderMap,
+    body: std::result::Result<Json<SshSignRequest>, JsonRejection>,
+) -> ApiResult<Json<SshSignResponse>> {
+    let (host, hash) = auth(&core, &headers).await?;
+    let Json(req) = body.map_err(bad_json)?;
+    Ok(Json(blocking(move || core.ssh_sign(&host, &hash, req)).await?))
+}
+
+async fn ssh_targets(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<SshTargetsResponse>> {
+    let _host = auth(&core, &headers).await?;
+    let targets = blocking(move || core.ssh_target_summaries()).await?;
+    Ok(Json(SshTargetsResponse { targets }))
 }

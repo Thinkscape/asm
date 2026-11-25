@@ -1,6 +1,6 @@
 ---
 name: asm
-description: "Request access to secrets such as API keys, access tokens, login credentials, certificates, GitHub CLI tokens, and gcloud tokens. Use them in commands as environment variables or files."
+description: "Request access to secrets such as API keys, access tokens, login credentials, certificates, GitHub CLI tokens, and gcloud tokens, and SSH access to hosts. Use them in commands as environment variables or files."
 ---
 
 # Agents Secrets Manager (`asm`)
@@ -234,6 +234,41 @@ the proxy's parent-death watchdog stops forwarding when the manager exits.
 File cleanup normally runs through the background reaper at expiry and shortly after
 revocation. `get --no-reaper` or `ASM_NO_REAPER=1` disables that process; later file-aware
 commands perform cleanup. File-free exec never starts a reaper or reconciles secret files.
+
+## SSH hosts
+
+`asm ssh hosts` lists hosts you can request, the privileged login each allows (`-` for
+none), the other users you may log in as and the restricted grants each allows. The
+manager signs logins with a short-lived certificate; you never receive a key.
+
+```bash
+asm ssh request web.example.com "Read nginx errors" --grant logs:nginx.service -- logs nginx.service 200
+asm ssh request web.example.com "Restart the API after the config fix" --grant restart:api.service -- restart api.service
+asm ssh request web.example.com "Debug the failing deploy" --privileged -- systemctl status api.service
+asm ssh request web.example.com "Debug the failing deploy" --privileged   # prints a connect line
+asm ssh request web.example.com "Check the app's file permissions" --as deploy -- ls -la /srv/app
+ssh web.example.com uptime            # after asm ssh install, while the lease is active
+```
+
+Prefer `--grant` (restricted account `asm-ops`: only `logs UNIT [LINES]` and
+`restart UNIT` for the granted units). When you need a shell, prefer `--as <user>` with
+the account that owns what you work on (listed under users in `asm ssh hosts`) over
+`--privileged`, which works only on hosts that list a privileged login. The operator may
+approve other access than you asked for, including another user; asm then prints `the
+operator approved …` to stderr, and the lease output shows the access. A command after
+`--` needs exactly one host. To connect, use the line `asm ssh request`
+prints: `ssh <host>` after `asm ssh install`, otherwise `ssh -F <config path> <host>`.
+After `asm ssh install`, plain `ssh <host>`, `scp`, `git` and Ansible work while the lease
+is active. For Ansible, use the asm host name as the inventory host and don't set
+`ansible_user`. Restricted leases can't run Ansible.
+
+Before a job that may outlast the lease, check `asm ssh leases`. Run
+`asm ssh extend <id> "<reason>"` at least 10 minutes before the end; every extension
+needs approval. Treat an `asm: … ends at …` line as a prompt to extend or to finish. When
+an extension is denied, finish or stop the work before the end. Exit codes match `get`.
+When the lease ends, new logins fail with `Permission denied` and open sessions are
+ended; request a new lease instead of retrying. Do not add keys, users or services on a
+host to keep access.
 
 ## Changing static secrets
 

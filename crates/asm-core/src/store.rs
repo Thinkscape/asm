@@ -140,6 +140,18 @@ CREATE TABLE IF NOT EXISTS resume_entries(
     sealed    BLOB NOT NULL,
     PRIMARY KEY(namespace, id)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ssh_targets(
+    id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, config TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    enroll_state TEXT NOT NULL DEFAULT 'not_enrolled'
+        CHECK (enroll_state IN ('not_enrolled','enrolling','enrolled','failed','removing')),
+    enrolled_revision INTEGER NOT NULL DEFAULT 0, enrolled_ca TEXT, enroll_at INTEGER, enroll_error TEXT,
+    created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS ssh_leases(
+    id TEXT PRIMARY KEY, host_id TEXT NOT NULL, agent TEXT NOT NULL, reason TEXT NOT NULL,
+    grant_json TEXT NOT NULL, certificate TEXT NOT NULL, created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL, revoked_at INTEGER, ended_at INTEGER, cleanup TEXT NOT NULL DEFAULT '{}');
+CREATE INDEX IF NOT EXISTS ssh_leases_host ON ssh_leases(host_id);
 ";
 
 // The issued UID identifies the account even for legacy OAuth leases whose
@@ -2195,6 +2207,511 @@ impl Store {
         Ok(old + over)
     }
 }
+
+// ---- SSH targets and leases ----
+
+const HOST_KEY_TYPES: [&str; 7] = [
+    "ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa",
+    "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com",
+];
+
+/// One SSH target as the operator configured it. The manager reaches it with the
+/// operator's own ssh at `destination`; agents reach it at `agent_hostname:agent_port`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshTargetConfig {
+    pub destination: String,
+    pub agent_hostname: String,
+    pub agent_port: u16,
+    /// The operator's own login for enrollment and removal; privileged leases run as it.
+    pub privileged_login: String,
+    /// Agents may request privileged access (the `asm-priv` account exists).
+    pub allow_privileged: bool,
+    /// `"<type> <b64>"` host public keys, pinned from the operator's known_hosts.
+    pub host_keys: Vec<String>,
+    /// Units whose journal restricted leases may read (`logs:<unit>`).
+    pub log_units: Vec<String>,
+    pub restart_units: Vec<String>,
+    pub max_duration_secs: u64,
+    /// Other users agents may log in as (through `asm-priv` and sudo), sorted by name.
+    #[serde(default)]
+    pub users: Vec<SshTargetUser>,
+}
+
+/// A user agents may log in as, as the operator chose it from the host's list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshTargetUser {
+    pub name: String,
+    /// How the user can become root (`in group sudo`), as the host reported it; `None`
+    /// when asm found no way. Enrollment checks it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin: Option<String>,
+}
+
+impl SshTargetConfig {
+    /// Sort and de-duplicate list fields and trim keys before [`Self::validate`].
+    pub fn canonicalize(&mut self) {
+        for key in &mut self.host_keys {
+            *key = key.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        }
+        self.host_keys.sort_unstable();
+        self.host_keys.dedup();
+        self.log_units.sort_unstable();
+        self.log_units.dedup();
+        self.restart_units.sort_unstable();
+        self.restart_units.dedup();
+        self.users.sort_by(|a, b| a.name.cmp(&b.name));
+        self.users.dedup_by(|a, b| a.name == b.name);
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_destination(&self.destination)?;
+        let h = &self.agent_hostname;
+        if h.is_empty() || h.len() > 253 || h.starts_with('-')
+            || !h.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b':' | b'-'))
+        {
+            return Err(CoreError::invalid("enter the hostname or address agents use to reach this target"));
+        }
+        if self.agent_port == 0 {
+            return Err(CoreError::invalid("the agent port must be 1–65535"));
+        }
+        asm_proto::ssh::validate_login(&self.privileged_login)?;
+        if self.host_keys.is_empty() || self.host_keys.len() > 8 {
+            return Err(CoreError::invalid("an SSH target needs 1–8 host keys"));
+        }
+        for key in &self.host_keys {
+            validate_host_key(key)?;
+        }
+        for (units, what) in [(&self.log_units, "log"), (&self.restart_units, "restart")] {
+            if units.len() > 32 {
+                return Err(CoreError::invalid(format!("at most 32 {what} units")));
+            }
+            for unit in units {
+                asm_proto::ssh::validate_unit(unit)?;
+            }
+            if units.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(CoreError::invalid(format!("{what} units must be sorted and unique")));
+            }
+        }
+        if !(60..=604_800).contains(&self.max_duration_secs) {
+            return Err(CoreError::invalid("the longest lease must be between 1 minute and 7 days"));
+        }
+        if self.users.len() > asm_proto::ssh::MAX_USERS {
+            return Err(CoreError::invalid(format!("at most {} users", asm_proto::ssh::MAX_USERS)));
+        }
+        for user in &self.users {
+            asm_proto::ssh::validate_login(&user.name)?;
+            if user.name == self.privileged_login {
+                return Err(CoreError::invalid(format!(
+                    "{} is the privileged login; agents get it with privileged access", user.name)));
+            }
+            if let Some(why) = &user.admin {
+                if why.is_empty() || why.chars().count() > 64 || why.chars().any(char::is_control) {
+                    return Err(CoreError::invalid(format!("invalid admin note for user {}", user.name)));
+                }
+                if !self.allow_privileged {
+                    return Err(CoreError::invalid(format!(
+                        "{} can become root ({why}): allow privileged access to let agents use it", user.name)));
+                }
+            }
+        }
+        if self.users.windows(2).any(|w| w[0].name >= w[1].name) {
+            return Err(CoreError::invalid("users must be sorted and unique"));
+        }
+        Ok(())
+    }
+}
+
+/// An ssh destination for the operator's own ssh: `[user@]host`, `[addr]` or
+/// `host:port` forms, with no characters ssh or a shell would interpret.
+pub fn validate_destination(d: &str) -> Result<()> {
+    if d.is_empty() || d.len() > 255 || d.starts_with('-')
+        || !d.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'@' | b':' | b'[' | b']' | b'-'))
+    {
+        return Err(CoreError::invalid(
+            "enter an SSH destination such as root@web.example (letters, digits and . _ @ : [ ] - only)"));
+    }
+    Ok(())
+}
+
+/// `"<type> <b64>"` of a supported host key type, in OpenSSH's canonical form.
+pub fn validate_host_key(line: &str) -> Result<()> {
+    let mut key = ssh_key::PublicKey::from_openssh(line)
+        .map_err(|_| CoreError::invalid(format!("invalid host key {line:?}")))?;
+    let kind = key.algorithm();
+    if !HOST_KEY_TYPES.contains(&kind.as_str()) {
+        return Err(CoreError::invalid(format!("unsupported host key type {:?}", kind.as_str())));
+    }
+    key.set_comment("");
+    if key.to_openssh().ok().as_deref() != Some(line) {
+        return Err(CoreError::invalid(format!("invalid host key {line:?}")));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshEnrollState {
+    NotEnrolled,
+    Enrolling,
+    Enrolled,
+    Failed,
+    Removing,
+}
+
+impl SshEnrollState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotEnrolled => "not_enrolled",
+            Self::Enrolling => "enrolling",
+            Self::Enrolled => "enrolled",
+            Self::Failed => "failed",
+            Self::Removing => "removing",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        Ok(match s {
+            "not_enrolled" => Self::NotEnrolled,
+            "enrolling" => Self::Enrolling,
+            "enrolled" => Self::Enrolled,
+            "failed" => Self::Failed,
+            "removing" => Self::Removing,
+            _ => return Err(CoreError::internal("invalid persisted SSH enrollment state")),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTargetRecord {
+    pub id: String,
+    pub name: String,
+    pub config: SshTargetConfig,
+    pub revision: u64,
+    pub enroll_state: SshEnrollState,
+    /// The revision the last successful enrollment installed; 0 when none.
+    pub enrolled_revision: u64,
+    /// Fingerprint of the CA key that enrollment installed.
+    pub enrolled_ca: Option<String>,
+    pub enroll_at: Option<i64>,
+    pub enroll_error: Option<String>,
+    pub created_at: i64,
+}
+
+/// The authority of one SSH lease, fixed at approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshGrant {
+    pub access: asm_proto::ssh::SshAccess,
+    pub targets: Vec<SshGrantTarget>,
+    pub grants: Vec<String>,
+    /// The user an access-as-a-user lease runs as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshGrantTarget {
+    pub target_id: String,
+    pub name: String,
+    pub revision: u64,
+    pub login: String,
+    pub hostname: String,
+    pub port: u16,
+    pub host_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshCleanupState {
+    Pending,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshCleanup {
+    pub state: SshCleanupState,
+    pub at: i64,
+    pub detail: String,
+    /// Failed attempts of a `Pending` entry so far.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Unix time the next attempt is due; 0 means now.
+    #[serde(default)]
+    pub due: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshLeaseRecord {
+    pub id: String,
+    pub host_id: String,
+    pub agent: String,
+    pub reason: String,
+    pub grant: SshGrant,
+    /// One OpenSSH certificate line.
+    pub certificate: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub revoked_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    /// Session cleanup per target id, set when the lease ends.
+    pub cleanup: std::collections::BTreeMap<String, SshCleanup>,
+}
+
+impl SshLeaseRecord {
+    pub fn status(&self, now: i64) -> LeaseStatus {
+        if self.revoked_at.is_some() {
+            LeaseStatus::Revoked
+        } else if self.ended_at.is_some() || self.expires_at <= now {
+            LeaseStatus::Expired
+        } else {
+            LeaseStatus::Active
+        }
+    }
+
+    pub fn is_active(&self, now: i64) -> bool {
+        self.status(now) == LeaseStatus::Active
+    }
+}
+
+const SSH_TARGET_COLUMNS: &str =
+    "id, name, config, revision, enroll_state, enrolled_revision, enrolled_ca, enroll_at, enroll_error, created_at";
+const SSH_LEASE_COLUMNS: &str =
+    "id, host_id, agent, reason, grant_json, certificate, created_at, expires_at, revoked_at, ended_at, cleanup";
+
+type SshTargetRow = (String, String, String, i64, String, i64, Option<String>, Option<i64>, Option<String>, i64);
+
+fn ssh_target_row(r: &Row<'_>) -> rusqlite::Result<SshTargetRow> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))
+}
+
+fn decode_ssh_target(row: SshTargetRow) -> Result<SshTargetRecord> {
+    let (id, name, config, revision, state, enrolled_revision, enrolled_ca, enroll_at, enroll_error, created_at) = row;
+    let config: SshTargetConfig = serde_json::from_str(&config)?;
+    config.validate().map_err(|_| CoreError::internal("invalid persisted SSH target"))?;
+    Ok(SshTargetRecord {
+        id, name, config,
+        revision: positive_u64(revision, "SSH target revision")?,
+        enroll_state: SshEnrollState::parse(&state)?,
+        enrolled_revision: u64::try_from(enrolled_revision)
+            .map_err(|_| CoreError::internal("invalid persisted SSH enrollment revision"))?,
+        enrolled_ca, enroll_at, enroll_error, created_at,
+    })
+}
+
+type SshLeaseRow = (String, String, String, String, String, String, i64, i64, Option<i64>, Option<i64>, String);
+
+fn ssh_lease_row(r: &Row<'_>) -> rusqlite::Result<SshLeaseRow> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?))
+}
+
+fn decode_ssh_lease(row: SshLeaseRow) -> Result<SshLeaseRecord> {
+    let (id, host_id, agent, reason, grant, certificate, created_at, expires_at, revoked_at, ended_at, cleanup) = row;
+    let grant: SshGrant = serde_json::from_str(&grant)?;
+    if !asm_proto::crypto::is_uuid(&id)
+        || !grant.targets.iter().all(|t| crate::ssh::scripts::is_target_id(&t.target_id))
+    {
+        return Err(CoreError::internal("invalid persisted SSH lease"));
+    }
+    Ok(SshLeaseRecord {
+        id, host_id, agent, reason, grant,
+        certificate, created_at, expires_at, revoked_at, ended_at,
+        cleanup: serde_json::from_str(&cleanup)?,
+    })
+}
+
+fn ssh_target_name_error(error: rusqlite::Error, name: &str) -> CoreError {
+    match error {
+        rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation => {
+            CoreError::exists(format!("an SSH target named {name} already exists"))
+        }
+        e => e.into(),
+    }
+}
+
+impl Store {
+    pub fn insert_ssh_target(&self, t: &SshTargetRecord) -> Result<()> {
+        t.config.validate()?;
+        asm_proto::ssh::validate_target_name(&t.name)?;
+        let config = serde_json::to_string(&t.config)?;
+        self.db().execute(
+            &format!("INSERT INTO ssh_targets({SSH_TARGET_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
+            params![t.id, t.name, config, sqlite_u64(t.revision, "SSH target revision")?, t.enroll_state.as_str(),
+                sqlite_u64(t.enrolled_revision, "SSH enrollment revision")?, t.enrolled_ca, t.enroll_at,
+                t.enroll_error, t.created_at],
+        ).map_err(|e| ssh_target_name_error(e, &t.name))?;
+        Ok(())
+    }
+
+    /// Compare-and-swap on the revision; returns the new revision.
+    pub fn update_ssh_target(&self, id: &str, name: &str, config: &SshTargetConfig, expected_revision: u64) -> Result<u64> {
+        config.validate()?;
+        asm_proto::ssh::validate_target_name(name)?;
+        let json = serde_json::to_string(config)?;
+        let expected = sqlite_u64(expected_revision, "SSH target revision")?;
+        let n = self.db().execute(
+            "UPDATE ssh_targets SET name = ?2, config = ?3, revision = revision + 1 WHERE id = ?1 AND revision = ?4",
+            params![id, name, json, expected],
+        ).map_err(|e| ssh_target_name_error(e, name))?;
+        if n == 0 {
+            return Err(CoreError::invalid("SSH target changed; reload it"));
+        }
+        Ok(expected_revision + 1)
+    }
+
+    fn query_ssh_targets(&self, clause: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<SshTargetRecord>> {
+        let db = self.db();
+        let mut st = db.prepare(&format!("SELECT {SSH_TARGET_COLUMNS} FROM ssh_targets {clause}"))?;
+        let rows = st.query_map(args, ssh_target_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(st);
+        drop(db);
+        rows.into_iter().map(decode_ssh_target).collect()
+    }
+
+    pub fn get_ssh_target(&self, id: &str) -> Result<Option<SshTargetRecord>> {
+        Ok(self.query_ssh_targets("WHERE id = ?1", &[&id])?.into_iter().next())
+    }
+
+    pub fn ssh_target_by_name(&self, name: &str) -> Result<Option<SshTargetRecord>> {
+        Ok(self.query_ssh_targets("WHERE name = ?1", &[&name])?.into_iter().next())
+    }
+
+    pub fn list_ssh_targets(&self) -> Result<Vec<SshTargetRecord>> {
+        self.query_ssh_targets("ORDER BY name", &[])
+    }
+
+    pub fn delete_ssh_target(&self, id: &str) -> Result<bool> {
+        Ok(self.db().execute("DELETE FROM ssh_targets WHERE id = ?1", [id])? > 0)
+    }
+
+    /// Compare-and-swap on the enrollment state. `enrolled_revision` and `enrolled_ca`
+    /// are written as given (`None` = 0 / NULL): only `enrolled` carries them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_ssh_enrollment(
+        &self, id: &str, from: &[SshEnrollState], to: SshEnrollState, enrolled_revision: Option<u64>,
+        enrolled_ca: Option<&str>, error: Option<&str>, at: i64,
+    ) -> Result<bool> {
+        if from.is_empty() {
+            return Ok(false);
+        }
+        let states: Vec<String> = from.iter().map(|s| format!("'{}'", s.as_str())).collect();
+        let n = self.db().execute(
+            &format!("UPDATE ssh_targets SET enroll_state = ?2, enrolled_revision = ?3, enrolled_ca = ?4,
+                      enroll_error = ?5, enroll_at = ?6 WHERE id = ?1 AND enroll_state IN ({})", states.join(",")),
+            params![id, to.as_str(), sqlite_u64(enrolled_revision.unwrap_or(0), "SSH enrollment revision")?,
+                enrolled_ca, error, at],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub(crate) fn insert_ssh_lease_with_request(
+        &self, lease: &SshLeaseRecord, rows: &[SealedResume], history: &HistoryRecord,
+    ) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::apply_resume(&tx, rows)?;
+        tx.execute(
+            &format!("INSERT INTO ssh_leases({SSH_LEASE_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
+            params![lease.id, lease.host_id, lease.agent, lease.reason, serde_json::to_string(&lease.grant)?,
+                lease.certificate, lease.created_at, lease.expires_at, lease.revoked_at, lease.ended_at,
+                serde_json::to_string(&lease.cleanup)?],
+        )?;
+        Self::insert_history_with(&tx, history)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replace an active lease's certificate and end, if it still ends at `from_expires_at`.
+    pub(crate) fn extend_ssh_lease_with_request(
+        &self, id: &str, from_expires_at: i64, expires_at: i64, certificate: &str, rows: &[SealedResume],
+        history: &HistoryRecord,
+    ) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::apply_resume(&tx, rows)?;
+        let n = tx.execute(
+            "UPDATE ssh_leases SET expires_at = ?2, certificate = ?3
+             WHERE id = ?1 AND expires_at = ?4 AND ended_at IS NULL AND revoked_at IS NULL",
+            params![id, expires_at, certificate, from_expires_at],
+        )?;
+        if n == 0 {
+            tx.rollback()?;
+            return Err(CoreError::invalid("the SSH lease has ended; request a new lease with asm ssh request"));
+        }
+        Self::insert_history_with(&tx, history)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn query_ssh_leases(&self, clause: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<SshLeaseRecord>> {
+        let db = self.db();
+        let mut st = db.prepare(&format!("SELECT {SSH_LEASE_COLUMNS} FROM ssh_leases {clause}"))?;
+        let rows = st.query_map(args, ssh_lease_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(st);
+        drop(db);
+        rows.into_iter().map(decode_ssh_lease).collect()
+    }
+
+    pub fn get_ssh_lease(&self, id: &str) -> Result<Option<SshLeaseRecord>> {
+        Ok(self.query_ssh_leases("WHERE id = ?1", &[&id])?.into_iter().next())
+    }
+
+    /// Newest first.
+    pub fn list_ssh_leases(&self) -> Result<Vec<SshLeaseRecord>> {
+        self.query_ssh_leases("ORDER BY created_at DESC, id", &[])
+    }
+
+    pub fn active_ssh_leases(&self, now: i64) -> Result<Vec<SshLeaseRecord>> {
+        self.query_ssh_leases(
+            "WHERE ended_at IS NULL AND revoked_at IS NULL AND expires_at > ?1 ORDER BY created_at, id", &[&now])
+    }
+
+    pub fn ssh_leases_of_host(&self, host_id: &str) -> Result<Vec<SshLeaseRecord>> {
+        self.query_ssh_leases("WHERE host_id = ?1 ORDER BY created_at, id", &[&host_id])
+    }
+
+    /// Leases not yet ended whose end has come.
+    pub fn ssh_leases_expiring(&self, now: i64) -> Result<Vec<SshLeaseRecord>> {
+        self.query_ssh_leases("WHERE ended_at IS NULL AND expires_at <= ?1 ORDER BY expires_at, id", &[&now])
+    }
+
+    /// End a lease once; returns false when it had already ended.
+    pub fn end_ssh_lease(
+        &self, id: &str, revoked_at: Option<i64>, ended_at: i64,
+        cleanup: &std::collections::BTreeMap<String, SshCleanup>,
+    ) -> Result<bool> {
+        let n = self.db().execute(
+            "UPDATE ssh_leases SET revoked_at = ?2, ended_at = ?3, cleanup = ?4 WHERE id = ?1 AND ended_at IS NULL",
+            params![id, revoked_at, ended_at, serde_json::to_string(cleanup)?],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn set_ssh_cleanup(&self, id: &str, cleanup: &std::collections::BTreeMap<String, SshCleanup>) -> Result<()> {
+        self.db().execute(
+            "UPDATE ssh_leases SET cleanup = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(cleanup)?],
+        )?;
+        Ok(())
+    }
+
+    /// Ended leases with a target still `pending`.
+    pub fn ssh_leases_needing_cleanup(&self) -> Result<Vec<SshLeaseRecord>> {
+        Ok(self.query_ssh_leases(
+            "WHERE ended_at IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(ssh_leases.cleanup)
+             WHERE json_extract(value, '$.state') = 'pending') ORDER BY ended_at, id", &[])?
+            .into_iter()
+            .filter(|l| l.cleanup.values().any(|c| c.state == SshCleanupState::Pending))
+            .collect())
+    }
+}
+
+#[cfg(test)]
+#[path = "store_ssh_tests.rs"]
+mod ssh_tests;
 
 #[cfg(test)]
 #[path = "store_gcloud_profiles_tests.rs"]

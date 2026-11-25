@@ -17,6 +17,7 @@ mod requests;
 mod router;
 mod service;
 mod skill;
+mod ssh;
 mod state;
 mod tls;
 
@@ -115,6 +116,9 @@ enum Command {
     /// Install the agent skill shipped with this CLI into agents' skill folders.
     #[command(subcommand)]
     Skill(skill::SkillCommand),
+    /// SSH access to the operator's hosts
+    #[command(subcommand)]
+    Ssh(ssh::SshCommand),
     /// Delete the files of ended leases in the background (started by other commands).
     #[command(hide = true)]
     Reap {
@@ -152,6 +156,7 @@ fn main() {
         Command::Login(args) => login::run(args),
         Command::Browser(cmd) => browser::run(cmd),
         Command::Gh(cmd) => gh::run(cmd),
+        Command::Ssh(cmd) => ssh::run(cmd),
     };
     if let Err(e) = result {
         if !e.message.is_empty() {

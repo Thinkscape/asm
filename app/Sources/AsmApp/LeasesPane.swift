@@ -43,7 +43,7 @@ struct LeasesPane: View {
                     TableColumn("Source", value: \.source) { lease in Text(verbatim: lease.source) }
                     TableColumn("Secret", value: \.name) { lease in Text(verbatim: lease.name) }
                     TableColumn("Mode", value: \.modeLine) { lease in
-                        Text(verbatim: lease.modeLine).foregroundStyle(lease.mode == .raw ? .orange : .primary)
+                        Text(verbatim: lease.modeLine).foregroundStyle(lease.mode == .raw && lease.ssh == nil ? .orange : .primary)
                     }
                     TableColumn("Allowed hosts", value: \.hostsLine) { lease in
                         Text(verbatim: lease.hostsLine).help(Text(verbatim: lease.hostsLine))
@@ -91,7 +91,7 @@ struct LeasesPane: View {
             set: { if !$0 { selection = [] } }
         )) {
             if let selectedLease {
-                LeaseDetail(lease: selectedLease)
+                LeaseDetail(lease: selectedLease, model: model)
                     .inspectorColumnWidth(min: 260, ideal: 320, max: 480)
             }
         }
@@ -157,7 +157,7 @@ struct LeasesPane: View {
     private func revoke(_ ids: Set<String>) {
         let active = activeIDs(in: ids)
         guard !active.isEmpty else { return }
-        if active.count > 1 || model.leases.contains(where: { active.contains($0.id) && $0.isGoogleGenerated }) {
+        if active.count > 1 || model.leases.contains(where: { active.contains($0.id) && ($0.isGoogleGenerated || $0.ssh != nil) }) {
             confirming = active
         } else {
             perform(active)
@@ -165,14 +165,20 @@ struct LeasesPane: View {
     }
 
     private func revokeMessage(for ids: Set<String>) -> Text {
-        let googleCount = model.leases.lazy.filter { ids.contains($0.id) && $0.isGoogleGenerated }.count
+        let leases = model.leases.filter { ids.contains($0.id) }
+        if !leases.isEmpty, leases.allSatisfy({ $0.ssh != nil }) {
+            return Text("New logins stop at once. asm then ends this lease's sessions on each target. Each host also ends them itself when the lease expires.")
+        }
+        let googleCount = leases.lazy.filter(\.isGoogleGenerated).count
         if googleCount == ids.count {
             return Text(GcloudTokenWarning.text)
         }
         if googleCount > 0 {
             return Text("Ending these leases stops ASM delivery. Google access tokens cannot be individually revoked; copies remain usable until credential expiry. ASM attempts to revoke GitHub tokens, and static raw values cannot be recalled.")
         }
-        return Text("Ending these leases stops ASM delivery. ASM attempts to revoke GitHub tokens, but delivered copies may remain usable until provider expiry if revocation fails. Static raw values cannot be recalled.")
+        let message = Text("Ending these leases stops ASM delivery. ASM attempts to revoke GitHub tokens, but delivered copies may remain usable until provider expiry if revocation fails. Static raw values cannot be recalled.")
+        guard leases.contains(where: { $0.ssh != nil }) else { return message }
+        return Text("\(message) SSH leases stop new logins at once; asm then ends their sessions on each target.")
     }
 
     private func perform(_ ids: Set<String>) {
@@ -191,6 +197,9 @@ private extension LeaseItem {
 
 private struct LeaseDetail: View {
     let lease: LeaseItem
+    let model: AppModel
+    @State private var retrying = false
+    @State private var error: String?
 
     var body: some View {
         ScrollView {
@@ -203,10 +212,17 @@ private struct LeaseDetail: View {
                 if let reason = lease.suspensionReason, lease.suspended {
                     Label(reason, systemImage: "pause.circle").fixedSize(horizontal: false, vertical: true)
                 }
-                LabeledContent("Authorized fields", value: lease.fields.formatted())
-                LabeledContent("Allowed hosts", value: lease.hostsLine)
+                if lease.ssh == nil {
+                    LabeledContent("Authorized fields", value: lease.fields.formatted())
+                    LabeledContent("Allowed hosts", value: lease.hostsLine)
+                }
                 LabeledContent("Approved") { Text(lease.createdAt, format: .dateTime.year().month().day().hour().minute()) }
                 LabeledContent("Lease expires") { ExpiryCell(date: lease.expiresAt) }
+                if let ssh = lease.ssh {
+                    Divider()
+                    Text("SSH").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+                    SshLeaseSummary(ssh: ssh, retrying: retrying, retry: retryCleanup)
+                }
                 if let generation = lease.generation {
                     Divider()
                     Text(lease.isGoogleGenerated ? "Google Cloud" : "GitHub App")
@@ -242,7 +258,7 @@ private struct LeaseDetail: View {
                         Label("Delivered tokens may remain usable until GitHub expiry after failed revocation or a manager crash.", systemImage: "exclamationmark.triangle")
                             .font(.callout).fixedSize(horizontal: false, vertical: true)
                     }
-                } else if lease.mode == .raw {
+                } else if lease.mode == .raw && lease.ssh == nil {
                     Text("Static raw values already delivered cannot be recalled.").font(.callout)
                 }
                 Divider()
@@ -251,6 +267,60 @@ private struct LeaseDetail: View {
             .font(.callout)
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .errorAlert($error)
+    }
+
+    private func retryCleanup() {
+        guard !retrying else { return }
+        retrying = true
+        let id = lease.id
+        Task {
+            error = await model.retrySshCleanup(id)
+            retrying = false
+        }
+    }
+}
+
+private struct SshLeaseSummary: View {
+    let ssh: SshLeaseDetailItem
+    let retrying: Bool
+    let retry: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            LabeledContent("Access", value: ssh.access.title)
+            LabeledContent("Logins", value: Array(Set(ssh.targets.map(\.login))).sorted().formatted())
+            LabeledContent("Grants", value: ssh.grants.isEmpty ? "—" : ssh.grants.formatted())
+            Text("Targets").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
+            ForEach(Array(ssh.targets.enumerated()), id: \.offset) { _, target in
+                Text(verbatim: Self.line(target))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            if ssh.targets.contains(where: { $0.cleanup == .failed }) {
+                HStack {
+                    Button("Retry Cleanup", action: retry).disabled(retrying)
+                    if retrying { ProgressView().controlSize(.small) }
+                }
+            }
+        }
+    }
+
+    /// `name — login — <cleanup state>`; no cleanup part while the lease is active.
+    private static func line(_ target: SshLeaseTargetItem) -> String {
+        var parts = [target.name, target.login]
+        if let cleanup = target.cleanup {
+            parts.append(cleanupLabel(cleanup, detail: target.cleanupDetail))
+        }
+        return parts.joined(separator: " — ")
+    }
+
+    private static func cleanupLabel(_ state: SshCleanupStateItem, detail: String) -> String {
+        switch state {
+        case .pending: String(localized: "Ending sessions…")
+        case .retrying: String(localized: "Retrying: \(detail)")
+        case .done, .failed: detail
         }
     }
 }

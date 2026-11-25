@@ -86,6 +86,16 @@ final class ApprovalPanelController {
     }
 
     private static func sharingType(for request: PendingItem?) -> NSWindow.SharingType {
+        #if DEBUG
+        // Design checks: SSH requests show no secret values, so a debug build started
+        // with ASM_DEBUG_SHAREABLE_PANEL=1 lets screenshots include them.
+        if ProcessInfo.processInfo.environment["ASM_DEBUG_SHAREABLE_PANEL"] == "1" {
+            switch request?.detail {
+            case .ssh?, .sshExtend?: return .readOnly
+            default: break
+            }
+        }
+        #endif
         guard case let .get(detail)? = request?.detail, detail.isGenerated else { return .none }
         return .readOnly
     }
@@ -111,7 +121,7 @@ final class ApprovalPanelController {
         panel.hidesOnDeactivate = false
         panel.sharingType = Self.sharingType(for: model.shownRequest)
         #if DEBUG
-        // Optional self-rendering of capturable token panels for debug layout checks.
+        // Optional self-rendering of capturable panels for debug layout checks.
         if ProcessInfo.processInfo.environment["ASM_DEBUG_SHAREABLE_PANEL"] == "1" {
             installSnapshotSignal()
         }

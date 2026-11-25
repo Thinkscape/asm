@@ -4,6 +4,7 @@
 use crate::error::ApiError;
 use crate::generators::{GenerationRequest, GenerationSelection, SourceKind};
 use crate::rules::{parse_login_url, validate_agent_text};
+use crate::ssh::{SshAccess, SshResult};
 use serde::{Deserialize, Serialize};
 
 /// Path prefix of every endpoint.
@@ -34,6 +35,8 @@ pub const CAPABILITY_BROADER_LEASE_REUSE_V1: &str = "broader_lease_reuse_v1";
 pub const CAPABILITY_LOGIN_GRANT_V1: &str = "login_grant_v1";
 /// Operator-assisted sign-in handing over a browser storage state (`asm login`).
 pub const CAPABILITY_LOGIN_BROKER_V1: &str = "login_broker_v1";
+/// SSH targets, SSH leases and `/v1/ssh/*`.
+pub const CAPABILITY_SSH_LEASES_V1: &str = "ssh_leases_v1";
 /// Lease duration choices: label and seconds (`None` = unlimited).
 pub const LEASE_DURATIONS: &[(&str, Option<u64>)] = &[
     ("5 min", Some(300)),
@@ -404,6 +407,29 @@ pub enum RequestBody {
         #[serde(default)]
         client_capabilities: Vec<String>,
     },
+    /// SSH access to enrolled targets (`kind: "ssh"`).
+    Ssh {
+        targets: Vec<String>,
+        access: SshAccess,
+        #[serde(default)]
+        grants: Vec<String>,
+        /// For access as a user: which user.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+        #[serde(default)]
+        new_lease: bool,
+        reason: String,
+        #[serde(default)]
+        agent: String,
+    },
+    /// Extend an active SSH lease of the calling host.
+    #[serde(rename = "ssh_extend")]
+    SshExtend {
+        lease_id: String,
+        reason: String,
+        #[serde(default)]
+        agent: String,
+    },
 }
 
 impl RequestBody {
@@ -414,6 +440,7 @@ impl RequestBody {
             RequestBody::Update { .. } => RequestKind::Update,
             RequestBody::Add { .. } => RequestKind::Add,
             RequestBody::Login { .. } => RequestKind::Login,
+            RequestBody::Ssh { .. } | RequestBody::SshExtend { .. } => RequestKind::Ssh,
         }
     }
 
@@ -424,6 +451,7 @@ impl RequestBody {
             | RequestBody::Update { name, .. }
             | RequestBody::Add { name, .. }
             | RequestBody::Login { name, .. } => name,
+            RequestBody::Ssh { .. } | RequestBody::SshExtend { .. } => "ssh",
         }
     }
 
@@ -433,7 +461,9 @@ impl RequestBody {
             RequestBody::Get { agent, .. }
             | RequestBody::Update { agent, .. }
             | RequestBody::Add { agent, .. }
-            | RequestBody::Login { agent, .. } => agent,
+            | RequestBody::Login { agent, .. }
+            | RequestBody::Ssh { agent, .. }
+            | RequestBody::SshExtend { agent, .. } => agent,
         }
     }
 
@@ -481,6 +511,24 @@ impl RequestBody {
             }
             if let Some(generation) = generation {
                 generation.canonicalize()?;
+            }
+        }
+        if let Self::Ssh { targets, access, grants, user, .. } = self {
+            if targets.is_empty() || targets.len() > crate::ssh::MAX_TARGETS {
+                return Err(ApiError::invalid(format!("name 1–{} SSH targets", crate::ssh::MAX_TARGETS)));
+            }
+            for target in targets.iter() {
+                crate::ssh::validate_target_name(target)?;
+            }
+            targets.sort_unstable();
+            targets.dedup();
+            crate::ssh::validate_access(*access, grants, user.as_deref())?;
+            grants.sort_unstable();
+            grants.dedup();
+        }
+        if let Self::SshExtend { lease_id, .. } = self {
+            if !crate::crypto::is_uuid(lease_id) {
+                return Err(ApiError::invalid("lease_id must be an SSH lease id"));
             }
         }
         Ok(())
@@ -545,6 +593,7 @@ pub enum RequestKind {
     Update,
     Add,
     Login,
+    Ssh,
 }
 
 /// Request lifecycle state: `pending` → one terminal state.
@@ -583,12 +632,14 @@ pub struct RequestState {
     pub pending_lifetime_secs: u64,
 }
 
-/// Result of an approved request: `GetResult` for `get`, `WriteResult` for `update`/`add`.
+/// Result of an approved request: `GetResult` for `get`, `WriteResult` for `update`/`add`,
+/// `SshResult` for `ssh` (last: its JSON has none of the other variants' required keys).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestResult {
     Get(GetResult),
     Write(WriteResult),
+    Ssh(SshResult),
 }
 
 /// Result of an approved `get`.
@@ -835,6 +886,70 @@ mod tests {
         .unwrap();
         assert_eq!(pending.expires_at.as_deref(), Some("2026-11-16T12:10:00Z"));
         assert_eq!(pending.pending_lifetime_secs, 600);
+    }
+
+    #[test]
+    fn ssh_requests_and_results() {
+        let mut b: RequestBody = from_str(
+            r#"{"kind":"ssh","targets":["web","db","web"],"access":"restricted","grants":["restart:a.service","logs:a.service","logs:a.service"],"reason":"r"}"#,
+        )
+        .unwrap();
+        assert_eq!(b.kind(), RequestKind::Ssh);
+        b.canonicalize().unwrap();
+        let RequestBody::Ssh { targets, grants, new_lease, .. } = &b else { panic!("not ssh") };
+        assert_eq!(targets, &["db", "web"]);
+        assert_eq!(grants, &["logs:a.service", "restart:a.service"]);
+        assert!(!new_lease);
+        let mut privileged_with_grants: RequestBody = from_str(
+            r#"{"kind":"ssh","targets":["web"],"access":"privileged","grants":["logs:a.service"],"reason":"r"}"#,
+        )
+        .unwrap();
+        assert!(privileged_with_grants.canonicalize().is_err());
+        let mut restricted_without: RequestBody =
+            from_str(r#"{"kind":"ssh","targets":["web"],"access":"restricted","reason":"r"}"#).unwrap();
+        assert!(restricted_without.canonicalize().is_err());
+        let mut no_targets: RequestBody =
+            from_str(r#"{"kind":"ssh","targets":[],"access":"privileged","reason":"r"}"#).unwrap();
+        assert!(no_targets.canonicalize().is_err());
+        let mut as_user: RequestBody =
+            from_str(r#"{"kind":"ssh","targets":["web"],"access":"user","user":"deploy","reason":"r"}"#).unwrap();
+        as_user.canonicalize().unwrap();
+        assert!(matches!(&as_user, RequestBody::Ssh { user: Some(u), .. } if u == "deploy"));
+        for (json, message) in [
+            (r#"{"kind":"ssh","targets":["web"],"access":"user","reason":"r"}"#, "access as a user needs the user's name"),
+            (r#"{"kind":"ssh","targets":["web"],"access":"privileged","user":"deploy","reason":"r"}"#,
+                "a user applies only to access as a user"),
+            (r#"{"kind":"ssh","targets":["web"],"access":"user","user":"deploy","grants":["logs:a.service"],"reason":"r"}"#,
+                "grants apply only to restricted access"),
+            (r#"{"kind":"ssh","targets":["web"],"access":"user","user":"asm-ops","reason":"r"}"#,
+                "logins starting with asm- are reserved for asm's accounts"),
+        ] {
+            let mut b: RequestBody = from_str(json).unwrap();
+            assert_eq!(b.canonicalize().unwrap_err().message, message, "{json}");
+        }
+
+        let ssh = json!({"request_id":"r","kind":"ssh","status":"approved","deny_reason":null,
+            "result":{"lease_id":"l","expires_at":"2026-11-16T12:10:00Z","access":"privileged","grants":[],
+                "certificate":"ssh-ed25519-cert-v01@openssh.com AAAA asm-lease-l",
+                "targets":[{"name":"web","target_id":"0a1b2c3d","login":"asm-priv","hostname":"web.example",
+                    "port":22,"host_keys":["ssh-ed25519 AAAA"]}]},
+            "expires_at":null,"pending_lifetime_secs":600});
+        let s: RequestState = serde_json::from_value(ssh.clone()).unwrap();
+        assert!(matches!(&s.result, Some(RequestResult::Ssh(r)) if r.access == SshAccess::Privileged));
+        assert_eq!(to_value(&s).unwrap(), ssh);
+    }
+
+    #[test]
+    fn ssh_extend_requests() {
+        let json = r#"{"kind":"ssh_extend","lease_id":"0f8fad5b-d9cb-469f-a165-70867728950e","reason":"more time","agent":"a"}"#;
+        let mut b: RequestBody = from_str(json).unwrap();
+        assert_eq!(b.kind(), RequestKind::Ssh);
+        assert_eq!(b.agent(), "a");
+        b.canonicalize().unwrap();
+        assert_eq!(to_value(&b).unwrap(), serde_json::from_str::<serde_json::Value>(json).unwrap());
+        let mut bad: RequestBody =
+            from_str(r#"{"kind":"ssh_extend","lease_id":"not-a-lease","reason":"r"}"#).unwrap();
+        assert_eq!(bad.canonicalize().unwrap_err().message, "lease_id must be an SSH lease id");
     }
 
     #[test]

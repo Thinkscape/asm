@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 enum SettingsPane: String, CaseIterable, Identifiable, Hashable {
-    case vaults, generators, hosts, leases, proxy, settings
+    case vaults, generators, sshTargets, hosts, leases, proxy, settings
 
     var id: String { rawValue }
 
@@ -10,6 +10,7 @@ enum SettingsPane: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .vaults: "Vaults"
         case .generators: "Generators"
+        case .sshTargets: "SSH Targets"
         case .hosts: "Hosts and Agents"
         case .leases: "Leases"
         case .proxy: "Proxy"
@@ -21,6 +22,7 @@ enum SettingsPane: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .vaults: "lock.rectangle.stack"
         case .generators: "key.horizontal"
+        case .sshTargets: "server.rack"
         case .hosts: "desktopcomputer"
         case .leases: "clock.badge.checkmark"
         case .proxy: "arrow.left.arrow.right"
@@ -135,6 +137,7 @@ private struct SettingsDetail: View {
             switch pane {
             case .vaults: VaultsPane(model: model)
             case .generators: GeneratorsPane(model: model)
+            case .sshTargets: SshTargetsPane(model: model)
             case .hosts: HostsPane(model: model)
             case .leases: LeasesPane(model: model)
             case .proxy: ProxyPane(model: model)

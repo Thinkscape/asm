@@ -139,7 +139,7 @@ pub(crate) struct GenerationState {
     pub cached: HashMap<String, CachedLease>,
     retired_only: HashMap<String, RetiredLease>,
     issuance: HashMap<String, Arc<Mutex<()>>>,
-    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    pub(super) clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     pub(super) shutting_down: bool,
 }
 

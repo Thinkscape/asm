@@ -15,6 +15,10 @@ pub struct DataDirs {
     pub values: PathBuf,
     /// `<temp_dir>/net.thinkscape.asm/gcloud/` — isolated SDK workspaces.
     pub gcloud: PathBuf,
+    /// `<data>/ssh/` — pinned SSH target host keys.
+    pub ssh: PathBuf,
+    /// `<temp_dir>/net.thinkscape.asm/ssh/` — keys and configs of certificate runs.
+    pub ssh_run: PathBuf,
 }
 
 impl DataDirs {
@@ -34,11 +38,14 @@ impl DataDirs {
             logs: data.join("logs"),
             values: runtime.join("values"),
             gcloud: runtime.join("gcloud"),
+            ssh: data.join("ssh"),
+            ssh_run: runtime.join("ssh"),
         };
-        for p in [&d.data, &d.tls, &d.proxy, &d.bw, &d.logs, &d.values] {
+        for p in [&d.data, &d.tls, &d.proxy, &d.bw, &d.logs, &d.values, &d.ssh] {
             ensure_private_dir(p)?;
         }
         ensure_private_runtime_dir(&d.gcloud)?;
+        ensure_private_runtime_dir(&d.ssh_run)?;
         Ok(d)
     }
 
@@ -47,6 +54,10 @@ impl DataDirs {
     }
     pub fn bw_vault(&self, vault_id: &str) -> PathBuf {
         self.bw.join(vault_id)
+    }
+    /// Known-hosts file the manager's own ssh uses for SSH targets.
+    pub fn ssh_known_hosts(&self) -> PathBuf {
+        self.ssh.join("known_hosts")
     }
 }
 

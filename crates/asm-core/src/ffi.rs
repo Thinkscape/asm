@@ -41,6 +41,213 @@ pub type FfiResult<T> = Result<T, ManagerError>;
 pub enum SourceKind {
     Vault,
     Generator,
+    /// An SSH lease (FFI only; the wire `SourceKind` has no SSH variant).
+    Ssh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SshAccess {
+    Privileged,
+    Restricted,
+    /// A shell as one of the target's other users.
+    User,
+}
+
+impl From<asm_proto::ssh::SshAccess> for SshAccess {
+    fn from(access: asm_proto::ssh::SshAccess) -> Self {
+        match access {
+            asm_proto::ssh::SshAccess::Privileged => Self::Privileged,
+            asm_proto::ssh::SshAccess::Restricted => Self::Restricted,
+            asm_proto::ssh::SshAccess::User => Self::User,
+        }
+    }
+}
+
+impl From<SshAccess> for asm_proto::ssh::SshAccess {
+    fn from(access: SshAccess) -> Self {
+        match access {
+            SshAccess::Privileged => Self::Privileged,
+            SshAccess::Restricted => Self::Restricted,
+            SshAccess::User => Self::User,
+        }
+    }
+}
+
+/// A user agents may log in as on a target.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SshTargetUser {
+    pub name: String,
+    /// How the user can become root (`in group sudo`); `None` when asm found no way.
+    pub admin: Option<String>,
+}
+
+impl From<crate::store::SshTargetUser> for SshTargetUser {
+    fn from(u: crate::store::SshTargetUser) -> Self {
+        Self { name: u.name, admin: u.admin }
+    }
+}
+
+impl From<SshTargetUser> for crate::store::SshTargetUser {
+    fn from(u: SshTargetUser) -> Self {
+        Self { name: u.name.trim().to_owned(), admin: u.admin }
+    }
+}
+
+/// One account of a host, as `list_ssh_host_users` read it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SshHostUser {
+    pub name: String,
+    pub uid: u32,
+    /// Outside the host's UID_MIN..UID_MAX (daemon accounts such as www-data).
+    pub system: bool,
+    /// Its shell can run a login session; otherwise asm runs /bin/sh for it.
+    pub login_shell: bool,
+    /// How it can become root; `None` when asm found no way.
+    pub admin: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SshCleanupState {
+    /// Not tried yet.
+    Pending,
+    /// An attempt could not reach the host; asm tries again.
+    Retrying,
+    Done,
+    Failed,
+}
+
+impl From<&crate::store::SshCleanup> for SshCleanupState {
+    fn from(cleanup: &crate::store::SshCleanup) -> Self {
+        match cleanup.state {
+            crate::store::SshCleanupState::Pending if cleanup.attempts == 0 => Self::Pending,
+            crate::store::SshCleanupState::Pending => Self::Retrying,
+            crate::store::SshCleanupState::Done => Self::Done,
+            crate::store::SshCleanupState::Failed => Self::Failed,
+        }
+    }
+}
+
+/// One target of a pending SSH request, as configured now.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SshApprovalTarget {
+    pub target_id: String,
+    pub name: String,
+    /// Address agents use.
+    pub hostname: String,
+    pub port: u16,
+    /// The operator's login on the target; privileged leases run as it.
+    pub privileged_login: String,
+    /// Privileged access is allowed (the `asm-priv` account exists).
+    pub allow_privileged: bool,
+    pub log_units: Vec<String>,
+    pub restart_units: Vec<String>,
+    pub users: Vec<SshTargetUser>,
+    /// Enrolled at the requested revision with the current CA.
+    pub ready: bool,
+    pub issue: Option<String>,
+    pub host_key_fingerprints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SshLeaseTarget {
+    pub name: String,
+    pub login: String,
+    /// `None` while the lease is active.
+    pub cleanup: Option<SshCleanupState>,
+    pub cleanup_detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SshLeaseDetail {
+    pub access: SshAccess,
+    pub grants: Vec<String>,
+    /// The user an access-as-a-user lease runs as.
+    pub user: Option<String>,
+    pub targets: Vec<SshLeaseTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SshHostKey {
+    /// `<type> <b64>`.
+    pub line: String,
+    /// `SHA256:…`.
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SshHostKeyLookup {
+    pub hostname: String,
+    pub port: u16,
+    /// Empty when the operator's known_hosts doesn't know the destination.
+    pub keys: Vec<SshHostKey>,
+    /// The ProxyJump hops ssh uses to reach the destination.
+    pub proxy_jump: Option<String>,
+    /// The operator's ssh config reaches the destination through a ProxyCommand.
+    pub proxy_command: bool,
+}
+
+/// The check login before a target is saved.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum SshHostCheck {
+    /// The host proved one of the pinned keys (and, before saving, the privileged login
+    /// and its sudo work).
+    Verified,
+    /// The host proved none of the pinned keys; it offers these instead (unverified).
+    KeyMismatch { presented: Vec<SshHostKey> },
+    /// The host wasn't reached, so nothing was checked.
+    Unreachable { message: String },
+}
+
+/// `id: None` adds a target; an edit passes its id and the revision it was read at.
+/// An empty `destination` or `agent_hostname` means the name.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SshTargetDraft {
+    pub id: Option<String>,
+    pub expected_revision: Option<u64>,
+    pub name: String,
+    pub destination: String,
+    pub agent_hostname: String,
+    pub agent_port: u16,
+    pub privileged_login: String,
+    pub allow_privileged: bool,
+    pub host_keys: Vec<String>,
+    pub log_units: Vec<String>,
+    pub restart_units: Vec<String>,
+    pub max_duration_secs: u64,
+    pub users: Vec<SshTargetUser>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SshTargetState {
+    NotEnrolled,
+    Enrolling,
+    Enrolled,
+    /// Enrolled, but its settings or the CA changed since; enroll again.
+    NeedsReenroll,
+    Failed,
+    Removing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SshTargetInfo {
+    pub id: String,
+    pub name: String,
+    pub destination: String,
+    pub agent_hostname: String,
+    pub agent_port: u16,
+    pub privileged_login: String,
+    pub allow_privileged: bool,
+    pub host_keys: Vec<SshHostKey>,
+    pub log_units: Vec<String>,
+    pub restart_units: Vec<String>,
+    pub max_duration_secs: u64,
+    pub users: Vec<SshTargetUser>,
+    pub revision: u64,
+    pub state: SshTargetState,
+    pub error: Option<String>,
+    /// The last run on the target failed its host key check: review it.
+    pub host_key_changed: bool,
+    pub active_leases: u32,
 }
 
 impl From<asm_proto::generators::SourceKind> for SourceKind {
@@ -867,6 +1074,21 @@ pub enum Decision {
         duration_secs: Option<u64>,
         fill_origins: Vec<String>,
     },
+    /// An SSH request: the targets (a subset of the request's), the access (any the
+    /// targets allow: privileged, restricted with grants, or a user every target allows),
+    /// restricted grants (no more than a restricted request asked for), the user for
+    /// access as a user, and the duration (60 s up to the targets' limit).
+    ApproveSsh {
+        target_ids: Vec<String>,
+        access: SshAccess,
+        grants: Vec<String>,
+        user: Option<String>,
+        duration_secs: u64,
+    },
+    /// An SSH lease extension: the lease then ends `duration_secs` from now.
+    ApproveSshExtend {
+        duration_secs: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -1037,6 +1259,29 @@ pub enum RequestDetail {
         reason: String,
         has_totp: bool,
     },
+    Ssh {
+        reason: String,
+        access: SshAccess,
+        grants: Vec<String>,
+        /// The requested user, for access as a user.
+        user: Option<String>,
+        targets: Vec<SshApprovalTarget>,
+        default_duration_secs: u64,
+        max_duration_secs: u64,
+    },
+    /// A request to extend an active SSH lease. `issue` is set when it can't be extended.
+    SshExtend {
+        lease_id: String,
+        reason: String,
+        access: SshAccess,
+        grants: Vec<String>,
+        user: Option<String>,
+        targets: Vec<SshApprovalTarget>,
+        expires_at: SystemTime,
+        issue: Option<String>,
+        default_duration_secs: u64,
+        max_duration_secs: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -1046,6 +1291,7 @@ pub enum RequestKind {
     Update,
     Add,
     Login,
+    Ssh,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -1326,6 +1572,8 @@ pub struct LeaseInfo {
     pub credential_expires_at: Option<SystemTime>,
     pub credential_version: Option<u64>,
     pub suspension_reason: Option<String>,
+    /// Set for SSH leases (`source_kind == Ssh`) only.
+    pub ssh: Option<SshLeaseDetail>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -1760,6 +2008,76 @@ impl Manager {
 
     pub fn revoke_lease(&self, lease_id: String) -> FfiResult<()> {
         Ok(self.core.revoke_lease(&lease_id)?)
+    }
+
+    pub fn list_ssh_targets(&self) -> FfiResult<Vec<SshTargetInfo>> {
+        Ok(self.core.list_ssh_targets()?)
+    }
+
+    /// Host keys for `destination` from the operator's own known_hosts files, without
+    /// contacting it; `keys` is empty when they don't know it.
+    pub fn lookup_ssh_host_keys(&self, destination: String) -> FfiResult<SshHostKeyLookup> {
+        Ok(self.core.lookup_ssh_host_keys(&destination)?)
+    }
+
+    /// The host keys `destination` offers, fetched without logging in. Unverified: show
+    /// them and have the operator confirm them before they are pinned.
+    pub fn fetch_ssh_host_keys(&self, destination: String) -> FfiResult<SshHostKeyLookup> {
+        Ok(self.core.fetch_ssh_host_keys(&destination)?)
+    }
+
+    /// Logs in to `destination` as enrollment will, pinned to `host_keys` (takes up to
+    /// 30 s); a refused login, sudo or connection is an error.
+    pub fn check_ssh_destination(
+        &self, destination: String, privileged_login: String, host_keys: Vec<String>,
+    ) -> FfiResult<SshHostCheck> {
+        Ok(self.core.check_ssh_destination(&destination, &privileged_login, &host_keys)?)
+    }
+
+    /// Logs in to `destination` as `privileged_login`, pinned to `host_keys`, and lists the
+    /// accounts agents could log in as (takes up to 30 s).
+    pub fn list_ssh_host_users(
+        &self, destination: String, privileged_login: String, host_keys: Vec<String>,
+    ) -> FfiResult<Vec<SshHostUser>> {
+        Ok(self.core.list_ssh_host_users(&destination, &privileged_login, &host_keys)?)
+    }
+
+    /// Asks a target for its host keys and compares them with the pinned ones (no login).
+    pub fn review_ssh_host_keys(&self, id: String) -> FfiResult<SshHostCheck> {
+        Ok(self.core.review_ssh_host_keys(&id)?)
+    }
+
+    /// Pins host keys the operator reviewed; ends the target's active leases and, for an
+    /// enrolled target, asks for enrolling again.
+    pub fn replace_ssh_host_keys(&self, id: String, expected_revision: u64, keys: Vec<String>) -> FfiResult<SshTargetInfo> {
+        Ok(self.core.replace_ssh_host_keys(&id, expected_revision, keys)?)
+    }
+
+    pub fn save_ssh_target(&self, draft: SshTargetDraft) -> FfiResult<SshTargetInfo> {
+        Ok(self.core.save_ssh_target(draft)?)
+    }
+
+    pub fn remove_ssh_target(&self, id: String) -> FfiResult<()> {
+        Ok(self.core.remove_ssh_target(&id)?)
+    }
+
+    /// Runs the enrollment script as root on the target over the operator's ssh, then
+    /// a test login as each asm account (blocks).
+    pub fn enroll_ssh_target(&self, id: String, expected_revision: u64) -> FfiResult<SshTargetInfo> {
+        Ok(self.core.enroll_ssh_target(&id, expected_revision)?)
+    }
+
+    /// Ends the target's leases, then removes asm's accounts, files and timer from it (blocks).
+    pub fn unenroll_ssh_target(&self, id: String) -> FfiResult<()> {
+        Ok(self.core.unenroll_ssh_target(&id)?)
+    }
+
+    pub fn ssh_enroll_script(&self, id: String) -> FfiResult<String> {
+        Ok(self.core.ssh_enroll_script(&id)?)
+    }
+
+    pub fn retry_ssh_cleanup(&self, lease_id: String) -> FfiResult<()> {
+        Ok(self.core.retry_ssh_cleanup(&lease_id)?)
     }
 
     pub fn proxy_settings(&self) -> ProxySettings {

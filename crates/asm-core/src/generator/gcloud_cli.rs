@@ -5,19 +5,20 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use asm_proto::generators::{validate_gcloud_project_id, validate_gcloud_scope};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 
 use crate::error::{CoreError, Result};
+use crate::process::{OutputErrors, collect_output};
 
 const SDK_PATHS: [(&str, &str); 4] = [
     ("/opt/homebrew/bin/gcloud", "/opt/homebrew"),
@@ -28,8 +29,12 @@ const SDK_PATHS: [(&str, &str); 4] = [
 const MINIMUM_SDK: (u32, u32, u32) = (582, 0, 0);
 const SDK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
-const STREAM_LIMIT: usize = 64 * 1024;
+const GCLOUD_OUTPUT: OutputErrors = OutputErrors {
+    read: "Could not read Google Cloud CLI output",
+    timeout: "Google Cloud CLI timed out. Check the Mac’s connection or browser and try again",
+    capture: "Could not capture Google Cloud CLI output",
+    too_large: "Google Cloud CLI response exceeded the size limit",
+};
 const ADC_LIMIT: usize = 1024 * 1024;
 const ADC_NAME: &str = "application_default_credentials.json";
 const NOFOLLOW: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
@@ -468,7 +473,7 @@ impl Operation<'_> {
             });
         }
         let child = command.spawn().map_err(|_| call.failed(&[]))?;
-        let (status, stdout, stderr) = collect_output(child, call.timeout(), || self.check_cancelled())?;
+        let (status, stdout, stderr) = collect_output(child, call.timeout(), || self.check_cancelled(), &GCLOUD_OUTPUT)?;
         self.check_cancelled()?;
         if status.success() { Ok(stdout) } else { Err(call.failed(&stderr)) }
     }
@@ -868,104 +873,6 @@ impl Drop for Workspace {
         // This runs while we still own the workspace lock, after the subprocess group is gone.
         if fs::remove_dir_all(&self.path).is_err() {
             log::warn!("Could not remove a private Google Cloud SDK workspace");
-        }
-    }
-}
-
-struct ProcessGroup {
-    child: Child,
-    reaped: bool,
-}
-
-impl ProcessGroup {
-    fn exited(&self) -> io::Result<bool> {
-        // SAFETY: waitid writes this siginfo for our direct child. WNOWAIT keeps the
-        // process-group ID reserved until cleanup has signalled all descendants.
-        unsafe {
-            let mut info: libc::siginfo_t = std::mem::zeroed();
-            let ret = libc::waitid(libc::P_PID, self.child.id() as _, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT);
-            if ret == 0 { Ok(info.si_pid() != 0) } else { Err(io::Error::last_os_error()) }
-        }
-    }
-
-    fn kill(&self) {
-        // SAFETY: process_group(0) made the child's PID its process-group ID. Only
-        // signal while the child has not been reaped, so the ID cannot be reused.
-        unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL); }
-    }
-
-    fn wait(&mut self) -> io::Result<ExitStatus> {
-        let status = self.child.wait()?;
-        self.reaped = true;
-        Ok(status)
-    }
-}
-
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        if !self.reaped {
-            self.kill();
-            let _ = self.wait();
-        }
-    }
-}
-
-fn collect_output(child: Child, timeout: Duration, check_cancelled: impl Fn() -> Result<()>) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-    let output_error = || CoreError::vault_unavailable("Could not read Google Cloud CLI output");
-    let mut process = ProcessGroup { child, reaped: false };
-    let mut stdout = process.child.stdout.take().ok_or_else(output_error)?;
-    let mut stderr = process.child.stderr.take().ok_or_else(output_error)?;
-    let mut fds = [pollable(stdout.as_raw_fd())?, pollable(stderr.as_raw_fd())?];
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let start = Instant::now();
-    loop {
-        check_cancelled()?;
-        let remaining = timeout.checked_sub(start.elapsed()).ok_or_else(|| {
-            CoreError::vault_unavailable("Google Cloud CLI timed out. Check the Mac’s connection or browser and try again")
-        })?;
-        let millis = remaining.min(POLL_INTERVAL).as_millis().max(1) as i32;
-        // SAFETY: fds is a live fixed-size array of pollfd for this call.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
-        if ready == -1 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted { continue; }
-            return Err(output_error());
-        }
-        if fds[0].revents != 0 && drain(&mut stdout, &mut out)? { fds[0].fd = -1; }
-        if fds[1].revents != 0 && drain(&mut stderr, &mut err)? { fds[1].fd = -1; }
-        match process.exited() {
-            Ok(true) => {
-                process.kill();
-                // The leader will not write any more; collect data already in its pipes.
-                drain(&mut stdout, &mut out)?;
-                drain(&mut stderr, &mut err)?;
-                return Ok((process.wait().map_err(|_| output_error())?, out, err));
-            }
-            Ok(false) => {}
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return Err(output_error()),
-        }
-    }
-}
-
-fn pollable(fd: RawFd) -> Result<libc::pollfd> {
-    // SAFETY: the caller owns this pipe descriptor, set nonblocking for bounded reads.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } == -1 {
-        return Err(CoreError::vault_unavailable("Could not capture Google Cloud CLI output"));
-    }
-    Ok(libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
-}
-
-fn drain(pipe: &mut impl Read, output: &mut Vec<u8>) -> Result<bool> {
-    let mut buffer = [0u8; 8192];
-    loop {
-        match pipe.read(&mut buffer) {
-            Ok(0) => return Ok(true),
-            Ok(len) if output.len() + len <= STREAM_LIMIT => output.extend_from_slice(&buffer[..len]),
-            Ok(_) => return Err(CoreError::vault_unavailable("Google Cloud CLI response exceeded the size limit")),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return Err(CoreError::vault_unavailable("Could not read Google Cloud CLI output")),
         }
     }
 }

@@ -4,7 +4,7 @@ import Foundation
 // UniFFI records onto these, so the views stay independent of binding details.
 
 enum RequestKind: String, Equatable, Sendable {
-    case pair, get, update, add, login
+    case pair, get, update, add, login, ssh
 
     var title: String {
         switch self {
@@ -13,6 +13,7 @@ enum RequestKind: String, Equatable, Sendable {
         case .update: "Update"
         case .add: "Add"
         case .login: "Sign in"
+        case .ssh: "SSH access"
         }
     }
 
@@ -23,6 +24,7 @@ enum RequestKind: String, Equatable, Sendable {
         case .update: "pencil"
         case .add: "plus.circle"
         case .login: "person.badge.key"
+        case .ssh: "terminal"
         }
     }
 }
@@ -66,6 +68,8 @@ enum RequestDetail: Equatable, Sendable {
     case update(name: String, vaultID: String, vaultName: String, field: String, oldValue: String, newValue: String)
     case add(name: String, value: String, targets: [AddTargetItem])
     case login(LoginDetail)
+    case ssh(SshRequestItem)
+    case sshExtend(SshExtendRequestItem)
 }
 
 /// `asm login`: the operator signs in on this Mac with a vault login the manager fills
@@ -162,7 +166,204 @@ struct RecentItem: Identifiable, Equatable, Sendable {
 
 
 enum SourceKindItem: Equatable, Sendable {
-    case vault, generator
+    case vault, generator, ssh
+}
+
+// MARK: - SSH
+
+/// SSH access; access as another user carries its name.
+enum SshAccessItem: Hashable, Sendable {
+    case privileged, restricted
+    case user(String)
+
+    var title: String {
+        switch self {
+        case .privileged: String(localized: "privileged")
+        case .restricted: String(localized: "restricted (asm-ops)")
+        case let .user(name): String(localized: "as \(name)")
+        }
+    }
+}
+
+/// A user agents may log in as on a target.
+struct SshTargetUserItem: Hashable, Sendable {
+    var name: String
+    /// How the user can become root (`in group sudo`); nil when asm found no way.
+    var admin: String?
+}
+
+/// One account of a host, as asm listed it while choosing a target's users.
+struct SshHostUserItem: Identifiable, Equatable, Sendable {
+    var name: String
+    var uid: UInt32
+    /// A daemon account (outside the host's UID_MIN..UID_MAX).
+    var system: Bool
+    /// Its shell can run a login session; asm runs /bin/sh otherwise.
+    var loginShell: Bool
+    /// How it can become root; nil when asm found no way.
+    var admin: String?
+
+    var id: String { name }
+}
+
+/// One target of a pending SSH request, as configured now.
+struct SshApprovalTargetItem: Identifiable, Equatable, Sendable {
+    var id: String
+    var name: String
+    /// Address agents use.
+    var hostname: String
+    var port: UInt16
+    var privilegedLogin: String
+    var allowPrivileged: Bool
+    var logUnits: [String]
+    var restartUnits: [String]
+    var users: [SshTargetUserItem]
+    /// Enrolled at the requested revision with the current CA.
+    var ready: Bool
+    var issue: String?
+    var hostKeyFingerprints: [String]
+}
+
+struct SshRequestItem: Equatable, Sendable {
+    var reason: String
+    var access: SshAccessItem
+    /// `logs:<unit>`, `restart:<unit>` (restricted access only).
+    var grants: [String]
+    var targets: [SshApprovalTargetItem]
+    var defaultDurationSecs: UInt64
+    var maxDurationSecs: UInt64
+}
+
+/// An agent asks to extend one of its active SSH leases. Access, grants and targets are the
+/// lease's and can't be edited.
+struct SshExtendRequestItem: Equatable, Sendable {
+    var leaseID: String
+    var reason: String
+    var access: SshAccessItem
+    var grants: [String]
+    var targets: [SshApprovalTargetItem]
+    var expiresAt: Date
+    /// Set when the lease can no longer be extended.
+    var issue: String?
+    var defaultDurationSecs: UInt64
+    var maxDurationSecs: UInt64
+}
+
+enum SshCleanupStateItem: Equatable, Sendable {
+    case pending, retrying, done, failed
+}
+
+struct SshLeaseTargetItem: Equatable, Sendable {
+    var name: String
+    var login: String
+    /// `nil` while the lease is active.
+    var cleanup: SshCleanupStateItem?
+    var cleanupDetail: String
+}
+
+struct SshLeaseDetailItem: Equatable, Sendable {
+    var access: SshAccessItem
+    var grants: [String]
+    var targets: [SshLeaseTargetItem]
+}
+
+struct SshHostKeyItem: Hashable, Sendable {
+    /// `<type> <b64>`.
+    var line: String
+    /// `SHA256:…`.
+    var fingerprint: String
+}
+
+struct SshHostKeyLookupItem: Equatable, Sendable {
+    var hostname: String
+    var port: UInt16
+    /// Empty when the operator's known_hosts doesn't know the destination.
+    var keys: [SshHostKeyItem]
+    /// The ProxyJump hops ssh uses to reach the destination.
+    var proxyJump: String?
+    /// The operator's ssh config reaches the destination through a ProxyCommand.
+    var proxyCommand: Bool
+}
+
+/// A host key check: before a target is saved (with a login), or a review (without).
+enum SshHostCheckItem: Equatable, Sendable {
+    case verified
+    /// The host proved none of the pinned keys; it offers these instead (unverified).
+    case keyMismatch(presented: [SshHostKeyItem])
+    /// The host wasn't reached, so nothing was checked.
+    case unreachable(String)
+}
+
+enum SshTargetStateItem: Equatable, Sendable {
+    case notEnrolled, enrolling, enrolled, needsReenroll, failed, removing
+
+    var title: String {
+        switch self {
+        case .notEnrolled: String(localized: "Not enrolled")
+        case .enrolling: String(localized: "Enrolling…")
+        case .enrolled: String(localized: "Enrolled")
+        case .needsReenroll: String(localized: "Enroll again (settings changed)")
+        case .failed: String(localized: "Failed")
+        case .removing: String(localized: "Removing from host…")
+        }
+    }
+}
+
+struct SshTargetItem: Identifiable, Equatable, Sendable {
+    var id: String
+    var name: String
+    var destination: String
+    var agentHostname: String
+    var agentPort: UInt16
+    var privilegedLogin: String
+    var hostKeys: [SshHostKeyItem]
+    var allowPrivileged: Bool
+    var logUnits: [String]
+    var restartUnits: [String]
+    var users: [SshTargetUserItem]
+    var maxDurationSecs: UInt64
+    var revision: UInt64
+    var state: SshTargetStateItem
+    var error: String?
+    var activeLeases: UInt32
+    /// The last run on the target failed its host key check.
+    var hostKeyChanged: Bool
+}
+
+/// `id` nil adds a target; an edit passes its id and the revision it was read at.
+struct SshTargetDraftItem: Sendable {
+    var id: String?
+    var expectedRevision: UInt64?
+    var name: String
+    var destination: String
+    var agentHostname: String
+    var agentPort: UInt16
+    var privilegedLogin: String
+    var hostKeys: [String]
+    var allowPrivileged: Bool
+    var logUnits: [String]
+    var restartUnits: [String]
+    var users: [SshTargetUserItem]
+    var maxDurationSecs: UInt64
+}
+
+/// Duration choices of the SSH approval popup and the target sheet's "Max lease".
+enum SshDurations {
+    static let approval: [LeaseDuration] = [
+        LeaseDuration(seconds: 900, title: "15 min"),
+        LeaseDuration(seconds: 3600, title: "1 h"),
+        LeaseDuration(seconds: 14_400, title: "4 h"),
+        LeaseDuration(seconds: 28_800, title: "8 h"),
+        LeaseDuration(seconds: 86_400, title: "24 h"),
+    ]
+    static let maxLease: [LeaseDuration] = approval + [LeaseDuration(seconds: 604_800, title: "7 days")]
+
+    /// `choices`, plus `extra` (titled from its length) when it is not one of them.
+    static func including(_ extra: UInt64, in choices: [LeaseDuration]) -> [LeaseDuration] {
+        guard !choices.contains(where: { $0.seconds == extra }) else { return choices }
+        let title = Duration.seconds(Int64(extra)).formatted(.units(allowed: [.days, .hours, .minutes], width: .abbreviated))
+        return (choices + [LeaseDuration(seconds: extra, title: title)]).sorted { $0.id < $1.id }
+    }
 }
 
 enum GithubPermissionLevel: String, CaseIterable, Comparable, Hashable, Sendable {
@@ -739,13 +940,17 @@ struct LeaseItem: Identifiable, Equatable, Sendable {
     var credentialExpiresAt: Date?
     var credentialVersion: UInt64?
     var suspensionReason: String?
+    /// Set for SSH leases only.
+    var ssh: SshLeaseDetailItem?
 
     // Sort keys for `Table` columns.
     var hostsLine: String {
+        if ssh != nil { return "—" }
         if mode == .raw { return "none (raw value)" }
         return hosts == ["*"] ? "any host" : hosts.joined(separator: ", ")
     }
     var modeLine: String {
+        if ssh != nil { return "SSH certificate" }
         if mode == .sentinel { return "sentinel" }
         return rawDelivered ? "raw value delivered" : "raw"
     }
@@ -932,6 +1137,8 @@ enum DecisionItem: Sendable {
     case approveWrite(vaultID: String, collectionID: String?)
     /// `durationSecs`: how long the handed-over session stays valid (`nil` = 1 hour).
     case approveLogin(durationSecs: UInt64?, fillOrigins: [String])
+    case approveSsh(targetIDs: [String], access: SshAccessItem, grants: [String], durationSecs: UInt64)
+    case approveSshExtend(durationSecs: UInt64)
 }
 
 struct HostPatternCheckItem: Equatable, Sendable {
@@ -949,7 +1156,7 @@ struct LeaseDuration: Identifiable, Hashable, Sendable {
 
 /// Categories of the activity log (core `ActivityEntry.category`).
 enum ActivityCategory: String, CaseIterable, Identifiable, Sendable {
-    case requests, leases, proxy, pairing, vaults, generators
+    case requests, leases, proxy, pairing, vaults, generators, ssh
 
     var id: String { rawValue }
 
@@ -961,6 +1168,7 @@ enum ActivityCategory: String, CaseIterable, Identifiable, Sendable {
         case .pairing: "Pairing"
         case .vaults: "Vaults"
         case .generators: "Generators"
+        case .ssh: "SSH"
         }
     }
 
@@ -972,6 +1180,7 @@ enum ActivityCategory: String, CaseIterable, Identifiable, Sendable {
         case .pairing: "link"
         case .vaults: "lock.rectangle.stack"
         case .generators: "key.horizontal"
+        case .ssh: "terminal"
         }
     }
 }

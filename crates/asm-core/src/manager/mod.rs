@@ -35,6 +35,8 @@ pub mod netinfo;
 pub mod pairing;
 pub mod requests;
 pub(crate) mod resume;
+#[doc(hidden)]
+pub mod ssh;
 
 pub use requests::Book;
 
@@ -48,6 +50,7 @@ pub const TOPIC_PROXY: &str = "proxy";
 pub const TOPIC_FIREWALL: &str = "firewall";
 pub const TOPIC_SETTINGS: &str = "settings";
 pub const TOPIC_ACTIVITY: &str = "activity";
+pub const TOPIC_SSH_TARGETS: &str = "ssh_targets";
 
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
 /// Sleep past an expiry instant by this much, so `now()` (whole seconds) has reached it.
@@ -171,6 +174,8 @@ pub struct Core {
     proxy_auth_sync: Mutex<()>,
     /// `asm login` sign-in browsers.
     pub(crate) broker: crate::broker::Broker,
+    /// SSH CA, lease keys, target operations and the session cleanup worker.
+    pub(crate) ssh: ssh::SshState,
 }
 
 /// One manager per data directory: take an exclusive lock on its lock file, or fail with
@@ -441,6 +446,7 @@ impl Core {
             .build()?;
         let rt_handle = rt.handle().clone();
         let (changes, _) = watch::channel(0u64);
+        let known_hosts = dirs.ssh_known_hosts();
         let core = Arc::new_cyclic(|weak| Self {
             broker: crate::broker::Broker::new(dirs.data.join("broker"), weak.clone()),
             dirs,
@@ -473,13 +479,16 @@ impl Core {
             firewall: Mutex::new(firewall::FirewallCheck::default()),
             firewall_wake,
             proxy_auth_sync: Mutex::new(()),
+            ssh: ssh::SshState::new(known_hosts),
         });
         // A crashed manager may have left a sign-in browser running.
         core.broker.cleanup_leftovers();
+        core.ssh.attach(&core);
         // Restore and validate authority before opening either listener.
         let recovered = (|| -> Result<()> {
             core.restore_generated()?;
             core.restore_request_book(now())?;
+            core.restore_ssh()?;
             let t = now();
             let active = core.store.active_leases(t)?;
             let (entries, routes) = {
@@ -599,7 +608,8 @@ impl Core {
         let t = self.generation_now();
         let leases = self.store.active_leases(t).ok()?;
         let live = lock(&self.generation).next_expiry(t);
-        let next = leases.iter().filter_map(|l| l.expires_at).chain(live).min()?;
+        let ssh = self.next_ssh_wake(t);
+        let next = leases.iter().filter_map(|l| l.expires_at).chain(live).chain(ssh).min()?;
         Some(
             to_system_time(next)
                 .duration_since(SystemTime::now())
@@ -924,6 +934,7 @@ impl Core {
             log::error!("expiring request records: {}", error.message);
         }
         self.sweep_generated_at(self.generation_now());
+        self.sweep_ssh_at(self.generation_now());
         self.sweep_gcloud_setup(t);
         let _ = self.store.prune_history(t - HISTORY_SECS);
         self.prune_activity(t);
@@ -973,6 +984,7 @@ impl Core {
     }
 
     pub fn shutdown(&self) {
+        self.ssh.stop();
         self.begin_generation_shutdown();
         self.broker.shutdown();
         self.shutdown_gcloud_setup();

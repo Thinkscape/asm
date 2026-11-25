@@ -249,6 +249,44 @@ pub(crate) enum Detail {
     Update(UpdateDetail),
     Add(AddDetail),
     Login(LoginDetail),
+    Ssh(SshDetail),
+    SshExtend(SshExtendDetail),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SshDetailTarget {
+    pub target_id: String,
+    pub name: String,
+    /// The target revision the request was checked against.
+    pub revision: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SshDetail {
+    pub targets: Vec<SshDetailTarget>,
+    pub access: asm_proto::ssh::SshAccess,
+    pub grants: Vec<String>,
+    /// For access as a user: which user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SshExtendDetail {
+    pub lease_id: String,
+    pub reason: String,
+    /// The lease's target names, for summaries.
+    pub names: Vec<String>,
+}
+
+impl SshDetail {
+    /// The same targets, access, grants and user (the request re-attaches instead of
+    /// creating a second approval).
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        self.access == other.access && self.grants == other.grants && self.user == other.user
+            && self.targets.iter().map(|t| &t.target_id).eq(other.targets.iter().map(|t| &t.target_id))
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -280,6 +318,7 @@ impl Pending {
             Detail::Update(_) => "update",
             Detail::Add(_) => "add",
             Detail::Login(_) => "login",
+            Detail::Ssh(_) | Detail::SshExtend(_) => "ssh",
         }
     }
 
@@ -288,7 +327,8 @@ impl Pending {
             Detail::Update(_) => RequestKind::Update,
             Detail::Add(_) => RequestKind::Add,
             Detail::Login(_) => RequestKind::Login,
-            _ => RequestKind::Get,
+            Detail::Ssh(_) | Detail::SshExtend(_) => RequestKind::Ssh,
+            Detail::Pair { .. } | Detail::Get(_) => RequestKind::Get,
         }
     }
 
@@ -303,6 +343,12 @@ impl Pending {
             Detail::Update(u) => format!("update {} ({})", u.secret.display, u.field),
             Detail::Add(a) => format!("add {}", a.name),
             Detail::Login(l) => format!("login {}", l.secret.display),
+            Detail::Ssh(s) => format!(
+                "ssh {} ({})",
+                s.targets.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "),
+                super::ssh::access_summary(s.access, &s.grants, s.user.as_deref())
+            ),
+            Detail::SshExtend(e) => format!("extend ssh lease on {}", e.names.join(", ")),
         }
     }
 
@@ -775,6 +821,8 @@ impl Core {
                 self.create_add(host, &agent, address, name, value)
             }
             body @ RequestBody::Login { .. } => self.create_login(host, &agent, address, body),
+            body @ RequestBody::Ssh { .. } => self.create_ssh(host, &agent, address, body),
+            body @ RequestBody::SshExtend { .. } => self.create_ssh_extend(host, &agent, address, body),
         }
     }
 
@@ -1505,6 +1553,8 @@ impl Core {
                     | (Detail::Update(_), ffi::Decision::ApproveWrite { .. })
                     | (Detail::Add(_), ffi::Decision::ApproveWrite { .. })
                     | (Detail::Login(_), ffi::Decision::ApproveLogin { .. })
+                    | (Detail::Ssh(_), ffi::Decision::ApproveSsh { .. })
+                    | (Detail::SshExtend(_), ffi::Decision::ApproveSshExtend { .. })
             );
             if !ok {
                 return Err(CoreError::invalid(
@@ -1567,6 +1617,17 @@ impl Core {
             (Detail::Login(l), ffi::Decision::ApproveLogin { duration_secs, fill_origins }) => self
                 .approve_login(&p, l, duration_secs, &fill_origins)
                 .map(|()| None),
+            (
+                Detail::Ssh(d),
+                ffi::Decision::ApproveSsh { target_ids, access, grants, user, duration_secs },
+            ) => self
+                .approve_ssh(&p, d, super::ssh::SshApproval {
+                    target_ids, access: access.into(), grants, user, duration_secs,
+                })
+                .map(|_| None),
+            (Detail::SshExtend(d), ffi::Decision::ApproveSshExtend { duration_secs }) => self
+                .approve_ssh_extend(&p, d, duration_secs)
+                .map(|_| None),
             _ => Err(Fail::Keep(CoreError::invalid(
                 "this decision does not fit the request kind",
             ))),
@@ -2243,6 +2304,7 @@ fn kind_from_str(s: &str) -> ffi::RequestKind {
         "update" => ffi::RequestKind::Update,
         "add" => ffi::RequestKind::Add,
         "login" => ffi::RequestKind::Login,
+        "ssh" => ffi::RequestKind::Ssh,
         _ => ffi::RequestKind::Get,
     }
 }
@@ -2359,6 +2421,8 @@ fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi
             fill_origins: l.fill_origins,
             reason: l.reason,
         },
+        Detail::Ssh(s) => core.ssh_approval_detail(&s, default_duration),
+        Detail::SshExtend(e) => core.ssh_extend_approval_detail(&e, default_duration),
     };
     ffi::PendingRequest {
         id: p.id,

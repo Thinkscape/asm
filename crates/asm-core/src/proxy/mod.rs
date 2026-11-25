@@ -38,6 +38,7 @@ pub use audit::ProxyEvent;
 pub use config::DEFAULT_DENY_CIDRS;
 pub use health::Phase;
 pub use redact::REDACTED;
+pub(crate) use files::write_private_atomic;
 
 /// Receives activity events from the proxy's threads; must not block.
 pub type EventSink = Arc<dyn Fn(ProxyEvent) + Send + Sync>;

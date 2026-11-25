@@ -27,6 +27,9 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
     private var unhealthyCheck: Task<Void, Never>?
     /// The current firewall incident was reported (reset once nothing is blocked).
     private var firewallReported = false
+    /// `<lease id>/<target name>` of every SSH cleanup problem seen; `nil` until the first
+    /// lease list.
+    private var sshCleanupSeen: Set<String>?
 
     /// `nil` when the process has no bundle (`swift run`): the API then traps.
     private var center: UNUserNotificationCenter? {
@@ -94,6 +97,30 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
             : ("macOS Firewall blocks Agents Secrets Manager",
                "Other machines can't pair or request secrets. Allow incoming connections for it in System Settings → Network → Firewall → Options.")
         Task { await post(id: Self.firewallRequestID, category: Self.firewallCategory, title: title, body: body) }
+    }
+
+    /// Feed every new lease list: one notification per target of a privileged SSH lease
+    /// whose session cleanup is retrying or failed. The first call only records the
+    /// problems that already exist.
+    func updateSshCleanup(_ leases: [LeaseItem]) {
+        var problems: [(key: String, leaseID: String, target: SshLeaseTargetItem)] = []
+        for lease in leases {
+            guard let ssh = lease.ssh, ssh.access == .privileged else { continue }
+            for target in ssh.targets where target.cleanup == .retrying || target.cleanup == .failed {
+                problems.append(("\(lease.id)/\(target.name)", lease.id, target))
+            }
+        }
+        guard var seen = sshCleanupSeen else {
+            sshCleanupSeen = Set(problems.map(\.key))
+            return
+        }
+        for problem in problems where seen.insert(problem.key).inserted {
+            let title = "Ending SSH sessions on \(problem.target.name) failed"
+            let body = "\(problem.target.cleanupDetail). Sessions of this privileged lease may stay open; the host ends them when the lease expires."
+            let id = "ssh-cleanup-\(problem.leaseID)-\(problem.target.name)"
+            Task { await post(id: id, category: "", title: title, body: body) }
+        }
+        sshCleanupSeen = seen
     }
 
     private func report(title: String, body: String) {

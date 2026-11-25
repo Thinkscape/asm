@@ -13,6 +13,7 @@ use crate::files::{Manifest, SecretsDir, default_secrets_path, lock_file};
 use asm_proto::error::ErrorCode;
 use asm_proto::wire::{LeaseStatus, LeasesResponse};
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -57,7 +58,7 @@ pub fn ensure_running(dir: &SecretsDir) {
     let started = match try_lock(dir.root()) {
         Ok(Some(probe)) => {
             drop(probe);
-            spawn(dir.root())
+            spawn_detached(&["reap".into(), "--dir".into(), dir.root().into()])
         }
         Ok(None) => return,
         Err(e) => Err(e),
@@ -69,14 +70,12 @@ pub fn ensure_running(dir: &SecretsDir) {
     }
 }
 
-/// Run `asm reap --dir <dir>` fully detached: the forked child starts a new session
-/// and forks again; the intermediate process exits at once and is reaped here, so the
-/// reaper is re-parented to init and never becomes our zombie.
-fn spawn(dir: &Path) -> std::io::Result<()> {
+/// Run `asm <args>` fully detached: the forked child starts a new session and forks
+/// again; the intermediate process exits at once and is reaped here, so the daemon
+/// is re-parented to init and never becomes our zombie.
+pub(crate) fn spawn_detached(args: &[OsString]) -> std::io::Result<()> {
     let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.arg("reap")
-        .arg("--dir")
-        .arg(dir)
+    cmd.args(args)
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

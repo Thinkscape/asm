@@ -675,7 +675,7 @@ impl Core {
     /// Invalidate the host's token, cancel its pending requests and revoke its leases.
     pub fn revoke_host(&self, host_id: &str) -> Result<()> {
         let t = self.generation_now();
-        let tokens = {
+        let (tokens, ssh_ended) = {
             let authority = lock(&self.authorization);
             if !self.store.revoke_host(host_id, t)? {
                 return Err(CoreError::not_found("no such host"));
@@ -689,7 +689,8 @@ impl Core {
                     tokens.extend(self.evict_generated_locked(&lease, &authority));
                 }
             }
-            tokens
+            let ssh_ended = self.end_host_ssh_leases_locked(host_id, &authority)?;
+            (tokens, ssh_ended)
         };
         self.sync_proxy_auth();
         if let Some(host) = self.store.get_host(host_id)? {
@@ -699,6 +700,9 @@ impl Core {
         let cancelled = self.cancel_host_requests(host_id);
         self.sync_proxy(false);
         self.revoke_tokens(tokens);
+        if ssh_ended {
+            self.kick_ssh_cleanup();
+        }
         self.notify(TOPIC_HOSTS);
         self.notify(TOPIC_LEASES);
         cancelled
@@ -865,12 +869,19 @@ impl Core {
                     agent: l.agent,
                     created_at: to_system_time(l.created_at),
                     expires_at: l.expires_at.map(to_system_time),
+                    ssh: None,
                 }
             })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .chain(self.ssh_lease_infos(&mut names))
             .collect()
     }
 
     pub fn revoke_lease(&self, id: &str) -> Result<()> {
+        if self.revoke_ssh_lease(id)? {
+            return Ok(());
+        }
         let tokens = {
             let authority = lock(&self.authorization);
             let lease = self.store.get_lease(id)?.ok_or_else(|| CoreError::not_found("no such lease"))?;

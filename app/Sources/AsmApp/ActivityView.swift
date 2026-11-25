@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Toolbar filter of the Activity Log.
 private enum ActivityTab: String, CaseIterable, Identifiable {
-    case all, requests, leases, proxy, pairing, vaults, generators
+    case all, requests, leases, proxy, pairing, vaults, generators, ssh
 
     var id: String { rawValue }
 

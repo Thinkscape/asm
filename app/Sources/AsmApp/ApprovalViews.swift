@@ -119,7 +119,7 @@ private struct CloseButton: View {
 }
 
 /// Position in the queue, navigation and the expiry of the shown request.
-private struct QueueInfo {
+struct QueueInfo {
     var position: Int
     var total: Int
     var expiresAt: Date
@@ -127,7 +127,7 @@ private struct QueueInfo {
 }
 
 /// What every request view needs besides its own detail.
-private struct RequestContext {
+struct RequestContext {
     var request: PendingItem
     var queue: QueueInfo
     var armed: Bool
@@ -191,6 +191,10 @@ private struct ApprovalBody: View {
             AddApproval(context: context, name: name, value: value, targets: targets)
         case let .login(detail):
             LoginBrokerApproval(context: context, detail: detail, durations: CoreBridge.leaseDurations, model: model)
+        case let .ssh(detail):
+            SshApproval(context: context, detail: detail, model: model)
+        case let .sshExtend(detail):
+            SshExtendApproval(context: context, detail: detail, model: model)
         }
     }
 
@@ -203,7 +207,7 @@ private struct ApprovalBody: View {
 
 /// Header, request-specific rows, the Request details disclosure, the core's error, the
 /// action row and a footnote, in that order.
-private struct ApprovalScaffold<Header: View, Content: View, Details: View, Actions: View>: View {
+struct ApprovalScaffold<Header: View, Content: View, Details: View, Actions: View>: View {
     let error: String?
     let footnote: Text?
     let contentHeight: CGFloat?
@@ -263,7 +267,7 @@ private struct ApprovalScaffold<Header: View, Content: View, Details: View, Acti
     }
 }
 
-private struct ApprovalHeader<Icon: View>: View {
+struct ApprovalHeader<Icon: View>: View {
     let title: Text
     let subtitle: Text
     let queue: QueueInfo
@@ -296,7 +300,7 @@ private struct ApprovalHeader<Icon: View>: View {
 }
 
 /// The bundle's app icon.
-private struct AppIconImage: View {
+struct AppIconImage: View {
     var body: some View {
         Image(nsImage: NSApp.applicationIconImage)
             .resizable()
@@ -344,7 +348,7 @@ private struct QueueBadge: View {
 }
 
 /// The agent's reason, quoted, on a tinted background with an accent bar.
-private struct ReasonBlock: View {
+struct ReasonBlock: View {
     let reason: String
     @State private var expanded = false
     @State private var fullHeight: CGFloat = 0
@@ -476,7 +480,7 @@ struct ApprovalDisclosure<Content: View>: View {
     }
 }
 
-private struct InfoRow: View {
+struct InfoRow: View {
     let label: LocalizedStringKey
     let value: String
 
@@ -494,7 +498,7 @@ private struct InfoRow: View {
 }
 
 /// Rows every request kind shows in Request details, after its own.
-private struct RequestMetaRows: View {
+struct RequestMetaRows: View {
     let context: RequestContext
 
     var body: some View {
@@ -507,7 +511,7 @@ private struct RequestMetaRows: View {
     }
 }
 
-private struct ErrorLine: View {
+struct ErrorLine: View {
     let message: String
 
     var body: some View {
@@ -590,7 +594,7 @@ private struct FlowLayout: Layout {
 
 /// Split Deny button (canned reasons, custom reason) on the left, approve buttons on
 /// the right. Esc denies without a reason once armed, unless a text field is edited.
-private struct ApprovalActions<Trailing: View>: View {
+struct ApprovalActions<Trailing: View>: View {
     let cannedReasons: [String]
     let armed: Bool
     let escapeDenies: Bool
@@ -900,7 +904,7 @@ private final class SplitMenuButton: NSButton {
 
 /// Filled capsule button drawn by SwiftUI: a new request does not make the panel key,
 /// and AppKit buttons would then look inactive (no accent fill, dimmed labels).
-private struct PanelButtonStyle: ButtonStyle {
+struct PanelButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
@@ -918,7 +922,7 @@ private struct PanelButtonStyle: ButtonStyle {
 }
 
 extension ButtonStyle where Self == PanelButtonStyle {
-    fileprivate static var panel: PanelButtonStyle { PanelButtonStyle() }
+    static var panel: PanelButtonStyle { PanelButtonStyle() }
 }
 
 // MARK: - Pair
@@ -1138,7 +1142,7 @@ private struct SameMachineCallout: View {
 
 /// On/off switch drawn by SwiftUI: AppKit's switch turns grey while the non-activating
 /// panel is not key, which hides whether it is on.
-private struct PanelSwitchStyle: ToggleStyle {
+struct PanelSwitchStyle: ToggleStyle {
     func makeBody(configuration: Configuration) -> some View {
         Button {
             configuration.isOn.toggle()
@@ -1985,7 +1989,7 @@ private struct GenerateTokenButton: View {
     }
 }
 
-private struct GetDurationPicker: View {
+struct GetDurationPicker: View {
     let durations: [LeaseDuration]
     @Binding var duration: UInt64
     /// Offer only limited durations up to this many seconds.

@@ -1,6 +1,7 @@
 //! Runs the `asm` binary against a fake manager (HTTPS, self-signed) to check the
 //! wire flow: interactive and unattended pairing, `get` (files, output, denial,
-//! pending, lost request), `update`, `add`, `list`, and the background reaper.
+//! pending, lost request), `update`, `add`, `list`, the background reaper, and SSH
+//! leases (`asm ssh request`, `hosts`, `leases`, `extend`, `install`, the ssh agent).
 
 use asm_proto::crypto::{hex_decode_array, hex_encode, sha256};
 use asm_proto::pairing::{UnattendedCode, client_commit, format_pairing_code, pairing_code};
@@ -4027,4 +4028,798 @@ fn gh_install_writes_an_updatable_shim_and_uninstall_removes_only_it() {
     let out = asm(&e, &["gh", "uninstall", "--dir", mine.to_str().unwrap()], "");
     assert!(text(&out.stdout).contains("left alone (not installed by asm gh)"), "{}", text(&out.stdout));
     assert!(mine.join("gh").exists());
+}
+
+// ---- SSH leases ----
+
+const SSH_TARGET_ID: &str = "0123abcd";
+const SSH_HOST_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";
+const SSH_EXPIRES: &str = "2999-01-01T00:00:00Z";
+const SSH_EXTENDED: &str = "2999-02-01T00:00:00Z";
+const HOSTS_CONF_HEADER: &str = "# Managed by asm: rewritten whenever this machine's SSH leases change. Don't edit.\n# `asm ssh install` includes it from ~/.ssh/config; `asm ssh uninstall` stops that.\n";
+const INSTALL_MARKER: &str = "# Added by asm ssh install; remove with asm ssh uninstall.";
+
+/// A stand-in certificate blob; the CLI never parses beyond the base64.
+fn ssh_cert_blob_with(fill: u8) -> Vec<u8> {
+    let mut blob = Vec::new();
+    asm_proto::ssh::put_string(&mut blob, b"ssh-ed25519-cert-v01@openssh.com");
+    asm_proto::ssh::put_string(&mut blob, &[fill; 32]);
+    blob
+}
+
+fn ssh_cert_blob() -> Vec<u8> {
+    ssh_cert_blob_with(7)
+}
+
+fn ssh_cert_line_with(fill: u8) -> String {
+    format!(
+        "ssh-ed25519-cert-v01@openssh.com {} asm-lease-{LEASE}",
+        asm_proto::ssh::b64_encode(&ssh_cert_blob_with(fill))
+    )
+}
+
+fn ssh_cert_line() -> String {
+    ssh_cert_line_with(7)
+}
+
+fn ssh_signature_blob() -> Vec<u8> {
+    let mut blob = Vec::new();
+    asm_proto::ssh::put_string(&mut blob, b"ssh-ed25519");
+    asm_proto::ssh::put_string(&mut blob, &[9; 64]);
+    blob
+}
+
+fn ssh_target(login: &str) -> Value {
+    json!({"name":"t1","target_id":SSH_TARGET_ID,"login":login,"hostname":"t1.example.com",
+        "port":2222,"host_keys":[SSH_HOST_KEY]})
+}
+
+/// A privileged lease on t1.
+fn ssh_result(expires_at: &str) -> Value {
+    json!({"lease_id":LEASE,"expires_at":expires_at,"access":"privileged","grants":[],
+        "certificate":ssh_cert_line(),"targets":[ssh_target("asm-priv")]})
+}
+
+/// A restricted lease on t1 that may read the logs of nginx.service.
+fn ssh_restricted_result(expires_at: &str) -> Value {
+    json!({"lease_id":LEASE,"expires_at":expires_at,"access":"restricted","grants":["logs:nginx.service"],
+        "certificate":ssh_cert_line(),"targets":[ssh_target("asm-ops")]})
+}
+
+/// A lease on t1 as `user`.
+fn ssh_user_result(expires_at: &str, user: &str) -> Value {
+    json!({"lease_id":LEASE,"expires_at":expires_at,"access":"user","grants":[],"user":user,
+        "certificate":ssh_cert_line(),"targets":[ssh_target("asm-priv")]})
+}
+
+/// What the fake manager answers; a test may change it between commands.
+struct SshScript {
+    /// The result of an `ssh` request.
+    result: Mutex<Value>,
+    /// The result of an `ssh_extend` request.
+    extend: Mutex<Value>,
+    /// `POST /v1/ssh/sign` answers 404 once set.
+    sign_ended: std::sync::atomic::AtomicBool,
+}
+
+fn approved_ssh(result: Value) -> Value {
+    json!({"request_id":REQ,"kind":"ssh","status":"approved","deny_reason":null,"result":result})
+}
+
+fn ssh_handler(capable: bool, script: Arc<SshScript>) -> Arc<Handler> {
+    Arc::new(move |method, path, body| match (method, path) {
+        ("GET", "/v1/health") => {
+            let capabilities: Vec<&str> = if capable { vec!["ssh_leases_v1"] } else { vec![] };
+            (200, json!({"name":"asm-manager","version":"0.1.0","capabilities":capabilities}))
+        }
+        ("POST", "/v1/requests") if body["kind"] == "ssh" => {
+            (200, approved_ssh(script.result.lock().unwrap().clone()))
+        }
+        ("POST", "/v1/requests") if body["kind"] == "ssh_extend" => {
+            (200, approved_ssh(script.extend.lock().unwrap().clone()))
+        }
+        ("GET", "/v1/ssh/targets") => (
+            200,
+            json!({"targets":[
+                {"name":"t1","privileged_login":"root","users":["deploy","postgres"],
+                    "grants":["logs:nginx.service","restart:nginx.service"]},
+                {"name":"t2","grants":["logs:web.service"]}]}),
+        ),
+        ("POST", "/v1/ssh/sign") if script.sign_ended.load(std::sync::atomic::Ordering::SeqCst) => (
+            404,
+            json!({"error":{"code":"not_found","message":"SSH lease has ended"}}),
+        ),
+        ("POST", "/v1/ssh/sign") if body["lease_id"] == LEASE => (
+            200,
+            json!({"signature":asm_proto::ssh::b64_encode(&ssh_signature_blob())}),
+        ),
+        _ => (
+            404,
+            json!({"error":{"code":"not_found","message":format!("{method} {path}")}}),
+        ),
+    })
+}
+
+fn ssh_paired_with(capable: bool, result: Value) -> (Fake, Env, Arc<SshScript>) {
+    let script = Arc::new(SshScript {
+        result: Mutex::new(result),
+        extend: Mutex::new(Value::Null),
+        sign_ended: std::sync::atomic::AtomicBool::new(false),
+    });
+    let f = start(ssh_handler(capable, script.clone()));
+    let e = env();
+    write_host_json(&e, &f);
+    (f, e, script)
+}
+
+fn ssh_paired(capable: bool) -> (Fake, Env) {
+    let (f, e, _) = ssh_paired_with(capable, ssh_result(SSH_EXPIRES));
+    (f, e)
+}
+
+/// The test's temporary directory: `HOME` of the asm processes.
+fn tmp_root(e: &Env) -> &Path {
+    e.cfg.parent().unwrap()
+}
+
+fn ssh_state_dir(e: &Env) -> PathBuf {
+    e.cfg.join("asm/ssh")
+}
+
+fn lease_config(e: &Env) -> PathBuf {
+    ssh_state_dir(e).join(LEASE).join("config")
+}
+
+/// `asm` for SSH commands: no reaper, the agent log in `<tmp>/agent.log`, and
+/// `<tmp>/bin` (where `fake_ssh` puts `ssh`) first on PATH.
+fn asm_ssh_command(e: &Env, args: &[&str]) -> Command {
+    let t = tmp_root(e);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_asm"));
+    c.args(args)
+        .env_clear()
+        .env("HOME", t)
+        .env("XDG_CONFIG_HOME", &e.cfg)
+        .env("ASM_SECRETS_DIR", &e.secrets)
+        .env("ASM_AGENT", "test-agent")
+        .env("ASM_NO_REAPER", "1")
+        .env("ASM_SSH_AGENT_LOG", t.join("agent.log"))
+        .env("PATH", format!("{}:/usr/bin:/bin", t.join("bin").display()))
+        .stdin(Stdio::null());
+    c
+}
+
+fn asm_ssh(e: &Env, args: &[&str]) -> Output {
+    asm_ssh_command(e, args).output().unwrap()
+}
+
+/// Put a fake `ssh` first on PATH. It appends its arguments as one line to
+/// `<tmp>/ssh-args`, then runs `body`.
+fn fake_ssh(e: &Env, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tmp_root(e).join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = format!(
+        "#!/bin/sh\necho \"$*\" >> '{}'\n{body}\n",
+        tmp_root(e).join("ssh-args").display()
+    );
+    std::fs::write(bin.join("ssh"), script).unwrap();
+    std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// One line per call of the fake ssh.
+fn ssh_calls(e: &Env) -> Vec<String> {
+    std::fs::read_to_string(tmp_root(e).join("ssh-args"))
+        .map(|s| s.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// Pids of the agents that logged `started for` to `log`.
+fn started_agents(log: &Path) -> Vec<i32> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("]: started for "))
+        .filter_map(|l| l.split("asm ssh-agent[").nth(1)?.split(']').next()?.parse().ok())
+        .collect()
+}
+
+/// Kills the agent processes a test started, also when it fails midway.
+struct Agents {
+    /// The log the detached agents write their pid to.
+    log: PathBuf,
+    /// An agent run as this test's child.
+    child: Option<std::process::Child>,
+}
+
+impl Agents {
+    fn new(e: &Env) -> Self {
+        Agents {
+            log: tmp_root(e).join("agent.log"),
+            child: None,
+        }
+    }
+}
+
+impl Drop for Agents {
+    fn drop(&mut self) {
+        for pid in started_agents(&self.log) {
+            // SAFETY: kill has no memory preconditions; the pid is an agent we started.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Whether some process holds the agent lock of `dir`.
+fn agent_running(dir: &Path) -> bool {
+    let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join("agent.lock"))
+    else {
+        return false;
+    };
+    // SAFETY: flock on a descriptor owned by `f`; closing it releases the lock.
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+}
+
+/// Stop the agents asm started and run one in the foreground of this test; returns
+/// its socket once it accepts connections.
+fn foreground_agent(e: &Env, agents: &mut Agents) -> PathBuf {
+    let dir = ssh_state_dir(e);
+    for pid in started_agents(&agents.log) {
+        // SAFETY: kill has no memory preconditions; the pid is an agent we started.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    assert!(wait_for(Duration::from_secs(5), || !agent_running(&dir)));
+    let child = Command::new(env!("CARGO_BIN_EXE_asm"))
+        .args(["ssh", "agent", "--dir", dir.to_str().unwrap()])
+        .env_clear()
+        .env("HOME", tmp_root(e))
+        .env("XDG_CONFIG_HOME", &e.cfg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    agents.child = Some(child);
+    let sock = dir.join("agent.sock");
+    assert!(wait_for(Duration::from_secs(5), || std::os::unix::net::UnixStream::connect(&sock).is_ok()));
+    sock
+}
+
+/// One framed agent request and its framed reply.
+fn agent_call(sock: &Path, msg: &[u8]) -> Vec<u8> {
+    let mut s = std::os::unix::net::UnixStream::connect(sock).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut framed = Vec::new();
+    asm_proto::ssh::put_string(&mut framed, msg);
+    s.write_all(&framed).unwrap();
+    let mut len = [0u8; 4];
+    s.read_exact(&mut len).unwrap();
+    let mut reply = vec![0u8; u32::from_be_bytes(len) as usize];
+    s.read_exact(&mut reply).unwrap();
+    reply
+}
+
+/// The IDENTITIES_ANSWER listing `blobs` of lease LEASE.
+fn identities_answer(blobs: &[Vec<u8>]) -> Vec<u8> {
+    let mut want = vec![12u8];
+    want.extend_from_slice(&(blobs.len() as u32).to_be_bytes());
+    for blob in blobs {
+        asm_proto::ssh::put_string(&mut want, blob);
+        asm_proto::ssh::put_string(&mut want, format!("asm-lease-{LEASE}").as_bytes());
+    }
+    want
+}
+
+fn sign_request(blob: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut sign = vec![13u8];
+    asm_proto::ssh::put_string(&mut sign, blob);
+    asm_proto::ssh::put_string(&mut sign, data);
+    sign.extend_from_slice(&0u32.to_be_bytes());
+    sign
+}
+
+#[test]
+fn ssh_writes_lease_files_and_the_agent_signs_through_the_manager() {
+    let (f, e) = ssh_paired(true);
+    let dir = ssh_state_dir(&e);
+    let ldir = dir.join(LEASE);
+    let mut agents = Agents::new(&e);
+
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--privileged"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let config = ldir.join("config");
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "ssh lease {LEASE} until {SSH_EXPIRES} (privileged)\nt1: ssh -F {} t1   (login asm-priv)\n",
+            config.display()
+        )
+    );
+    let sent = f.log.lock().unwrap().iter().find(|(m, p, _)| m == "POST" && p == "/v1/requests").unwrap().2.clone();
+    assert_eq!(
+        sent,
+        json!({"kind":"ssh","targets":["t1"],"access":"privileged","grants":[],"new_lease":false,"reason":"r","agent":"test-agent"})
+    );
+    let config_text = std::fs::read_to_string(&config).unwrap();
+    assert!(config_text.starts_with(&format!("# Written by asm ssh for lease {LEASE}.\n")), "{config_text}");
+    assert!(config_text.contains("\nHost t1 t1.example.com\n  HostName t1.example.com\n  Port 2222\n  User asm-priv\n  HostKeyAlias asm-target-0123abcd\n"), "{config_text}");
+    assert!(config_text.contains(&format!("  UserKnownHostsFile \"{}\"\n", ldir.join("known_hosts").display())), "{config_text}");
+    assert!(config_text.contains(&format!("  IdentityAgent \"{}\"\n", dir.join("agent.sock").display())), "{config_text}");
+    assert!(config_text.contains(&format!("  IdentityFile \"{}\"\n", ldir.join("cert.pub").display())), "{config_text}");
+    assert_eq!(
+        std::fs::read_to_string(ldir.join("known_hosts")).unwrap(),
+        format!("asm-target-{SSH_TARGET_ID} {SSH_HOST_KEY}\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(ldir.join("cert.pub")).unwrap(),
+        format!("{}\n", ssh_cert_line())
+    );
+    let leases = read_json(&dir.join("leases.json"));
+    assert_eq!(leases[0]["lease_id"], LEASE);
+    assert!(leases[0]["requested_at"].as_i64().unwrap() > 0);
+    let hosts_conf = std::fs::read_to_string(dir.join("asm-ssh-hosts.conf")).unwrap();
+    assert!(hosts_conf.starts_with(HOSTS_CONF_HEADER), "{hosts_conf}");
+    assert!(hosts_conf.contains("\nHost t1 t1.example.com\n"), "{hosts_conf}");
+    assert!(!dir.join("config").exists() && !dir.join("known_hosts").exists());
+
+    // `asm ssh request` started the agent and waited for its socket.
+    let started = started_agents(&agents.log);
+    assert_eq!(started.len(), 1, "{}", std::fs::read_to_string(&agents.log).unwrap_or_default());
+    assert!(agent_running(&dir));
+    // A second instance leaves at once.
+    let out = asm_ssh(&e, &["ssh", "agent", "--dir", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(std::fs::read_to_string(&agents.log).unwrap().contains("another agent holds the lock"));
+
+    let sock = foreground_agent(&e, &mut agents);
+    let blob = ssh_cert_blob();
+    assert_eq!(agent_call(&sock, &[11]), identities_answer(std::slice::from_ref(&blob)));
+
+    let sign = sign_request(&blob, b"session data");
+    let mut want = vec![14u8];
+    asm_proto::ssh::put_string(&mut want, &ssh_signature_blob());
+    assert_eq!(agent_call(&sock, &sign), want);
+    let signed = f.log.lock().unwrap().iter().find(|(m, p, _)| m == "POST" && p == "/v1/ssh/sign").unwrap().2.clone();
+    assert_eq!(signed, json!({"lease_id":LEASE,"data":asm_proto::ssh::b64_encode(b"session data")}));
+
+    // An unknown key, an extension (session-bind) and a truncated request all fail.
+    assert_eq!(agent_call(&sock, &sign_request(b"other key", b"data")), vec![5]);
+    let mut extension = vec![27u8];
+    asm_proto::ssh::put_string(&mut extension, b"session-bind@openssh.com");
+    assert_eq!(agent_call(&sock, &extension), vec![5]);
+    assert_eq!(agent_call(&sock, &sign[..sign.len() - 1]), vec![5]);
+}
+
+#[test]
+fn ssh_hosts_lists_users_and_grants() {
+    let (_f, e) = ssh_paired(true);
+    let out = asm(&e, &["ssh", "hosts"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "t1\tprivileged:root\tusers:deploy,postgres\tgrants:logs:nginx.service,restart:nginx.service\nt2\tprivileged:-\tusers:-\tgrants:logs:web.service\n"
+    );
+    let out = asm(&e, &["ssh", "hosts", "--json"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["targets"][0]["privileged_login"], "root");
+    assert_eq!(doc["targets"][0]["users"], json!(["deploy", "postgres"]));
+    assert!(doc["targets"][1].get("privileged_login").is_none(), "{doc}");
+}
+
+#[test]
+fn ssh_requires_manager_support() {
+    let (f, e) = ssh_paired(false);
+    for args in [&["ssh", "request", "t1", "r", "--privileged"][..], &["ssh", "hosts"]] {
+        let out = asm(&e, args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(
+            text(&out.stderr),
+            "invalid: the manager does not support SSH leases; upgrade Agents Secrets Manager\n"
+        );
+    }
+    assert!(!f.log.lock().unwrap().iter().any(|(m, _, _)| m == "POST"));
+    assert!(!e.cfg.join("asm/ssh").exists());
+}
+
+#[test]
+fn ssh_rejects_invalid_access_before_contacting_the_manager() {
+    let (f, e) = ssh_paired(true);
+    let cases: [(&[&str], &str); 7] = [
+        (&["ssh", "request", "t1", "r", "--grant", "logs:nginx.service", "--privileged"], "cannot be used with"),
+        (&["ssh", "request", "t1", "r", "--as", "deploy", "--privileged"], "cannot be used with"),
+        (&["ssh", "request", "t1", "r", "--as", "deploy", "--grant", "logs:nginx.service"], "cannot be used with"),
+        (&["ssh", "request", "t1", "r"], "choose --privileged, --as <user> or at least one --grant (logs:<unit>, restart:<unit>)"),
+        (&["ssh", "request", "t1,t2", "r", "--privileged", "--", "uptime"], "a command needs exactly one host"),
+        (&["ssh", "request", "t1", "r", "--grant", "restart:nginx"], "invalid"),
+        (&["ssh", "request", "t1", "r", "--grant", "logs"], "invalid"),
+    ];
+    for (args, message) in cases {
+        let out = asm(&e, args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(text(&out.stderr).contains(message), "{args:?}: {}", text(&out.stderr));
+    }
+    assert!(f.log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn ssh_accepts_a_narrowed_approval() {
+    let (_f, e, _s) = ssh_paired_with(true, ssh_restricted_result(SSH_EXPIRES));
+    let _agents = Agents::new(&e);
+    let out = asm_ssh(&e, &["ssh", "request", "t1,t2", "r", "--privileged"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "ssh lease {LEASE} until {SSH_EXPIRES} (restricted: logs:nginx.service)\nt1: ssh -F {} t1   (login asm-ops)\n",
+            lease_config(&e).display()
+        )
+    );
+}
+
+#[test]
+fn ssh_requests_access_as_a_user() {
+    let (f, e, _s) = ssh_paired_with(true, ssh_user_result(SSH_EXPIRES, "deploy"));
+    let _agents = Agents::new(&e);
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--as", "deploy"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "ssh lease {LEASE} until {SSH_EXPIRES} (as deploy)\nt1: ssh -F {} t1   (login asm-priv as deploy)\n",
+            lease_config(&e).display()
+        )
+    );
+    assert!(!text(&out.stderr).contains("operator approved"), "{}", text(&out.stderr));
+    let sent = f.log.lock().unwrap().iter().find(|(m, p, _)| m == "POST" && p == "/v1/requests").unwrap().2.clone();
+    assert_eq!(
+        sent,
+        json!({"kind":"ssh","targets":["t1"],"access":"user","grants":[],"user":"deploy","new_lease":false,"reason":"r","agent":"test-agent"})
+    );
+    let out = asm_ssh(&e, &["ssh", "leases", "--json"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc[0]["user"], "deploy");
+}
+
+#[test]
+fn ssh_reports_an_approval_of_other_access() {
+    let (_f, e, _s) = ssh_paired_with(true, ssh_result(SSH_EXPIRES));
+    let _agents = Agents::new(&e);
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--as", "deploy"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("asm: the operator approved privileged access, not the access as deploy requested\n"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn ssh_agent_forgets_an_ended_lease() {
+    let (_f, e, script) = ssh_paired_with(true, ssh_result(SSH_EXPIRES));
+    let dir = ssh_state_dir(&e);
+    let mut agents = Agents::new(&e);
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--privileged"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let sock = foreground_agent(&e, &mut agents);
+
+    script.sign_ended.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(agent_call(&sock, &sign_request(&ssh_cert_blob(), b"data")), vec![5]);
+    assert!(wait_for(Duration::from_secs(2), || {
+        !dir.join(LEASE).exists() && !std::fs::read_to_string(dir.join("leases.json")).unwrap().contains(LEASE)
+    }));
+    assert_eq!(agent_call(&sock, &[11]), identities_answer(&[]));
+}
+
+#[test]
+fn ssh_agent_serves_a_replaced_certificate_at_once() {
+    let (_f, e, script) = ssh_paired_with(true, ssh_result(SSH_EXPIRES));
+    let mut agents = Agents::new(&e);
+    fake_ssh(&e, "exit 0");
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--privileged"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let sock = foreground_agent(&e, &mut agents);
+    assert_eq!(agent_call(&sock, &[11]), identities_answer(&[ssh_cert_blob()]));
+
+    // `asm ssh extend` stores the new certificate for the same lease.
+    let mut extended = ssh_result(SSH_EXTENDED);
+    extended["certificate"] = json!(ssh_cert_line_with(8));
+    *script.extend.lock().unwrap() = extended;
+    let out = asm_ssh(&e, &["ssh", "extend", LEASE, "more time"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(agent_call(&sock, &[11]), identities_answer(&[ssh_cert_blob_with(8)]));
+}
+
+#[test]
+fn ssh_install_edits_ssh_config_once_and_uninstall_restores_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = env();
+    let ssh = tmp_root(&e).join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    let config = ssh.join("config");
+    let original = b"Host other\n  User x\n";
+    std::fs::write(&config, original).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let hosts_conf = ssh_state_dir(&e).join("asm-ssh-hosts.conf");
+    let include = format!("Include \"{}\"", hosts_conf.display());
+
+    let out = asm_ssh(&e, &["ssh", "install"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!("installed: {} now includes {}\n", config.display(), hosts_conf.display())
+    );
+    let installed = std::fs::read(&config).unwrap();
+    let mut want = format!("{INSTALL_MARKER}\n{include}\n\n").into_bytes();
+    want.extend_from_slice(original);
+    assert_eq!(installed, want);
+    assert_eq!(std::fs::metadata(&config).unwrap().permissions().mode() & 0o777, 0o644);
+    assert_eq!(std::fs::read_to_string(&hosts_conf).unwrap(), HOSTS_CONF_HEADER);
+
+    let out = asm_ssh(&e, &["ssh", "install"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("already installed: {}\n", config.display()));
+    assert_eq!(std::fs::read(&config).unwrap(), installed);
+
+    let out = asm_ssh(&e, &["ssh", "uninstall"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("uninstalled: {}\n", config.display()));
+    assert_eq!(std::fs::read(&config).unwrap(), original);
+    let out = asm_ssh(&e, &["ssh", "uninstall"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "not installed\n");
+    assert_eq!(std::fs::read(&config).unwrap(), original);
+    assert!(hosts_conf.exists());
+}
+
+#[test]
+fn ssh_install_follows_a_symlinked_config() {
+    let e = env();
+    let ssh = tmp_root(&e).join(".ssh");
+    let dotfiles = tmp_root(&e).join("dotfiles");
+    std::fs::create_dir_all(&ssh).unwrap();
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    let real = dotfiles.join("ssh_config");
+    std::fs::write(&real, "Host other\n").unwrap();
+    std::os::unix::fs::symlink(&real, ssh.join("config")).unwrap();
+
+    let out = asm_ssh(&e, &["ssh", "install"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(std::fs::symlink_metadata(ssh.join("config")).unwrap().file_type().is_symlink());
+    let include = format!("Include \"{}\"", ssh_state_dir(&e).join("asm-ssh-hosts.conf").display());
+    let content = std::fs::read_to_string(&real).unwrap();
+    assert!(content.lines().any(|l| l == include), "{content}");
+    assert!(content.ends_with("\nHost other\n"), "{content}");
+}
+
+#[test]
+fn ssh_hosts_conf_tracks_leases() {
+    if !Path::new("/usr/bin/ssh").exists() {
+        eprintln!("skipping: /usr/bin/ssh not found");
+        return;
+    }
+    let (_f, e, script) = ssh_paired_with(true, ssh_result(SSH_EXPIRES));
+    let dir = ssh_state_dir(&e);
+    let _agents = Agents::new(&e);
+    let config = tmp_root(&e).join(".ssh/config");
+    let ssh_g = |host: &str| {
+        let out = Command::new("/usr/bin/ssh")
+            .args(["-G", "-F", config.to_str().unwrap(), host])
+            .env("HOME", tmp_root(&e))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "ssh -G {host}: {}", text(&out.stderr));
+        text(&out.stdout)
+    };
+
+    let out = asm_ssh(&e, &["ssh", "install"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--privileged"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("\nt1: ssh t1   (login asm-priv)\n"), "{}", text(&out.stdout));
+
+    let resolved = ssh_g("t1");
+    assert!(resolved.lines().any(|l| l == "user asm-priv"), "{resolved}");
+    assert!(resolved.lines().any(|l| l == "hostkeyalias asm-target-0123abcd"), "{resolved}");
+    let resolved = ssh_g("t1.example.com");
+    assert!(resolved.lines().any(|l| l == "hostkeyalias asm-target-0123abcd"), "{resolved}");
+
+    // The manager ends the lease: the agent forgets it at the next signature.
+    script.sign_ended.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(agent_call(&dir.join("agent.sock"), &sign_request(&ssh_cert_blob(), b"data")), vec![5]);
+    let hosts_conf = dir.join("asm-ssh-hosts.conf");
+    assert!(wait_for(Duration::from_secs(2), || {
+        std::fs::read_to_string(&hosts_conf).unwrap() == HOSTS_CONF_HEADER
+    }));
+    assert_eq!(std::fs::read_to_string(&hosts_conf).unwrap().lines().count(), 2);
+    let resolved = ssh_g("t1");
+    assert!(!resolved.contains("hostkeyalias asm-target"), "{resolved}");
+}
+
+#[test]
+fn ssh_command_warns_before_the_lease_ends() {
+    let expires = asm_proto::time::fmt_unix(unix_now() + 300);
+    let (_f, e, _s) = ssh_paired_with(true, ssh_result(&expires));
+    let _agents = Agents::new(&e);
+    fake_ssh(&e, "sleep 1\nexit 7");
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--privileged", "--", "uptime"]);
+    assert_eq!(out.status.code(), Some(7), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains(&format!("ends at {expires} (in 5 minutes)")), "{stderr}");
+    assert!(stderr.contains(&format!("asm ssh extend {LEASE}")), "{stderr}");
+    assert_eq!(ssh_calls(&e), [format!("-F {} -- t1 uptime", lease_config(&e).display())]);
+}
+
+#[test]
+fn ssh_command_forwards_sigterm() {
+    let (_f, e, _s) = ssh_paired_with(true, ssh_result(SSH_EXPIRES));
+    let _agents = Agents::new(&e);
+    let got = tmp_root(&e).join("got");
+    let ready = tmp_root(&e).join("ready");
+    fake_ssh(
+        &e,
+        &format!(
+            "trap 'kill $p; echo got-term >> {}; exit 9' TERM\nsleep 30 &\np=$!\necho ready > {}\nwait",
+            got.display(),
+            ready.display()
+        ),
+    );
+    let mut child = asm_ssh_command(&e, &["ssh", "request", "t1", "r", "--privileged", "--", "uptime"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    if !wait_for(Duration::from_secs(10), || ready.exists()) {
+        let _ = child.kill();
+        panic!("the fake ssh did not start");
+    }
+    // SAFETY: kill has no memory preconditions; the pid is our child.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let until = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= until {
+            let _ = child.kill();
+            panic!("asm did not exit within 5 s of SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(9));
+    assert!(std::fs::read_to_string(&got).unwrap().contains("got-term"));
+}
+
+#[test]
+fn ssh_extend_updates_the_lease_and_confirms_targets() {
+    let (f, e, script) = ssh_paired_with(true, ssh_result(SSH_EXPIRES));
+    let dir = ssh_state_dir(&e);
+    let _agents = Agents::new(&e);
+    fake_ssh(&e, "exit 0");
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--privileged"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let config = std::fs::read(lease_config(&e)).unwrap();
+    let requested_at = read_json(&dir.join("leases.json"))[0]["requested_at"].clone();
+
+    let mut extended = ssh_result(SSH_EXTENDED);
+    extended["certificate"] = json!(ssh_cert_line_with(8));
+    *script.extend.lock().unwrap() = extended;
+    let out = asm_ssh(&e, &["ssh", "extend", LEASE, "more time"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!("ssh lease {LEASE} extended until {SSH_EXTENDED}\nt1: confirmed\n")
+    );
+    let sent = f.log.lock().unwrap().iter().rfind(|(m, p, _)| m == "POST" && p == "/v1/requests").unwrap().2.clone();
+    assert_eq!(sent, json!({"kind":"ssh_extend","lease_id":LEASE,"reason":"more time","agent":"test-agent"}));
+    let leases = read_json(&dir.join("leases.json"));
+    assert_eq!(leases[0]["expires_at"], asm_proto::time::parse_unix(SSH_EXTENDED).unwrap());
+    assert_eq!(leases[0]["certificate"], ssh_cert_line_with(8));
+    assert_eq!(leases[0]["requested_at"], requested_at);
+    assert_eq!(
+        std::fs::read_to_string(dir.join(LEASE).join("cert.pub")).unwrap(),
+        format!("{}\n", ssh_cert_line_with(8))
+    );
+    assert_eq!(std::fs::read(lease_config(&e)).unwrap(), config);
+    assert_eq!(
+        ssh_calls(&e),
+        [format!("-F {} -o BatchMode=yes -o ConnectTimeout=10 -- t1 true", lease_config(&e).display())]
+    );
+
+    // A result that doesn't end later is refused; a later one is stored.
+    let out = asm_ssh(&e, &["ssh", "extend", LEASE, "more time", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), "error: the manager sent an invalid SSH result\n");
+    *script.extend.lock().unwrap() = ssh_result("2999-03-01T00:00:00Z");
+    let out = asm_ssh(&e, &["ssh", "extend", LEASE, "more time", "--json"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        doc,
+        json!({"lease_id":LEASE,"expires_at":"2999-03-01T00:00:00Z","previous_expires_at":SSH_EXTENDED,
+            "config":lease_config(&e).to_str().unwrap(),"targets":[{"name":"t1","confirmed":true}]})
+    );
+}
+
+#[test]
+fn ssh_extend_of_a_restricted_lease_logs_in_nowhere() {
+    let (_f, e, script) = ssh_paired_with(true, ssh_restricted_result(SSH_EXPIRES));
+    let _agents = Agents::new(&e);
+    fake_ssh(&e, "exit 0");
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--grant", "logs:nginx.service"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    *script.extend.lock().unwrap() = ssh_restricted_result(SSH_EXTENDED);
+    let out = asm_ssh(&e, &["ssh", "extend", LEASE, "more time"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("ssh lease {LEASE} extended until {SSH_EXTENDED}\n"));
+    assert!(ssh_calls(&e).is_empty());
+}
+
+#[test]
+fn ssh_extend_reports_an_unreachable_target() {
+    let (_f, e, script) = ssh_paired_with(true, ssh_result(SSH_EXPIRES));
+    let _agents = Agents::new(&e);
+    fake_ssh(
+        &e,
+        "echo 'ssh: connect to host t1.example.com port 2222: Connection refused' >&2\nexit 255",
+    );
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--privileged"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    *script.extend.lock().unwrap() = ssh_result(SSH_EXTENDED);
+    let out = asm_ssh(&e, &["ssh", "extend", LEASE, "more time"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), format!("ssh lease {LEASE} extended until {SSH_EXTENDED}\n"));
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "asm: could not reach t1 (ssh: connect to host t1.example.com port 2222: Connection refused); its running sessions still end at {SSH_EXPIRES} unless"
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn ssh_extend_refuses_an_unknown_lease() {
+    let (f, e) = ssh_paired(true);
+    let out = asm_ssh(&e, &["ssh", "extend", LEASE, "more time"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        text(&out.stderr),
+        format!("invalid: no active SSH lease {LEASE} on this machine; see asm ssh leases\n")
+    );
+    assert!(f.log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn ssh_leases_lists_local_leases() {
+    let (_f, e) = ssh_paired(true);
+    let _agents = Agents::new(&e);
+    let out = asm_ssh(&e, &["ssh", "leases"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "");
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--privileged"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+
+    let config = lease_config(&e);
+    let out = asm_ssh(&e, &["ssh", "leases"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!("{LEASE}\tuntil {SSH_EXPIRES}\tprivileged\tt1\t{}\n", config.display())
+    );
+    let out = asm_ssh(&e, &["ssh", "leases", "--json"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        doc,
+        json!([{"lease_id":LEASE,"expires_at":SSH_EXPIRES,"access":"privileged","grants":[],"user":null,
+            "targets":[{"name":"t1","login":"asm-priv"}],"config":config.to_str().unwrap()}])
+    );
 }

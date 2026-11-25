@@ -1,6 +1,7 @@
 use super::*;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::thread;
+use std::time::Instant;
 
 const SDK_VERSION: &str = r#"{"Google Cloud SDK":"582.0.0","bq":"fixture"}"#;
 const ADC: &str = r#"{"type":"authorized_user","client_id":"fixture-client","client_secret":"fixture-secret","refresh_token":"fixture-refresh","account":"discard@example.test","quota_project_id":"discard-me","universe_domain":"googleapis.com","rapt_token":"discard-this","token":"discard-this-too"}"#;
@@ -281,7 +282,7 @@ fn bounds_both_output_streams_and_process_deadline() {
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let child = command.spawn().unwrap();
     let pid = child.id() as libc::pid_t;
-    let err = collect_output(child, Duration::from_millis(75), || Ok(())).unwrap_err();
+    let err = collect_output(child, Duration::from_millis(75), || Ok(()), &GCLOUD_OUTPUT).unwrap_err();
     assert!(err.message.contains("timed out"));
     assert_reaped(pid);
 }

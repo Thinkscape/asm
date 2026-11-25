@@ -29,6 +29,8 @@ security-framework-sys = "2.17"
 core-foundation = "0.10"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "process", "io-util", "fs"] }
 base64 = "0.22"
+ed25519-dalek = "3"
+ssh-key = { version = "=0.7.0-rc.12", default-features = false, features = ["std", "ed25519", "ecdsa"] }
 hex = "0.4"
 thiserror = "2"
 libc = "0.2"

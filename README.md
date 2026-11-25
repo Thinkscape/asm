@@ -12,8 +12,8 @@
 
 Coding agents need API keys and passwords. asm provides operator-approved access through static vaults, scoped dynamic credentials and browser logins:
 
-- a **macOS menu-bar app** (the *manager*) reads static vaults (Bitwarden/Vaultwarden, `.env` files, the macOS login keychain), issues GitHub App and Google service-account tokens, and approves access;
-- the **`asm` CLI** runs on agent machines (Linux or macOS), pairs with the manager, requests secrets and sets up browsers for logins;
+- a **macOS menu-bar app** (the *manager*) reads static vaults (Bitwarden/Vaultwarden, `.env` files, the macOS login keychain), issues GitHub App and Google service-account tokens, issues short-lived SSH certificates for enrolled hosts, and approves access;
+- the **`asm` CLI** runs on agent machines (Linux or macOS), pairs with the manager, requests secrets and SSH access, and sets up browsers for logins;
 - a **patched [iron-proxy](https://github.com/paradigmxyz/iron-proxy)**, run by the manager, puts the real value into requests on the way out;
 - an **agent skill** ([`skill/asm/SKILL.md`](skill/asm/SKILL.md), with a setup and troubleshooting guide, [`SETUP.md`](skill/asm/SETUP.md)) teaches agents the workflow.
 
@@ -346,6 +346,92 @@ Restart records are encrypted in the manager database with a per-database key he
 
 The first upgrade from a memory-only manager cannot recover credentials or pending requests the old process never saved. Let current work finish before quitting that version. Bitwarden restores a verified session key, never the master password; a rejected or unavailable key requires unlocking the vault again.
 
+### SSH access
+
+Agents can log in to SSH hosts without ever holding a reusable key. The manager keeps an SSH user CA in its encrypted restart storage, issues a per-lease Ed25519 key and certificate for each approval, and signs logins for the agent while the lease is active. The private key never leaves the Mac.
+
+**Set up a host once (Settings → SSH Targets).**
+1. Add a host:
+   - its **host name** (`web.example.com`), which agents also use;
+   - the **privileged login** your own ssh uses to enroll and remove;
+   - whether to **Allow privileged access**;
+   - the **other users** agents may log in as (**Choose Users…** lists the host's accounts);
+   - the **log units** and **restart units** restricted leases may use;
+   - the longest lease.
+
+   The Mac's ssh destination and the address agents connect to default to the host name. Set them only for exceptions such as split DNS. The sheet takes the host keys from your `known_hosts` as you type; asm never writes to it. If it has no key for the destination (check for a typo), **Get Keys from Host** asks the host without logging in. **Add** then logs in as the privileged login, the way enrollment will, pinned to those keys (with `sudo -n` unless the login is root). Keys that came from the host, or a host that proves none of the expected keys, need a separate confirmation first: compare a fingerprint with the host's console (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), because a mismatch can mean someone is intercepting the connection. If the host can't be reached, **Add Without Checking** saves it anyway; enrollment checks it later.
+
+   A host behind a jump host works as your ssh config sets it up (`ProxyJump`, `ProxyCommand`), and the sheet shows the route. Every ssh run asm starts uses its own config, which includes yours but checks every host strictly: jump hosts must already be in your `known_hosts`, and asm never adds them.
+2. **Enroll** runs a reviewed script as root over your own ssh. No existing account or file changes, no global sshd setting changes, and sshd is not reloaded. It installs:
+   - `/usr/lib/asm-ssh/` (`asm-dispatch`, `asm-shell`, `asm-end-lease`, `asm-logs`, `asm-remove`);
+   - `/var/lib/asm-ssh/manifest`, a record of everything asm installed;
+   - `/etc/sudoers.d/asm-ssh`;
+   - `asm-end-lease.timer`, which runs every minute;
+   - the system account `asm-ops` (restricted access and the manager's cleanup);
+   - with privileged access or other users, the system account `asm-priv`, which runs a lease's shell or command through sudo as the privileged login or the lease's user. Its sudo rule names exactly those accounts.
+
+   Each asm account gets its own root-owned `authorized_keys` that trusts the CA only for that host and role. Enrollment ends with a test login as each asm account. **Remove from Host** ends the host's leases and removes all of it.
+
+   If a run on the host (enroll, removal or cleanup) finds that it no longer proves its pinned host key, the target shows **Host key changed** and asm opens the review: the expected keys next to the ones the host sent. **Review Host Key** does the same at any time. **Use the New Keys** pins them after the same fingerprint check, ends the target's leases and asks for enrolling again.
+
+   **Other users.** **Choose Users…** logs in as the privileged login and lists the host's accounts in three groups: users, accounts that can become root (uid 0, a group such as `sudo`, `wheel`, `docker` or `lxd`, or any sudo rule), and system accounts. Access as an account that can become root is privileged access, so choosing one needs **Allow privileged access**. Accounts without a login shell (such as `www-data`) get `/bin/sh`. Enrollment checks each user again and fails when one gained or lost a way to become root since you chose it; choose the users again. Changing the users ends the target's leases, and enrolling again applies them.
+
+   Requirements:
+   - Linux with systemd, and ssh logins registered with systemd-logind (`UsePAM yes` with `pam_systemd`);
+   - sudo, and a per-account `AuthorizedKeysFile` inside root-owned directories;
+   - for the asm accounts: `PermitTunnel no`, no `ForceCommand`, `PermitUserEnvironment no`, and no `AcceptEnv` beyond `LANG LC_* COLORTERM NO_COLOR`.
+
+**On the agent machine:**
+```sh
+asm ssh hosts
+asm ssh request web.example.com "Find why nginx returns 502" --grant logs:nginx.service -- logs nginx.service 200
+asm ssh request web.example.com "Restart the worker" --grant restart:worker.service -- restart worker.service
+asm ssh request web.example.com,db.example.com "Inspect disk usage" --privileged
+asm ssh request web.example.com "Check the app's file permissions" --as deploy -- ls -la /srv/app
+asm ssh install                       # once: plain ssh, scp, git and Ansible use active leases
+ssh web.example.com df -h             # while the lease is active
+```
+Each lease prints one connect line per host: `ssh <host>` after `asm ssh install`, otherwise `ssh -F ~/.config/asm/ssh/<lease id>/config <host>`.
+- `--grant` logs in as `asm-ops`, which can only run `logs UNIT [LINES]` and `restart UNIT` for the granted units.
+- `--privileged` logs in as `asm-priv` and runs as the host's privileged login through sudo, so host logs show `asm-priv` and sudo.
+- `--as USER` logs in as `asm-priv` and runs as one of the other users the host allows, the same way. `asm ssh hosts` lists them.
+- The operator chooses the duration and may approve fewer hosts, fewer grants, or other access: restricted, privileged on hosts that allow it, or another user every chosen host allows. The CLI then says which access was approved. An identical active lease of the same paired machine is reused; a broader one never is.
+- `asm ssh request` keeps a small ssh-agent running in `~/.config/asm/ssh/`. It forwards sign requests to the manager.
+
+**`asm ssh install`** adds one `Include` of `~/.config/asm/ssh/asm-ssh-hosts.conf` to the top of `~/.ssh/config`; `asm ssh uninstall` removes it. asm rewrites that file atomically whenever leases change. While a lease is active, the file has a block that matches the host name and its agent address. When no lease is active, it holds only a comment, so ssh always reads a valid file.
+
+**Ansible** on the agent machine works with privileged leases and leases as a user. It runs the system ssh, so after `asm ssh install` it uses the lease. Commands, file transfers, pipelining, ControlPersist and `become` run through `asm-shell` as the lease's login.
+- The inventory hosts must be the asm host names or their agent addresses.
+- Don't set `ansible_user` or `remote_user`.
+- Restricted leases can't run Ansible.
+
+**Keeping access going.**
+- `asm ssh request … -- <command>` warns on stderr 10 and 2 minutes before the lease ends. The host also writes a warning line to the terminal of interactive sessions of privileged leases and leases as a user. `asm ssh leases` lists this machine's leases and their end times.
+- `asm ssh extend <lease id> "<reason>"` asks to extend a lease that hasn't ended, and every extension needs approval. For privileged leases and leases as a user, the CLI then logs in once to each host so the host records the new end.
+- Work an agent moved out of its session (for example with `systemd-run`) isn't ended.
+
+**Ending a lease** stops new logins at once (the manager refuses to sign).
+- The manager then ends the lease's sessions on each host, logging in with a 5-minute certificate as `asm-ops`. Your own keys and ssh settings never reach the host; only a jump host uses them.
+- Each host's timer also ends sessions at the lease's expiry, even while the Mac is asleep or offline.
+- **Leases** shows the outcome per host, as reported by the host. A host the Mac can't reach is retried for 24 hours; a privileged lease whose cleanup fails also raises a notification. **Retry Cleanup** runs a failed cleanup again.
+
+**Limits.**
+- A privileged login can keep access after the lease, for example by adding its own key. The lease ends only the route in, so prefer restricted grants.
+- Any user an agent logs in as can keep access the same way, for example with its own key or a cron job. asm looks for groups and sudo rules that lead to root, not other routes such as polkit rules or writable service files.
+- Any process on the paired machine can use an active SSH lease, as with other leases.
+- One CA serves every host. Whoever extracts it from this Mac can, on every enrolled host:
+  - run the allowed restricted operations;
+  - end lease sessions;
+  - use SFTP as `asm-ops`;
+  - where privileged access is allowed, get the privileged login;
+  - log in as each user the host allows.
+- Unattended cleanup reaches jump hosts with your own ssh setup.
+- Restart grants can be used to cause outages.
+- Cleanup results come from the host.
+- sshd `Match Address` rules for agent client addresses aren't checked.
+
+**Without the Mac:** run `sudo /usr/lib/asm-ssh/asm-remove` on each enrolled host. It removes asm's key files, ends lease sessions, and removes the accounts, files and timer.
+
 Bindings use `[DEST=]SOURCE[::FIELD]`: for example
 `asm get 'GOOGLE_USER=Vaultwarden/google::username' 'Sign in'`.
 Exec takes comma-separated bindings and literal `--` before argv. Use single quotes to
@@ -372,6 +458,7 @@ Commands:
   browser     Set up browsers for login grants: route their HTTPS through asm's proxy router and trust the asm browser CA
   gh          Use the GitHub CLI (gh) through the manager: a gh shim that adds GitHub App tokens for the repositories you add
   skill       Install the agent skill shipped with this CLI into agents' skill folders
+  ssh         SSH access to the operator's hosts
 ```
 
 |Command|Options|Notes|
@@ -401,6 +488,12 @@ Commands:
 |`asm skill install`|`--dir <DIR>` (repeatable; default `~/.agents/skills`)<br>`--force`: replace a skill not installed by asm, or an `asm` symlink<br>`--print`: print the embedded `SKILL.md` instead<br>`--print-setup`: print the embedded `SETUP.md` instead|Writes `<DIR>/asm/SKILL.md` and `<DIR>/asm/SETUP.md` (folders 0755, files 0644). Prints `installed: …`, `updated: …`, `updated (asm-version only): …` or `up to date: …` per folder; refusals go to stderr and make the exit code 1. See [The agent skill](#the-agent-skill).|
 |`asm skill uninstall`|`--dir <DIR>` (repeatable)|Removes `<DIR>/asm/SKILL.md` and its `SETUP.md` only when asm installed the skill, then the `asm` folder when empty. Prints `removed: …`, `not installed: …` or `left alone (…): …`; exit 0.|
 |`asm skill status`|`--dir <DIR>` (repeatable)<br>`--json`|One line per folder: `installed (current)` or `installed (outdated)` with the installed `asm-version`, `foreign`, `symlink` or `missing`. `--json` adds `installed_version` and this CLI's `version`. Exit 0.|
+|`asm ssh request <HOSTS> <REASON> [-- COMMAND...]`|`--privileged`, `--as <USER>` or `--grant <GRANT>` (repeatable: `logs:<unit>`, `restart:<unit>`), `--new-lease`, `--wait`, `--json`|Requests an SSH lease for comma-separated hosts. Without a command it prints the lease and one connect line per host (`ssh <host>` after `asm ssh install`, otherwise `ssh -F <lease config> <host>`). With a command (one host only) it runs `ssh` with the lease as a child process and warns before the lease ends. See [SSH access](#ssh-access).|
+|`asm ssh hosts`|`--json`|Enrolled hosts with their privileged login (`-` without privileged access), the other users agents may log in as, and the restricted grants they allow.|
+|`asm ssh leases`|`--json`|This machine's SSH leases that haven't expired, with their end times and config paths.|
+|`asm ssh extend <LEASE_ID> <REASON>`|`--wait`, `--json`|Asks to extend an SSH lease. For a privileged lease or a lease as a user it then logs in once to each host and prints `<host>: confirmed` for each host that recorded the new end.|
+|`asm ssh install`|—|Adds `Include …/asm-ssh-hosts.conf` to the top of `~/.ssh/config` (following a symlinked config), so `ssh`, `scp`, `git` and Ansible use active leases by host name. Running it again does nothing.|
+|`asm ssh uninstall`|—|Removes what `asm ssh install` added.|
 
 Host patterns follow iron-proxy's rules: case-insensitive, `*` matches any host, `*.example.com` matches `example.com` and every subdomain, and any other `*` is a glob. Patterns have no scheme and no port.
 
@@ -429,10 +522,11 @@ Files on the agent machine:
 |`${XDG_CONFIG_HOME:-~/.config}/asm/gh.json`, `gh-state.json`, `gh.lock`|`asm gh` repositories and permissions per owner (0600), the denial backoff, and the lock of `asm gh repo` changes|
 |`$XDG_RUNTIME_DIR/asm/gh/<owner>.json`|`asm gh` cached tokens (0600; only when `$XDG_RUNTIME_DIR` is a tmpfs)|
 |`~/.local/bin/gh`|the `asm gh` shim (`asm gh install --dir` puts it elsewhere)|
+|`${XDG_CONFIG_HOME:-~/.config}/asm/ssh/`|SSH leases (`leases.json`), one folder per lease (`cert.pub`, `known_hosts`, `config`), `asm-ssh-hosts.conf` (included from `~/.ssh/config` by `asm ssh install`), and the ssh-agent socket `agent.sock`|
 
 File-based commands start one detached `asm reap` per secrets directory, held single by `.reaper.lock`. It removes material at lease expiry or raw generated-token expiry and polls revocations about once a minute. Generated token cleanup retains bindings/version reservations until authorization ends. `--no-reaper` or `ASM_NO_REAPER=1` leaves cleanup to later file-aware commands. File-free exec does not read/write secret manifests, clean secret files or start the reaper.
 
-Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets directory), `ASM_AGENT` (agent label shown to the operator; defaults to the CLI's parent process name; `asm gh` always uses `asm-gh`), `ASM_NO_REAPER=1` (no background cleanup), `ASM_REAPER_LOG` (a file the background cleanup logs to, for debugging) and `ASM_GH_WAIT` (seconds a `gh` command waits for an approval; default 120, `0` does not wait).
+Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets directory), `ASM_AGENT` (agent label shown to the operator; defaults to the CLI's parent process name; `asm gh` always uses `asm-gh`), `ASM_NO_REAPER=1` (no background cleanup), `ASM_REAPER_LOG` (a file the background cleanup logs to, for debugging), `ASM_SSH_AGENT_LOG` (the same for the SSH agent) and `ASM_GH_WAIT` (seconds a `gh` command waits for an approval; default 120, `0` does not wait).
 
 ## The manager app
 
@@ -444,10 +538,11 @@ Environment: `ASM_PAIRING_CODE` (unattended pairing), `ASM_SECRETS_DIR` (secrets
   - **Generators**: configure a GitHub App’s client ID and private key once. Add each installation by account or ID and choose its allowed repositories and permissions. Adding it in ASM does not install it on GitHub. Agents request `GH_TOKEN` / `GITHUB_TOKEN`; the popup identifies the installation, and the operator chooses when several match. Qualify the source (`release-bot/GH_TOKEN`) to request a particular app. Google Cloud connections share `CLOUDSDK_AUTH_ACCESS_TOKEN` and can also be qualified (`gcloud-dev/CLOUDSDK_AUTH_ACCESS_TOKEN`).
     In **Edit Limits**, **Select all** and **Deselect all** change the current installation’s draft limits. In the approval popup, repository checkboxes and permission menus change only the proposed lease, not the saved installation limits. A GitHub token can include at most 500 repositories.
   - **Hosts and Agents**: paired machines (OS, addresses, agents seen, active leases), renaming and revocation; pairing codes.
+  - **SSH Targets**: hosts agents may request SSH access to, whether they allow privileged access, their log and restart units, pinned host keys and enrollment state; **Enroll**, **Review Host Key** and **Remove from Host**.
   - **Leases**: active and ended grants with host, source, mode, fields and hosts; generated details show the identity, approved grant, authorization deadline and provider-token deadline.
   - **Proxy**: status (running, starting, not running with the cause and since when, not responding), failed starts, health and CA expiry; network access (whether the proxy and the API listen for other machines, and what the macOS Firewall does to iron-proxy and the app); listener address and port; hostname hints; advanced ports, request body limit and plain-HTTP substitution (off by default); **Require proxy authentication** (off by default: each paired host then signs in to the proxy with its own credentials, login grants work only from the requesting machine, and asm CLIs older than 0.8.0 can no longer use the proxy); the CA certificate; the proxy log. The sidebar marks **Proxy** while it is down or blocked by the firewall.
   - **Settings**: manager API address and port, default lease duration, pending request lifetime, launch at login, the `bw` path, version.
-- **Activity Log** (Window ▸ Show Activity Log, ⌘L): a persistent audit trail of pairing, requests, leases, proxy substitutions, vault and generator events, filterable by category. Generator events contain grant metadata and sanitized status, never keys or tokens.
+- **Activity Log** (Window ▸ Show Activity Log, ⌘L): a persistent audit trail of pairing, requests, leases, proxy substitutions, vault, generator and SSH events (target changes, enrollment, every SSH signature issued, extensions, session cleanup), filterable by category. Generator events contain grant metadata and sanitized status, never keys or tokens.
 
 Data lives in `~/Library/Application Support/asm/`. Vault credentials are kept in the login keychain under the service `net.thinkscape.asm`. One manager runs per data directory (`manager.lock`): a second copy shows an alert and quits.
 

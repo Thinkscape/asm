@@ -607,11 +607,22 @@ private struct KeychainSheet: View {
     }
 }
 
-/// Cancel / Save row at the bottom of a sheet; shows why saving is not possible yet.
+/// An extra button in `SheetButtons`.
+struct SheetAction {
+    let title: Text
+    let action: () -> Void
+}
+
+/// Cancel / Save row at the bottom of a sheet; shows why saving is not possible yet, or
+/// why the last attempt failed.
 struct SheetButtons: View {
     let saveTitle: LocalizedStringKey
     let problem: String?
+    /// Why the last save failed; shown when there is no `problem`.
+    var error: String? = nil
     let saving: Bool
+    /// An extra action before Cancel, such as saving without a check that failed.
+    var secondary: SheetAction? = nil
     let cancel: () -> Void
     let save: () -> Void
 
@@ -619,9 +630,20 @@ struct SheetButtons: View {
         HStack {
             if let problem {
                 Text(verbatim: problem).font(.callout).foregroundStyle(.secondary)
+            } else if let error {
+                Text(verbatim: error)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
             Spacer()
             if saving { ProgressView().controlSize(.small) }
+            if let secondary {
+                Button(action: secondary.action) { secondary.title }
+                    .disabled(saving)
+            }
             Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
             Button(saveTitle, action: save)
                 .keyboardShortcut(.defaultAction)

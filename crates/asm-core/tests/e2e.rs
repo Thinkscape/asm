@@ -124,6 +124,16 @@ impl AutoApprover {
                     Decision::ApproveWrite { vault_id: target.vault_id.clone(), collection_id: None }
                 }
                 RequestDetail::Login { .. } => Decision::Deny { reason: "e2e does not sign in".into() },
+                RequestDetail::Ssh { targets, access, grants, user, max_duration_secs, .. } => Decision::ApproveSsh {
+                    target_ids: targets.iter().filter(|t| t.ready).map(|t| t.target_id.clone()).collect(),
+                    access: *access,
+                    grants: grants.clone(),
+                    user: user.clone(),
+                    duration_secs: 300.min(*max_duration_secs),
+                },
+                RequestDetail::SshExtend { max_duration_secs, .. } => Decision::ApproveSshExtend {
+                    duration_secs: *max_duration_secs,
+                },
             };
             let deny = matches!(decision, Decision::Deny { .. });
             if m.resolve_request(p.id.clone(), decision).is_ok() && !deny {
@@ -219,7 +229,8 @@ impl Env {
         self.run_env(args, stdin, &[])
     }
 
-    fn run_env(&self, args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> Out {
+    /// The CLI with this environment's isolated config and secrets, and `env` on top.
+    fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut c = Command::new(&self.cli);
         c.args(args)
             .env("XDG_CONFIG_HOME", &self.config)
@@ -236,12 +247,13 @@ impl Env {
             .env_remove("NO_PROXY")
             .env_remove("no_proxy")
             .env_remove("ASM_NO_REAPER")
-            .envs(env.iter().copied())
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+            .envs(env.iter().copied());
+        c
+    }
+
+    fn run_env(&self, args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> Out {
+        let mut c = self.command(args, env);
+        c.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = c.spawn().expect("spawn asm");
@@ -2048,3 +2060,9 @@ mod gcloud;
 
 #[path = "e2e/browser_login.rs"]
 mod browser_login;
+
+#[path = "e2e/ssh.rs"]
+mod ssh;
+
+#[path = "e2e/ssh_docker.rs"]
+mod ssh_docker;

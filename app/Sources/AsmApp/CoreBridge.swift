@@ -19,7 +19,7 @@ final class ObserverBridge: ManagerObserver, @unchecked Sendable {
 /// these off the main thread. `Manager` is an `Arc` of a thread-safe Rust object.
 final class CoreBridge: @unchecked Sendable {
     /// Observer topics, in initial-load order.
-    static let topics = ["settings", "vaults", "generators", "gcloud_accounts", "hosts", "leases", "proxy", "firewall", "requests"]
+    static let topics = ["settings", "vaults", "generators", "gcloud_accounts", "ssh_targets", "hosts", "leases", "proxy", "firewall", "requests"]
 
     /// Lease duration choices, in display order (`id` 0 = unlimited).
     static let leaseDurations: [LeaseDuration] = AsmCore.leaseDurations().map {
@@ -118,6 +118,10 @@ final class CoreBridge: @unchecked Sendable {
                         generation: generation.map(GenerationSelection.init))
         case let .approveWrite(vaultID, collectionID): .approveWrite(vaultId: vaultID, collectionId: collectionID)
         case let .approveLogin(durationSecs, fillOrigins): .approveLogin(durationSecs: durationSecs, fillOrigins: fillOrigins)
+        case let .approveSsh(targetIDs, access, grants, durationSecs):
+            .approveSsh(targetIds: targetIDs, access: SshAccess(access), grants: grants, user: access.user,
+                        durationSecs: durationSecs)
+        case let .approveSshExtend(durationSecs): .approveSshExtend(durationSecs: durationSecs)
         }
     }
 
@@ -245,6 +249,71 @@ final class CoreBridge: @unchecked Sendable {
         try Self.mapped { try manager.deleteGcloudOwnedAccount(target: target) }
     }
 
+    // MARK: SSH targets
+
+    func listSshTargets() throws -> [SshTargetItem] {
+        try Self.mapped { try manager.listSshTargets() }.map(SshTargetItem.init)
+    }
+
+    /// Host keys of `destination` from the operator's known_hosts files; never contacts it.
+    func lookupSshHostKeys(_ destination: String) throws -> SshHostKeyLookupItem {
+        SshHostKeyLookupItem(try Self.mapped { try manager.lookupSshHostKeys(destination: destination) })
+    }
+
+    /// The host keys `destination` offers, fetched without logging in (unverified).
+    func fetchSshHostKeys(_ destination: String) throws -> SshHostKeyLookupItem {
+        SshHostKeyLookupItem(try Self.mapped { try manager.fetchSshHostKeys(destination: destination) })
+    }
+
+    /// Logs in as enrollment will, pinned to `hostKeys`.
+    func checkSshDestination(_ destination: String, login: String, hostKeys: [String]) throws -> SshHostCheckItem {
+        SshHostCheckItem(try Self.mapped {
+            try manager.checkSshDestination(destination: destination, privilegedLogin: login, hostKeys: hostKeys)
+        })
+    }
+
+    /// Logs in as the privileged login, pinned to `hostKeys`, and lists the accounts agents
+    /// could log in as.
+    func listSshHostUsers(_ destination: String, login: String, hostKeys: [String]) throws -> [SshHostUserItem] {
+        try Self.mapped {
+            try manager.listSshHostUsers(destination: destination, privilegedLogin: login, hostKeys: hostKeys)
+        }.map { u in
+            SshHostUserItem(name: u.name, uid: u.uid, system: u.system, loginShell: u.loginShell, admin: u.admin)
+        }
+    }
+
+    /// Asks a target for its host keys and compares them with the pinned ones (no login).
+    func reviewSshHostKeys(_ id: String) throws -> SshHostCheckItem {
+        SshHostCheckItem(try Self.mapped { try manager.reviewSshHostKeys(id: id) })
+    }
+
+    /// Pins reviewed host keys; ends the target's leases.
+    func replaceSshHostKeys(_ id: String, expectedRevision: UInt64, keys: [String]) throws -> SshTargetItem {
+        SshTargetItem(try Self.mapped { try manager.replaceSshHostKeys(id: id, expectedRevision: expectedRevision, keys: keys) })
+    }
+
+    func saveSshTarget(_ draft: SshTargetDraftItem) throws -> SshTargetItem {
+        SshTargetItem(try Self.mapped { try manager.saveSshTarget(draft: SshTargetDraft(draft)) })
+    }
+
+    func removeSshTarget(_ id: String) throws {
+        try Self.mapped { try manager.removeSshTarget(id: id) }
+    }
+
+    /// Runs the enrollment script on the target over the operator's ssh (blocks).
+    func enrollSshTarget(_ id: String, expectedRevision: UInt64) throws {
+        _ = try Self.mapped { try manager.enrollSshTarget(id: id, expectedRevision: expectedRevision) }
+    }
+
+    /// Ends the target's leases and removes asm from it over the operator's ssh (blocks).
+    func unenrollSshTarget(_ id: String) throws {
+        try Self.mapped { try manager.unenrollSshTarget(id: id) }
+    }
+
+    func sshEnrollScript(_ id: String) throws -> String {
+        try Self.mapped { try manager.sshEnrollScript(id: id) }
+    }
+
     // MARK: Hosts and pairing codes
 
     func listHosts() throws -> [HostItem] {
@@ -282,6 +351,10 @@ final class CoreBridge: @unchecked Sendable {
 
     func revokeLease(_ id: String) throws {
         try Self.mapped { try manager.revokeLease(leaseId: id) }
+    }
+
+    func retrySshCleanup(_ leaseID: String) throws {
+        try Self.mapped { try manager.retrySshCleanup(leaseId: leaseID) }
     }
 
     // MARK: Proxy and settings
@@ -417,6 +490,7 @@ private extension RequestKind {
         case .update: self = .update
         case .add: self = .add
         case .login: self = .login
+        case .ssh: self = .ssh
         }
     }
 }
@@ -468,6 +542,19 @@ private extension PendingItem {
         case let .login(name, vaultName, url, fillOrigins, reason, hasTotp):
             .login(LoginDetail(
                 name: name, vaultName: vaultName, url: url, fillOrigins: fillOrigins, reason: reason, hasTotp: hasTotp
+            ))
+        case let .ssh(reason, access, grants, user, targets, defaultDurationSecs, maxDurationSecs):
+            .ssh(SshRequestItem(
+                reason: reason, access: SshAccessItem(access, user: user), grants: grants,
+                targets: targets.map(SshApprovalTargetItem.init),
+                defaultDurationSecs: defaultDurationSecs, maxDurationSecs: maxDurationSecs
+            ))
+        case let .sshExtend(leaseID, reason, access, grants, user, targets, expiresAt, issue, defaultDurationSecs,
+                            maxDurationSecs):
+            .sshExtend(SshExtendRequestItem(
+                leaseID: leaseID, reason: reason, access: SshAccessItem(access, user: user), grants: grants,
+                targets: targets.map(SshApprovalTargetItem.init), expiresAt: expiresAt, issue: issue,
+                defaultDurationSecs: defaultDurationSecs, maxDurationSecs: maxDurationSecs
             ))
         }
         self.init(
@@ -591,10 +678,155 @@ private extension LeaseItem {
             id: l.leaseId, hostLabel: l.hostLabel, hostname: l.hostname, source: l.vaultName, name: l.name,
             mode: l.mode == .raw ? .raw : .sentinel, hosts: l.hosts, createdAt: l.createdAt,
             expiresAt: l.expiresAt, status: LeaseStatus(l.status), suspended: l.suspended, rawDelivered: l.rawDelivered,
-            sourceKind: l.sourceKind == .generator ? .generator : .vault, sourceID: l.vaultId, fields: l.fields,
+            sourceKind: SourceKindItem(l.sourceKind), sourceID: l.vaultId, fields: l.fields,
             generation: l.generation.map(GenerationSelectionItem.init), generatorName: l.generatorName,
             credentialExpiresAt: l.credentialExpiresAt, credentialVersion: l.credentialVersion,
-            suspensionReason: l.suspensionReason
+            suspensionReason: l.suspensionReason, ssh: l.ssh.map(SshLeaseDetailItem.init)
+        )
+    }
+}
+
+private extension SourceKindItem {
+    init(_ kind: SourceKind) {
+        self = switch kind {
+        case .vault: .vault
+        case .generator: .generator
+        case .ssh: .ssh
+        }
+    }
+}
+
+// MARK: - SSH record mapping
+
+private extension SshAccessItem {
+    init(_ access: SshAccess, user: String?) {
+        self = switch access {
+        case .privileged: .privileged
+        case .restricted: .restricted
+        case .user: .user(user ?? "")
+        }
+    }
+
+    /// The user of access as a user.
+    var user: String? {
+        if case let .user(name) = self { return name }
+        return nil
+    }
+}
+
+private extension SshAccess {
+    init(_ access: SshAccessItem) {
+        self = switch access {
+        case .privileged: .privileged
+        case .restricted: .restricted
+        case .user: .user
+        }
+    }
+}
+
+private extension SshTargetUserItem {
+    init(_ u: SshTargetUser) {
+        self.init(name: u.name, admin: u.admin)
+    }
+}
+
+private extension SshTargetUser {
+    init(_ u: SshTargetUserItem) {
+        self.init(name: u.name, admin: u.admin)
+    }
+}
+
+private extension SshApprovalTargetItem {
+    init(_ t: SshApprovalTarget) {
+        self.init(
+            id: t.targetId, name: t.name, hostname: t.hostname, port: t.port, privilegedLogin: t.privilegedLogin,
+            allowPrivileged: t.allowPrivileged, logUnits: t.logUnits, restartUnits: t.restartUnits,
+            users: t.users.map(SshTargetUserItem.init), ready: t.ready, issue: t.issue,
+            hostKeyFingerprints: t.hostKeyFingerprints
+        )
+    }
+}
+
+private extension SshCleanupStateItem {
+    init(_ state: SshCleanupState) {
+        self = switch state {
+        case .pending: .pending
+        case .retrying: .retrying
+        case .done: .done
+        case .failed: .failed
+        }
+    }
+}
+
+private extension SshLeaseDetailItem {
+    init(_ d: SshLeaseDetail) {
+        self.init(
+            access: SshAccessItem(d.access, user: d.user), grants: d.grants,
+            targets: d.targets.map { t in
+                SshLeaseTargetItem(name: t.name, login: t.login, cleanup: t.cleanup.map(SshCleanupStateItem.init),
+                                   cleanupDetail: t.cleanupDetail)
+            }
+        )
+    }
+}
+
+private extension SshHostKeyItem {
+    init(_ k: SshHostKey) {
+        self.init(line: k.line, fingerprint: k.fingerprint)
+    }
+}
+
+private extension SshHostKeyLookupItem {
+    init(_ lookup: SshHostKeyLookup) {
+        self.init(hostname: lookup.hostname, port: lookup.port, keys: lookup.keys.map(SshHostKeyItem.init),
+                  proxyJump: lookup.proxyJump, proxyCommand: lookup.proxyCommand)
+    }
+}
+
+private extension SshHostCheckItem {
+    init(_ check: SshHostCheck) {
+        self = switch check {
+        case .verified: .verified
+        case let .keyMismatch(presented): .keyMismatch(presented: presented.map(SshHostKeyItem.init))
+        case let .unreachable(message): .unreachable(message)
+        }
+    }
+}
+
+private extension SshTargetStateItem {
+    init(_ state: SshTargetState) {
+        self = switch state {
+        case .notEnrolled: .notEnrolled
+        case .enrolling: .enrolling
+        case .enrolled: .enrolled
+        case .needsReenroll: .needsReenroll
+        case .failed: .failed
+        case .removing: .removing
+        }
+    }
+}
+
+private extension SshTargetItem {
+    init(_ t: SshTargetInfo) {
+        self.init(
+            id: t.id, name: t.name, destination: t.destination, agentHostname: t.agentHostname, agentPort: t.agentPort,
+            privilegedLogin: t.privilegedLogin, hostKeys: t.hostKeys.map(SshHostKeyItem.init),
+            allowPrivileged: t.allowPrivileged, logUnits: t.logUnits,
+            restartUnits: t.restartUnits, users: t.users.map(SshTargetUserItem.init), maxDurationSecs: t.maxDurationSecs,
+            revision: t.revision,
+            state: SshTargetStateItem(t.state), error: t.error, activeLeases: t.activeLeases,
+            hostKeyChanged: t.hostKeyChanged
+        )
+    }
+}
+
+private extension SshTargetDraft {
+    init(_ d: SshTargetDraftItem) {
+        self.init(
+            id: d.id, expectedRevision: d.expectedRevision, name: d.name, destination: d.destination,
+            agentHostname: d.agentHostname, agentPort: d.agentPort, privilegedLogin: d.privilegedLogin,
+            allowPrivileged: d.allowPrivileged, hostKeys: d.hostKeys, logUnits: d.logUnits, restartUnits: d.restartUnits,
+            maxDurationSecs: d.maxDurationSecs, users: d.users.map(SshTargetUser.init)
         )
     }
 }

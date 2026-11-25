@@ -293,6 +293,7 @@ pub(crate) fn submit_get_with(
     let result = match result {
         RequestResult::Get(result) => result,
         RequestResult::Write(_) => return Err(CliError::failure("the manager sent a write result for a get")),
+        RequestResult::Ssh(_) => return Err(CliError::failure("the manager sent an SSH result for a get")),
     };
     let RequestBody::Get { fields, generation, sentinel, lease_id, .. } = body else {
         return Err(CliError::failure("invalid get request"));
@@ -1031,6 +1032,9 @@ fn write_result(r: RequestResult) -> Result<WriteResult, CliError> {
         RequestResult::Write(w) => Ok(w),
         RequestResult::Get(_) => Err(CliError::failure(
             "the manager sent a get result for a write",
+        )),
+        RequestResult::Ssh(_) => Err(CliError::failure(
+            "the manager sent an SSH result for a write",
         )),
     }
 }

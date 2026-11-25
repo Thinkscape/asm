@@ -41,6 +41,7 @@ pub enum Category {
     Proxy,
     Vaults,
     Generators,
+    Ssh,
 }
 
 impl Category {
@@ -52,6 +53,7 @@ impl Category {
             Category::Proxy => "proxy",
             Category::Vaults => "vaults",
             Category::Generators => "generators",
+            Category::Ssh => "ssh",
         }
     }
 }
@@ -415,6 +417,17 @@ fn request_detail(p: &Pending) -> Map<String, Value> {
             d.insert("fill_origins".into(), json!(l.fill_origins));
             d.insert("reason".into(), json!(l.reason));
         }
+        Detail::Ssh(s) => {
+            d.insert("targets".into(), json!(s.targets.iter().map(|t| &t.name).collect::<Vec<_>>()));
+            d.insert("access".into(), json!(s.access));
+            d.insert("grants".into(), json!(s.grants));
+            d.insert("user".into(), json!(s.user));
+            d.insert("reason".into(), json!(s.reason));
+        }
+        Detail::SshExtend(e) => {
+            d.insert("lease_id".into(), json!(e.lease_id));
+            d.insert("reason".into(), json!(e.reason));
+        }
     }
     d
 }
@@ -426,6 +439,7 @@ fn request_event(p: &Pending, kind: &'static str, summary: String, extra: Value)
         Detail::Update(u) => (Category::Requests, Some(u.secret.display.as_str())),
         Detail::Add(a) => (Category::Requests, Some(a.name.as_str())),
         Detail::Login(l) => (Category::Requests, Some(l.secret.display.as_str())),
+        Detail::Ssh(_) | Detail::SshExtend(_) => (Category::Requests, None),
     };
     let mut d = request_detail(p);
     if let Value::Object(x) = extra {
@@ -543,6 +557,27 @@ pub(crate) fn approved(p: &Pending, result: Option<&RequestResult>, t: i64) -> E
                 "approved",
                 format!("{} approved, {verb} {}", subject(p), w.vault),
                 json!({ "vault": w.vault }),
+            )
+        }
+        (_, Some(RequestResult::Ssh(s))) => {
+            let secs = parse_unix(&s.expires_at).map(|e| e - t);
+            let names: Vec<&str> = s.targets.iter().map(|t| t.name.as_str()).collect();
+            request_event(
+                p,
+                "approved",
+                format!("{} approved: {} to {}, {}", subject(p), match s.access {
+                    asm_proto::ssh::SshAccess::User => format!("SSH as {}", s.user.as_deref().unwrap_or("-")),
+                    access => format!("{} SSH", access.as_str()),
+                }, names.join(", "), fmt_duration(secs)),
+                json!({
+                    "lease_id": s.lease_id,
+                    "access": s.access,
+                    "grants": s.grants,
+                    "user": s.user,
+                    "targets": names,
+                    "duration_secs": secs,
+                    "expires_at": s.expires_at,
+                }),
             )
         }
         (_, None) => request_event(
