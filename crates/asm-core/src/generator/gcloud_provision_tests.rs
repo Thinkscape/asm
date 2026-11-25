@@ -444,6 +444,31 @@ fn no_stale_policy_retry_and_no_success_from_incomplete_write_ack() {
 }
 
 #[test]
+fn failed_policy_write_reports_googles_message_but_never_an_echoed_token() {
+    let mut expected_write = project_policy();
+    expected_write["etag"] = json!("ACAB");
+    expected_write["version"] = json!(3);
+    expected_write["bindings"] = json!(access().permissions.iter().map(|p| binding(p.role(), ACCOUNT_MEMBER)).collect::<Vec<_>>());
+    let explained = json!({"error": {"code": 400, "status": "INVALID_ARGUMENT",
+        "message": "Service account asm-profile-test@test-project.iam.gserviceaccount.com does not exist.\nRetry later."}});
+    let echoed = json!({"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": format!("bad token {TOKEN}")}});
+    for (response, expected) in [
+        (explained, "HTTP 400; Google: INVALID_ARGUMENT: Service account asm-profile-test@test-project.iam.gserviceaccount.com does not exist. Retry later."),
+        (echoed, "(HTTP 400)"),
+    ] {
+        loopback(vec![
+            Exchange::get_project_policy(json!({"etag":"ACAB"})), Exchange::account(),
+            Exchange { status: 400, ..Exchange::set_policy(SET_PROJECT_POLICY_PATH, expected_write.clone(), response) },
+        ], |http| {
+            let error = http.apply_profile_project_roles(TOKEN, &access(), UNIQUE_ID, ACCOUNT_EMAIL, || Ok(())).unwrap_err();
+            assert_eq!(error.code, ErrorCode::VaultUnavailable);
+            assert!(error.message.contains(expected), "{}", error.message);
+            assert!(!error.message.contains(TOKEN));
+        });
+    }
+}
+
+#[test]
 fn deletes_disabled_account_by_uid_and_prunes_only_its_approved_unconditional_deleted_bindings() {
     const OTHER_UID: &str = "deleted:serviceAccount:asm-profile-test@test-project.iam.gserviceaccount.com?uid=102030405060708090009";
     let mut disabled = account();

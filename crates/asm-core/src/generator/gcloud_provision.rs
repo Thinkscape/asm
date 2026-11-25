@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     GcloudHttp, GcloudIdentity, decode, endpoint, failed, identity_text,
-    malformed, send, sign_in_again, successful, valid_hostname, validate_unique_id,
+    malformed, rejected, send, sign_in_again, successful, valid_hostname, validate_unique_id,
 };
 use crate::error::{CoreError, Result};
 
@@ -50,10 +50,10 @@ impl GcloudHttp {
             CREATE_ACCOUNT,
         )?;
         if response.status() == StatusCode::CONFLICT {
-            return Err(failed(CREATE_ACCOUNT, "the account name already exists; ASM did not adopt it"));
+            return Err(rejected(response, CREATE_ACCOUNT, "the account name already exists; ASM did not adopt it", token));
         }
         let account: ProfileAccountResponse = decode(
-            authorized(response, CREATE_ACCOUNT, "iam.serviceAccounts.create")?,
+            authorized(response, CREATE_ACCOUNT, "iam.serviceAccounts.create", token)?,
             CREATE_ACCOUNT,
             ACCOUNT_RESPONSE,
         )?;
@@ -97,7 +97,7 @@ impl GcloudHttp {
         if response.status() == StatusCode::NOT_FOUND {
             confirm_not_found(response, GET_ACCOUNT)?;
         } else {
-            let response = authorized(response, GET_ACCOUNT, "iam.serviceAccounts.get")?;
+            let response = authorized(response, GET_ACCOUNT, "iam.serviceAccounts.get", token)?;
             if response.status() != StatusCode::OK {
                 return Err(malformed(GET_ACCOUNT));
             }
@@ -110,7 +110,7 @@ impl GcloudHttp {
             if response.status() == StatusCode::NOT_FOUND {
                 confirm_not_found(response, DELETE_ACCOUNT)?;
             } else {
-                let response = authorized(response, DELETE_ACCOUNT, "iam.serviceAccounts.delete")?;
+                let response = authorized(response, DELETE_ACCOUNT, "iam.serviceAccounts.delete", token)?;
                 // IAM documents HTTP 200 with an empty JSON object. Anything
                 // else leaves the operation pending for an explicit retry.
                 if response.status() != StatusCode::OK
@@ -250,7 +250,7 @@ impl GcloudHttp {
     fn verify_pinned_account(&self, token: &str, account: PinnedAccount<'_>) -> Result<()> {
         let response = self.get_pinned_account(token, account)?;
         let current: ProfileAccountResponse = decode(
-            authorized(response, GET_ACCOUNT, "iam.serviceAccounts.get")?,
+            authorized(response, GET_ACCOUNT, "iam.serviceAccounts.get", token)?,
             GET_ACCOUNT,
             ACCOUNT_RESPONSE,
         )?;
@@ -293,7 +293,7 @@ impl GcloudHttp {
                 )
             }
         };
-        parse_policy(send(request, operation)?, operation, permission)
+        parse_policy(send(request, operation)?, operation, permission, token)
     }
 
     fn write_profile_policy(
@@ -313,9 +313,9 @@ impl GcloudHttp {
         before_write()?;
         let response = send(request, operation)?;
         if matches!(response.status(), StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED) {
-            return Err(failed(operation, "the IAM policy changed concurrently; no retry was attempted"));
+            return Err(rejected(response, operation, "the IAM policy changed concurrently; no retry was attempted", token));
         }
-        parse_policy(response, operation, permission)
+        parse_policy(response, operation, permission, token)
     }
 }
 
@@ -618,15 +618,15 @@ fn confirm_not_found(response: Response, operation: &str) -> Result<()> {
     Ok(())
 }
 
-fn authorized(response: Response, operation: &str, permission: &str) -> Result<Response> {
+fn authorized(response: Response, operation: &str, permission: &str, token: &str) -> Result<Response> {
     if response.status() == StatusCode::FORBIDDEN {
-        return Err(failed(operation, &format!("requires {permission} and serviceusage.services.use on the selected project; check that its APIs are enabled")));
+        return Err(rejected(response, operation, &format!("requires {permission} and serviceusage.services.use on the selected project; check that its APIs are enabled"), token));
     }
-    successful(response, operation, true)
+    successful(response, operation, true, token)
 }
 
-fn parse_policy(response: Response, operation: &str, permission: &str) -> Result<IamPolicy> {
-    let policy: IamPolicy = decode(authorized(response, operation, permission)?, operation, POLICY_RESPONSE)?;
+fn parse_policy(response: Response, operation: &str, permission: &str, token: &str) -> Result<IamPolicy> {
+    let policy: IamPolicy = decode(authorized(response, operation, permission, token)?, operation, POLICY_RESPONSE)?;
     policy.validate(operation)?;
     Ok(policy)
 }

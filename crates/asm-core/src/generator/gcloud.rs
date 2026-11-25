@@ -11,7 +11,7 @@ use asm_proto::generators::{GcloudAccessGrant, GcloudGrant, validate_gcloud_proj
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::{Method, StatusCode, Url};
 use serde::{Deserialize, de::DeserializeOwned};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::gcloud_cli::{AuthorizedUser, GcloudRunner};
 use super::{GcloudConfig, GcloudConnectionConfig, GeneratedCredential};
@@ -26,6 +26,9 @@ const TOKENINFO: &str = "Google access token verification";
 const PROJECT_SEARCH: &str = "Google Cloud project discovery";
 const IMPERSONATE_PERMISSION: &str = "iam.serviceAccounts.getAccessToken";
 const SMALL_RESPONSE: u64 = 64 * 1024;
+/// Google error bodies are small; anything larger is not parsed for a message.
+const ERROR_RESPONSE: u64 = 16 * 1024;
+const ERROR_MESSAGE_CHARS: usize = 500;
 const PROJECTS_PAGE_SIZE: usize = 100;
 const PROJECTS_MAX_PAGES: usize = 100;
 const PROJECTS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -232,10 +235,61 @@ fn malformed(operation: &str) -> CoreError {
 }
 
 fn send(request: RequestBuilder, operation: &str) -> Result<Response> {
-    request.send().map_err(|_| failed(operation, "network error"))
+    request.send().map_err(|error| {
+        let detail = if error.is_timeout() {
+            "network error: timed out"
+        } else if error.is_connect() {
+            "network error: could not connect"
+        } else {
+            "network error"
+        };
+        failed(operation, detail)
+    })
 }
 
-fn successful(response: Response, operation: &str, authenticated: bool) -> Result<Response> {
+/// A failed Google call, with Google's own explanation appended when its error
+/// body has one. Operator diagnostics only: `VaultUnavailable` messages never
+/// reach manager API clients (see `asm_proto::ApiError::from`). `sent` is the
+/// credential the request carried; a message echoing it is dropped.
+fn rejected(response: Response, operation: &str, detail: &str, sent: &str) -> CoreError {
+    match google_message(response, sent) {
+        Some(message) => failed(operation, &format!("{detail}; Google: {message}")),
+        None => failed(operation, detail),
+    }
+}
+
+/// `error.status: error.message` (API errors) or `error: error_description`
+/// (OAuth errors), flattened to one line and capped.
+fn google_message(response: Response, sent: &str) -> Option<String> {
+    let mut bytes = Vec::new();
+    response.take(ERROR_RESPONSE).read_to_end(&mut bytes).ok()?;
+    let body: Value = serde_json::from_slice(&bytes).ok()?;
+    let text = match body.get("error")? {
+        Value::Object(error) => {
+            let message = error.get("message").and_then(Value::as_str)?;
+            match error.get("status").and_then(Value::as_str) {
+                Some(status) => format!("{status}: {message}"),
+                None => message.to_owned(),
+            }
+        }
+        Value::String(code) => match body.get("error_description").and_then(Value::as_str) {
+            Some(description) => format!("{code}: {description}"),
+            None => code.clone(),
+        },
+        _ => return None,
+    };
+    if !sent.is_empty() && text.contains(sent) {
+        return None;
+    }
+    let text: String = text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(ERROR_MESSAGE_CHARS)
+        .collect();
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn successful(response: Response, operation: &str, authenticated: bool, sent: &str) -> Result<Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
@@ -249,9 +303,9 @@ fn successful(response: Response, operation: &str, authenticated: bool) -> Resul
             PROJECT_SEARCH => "requires resourcemanager.projects.get to see a project; check that the Resource Manager API is enabled",
             _ => "permission denied",
         };
-        return Err(failed(operation, detail));
+        return Err(rejected(response, operation, detail, sent));
     }
-    Err(failed(operation, &format!("HTTP {}", status.as_u16())))
+    Err(rejected(response, operation, &format!("HTTP {}", status.as_u16()), sent))
 }
 
 fn decode<T: DeserializeOwned>(response: Response, operation: &str, limit: u64) -> Result<T> {
@@ -323,7 +377,7 @@ impl GcloudHttp {
     pub(crate) fn identity(&self, token: &str) -> Result<GcloudIdentity> {
         let url = endpoint("https://openidconnect.googleapis.com/v1/userinfo");
         let response = send(self.request(Method::GET, url).bearer_auth(token), IDENTITY)?;
-        let user: UserInfo = decode(successful(response, IDENTITY, true)?, IDENTITY, SMALL_RESPONSE)?;
+        let user: UserInfo = decode(successful(response, IDENTITY, true, token)?, IDENTITY, SMALL_RESPONSE)?;
         if !user.email_verified {
             return Err(failed(IDENTITY, "Google account email is not verified"));
         }
@@ -360,7 +414,7 @@ impl GcloudHttp {
             let request = self.request(Method::GET, url).bearer_auth(token).timeout(remaining);
             let response = send(request, PROJECT_SEARCH)?;
             let page: SearchProjectsPage = decode(
-                successful(response, PROJECT_SEARCH, true)?, PROJECT_SEARCH, SMALL_RESPONSE,
+                successful(response, PROJECT_SEARCH, true, token)?, PROJECT_SEARCH, SMALL_RESPONSE,
             )?;
             if page.projects.len() > PROJECTS_PAGE_SIZE {
                 return Err(malformed(PROJECT_SEARCH));
@@ -396,7 +450,7 @@ impl GcloudHttp {
         let request = self.management(Method::POST, url, token, project_id)
             .json(&json!({ "permissions": [IMPERSONATE_PERMISSION] }));
         let response = send(request, PREFLIGHT)?;
-        let result: TestPermissions = decode(successful(response, PREFLIGHT, true)?, PREFLIGHT, SMALL_RESPONSE)?;
+        let result: TestPermissions = decode(successful(response, PREFLIGHT, true, token)?, PREFLIGHT, SMALL_RESPONSE)?;
         if !result.permissions.iter().any(|permission| permission == IMPERSONATE_PERMISSION) {
             return Err(failed(PREFLIGHT, "ask an administrator to grant iam.serviceAccounts.getAccessToken on this service account (commonly Service Account Token Creator)"));
         }
@@ -411,7 +465,7 @@ impl GcloudHttp {
         let request = self.request(Method::POST, url).form(&[("access_token", token)]);
         let before = now()?;
         let response = send(request, TOKENINFO)?;
-        let info: TokenInfo = decode(successful(response, TOKENINFO, false)?, TOKENINFO, SMALL_RESPONSE)?;
+        let info: TokenInfo = decode(successful(response, TOKENINFO, false, token)?, TOKENINFO, SMALL_RESPONSE)?;
         let mut reported: Vec<_> = info.scope.split(' ').collect();
         reported.sort_unstable();
         reported.dedup();
