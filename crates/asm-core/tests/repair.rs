@@ -118,7 +118,7 @@ fn pending_write_survives_abrupt_process_exit() {
         let (id, _) = pair_code(&manager, "restart-test", None, None);
         let host = manager.core().store.get_host(&id).unwrap().unwrap();
         let pending = manager.core().create_request(&host, "127.0.0.1", RequestBody::Add {
-            name: "AFTER_RESTART".into(), value: PROPOSED.into(), agent: "test".into(),
+            name: "AFTER_RESTART".into(), value: PROPOSED.into(), agent: "test".into(), vault: None, collection: None,
         }).unwrap();
         std::fs::write(root.join("client-receipt"), serde_json::to_vec(&(id, pending)).unwrap()).unwrap();
         std::process::exit(0);

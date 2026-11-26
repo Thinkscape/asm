@@ -28,6 +28,7 @@ impl asm_core::vault::VaultProvider for SiteLogin {
             kind: asm_proto::wire::SecretKind::Login,
             fields: vec!["username".into(), "password".into()],
             uri_hosts: vec!["login.test".into()],
+            collections: vec![],
         }])
     }
 

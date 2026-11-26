@@ -17,6 +17,13 @@ reinstalling and fixing failures are covered in `SETUP.md` next to this file.
    and routing affinity, not isolation from another agent on the same host.
 2. **Discover.** Run `asm list --json` for addressable names, aliases, fields and leases.
    Fields are exact metadata names, not JSONPath. Use qualified names when outputs collide.
+   A name two vaults share is listed as `vault/NAME`; items sharing a name in one vault
+   are listed as `NAME~<hash>`, and the bare `NAME` then fails as ambiguous, listing the
+   choices. Exception: while this host holds an active lease taken under exactly that
+   name, `get` and `update` of the name keep reaching the leased item and print
+   `warning: NAME is ambiguous now (…)`; switch to one of the listed names. When the
+   operator allows it, entries carry `collections` (Bitwarden collection names) to tell
+   such items apart.
 3. **Launch with credentials**, preferably without files:
 
    ```bash
@@ -108,6 +115,8 @@ Use reported paths, selected app/grant, mode and deadlines; never print file con
 Generated aliases share a lease and credential version. A later get updates all known
 local file views of the returned field, including both GitHub aliases; subset static gets
 leave other fields intact. Explicit destinations are local delivery metadata, not grants.
+Default file paths follow the listed name (`vault/NAME` only while another vault shares
+`NAME`): qualifying a request pins its source, not its file path.
 
 The **lease deadline** ends authorization; the **credential deadline** ends one provider
 token. GitHub tokens last about an hour. A 12-hour lease allows on-demand renewal of the
@@ -286,8 +295,14 @@ host to keep access.
 ```bash
 printf '%s' "$NEW_VALUE" | asm update --field password NAME
 printf '%s' "$VALUE" | asm add NAME
+printf '%s' "$VALUE" | asm add --vault work --collection Infra NAME
 ```
 
-Both require approval and read values from stdin. Add creates no lease; request access
-afterwards. Update revokes static raw leases and refreshes existing sentinel substitution.
-Generated secrets cannot be updated; their app configuration and approved claims control issuance.
+Both require approval and read values from stdin. The operator decides where an added
+secret is stored; `--vault` (a vault name from `asm list`) and `--collection` only
+suggest it. Add prints where it went and the name to request:
+`added NAME to work (collection Infra); request it as 'work/NAME'` (the collection only
+when the operator shares collection names). Add creates no lease; request access
+afterwards with that name. Update revokes static raw leases and refreshes existing sentinel
+substitution. Generated secrets cannot be updated; their app configuration and approved
+claims control issuance.

@@ -21,6 +21,8 @@ use crate::error::{CoreError, Result};
 use crate::ffi;
 use crate::proxy::{Phase, ProxyConfig};
 use crate::store::{PairingCodeRecord, Store, VaultRecord};
+use super::requests::{name_taken, new_secret_name};
+use crate::vault::names::NamedSecret;
 use crate::vault::registry::{Registry, VaultEntry};
 use crate::vault::{BitwardenSecrets, CollectionInfo, VaultConfig, VaultStatus, bitwarden, creds};
 
@@ -612,6 +614,88 @@ impl Core {
         }
         self.track_vaults();
         self.sync_proxy(true);
+        Ok(())
+    }
+
+    /// Items agents can list whose vault names collide, within one vault or across vaults,
+    /// with the spelling agents need for each now.
+    pub fn name_conflicts(&self) -> Result<Vec<ffi::NameConflict>> {
+        let catalog = self.secret_catalog()?;
+        let mut groups: BTreeMap<&str, Vec<&NamedSecret>> = BTreeMap::new();
+        for n in &catalog.static_entries {
+            groups.entry(n.meta.name.as_str()).or_default().push(n);
+        }
+        let vaults = self.registry.all();
+        let mut collection_names: HashMap<&str, HashMap<String, String>> = HashMap::new();
+        let mut conflicts = Vec::new();
+        for (name, items) in groups.into_iter().filter(|(_, items)| items.len() > 1) {
+            let items = items.into_iter().map(|n| {
+                let vault = vaults.iter().find(|v| v.id == n.vault_id);
+                let location = match vault {
+                    Some(v @ VaultEntry { config: VaultConfig::Bitwarden(b), .. }) => {
+                        let names = collection_names.entry(v.id.as_str()).or_insert_with(|| {
+                            let mut names: HashMap<String, String> = b.collection_names.clone().into_iter().collect();
+                            names.extend(v.provider.collections().unwrap_or_default().into_iter().map(|c| (c.id, c.name)));
+                            names
+                        });
+                        let labels: Vec<&str> = n.meta.collections.iter()
+                            .map(|id| names.get(id).map_or(id.as_str(), String::as_str))
+                            .collect();
+                        Some(match labels.as_slice() {
+                            [] => "personal vault".to_owned(),
+                            [one] => format!("collection {one}"),
+                            many => format!("collections {}", many.join(", ")),
+                        })
+                    }
+                    _ => None,
+                };
+                ffi::NameConflictItem {
+                    vault_id: n.vault_id.clone(),
+                    vault_name: n.vault_name.clone(),
+                    key: n.meta.key.clone(),
+                    agent_name: n.display.clone(),
+                    renamable: location.is_some(),
+                    location,
+                }
+            }).collect();
+            conflicts.push(ffi::NameConflict { name: name.to_owned(), items });
+        }
+        Ok(conflicts)
+    }
+
+    /// Rename a Bitwarden item agents can see, to a name no listed secret uses.
+    pub fn rename_secret(&self, vault_id: &str, key: &str, new_name: &str) -> Result<()> {
+        let new_name = new_secret_name(new_name)?;
+        let writes = lock(&self.vault_writes);
+        let entry = self.registry.get(vault_id).ok_or_else(|| CoreError::not_found("no such vault"))?;
+        if !matches!(entry.config, VaultConfig::Bitwarden(_)) {
+            return Err(CoreError::invalid("only Bitwarden items can be renamed here"));
+        }
+        let catalog = self.secret_catalog()?;
+        if !catalog.unlisted.is_empty() {
+            return Err(CoreError::vault_unavailable(format!(
+                "could not list {}; try again", catalog.unlisted.join(", ")
+            )));
+        }
+        let old = catalog.static_entries.iter()
+            .find(|n| n.vault_id == vault_id && n.meta.key == key)
+            .ok_or_else(|| CoreError::not_found("agents cannot see this item"))?;
+        if old.meta.name == new_name {
+            return Ok(());
+        }
+        if name_taken(&catalog, &new_name) {
+            return Err(CoreError::exists(format!("a secret named {new_name:?} already exists")));
+        }
+        entry.provider.rename(key, &new_name)?;
+        drop(writes);
+        self.log(activity::vault_event(
+            "item_renamed",
+            &entry.id,
+            &entry.name,
+            &entry.config,
+            format!("vault {}: {} renamed to {new_name}", entry.name, old.meta.name),
+        ));
+        self.notify(TOPIC_VAULTS);
         Ok(())
     }
 

@@ -13,9 +13,9 @@ use asm_proto::generators::{
 use asm_proto::names::{canonical_generated_output, generated_output};
 use asm_proto::rules::LoginTarget;
 use asm_proto::wire::{
-    CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_LOGIN_GRANT_V1,
+    CAPABILITY_ADD_DESTINATION_V1, CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_LOGIN_GRANT_V1,
     GetResult, LeaseInfo, LeaseMode, LeaseStatus, LeasesResponse, LoginScope, MAX_POLL_WAIT_SECS, RequestBody,
-    RequestResult, RequestState, RequestStatus, RequestedMode, SecretsResponse, WriteResult,
+    RequestResult, RequestState, RequestStatus, RequestedMode, SecretEntry, SecretsResponse, WriteResult,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -584,6 +584,8 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
     let owned = s.sync_leases()?;
     let mut refresh_from_version = None;
     let mut pinned = None;
+    // A bare name that is ambiguous now but may still reach this host's lease on it.
+    let mut ambiguity: Option<(String, Vec<SecretEntry>)> = None;
     let (binding, request_name, output, fields) = if let Some(id) = &a.lease {
         if !asm_proto::crypto::is_uuid(id) {
             return Err(CliError::invalid("invalid lease id"));
@@ -651,6 +653,9 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
                 && !canonical_generated_output(&binding.source).is_some_and(|output| {
                     entries.iter().any(|entry| generated_output(entry) == Some(output))
                 }) => {
+                if e.code == Some(ErrorCode::Ambiguous) {
+                    ambiguity = Some((e.message, entries));
+                }
                 let name = binding.source.clone();
                 (binding, name, None, None)
             }
@@ -726,6 +731,12 @@ pub fn get(a: GetArgs) -> Result<(), CliError> {
         crate::delivery::proxy_hint();
     }
     print_get(a.json, &result, &stored);
+    if let Some((message, entries)) = &ambiguity {
+        let leased = entries.iter()
+            .find(|e| e.lease.as_ref().is_some_and(|l| l.lease_id == result.lease_id))
+            .map(|e| e.aliases.first().unwrap_or(&e.name).as_str());
+        eprintln!("{}", ambiguity_warning(&name, message, leased));
+    }
     if let Some(selection) = &result.generation {
         let mode = if result.mode == LeaseMode::Sentinel { " --sentinel" } else { "" };
         eprintln!("refresh: asm get --lease {} --refresh{} {} {}", result.lease_id, mode, crate::bindings::shell_quote(&name), crate::bindings::shell_quote(&reason));
@@ -1052,8 +1063,14 @@ pub fn update(field: Option<String>, wait: Option<u64>, name: String) -> Result<
     let s = Session::open()?;
     s.warn_secrets();
     s.sync_leases()?;
+    // The manager still updates this host's leased item under a name that became
+    // ambiguous; say so. Best effort: the catalog only feeds the warning.
+    let ambiguity = crate::bindings::catalog(&s.api).ok()
+        .and_then(|entries| asm_proto::names::resolve_catalog_name(&name, &entries).err())
+        .filter(|e| e.code == ErrorCode::Ambiguous)
+        .map(|e| e.message);
     let body = RequestBody::Update {
-        name,
+        name: name.clone(),
         field,
         value,
         agent: crate::hostinfo::agent_label(),
@@ -1065,10 +1082,21 @@ pub fn update(field: Option<String>, wait: Option<u64>, name: String) -> Result<
         eprintln!("warning: {}", e.message);
     }
     println!("updated {} in {}", w.name, w.vault);
+    if let Some(message) = ambiguity {
+        eprintln!("{}", ambiguity_warning(&name, &message, Some(&w.name)));
+    }
     Ok(())
 }
 
-pub fn add(wait: Option<u64>, name: String) -> Result<(), CliError> {
+/// `name` matched several secrets, and the manager answered it with the one this host
+/// holds a lease on (`leased`, when known).
+fn ambiguity_warning(name: &str, message: &str, leased: Option<&str>) -> String {
+    let choices = message.split_once("use one of: ").map_or(message, |(_, choices)| choices);
+    let target = leased.map_or_else(|| "this host's existing lease".to_owned(), |leased| format!("this host's lease on {leased}"));
+    format!("warning: {name} is ambiguous now ({choices}); asm used {target}. Request one of these names to choose.")
+}
+
+pub fn add(wait: Option<u64>, vault: Option<String>, collection: Option<String>, name: String) -> Result<(), CliError> {
     check_name(&name)?;
     if name.contains('/') {
         return Err(CliError::invalid("a new secret name must not contain '/'"));
@@ -1077,15 +1105,34 @@ pub fn add(wait: Option<u64>, name: String) -> Result<(), CliError> {
     let s = Session::open()?;
     s.warn_secrets();
     s.sync_leases()?;
-    let body = RequestBody::Add {
+    let mut body = RequestBody::Add {
         name,
         value,
         agent: crate::hostinfo::agent_label(),
+        vault,
+        collection,
     };
+    body.canonicalize()?;
+    if matches!(&body, RequestBody::Add { vault: Some(_), .. }) {
+        // An older manager would drop the suggestion silently.
+        crate::bindings::require_capabilities(&s.api, false, false, Some(CAPABILITY_ADD_DESTINATION_V1))?;
+    }
     let (result, _) = submit(&s.api, &body, deadline(wait))?;
     let w = write_result(result)?;
-    println!("added {} to {}; run asm get to use it", w.name, w.vault);
+    println!("{}", added_message(&w));
     Ok(())
+}
+
+/// What `asm add` reports: where the operator stored the secret and how to request it.
+fn added_message(w: &WriteResult) -> String {
+    let collection = w.collection.as_ref().map(|c| format!(" (collection {c})")).unwrap_or_default();
+    match &w.qualified_name {
+        Some(qualified) => format!(
+            "added {} to {}{collection}; request it as {}",
+            w.name, w.vault, crate::bindings::shell_quote(&crate::bindings::binding_escape(qualified)),
+        ),
+        None => format!("added {} to {}{collection}; run asm get to use it", w.name, w.vault),
+    }
 }
 
 #[cfg(test)]

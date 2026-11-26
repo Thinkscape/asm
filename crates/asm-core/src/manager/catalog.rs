@@ -1,6 +1,6 @@
 //! Overlay dynamic outputs on the static-only name table without renaming unrelated items.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use asm_proto::generators::{GenerationChoice, GenerationGrant, SourceKind};
 use asm_proto::names::resolve_catalog_name;
@@ -41,6 +41,8 @@ pub(crate) struct SecretCatalog {
     pub wire_entries: Vec<SecretEntry>,
     generated_group_by_wire_row: Vec<Option<usize>>,
     base_names: BTreeSet<String>,
+    /// Ready vaults whose listing failed: their names are unknown, not absent.
+    pub unlisted: Vec<String>,
 }
 
 fn static_base(n: &NamedSecret) -> &str {
@@ -118,6 +120,8 @@ fn generated_row(name: String, aliases: Vec<String>, choices: &[GenerationChoice
         source_kind: SourceKind::Generator,
         generators,
         aliases,
+        item_name: None,
+        collections: Vec::new(),
     }
 }
 
@@ -131,8 +135,9 @@ fn build_catalog(listings: &[VaultListing], choices: Vec<GenerationChoice>) -> S
         if let Some(output) = generated.iter_mut().find(|output| output.canonical_name == names[0]) {
             output.choices.push(choice);
         } else {
+            // Raw names: two copies of a static item collide with an output like one does.
             let static_collisions = names.iter().copied()
-                .filter(|name| static_entries.iter().any(|n| static_base(n) == *name))
+                .filter(|name| static_entries.iter().any(|n| n.meta.name == *name))
                 .map(str::to_owned)
                 .collect();
             base_names.extend(names.iter().map(|name| (*name).to_owned()));
@@ -142,15 +147,21 @@ fn build_catalog(listings: &[VaultListing], choices: Vec<GenerationChoice>) -> S
         }
     }
     for n in &mut static_entries {
-        if generated.iter().any(|output| output.static_collisions.iter().any(|name| name == static_base(n))) && !n.prefixed {
+        if generated.iter().any(|output| output.static_collisions.contains(&n.meta.name)) && !n.prefixed {
             n.display = format!("{}/{}", n.vault_name, n.display);
             n.prefixed = true;
         }
     }
+    let shared_collections: HashMap<&str, &HashMap<String, String>> = listings.iter()
+        .map(|l| (l.vault_id.as_str(), &l.shared_collection_names)).collect();
     let mut wire_entries: Vec<_> = static_entries.iter().map(|n| SecretEntry {
         name: n.display.clone(), vault: n.vault_name.clone(), kind: n.meta.kind,
         fields: n.meta.fields.clone(), lease: None, source_kind: SourceKind::Vault,
         generators: Vec::new(), aliases: vec![format!("{}/{}", n.vault_name, static_base(n))],
+        item_name: (n.meta.name != static_base(n)).then(|| n.meta.name.clone()),
+        collections: shared_collections.get(n.vault_id.as_str()).map(|names| {
+            n.meta.collections.iter().filter_map(|id| names.get(id).cloned()).collect()
+        }).unwrap_or_default(),
     }).collect();
     let mut generated_group_by_wire_row = vec![None; wire_entries.len()];
     for (index, output) in generated.iter().enumerate() {
@@ -175,12 +186,29 @@ fn build_catalog(listings: &[VaultListing], choices: Vec<GenerationChoice>) -> S
             }
         }
     }
-    SecretCatalog { static_entries, generated, wire_entries, generated_group_by_wire_row, base_names }
+    // A bare spelling must lead back to its own row: a duplicate's suffix can equal another
+    // vault's literal name, and a literal `work/X` can be taken by the vault `work`.
+    loop {
+        let shadowed: Vec<usize> = (0..static_entries.len())
+            .filter(|&i| !static_entries[i].prefixed && !matches!(
+                resolve_catalog_name(&wire_entries[i].name, &wire_entries), Ok(found) if found.entry_index == i))
+            .collect();
+        if shadowed.is_empty() {
+            break;
+        }
+        for i in shadowed {
+            let n = &mut static_entries[i];
+            n.display = format!("{}/{}", n.vault_name, n.display);
+            n.prefixed = true;
+            wire_entries[i].name = n.display.clone();
+        }
+    }
+    SecretCatalog { static_entries, generated, wire_entries, generated_group_by_wire_row, base_names, unlisted: Vec::new() }
 }
 
 impl Core {
     pub(crate) fn secret_catalog(&self) -> Result<SecretCatalog> {
-        let listings = self.registry.listings();
+        let (listings, unlisted) = self.registry.listings();
         let mut choices = Vec::new();
         for entry in self.generators.entries() {
             choices.extend(entry.record.config.ceilings().map(|ceiling| GenerationChoice {
@@ -189,7 +217,7 @@ impl Core {
                 available: entry.generator.is_some(), unavailable_reason: entry.unavailable_reason.clone(),
             }));
         }
-        Ok(build_catalog(&listings, choices))
+        Ok(SecretCatalog { unlisted, ..build_catalog(&listings, choices) })
     }
 
     /// Vault login items listed to hosts (the `/secrets` catalog) with a URI for
@@ -216,9 +244,52 @@ mod tests {
     use crate::vault::SecretMeta;
 
     fn listing(names: &[&str]) -> Vec<VaultListing> {
-        vec![VaultListing { vault_id: "vault-id".into(), vault_name: "vault".into(), secrets: names.iter().map(|name| SecretMeta {
-            key: (*name).into(), name: (*name).into(), kind: SecretKind::Single, fields: vec!["value".into()], uri_hosts: vec![],
-        }).collect() }]
+        let items: Vec<(&str, &str)> = names.iter().map(|name| (*name, *name)).collect();
+        vec![vault_listing("vault-id", "vault", &items)]
+    }
+    fn vault_listing(id: &str, name: &str, items: &[(&str, &str)]) -> VaultListing {
+        VaultListing { vault_id: id.into(), vault_name: name.into(), secrets: items.iter().map(|(key, name)| SecretMeta {
+            key: (*key).into(), name: (*name).into(), kind: SecretKind::Single, fields: vec!["value".into()], uri_hosts: vec![],
+            collections: vec![],
+        }).collect(), shared_collection_names: HashMap::new() }
+    }
+
+    #[test]
+    fn every_listed_spelling_leads_back_to_its_own_item() {
+        let suffixed = format!("X{}", asm_proto::names::duplicate_suffix("k1"));
+        let c = build_catalog(&[
+            vault_listing("v1", "a", &[("k1", "X"), ("k2", "X"), ("k3", "Y")]),
+            vault_listing("v2", "b", &[("k4", &suffixed), ("k5", "a/Y"), ("k6", "Z")]),
+        ], vec![]);
+        let displays: Vec<&str> = c.static_entries.iter().map(|n| n.display.as_str()).collect();
+        assert_eq!(displays[0], format!("a/{suffixed}"), "{displays:?}");
+        assert_eq!(displays[3], format!("b/{suffixed}"));
+        assert_eq!((displays[2], displays[4], displays[5]), ("Y", "b/a/Y", "Z"));
+        for (index, entry) in c.wire_entries.iter().enumerate() {
+            assert_eq!(resolve_catalog_name(&entry.name, &c.wire_entries).unwrap().entry_index, index, "{}", entry.name);
+        }
+    }
+
+    #[test]
+    fn duplicates_collide_with_a_generated_output_like_a_single_item() {
+        let c = build_catalog(&[vault_listing("v", "vault", &[("k1", "GH_TOKEN"), ("k2", "GH_TOKEN")])], vec![choice("bot")]);
+        assert!(c.static_entries.iter().all(|n| n.prefixed && n.display.starts_with("vault/GH_TOKEN~")));
+        let error = c.resolve("GH_TOKEN").unwrap_err();
+        assert_eq!(error.code, asm_proto::ErrorCode::Ambiguous);
+        assert!(error.message.contains("bot/GH_TOKEN") && error.message.matches("vault/GH_TOKEN~").count() == 2, "{}", error.message);
+        assert_eq!(c.resolve_generated("bot/GH_TOKEN").unwrap().unwrap().pinned_generator_id.as_deref(), Some("id-bot"));
+    }
+
+    #[test]
+    fn collection_names_reach_agents_only_when_shared_and_known() {
+        let mut shared = vault_listing("v1", "work", &[("k1", "A")]);
+        shared.secrets[0].collections = vec!["c-1".into(), "c-unknown".into()];
+        shared.shared_collection_names = [("c-1".to_owned(), "Infra".to_owned())].into();
+        let mut private = vault_listing("v2", "home", &[("k2", "B")]);
+        private.secrets[0].collections = vec!["c-2".into()];
+        let c = build_catalog(&[shared, private], vec![]);
+        assert_eq!(c.wire_entries[0].collections, ["Infra"]);
+        assert!(c.wire_entries[1].collections.is_empty());
     }
     fn choice(name: &str) -> GenerationChoice {
         GenerationChoice { generator_id: format!("id-{name}"), name: name.into(), revision: 1,

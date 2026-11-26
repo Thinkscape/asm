@@ -37,6 +37,10 @@ pub const CAPABILITY_LOGIN_GRANT_V1: &str = "login_grant_v1";
 pub const CAPABILITY_LOGIN_BROKER_V1: &str = "login_broker_v1";
 /// SSH targets, SSH leases with per-host access and `/v1/ssh/*`.
 pub const CAPABILITY_SSH_LEASES_V2: &str = "ssh_leases_v2";
+/// `asm add --vault/--collection`: a suggested destination the operator can preselect.
+pub const CAPABILITY_ADD_DESTINATION_V1: &str = "add_destination_v1";
+/// Longest suggested vault or collection name in an `add` request.
+pub const MAX_DESTINATION_HINT_CHARS: usize = 128;
 /// Lease duration choices: label and seconds (`None` = unlimited).
 pub const LEASE_DURATIONS: &[(&str, Option<u64>)] = &[
     ("5 min", Some(300)),
@@ -307,6 +311,14 @@ pub struct SecretEntry {
     pub generators: Vec<GeneratorOption>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// The vault item's own name when it differs from the listed name (a duplicate shown
+    /// as `name~<hash>`): a bare lookup of it is ambiguous instead of unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_name: Option<String>,
+    /// Names of the Bitwarden collections that hold the item, when its vault shares them
+    /// with agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<String>,
 }
 
 /// Public generator identity; readiness and ceilings stay in the manager.
@@ -393,6 +405,13 @@ pub enum RequestBody {
         value: String,
         #[serde(default)]
         agent: String,
+        /// Suggested destination vault (by name); the operator decides. Needs
+        /// [`CAPABILITY_ADD_DESTINATION_V1`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vault: Option<String>,
+        /// Suggested Bitwarden collection (by name) in `vault`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        collection: Option<String>,
     },
     /// Operator-assisted sign-in: the manager fills a browser on the Mac and hands
     /// the agent the resulting storage state. An empty `name` means "infer".
@@ -530,6 +549,22 @@ impl RequestBody {
             && !crate::crypto::is_uuid(lease_id)
         {
             return Err(ApiError::invalid("lease_id must be an SSH lease id"));
+        }
+        if let Self::Add { vault, collection, .. } = self {
+            for (what, hint) in [("vault", &mut *vault), ("collection", &mut *collection)] {
+                if let Some(text) = hint.take() {
+                    let text = text.trim();
+                    validate_agent_text(what, text)?;
+                    let n = text.chars().count();
+                    if n == 0 || n > MAX_DESTINATION_HINT_CHARS {
+                        return Err(ApiError::invalid(format!("{what} must be 1–{MAX_DESTINATION_HINT_CHARS} characters")));
+                    }
+                    *hint = Some(text.to_owned());
+                }
+            }
+            if collection.is_some() && vault.is_none() {
+                return Err(ApiError::invalid("a collection needs its vault"));
+            }
         }
         Ok(())
     }
@@ -720,6 +755,14 @@ pub struct ResultFile {
 pub struct WriteResult {
     pub name: String,
     pub vault: String,
+    /// `add`: the source-qualified spelling of the new secret (`<vault>/<name>`), when the
+    /// manager could check that it names exactly that secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified_name: Option<String>,
+    /// `add`: the Bitwarden collection the operator chose, when the vault shares
+    /// collection names with agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
 }
 
 /// One entry of `GET /leases`.
@@ -981,6 +1024,8 @@ mod tests {
                 source_kind: SourceKind::Vault,
                 generators: vec![],
                 aliases: vec![],
+                item_name: None,
+                collections: vec![],
             }],
         };
         let v = to_value(&s).unwrap();

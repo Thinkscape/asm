@@ -1,10 +1,12 @@
 //! Secret display names and lookup (plan step 4, "Secret names").
 //!
 //! 1. Within a vault, secrets sharing a name each become `name~<first 8 hex of sha256(key)>`.
-//! 2. When any name occurs in two or more vaults, every secret is shown as `<vault>/<name>`.
-//! 3. Lookup: `<vault>/<name>` always; a bare name when exactly one vault has it;
-//!    otherwise `ambiguous` or `not_found`. Comparison is exact and case-sensitive;
-//!    secrets with an empty name are skipped.
+//! 2. A name that occurs in two or more vaults is shown as `<vault>/<name>` for those
+//!    secrets only; every other secret keeps its bare name.
+//! 3. Lookup: `<vault>/<name>` always; a bare name (or a duplicate's `name~<hash>`) when it
+//!    identifies one secret; otherwise `ambiguous` (listing the qualified choices, also for
+//!    a bare name whose copies carry `~<hash>` suffixes) or `not_found`. Comparison is exact
+//!    and case-sensitive; secrets with an empty name are skipped.
 
 use crate::crypto::{hex_encode, sha256};
 use crate::error::ApiError;
@@ -32,8 +34,10 @@ pub struct NamedSecret {
     pub vault: String,
     /// Name inside its vault after rule 1 (`name` or `name~<hash>`).
     pub base: String,
-    /// Display name: `base`, or `<vault>/<base>` while names are vault-prefixed.
+    /// Display name: `base`, or `<vault>/<base>` when `prefixed`.
     pub display: String,
+    /// The name occurs in another vault too (rule 2).
+    pub prefixed: bool,
 }
 
 /// Display names computed from the current vault contents.
@@ -41,15 +45,15 @@ pub struct NamedSecret {
 pub struct NameTable {
     /// Named secrets, in input order (empty names omitted).
     pub entries: Vec<NamedSecret>,
-    /// True when every name is shown as `<vault>/<name>` (rule 2).
-    pub vault_prefixed: bool,
-    raw_names: HashSet<String>,
 }
 
 /// The rule-1 suffix for a key: `~` + first 8 hex characters of `sha256(key)`.
 pub fn duplicate_suffix(key: &str) -> String {
     format!("~{}", &hex_encode(&sha256(key.as_bytes()))[..8])
 }
+
+/// Suffix lengths a rule-1 duplicate tries in turn, shortest first.
+const SUFFIX_HEX_LENGTHS: [usize; 4] = [8, 16, 32, 64];
 
 impl NameTable {
     /// Apply rules 1 and 2 to `items`.
@@ -60,47 +64,64 @@ impl NameTable {
             *per_vault.entry((it.vault, it.name)).or_default() += 1;
             vaults_of.entry(it.name).or_default().insert(it.vault);
         }
-        let vault_prefixed = vaults_of.values().any(|v| v.len() >= 2);
-        let entries = items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| !it.name.is_empty())
-            .map(|(index, it)| {
-                let base = if per_vault[&(it.vault, it.name)] > 1 {
-                    format!("{}{}", it.name, duplicate_suffix(it.key))
-                } else {
-                    it.name.to_owned()
-                };
-                let display = if vault_prefixed { format!("{}/{}", it.vault, base) } else { base.clone() };
-                NamedSecret { index, vault: it.vault.to_owned(), base, display }
-            })
+        let named: Vec<(usize, &NameInput<'_>)> =
+            items.iter().enumerate().filter(|(_, it)| !it.name.is_empty()).collect();
+        let bases = duplicate_bases(&named, &per_vault);
+        let entries = named.into_iter().zip(bases).map(|((index, it), base)| {
+            let prefixed = vaults_of[it.name].len() >= 2;
+            let display = if prefixed { format!("{}/{}", it.vault, base) } else { base.clone() };
+            NamedSecret { index, vault: it.vault.to_owned(), base, display, prefixed }
+        }).collect();
+        NameTable { entries }
+    }
+}
+
+/// Rule 1 with `<vault>/<base>` naming one secret: a duplicate's suffix grows (8, 16, 32,
+/// 64 hex) while its base equals a name in its vault (every item name there is a lookup
+/// key) or another duplicate's base, then takes a counter.
+fn duplicate_bases(named: &[(usize, &NameInput<'_>)], per_vault: &HashMap<(&str, &str), usize>) -> Vec<String> {
+    let raw: HashSet<(&str, &str)> = named.iter().map(|(_, it)| (it.vault, it.name)).collect();
+    let hashes: Vec<Option<String>> = named.iter()
+        .map(|(_, it)| (per_vault[&(it.vault, it.name)] > 1).then(|| hex_encode(&sha256(it.key.as_bytes()))))
+        .collect();
+    let mut level = vec![0; named.len()];
+    loop {
+        let bases: Vec<String> = named.iter().zip(&hashes).zip(&level).map(|(((_, it), hash), &l)| match hash {
+            Some(hash) => format!("{}~{}", it.name, &hash[..SUFFIX_HEX_LENGTHS[l]]),
+            None => it.name.to_owned(),
+        }).collect();
+        let mut count: HashMap<(&str, &str), usize> = HashMap::new();
+        for ((_, it), base) in named.iter().zip(&bases) {
+            *count.entry((it.vault, base.as_str())).or_default() += 1;
+        }
+        let clashes = |i: usize| {
+            let key = (named[i].1.vault, bases[i].as_str());
+            hashes[i].is_some() && (raw.contains(&key) || count[&key] > 1)
+        };
+        let grow: Vec<usize> = (0..named.len())
+            .filter(|&i| clashes(i) && level[i] + 1 < SUFFIX_HEX_LENGTHS.len())
             .collect();
-        let raw_names = vaults_of.into_keys().map(str::to_owned).collect();
-        NameTable { entries, vault_prefixed, raw_names }
-    }
-
-    /// Resolve a name given by an agent (rule 3).
-    pub fn lookup(&self, query: &str) -> Result<&NamedSecret, ApiError> {
-        if let Some((vault, rest)) = query.split_once('/')
-            && let Some(e) = self.entries.iter().find(|e| e.vault == vault && e.base == rest)
-        {
-            return Ok(e);
-        }
-        let hits: Vec<&NamedSecret> = self.entries.iter().filter(|e| e.base == query).collect();
-        match hits.as_slice() {
-            [] => Err(ApiError::not_found(format!("no secret named {query:?}"))),
-            [one] => Ok(one),
-            many => {
-                let list: Vec<String> = many.iter().map(|e| format!("{}/{}", e.vault, e.base)).collect();
-                Err(ApiError::ambiguous(format!("{query:?} is ambiguous; use one of: {}", list.join(", "))))
+        if grow.is_empty() {
+            // Distinct keys have distinct whole hashes: only a literal spelled like one is left.
+            let mut taken: HashSet<(String, String)> = named.iter().zip(&bases)
+                .map(|((_, it), base)| (it.vault.to_owned(), base.clone()))
+                .chain(raw.iter().map(|(vault, name)| ((*vault).to_owned(), (*name).to_owned())))
+                .collect();
+            let stuck: Vec<usize> = (0..named.len()).filter(|&i| clashes(i)).collect();
+            let mut bases = bases.clone();
+            for i in stuck {
+                let vault = named[i].1.vault.to_owned();
+                let base = (2..).map(|n| format!("{}~{n}", bases[i]))
+                    .find(|b| !taken.contains(&(vault.clone(), b.clone())))
+                    .expect("an unused counter");
+                taken.insert((vault, base.clone()));
+                bases[i] = base;
             }
+            return bases;
         }
-    }
-
-    /// True when any vault has a secret with this name (before rule-1 suffixes);
-    /// `add` answers `exists` then.
-    pub fn has_base_name(&self, name: &str) -> bool {
-        self.raw_names.contains(name)
+        for i in grow {
+            level[i] += 1;
+        }
     }
 }
 
@@ -125,6 +146,11 @@ fn static_base(entry: &SecretEntry) -> &str {
     entry.aliases.iter().find_map(|name| unqualify(&entry.vault, name)).unwrap_or_else(|| {
         unqualify(&entry.vault, &entry.name).unwrap_or(&entry.name)
     })
+}
+
+/// The vault item's own name: differs from [`static_base`] only for a rule-1 duplicate.
+fn item_name(entry: &SecretEntry) -> &str {
+    entry.item_name.as_deref().unwrap_or_else(|| static_base(entry))
 }
 
 /// Map an unqualified generated spelling to its provider's canonical output.
@@ -218,7 +244,7 @@ pub fn resolve_catalog_name(query: &str, entries: &[SecretEntry]) -> Result<Reso
         for (index, entry) in entries.iter().enumerate() {
             match entry.source_kind {
                 SourceKind::Vault if entry.vault == source => {
-                    if static_base(entry) == rest || entry.aliases.iter().any(|alias| alias == query) {
+                    if static_base(entry) == rest || item_name(entry) == rest || entry.aliases.iter().any(|alias| alias == query) {
                         add_catalog_match(&mut matches, CatalogMatch { index, generator: None }, entries);
                     }
                 }
@@ -240,7 +266,7 @@ pub fn resolve_catalog_name(query: &str, entries: &[SecretEntry]) -> Result<Reso
     if let Some(output) = requested_output {
         for (index, entry) in entries.iter().enumerate() {
             if entry.source_kind == SourceKind::Vault
-                && static_base(entry) == query
+                && item_name(entry) == query
             {
                 add_catalog_match(&mut matches, CatalogMatch { index, generator: None }, entries);
             }
@@ -260,7 +286,8 @@ pub fn resolve_catalog_name(query: &str, entries: &[SecretEntry]) -> Result<Reso
     }
     for (index, entry) in entries.iter().enumerate() {
         let matched = match entry.source_kind {
-            SourceKind::Vault => entry.name == query || static_base(entry) == query || entry.aliases.iter().any(|alias| alias == query),
+            SourceKind::Vault => entry.name == query || static_base(entry) == query || item_name(entry) == query
+                || entry.aliases.iter().any(|alias| alias == query),
             SourceKind::Generator => requested_output.is_some() && generated_output(entry) == requested_output
                 && (entry.name == query || entry.aliases.iter().any(|alias| alias == query)),
         };
@@ -280,59 +307,116 @@ mod tests {
         NameInput { vault, key, name }
     }
 
-    #[test]
-    fn unique_names_stay_bare() {
-        let t = NameTable::build(&[n("env", "A", "A"), n("kc", "k1", "B"), n("kc", "k2", "")]);
-        assert!(!t.vault_prefixed);
-        assert_eq!(t.entries.len(), 2);
-        assert_eq!(t.lookup("A").unwrap().display, "A");
-        assert_eq!(t.lookup("kc/B").unwrap().index, 1);
-        assert_eq!(t.lookup("missing").unwrap_err().code, ErrorCode::NotFound);
+    /// Wire rows as the manager builds them from a name table.
+    fn catalog(items: &[NameInput<'_>]) -> Vec<SecretEntry> {
+        NameTable::build(items).entries.into_iter().map(|e| {
+            let raw = items[e.index].name;
+            let mut entry = vault_entry(&e.vault, &e.base, &e.display);
+            entry.item_name = (raw != e.base).then(|| raw.to_owned());
+            entry
+        }).collect()
     }
 
     #[test]
-    fn shared_name_across_vaults_prefixes_everything() {
-        let t = NameTable::build(&[
+    fn unique_names_stay_bare() {
+        let items = [n("env", "A", "A"), n("kc", "k1", "B"), n("kc", "k2", "")];
+        let t = NameTable::build(&items);
+        assert_eq!(t.entries.len(), 2);
+        assert!(t.entries.iter().all(|e| !e.prefixed && e.display == e.base));
+        let entries = catalog(&items);
+        assert_eq!(resolve_catalog_name("A", &entries).unwrap().entry_index, 0);
+        assert_eq!(resolve_catalog_name("kc/B", &entries).unwrap().entry_index, 1);
+        assert_eq!(resolve_catalog_name("missing", &entries).unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn shared_name_across_vaults_prefixes_only_that_name() {
+        let items = [
             n("env1", "SOME_APP_TOKEN", "SOME_APP_TOKEN"),
             n("env2", "SOME_APP_TOKEN", "SOME_APP_TOKEN"),
             n("env2", "OTHER", "OTHER"),
-        ]);
-        assert!(t.vault_prefixed);
-        let d: Vec<&str> = t.entries.iter().map(|e| e.display.as_str()).collect();
-        assert_eq!(d, ["env1/SOME_APP_TOKEN", "env2/SOME_APP_TOKEN", "env2/OTHER"]);
-        assert_eq!(t.lookup("OTHER").unwrap().index, 2);
-        assert_eq!(t.lookup("env2/SOME_APP_TOKEN").unwrap().index, 1);
-        let e = t.lookup("SOME_APP_TOKEN").unwrap_err();
+        ];
+        let t = NameTable::build(&items);
+        let d: Vec<(&str, bool)> = t.entries.iter().map(|e| (e.display.as_str(), e.prefixed)).collect();
+        assert_eq!(d, [("env1/SOME_APP_TOKEN", true), ("env2/SOME_APP_TOKEN", true), ("OTHER", false)]);
+        let entries = catalog(&items);
+        assert_eq!(resolve_catalog_name("OTHER", &entries).unwrap().entry_index, 2);
+        assert_eq!(resolve_catalog_name("env2/OTHER", &entries).unwrap().entry_index, 2);
+        assert_eq!(resolve_catalog_name("env2/SOME_APP_TOKEN", &entries).unwrap().entry_index, 1);
+        let e = resolve_catalog_name("SOME_APP_TOKEN", &entries).unwrap_err();
         assert_eq!(e.code, ErrorCode::Ambiguous);
-        assert!(e.message.contains("env1/SOME_APP_TOKEN"));
-        assert!(t.has_base_name("SOME_APP_TOKEN"));
-        assert!(!t.has_base_name("NEW"));
+        assert!(e.message.contains("env1/SOME_APP_TOKEN") && e.message.contains("env2/SOME_APP_TOKEN"));
     }
 
     #[test]
-    fn duplicate_within_vault_gets_hash() {
-        let t = NameTable::build(&[n("bw", "id-1", "GitHub"), n("bw", "id-2", "GitHub")]);
-        assert!(!t.vault_prefixed);
+    fn bare_name_of_duplicates_within_a_vault_is_ambiguous() {
+        let items = [n("bw", "id-1", "GitHub"), n("bw", "id-2", "GitHub")];
+        let t = NameTable::build(&items);
+        assert!(t.entries.iter().all(|e| !e.prefixed));
         assert_eq!(t.entries[0].display, format!("GitHub{}", duplicate_suffix("id-1")));
         assert_ne!(t.entries[0].display, t.entries[1].display);
         assert_eq!(duplicate_suffix("id-1").len(), 9);
-        assert_eq!(t.lookup(&t.entries[1].display).unwrap().index, 1);
-        assert_eq!(t.lookup("GitHub").unwrap_err().code, ErrorCode::NotFound);
-        assert!(t.has_base_name("GitHub"));
+        let entries = catalog(&items);
+        assert_eq!(resolve_catalog_name(&t.entries[1].display, &entries).unwrap().entry_index, 1);
+        for query in ["GitHub", "bw/GitHub"] {
+            let e = resolve_catalog_name(query, &entries).unwrap_err();
+            assert_eq!(e.code, ErrorCode::Ambiguous, "{query}");
+            for entry in &t.entries {
+                assert!(e.message.contains(&format!("bw/{}", entry.base)), "{}", e.message);
+            }
+        }
+        // Without the item name (an older manager) the bare name matches nothing.
+        let legacy: Vec<_> = entries.into_iter().map(|e| SecretEntry { item_name: None, ..e }).collect();
+        assert_eq!(resolve_catalog_name("GitHub", &legacy).unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn a_bare_name_never_resolves_past_duplicates_in_another_vault() {
+        let items = [n("a", "k1", "X"), n("a", "k2", "X"), n("b", "k3", "X")];
+        let entries = catalog(&items);
+        let e = resolve_catalog_name("X", &entries).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Ambiguous);
+        assert_eq!(e.message.matches("a/X~").count(), 2, "{}", e.message);
+        assert!(e.message.contains("b/X"));
+        assert_eq!(resolve_catalog_name("b/X", &entries).unwrap().entry_index, 2);
     }
 
     #[test]
     fn slash_in_bare_name() {
-        let t = NameTable::build(&[n("bw", "id", "a/b")]);
-        assert_eq!(t.lookup("a/b").unwrap().index, 0);
-        assert_eq!(t.lookup("bw/a/b").unwrap().index, 0);
+        let entries = catalog(&[n("bw", "id", "a/b")]);
+        assert_eq!(resolve_catalog_name("a/b", &entries).unwrap().entry_index, 0);
+        assert_eq!(resolve_catalog_name("bw/a/b", &entries).unwrap().entry_index, 0);
+    }
+
+    #[test]
+    fn a_duplicate_suffix_grows_past_every_name_in_its_vault() {
+        let hash = hex_encode(&sha256(b"k1"));
+        let short = format!("X~{}", &hash[..8]);
+        let longer = format!("X~{}", &hash[..16]);
+        // Literal names spelled like k1's 8- and 16-hex suffixes, and a second duplicate
+        // group named like the 32-hex one.
+        let thirty_two = format!("X~{}", &hash[..32]);
+        let items = [
+            n("bw", "k1", "X"), n("bw", "k2", "X"), n("bw", "k3", &short), n("bw", "k4", &longer),
+            n("bw", "k5", &thirty_two), n("bw", "k6", &thirty_two),
+        ];
+        let t = NameTable::build(&items);
+        let bases: Vec<&str> = t.entries.iter().map(|e| e.base.as_str()).collect();
+        assert_eq!(bases[0], format!("X~{hash}"), "{bases:?}");
+        assert_eq!(bases[1], format!("X{}", duplicate_suffix("k2")));
+        assert_eq!((bases[2], bases[3]), (short.as_str(), longer.as_str()));
+        let entries = catalog(&items);
+        for (index, base) in bases.iter().enumerate() {
+            assert_eq!(resolve_catalog_name(&format!("bw/{base}"), &entries).unwrap().entry_index, index, "{base}");
+        }
     }
 
     fn vault_entry(vault: &str, base: &str, display: &str) -> SecretEntry {
         SecretEntry {
             name: display.into(), vault: vault.into(), kind: crate::wire::SecretKind::Single,
             fields: vec!["value".into()], lease: None, source_kind: SourceKind::Vault,
-            generators: vec![], aliases: vec![format!("{vault}/{base}")],
+            generators: vec![], aliases: vec![format!("{vault}/{base}")], item_name: None,
+            collections: vec![],
         }
     }
 
@@ -343,7 +427,7 @@ mod tests {
             generators: sources.iter().map(|(id, name)| {
                 crate::wire::GeneratorOption::listed((*id).into(), (*name).into())
             }).collect(),
-            aliases: aliases.iter().map(|s| (*s).into()).collect(),
+            aliases: aliases.iter().map(|s| (*s).into()).collect(), item_name: None, collections: vec![],
         }
     }
 

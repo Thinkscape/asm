@@ -177,17 +177,28 @@ impl Registry {
             .collect()
     }
 
-    /// List discoverable secret names. Provider diagnostics stay in the manager.
-    pub(crate) fn listings(&self) -> Vec<VaultListing> {
-        let mut listings = Vec::new();
+    /// List discoverable secret names, and the ready vaults whose listing failed (their
+    /// names are unknown, not absent). Provider diagnostics stay in the manager.
+    pub(crate) fn listings(&self) -> (Vec<VaultListing>, Vec<String>) {
+        let (mut listings, mut unlisted) = (Vec::new(), Vec::new());
         for e in self.all() {
-            if e.provider.status() == VaultStatus::Ready
-                && let Ok(secrets) = e.provider.list()
-            {
-                listings.push(VaultListing { vault_id: e.id, vault_name: e.name, secrets });
+            if e.provider.status() != VaultStatus::Ready {
+                continue;
             }
+            let Ok(secrets) = e.provider.list() else {
+                unlisted.push(e.name);
+                continue;
+            };
+            // Unknown collection names are left out, never replaced by their ids.
+            let shared_collection_names = match &e.config {
+                VaultConfig::Bitwarden(b) if b.share_collection_names => e.provider.collections()
+                    .map(|cs| cs.into_iter().map(|c| (c.id, c.name)).collect())
+                    .unwrap_or_default(),
+                _ => HashMap::new(),
+            };
+            listings.push(VaultListing { vault_id: e.id, vault_name: e.name, secrets, shared_collection_names });
         }
-        listings
+        (listings, unlisted)
     }
 
     pub fn shutdown_all(&self) {
@@ -233,14 +244,15 @@ mod tests {
         broken.name = "gone".into();
         r.insert(broken);
 
-        let ls = r.listings();
+        let (ls, unlisted) = r.listings();
+        assert!(unlisted.is_empty(), "a vault that is not ready is not unlisted: {unlisted:?}");
         assert_eq!(ls.len(), 2);
         assert!(matches!(r.get("c").unwrap().provider.status(), VaultStatus::Error(_)));
         let names = super::super::names::compute_names(&ls);
         let d: Vec<&str> = names.iter().map(|n| n.display.as_str()).collect();
         assert_eq!(
             d,
-            ["work/SOME_APP_TOKEN", "home/SOME_APP_TOKEN", "home/OTHER"]
+            ["work/SOME_APP_TOKEN", "home/SOME_APP_TOKEN", "OTHER"]
         );
 
         // Replace "b" with a renamed vault.
@@ -249,7 +261,7 @@ mod tests {
         assert_eq!(r.get("b").unwrap().name, "personal");
         assert!(r.remove("c").unwrap().is_some());
         assert!(r.remove("c").unwrap().is_none());
-        let ls = r.listings();
+        let (ls, _) = r.listings();
         let d: Vec<String> = super::super::names::compute_names(&ls)
             .into_iter()
             .map(|n| n.display)

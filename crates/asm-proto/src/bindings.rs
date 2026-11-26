@@ -180,7 +180,7 @@ mod tests {
         let entries = ["A=b", "item::literal", "A=B=C", "item\\name", "item,with,commas"].map(|name| SecretEntry {
             name: name.into(), vault: "work".into(), kind: SecretKind::Single,
             fields: vec!["value".into()], lease: None, source_kind: SourceKind::Vault,
-            generators: vec![], aliases: vec![],
+            generators: vec![], aliases: vec![], item_name: None, collections: vec![],
         });
         for name in ["A=b", "item::literal", "A=B=C", "item\\name", "item,with,commas"] {
             assert_eq!(parse_get_binding(name, &entries).unwrap_err().code, crate::ErrorCode::Ambiguous);

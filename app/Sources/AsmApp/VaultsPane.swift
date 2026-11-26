@@ -22,6 +22,7 @@ struct VaultsPane: View {
     @State private var sheet: VaultSheet?
     @State private var removing: VaultItem?
     @State private var error: String?
+    @State private var renaming: NameConflictEntryItem?
     @State private var nameColumnWidth: CGFloat?
 
     private static let secretsColumnWidth: CGFloat = {
@@ -87,6 +88,10 @@ struct VaultsPane: View {
                     if let id = ids.first, let vault = model.vaults.first(where: { $0.id == id }) { edit(vault) }
                 }
             }
+            if !model.nameConflicts.isEmpty {
+                NameConflictsBox(conflicts: model.nameConflicts) { renaming = $0 }
+                    .padding()
+            }
         }
         .onChange(of: model.vaults, initial: true) { previousVaults, vaults in
             guard nameColumnWidth == nil ||
@@ -122,6 +127,9 @@ struct VaultsPane: View {
             case let .envFile(vault): EnvFileSheet(model: model, vault: vault)
             case let .keychain(vault): KeychainSheet(model: model, vault: vault)
             }
+        }
+        .sheet(item: $renaming) { item in
+            RenameSecretSheet(model: model, item: item)
         }
         .confirmationDialog(
             "Remove vault “\(removing?.name ?? "")”?",
@@ -399,6 +407,10 @@ private struct BitwardenSheet: View {
                             .foregroundStyle(.secondary)
                     }
                     Toggle("Expose items without an organization (personal vault)", isOn: $config.exposePersonal)
+                    Toggle(isOn: $config.shareCollectionNames) {
+                        Text("Show collection names to agents")
+                        Text("Agents see which exposed collections hold each item (asm list --json), and asm add reports the collection you chose.")
+                    }
                 } header: {
                     Text("Exposed items")
                 } footer: {
@@ -475,6 +487,116 @@ private struct BitwardenSheet: View {
             } else {
                 dismiss()
             }
+        }
+    }
+}
+
+// MARK: - Name conflicts
+
+/// Visible items sharing a name: agents must request them by a qualified name.
+private struct NameConflictsBox: View {
+    let conflicts: [NameConflictGroupItem]
+    let rename: (NameConflictEntryItem) -> Void
+
+    var body: some View {
+        GroupBox {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Agents cannot request these by their plain name.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    ForEach(conflicts) { conflict in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(verbatim: conflict.name).fontWeight(.semibold).textSelection(.enabled)
+                            ForEach(conflict.items) { item in
+                                HStack(alignment: .firstTextBaseline) {
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(verbatim: item.location.map { "\(item.vaultName) · \($0)" } ?? item.vaultName)
+                                        Text("agents use: \(Text(verbatim: item.agentName).font(.caption.monospaced()))")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .textSelection(.enabled)
+                                    }
+                                    Spacer()
+                                    if item.renamable {
+                                        Button("Rename…") { rename(item) }
+                                            .controlSize(.small)
+                                    }
+                                }
+                                .padding(.leading, 12)
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(4)
+            }
+            .frame(maxHeight: 200)
+        } label: {
+            Label("Name conflicts", systemImage: "exclamationmark.triangle")
+        }
+    }
+}
+
+/// Renames a Bitwarden item from the Name conflicts box.
+private struct RenameSecretSheet: View {
+    let model: AppModel
+    let item: NameConflictEntryItem
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String
+    @State private var error: String?
+    @State private var working = false
+
+    init(model: AppModel, item: NameConflictEntryItem) {
+        self.model = model
+        self.item = item
+        _name = State(initialValue: item.name)
+    }
+
+    private var canRename: Bool {
+        !working && !name.trimmingCharacters(in: .whitespaces).isEmpty && name != item.name
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    TextField("Name", text: $name)
+                        .onSubmit(save)
+                } header: {
+                    Text("Rename \(Text(verbatim: item.name)) in \(Text(verbatim: item.vaultName))")
+                } footer: {
+                    Text("Renames the item in Bitwarden. Agents then request it by the new name.")
+                }
+                if let error {
+                    Text(verbatim: error).foregroundStyle(.red).textSelection(.enabled)
+                }
+            }
+            .formStyle(.grouped)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Rename", action: save)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canRename)
+            }
+            .padding()
+        }
+        .frame(width: 420, height: error == nil ? 220 : 280)
+    }
+
+    private func save() {
+        guard canRename else { return }
+        working = true
+        error = nil
+        let newName = name
+        Task {
+            if let failure = await model.renameSecret(vaultID: item.vaultID, key: item.key, newName: newName) {
+                error = failure
+            } else {
+                dismiss()
+            }
+            working = false
         }
     }
 }

@@ -62,11 +62,27 @@ struct AddTargetItem: Identifiable, Equatable, Sendable {
     var personalAllowed: Bool
 }
 
+/// `asm add`: a new secret the operator saves to one of the offered destinations.
+struct AddDetail: Equatable, Sendable {
+    var name: String
+    var value: String
+    var targets: [AddTargetItem]
+    /// The agent's suggested vault name (`asm add --vault`); the manager does not check it.
+    var suggestedVault: String?
+    /// The agent's suggested Bitwarden collection name; only set with `suggestedVault`.
+    var suggestedCollection: String?
+    /// Operator-only labels ("<vault>: collection X") of items with this name that are not
+    /// exposed to agents.
+    var hiddenMatches: [String]
+    /// Vaults whose unexposed items could not be checked, as "<vault>: <message>".
+    var hiddenCheckErrors: [String]
+}
+
 enum RequestDetail: Equatable, Sendable {
     case pair(info: HostInfoItem, observedAddress: String, code: String, repair: RepairItem?)
     case get(GetDetail)
     case update(name: String, vaultID: String, vaultName: String, field: String, oldValue: String, newValue: String)
-    case add(name: String, value: String, targets: [AddTargetItem])
+    case add(AddDetail)
     case login(LoginDetail)
     case ssh(SshRequestItem)
     case sshExtend(SshExtendRequestItem)
@@ -882,6 +898,9 @@ struct BitwardenConfig: Equatable, Sendable {
     var clientID: String = ""
     var collectionIDs: [String] = []
     var exposePersonal: Bool = false
+    /// Agents see which exposed collections hold each item, and an approved add reports
+    /// the collection chosen.
+    var shareCollectionNames: Bool = false
     var bwPath: String = ""
 }
 
@@ -907,6 +926,29 @@ enum VaultDraftItem: Sendable {
     case bitwarden(id: String?, name: String, config: BitwardenConfig, clientSecret: String, masterPassword: String)
     case envFile(id: String?, name: String, path: String)
     case keychain(id: String?, name: String)
+}
+
+/// Visible items (what agents can list) sharing one name, within a vault or across vaults.
+struct NameConflictGroupItem: Identifiable, Equatable, Sendable {
+    var id: String { name }
+    var name: String
+    var items: [NameConflictEntryItem]
+}
+
+struct NameConflictEntryItem: Identifiable, Equatable, Sendable {
+    var id: String { "\(vaultID)\u{1}\(key)" }
+    /// The shared item name.
+    var name: String
+    var vaultID: String
+    var vaultName: String
+    /// Provider key (Bitwarden item id).
+    var key: String
+    /// What agents must type for it now, e.g. "DB_PASS~1a2b3c4d" or "work/DB_PASS".
+    var agentName: String
+    /// "collection Infra, Shared" / "personal vault"; `nil` outside Bitwarden.
+    var location: String?
+    /// Only Bitwarden items can be renamed from the app.
+    var renamable: Bool
 }
 
 struct AgentSeenItem: Equatable, Sendable {

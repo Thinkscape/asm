@@ -1203,6 +1203,28 @@ pub struct CollectionChoice {
     pub enabled: bool,
 }
 
+/// Items agents can list that share one vault item name (`Manager::name_conflicts`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NameConflict {
+    pub name: String,
+    /// Two or more.
+    pub items: Vec<NameConflictItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NameConflictItem {
+    pub vault_id: String,
+    pub vault_name: String,
+    /// Provider key (Bitwarden item id).
+    pub key: String,
+    /// What agents type for it now, e.g. "DB_PASS~1a2b3c4d" or "work/DB_PASS".
+    pub agent_name: String,
+    /// "collection Infra, Shared" / "personal vault"; `None` outside Bitwarden.
+    pub location: Option<String>,
+    /// Only Bitwarden items can be renamed from the app.
+    pub renamable: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum VaultKind {
     Bitwarden,
@@ -1278,6 +1300,16 @@ pub enum RequestDetail {
         name: String,
         value: String,
         targets: Vec<AddTarget>,
+        /// The agent's suggested vault name (`asm add --vault`), unvalidated.
+        suggested_vault: Option<String>,
+        /// The agent's suggested collection name (`--collection`), unvalidated; only
+        /// together with `suggested_vault`.
+        suggested_collection: Option<String>,
+        /// Items with this name that vaults hold but do not expose to agents, as
+        /// "<vault>: collection Secrets" / "<vault>: personal vault".
+        hidden_matches: Vec<String>,
+        /// Vaults whose unexposed items could not be checked, as "<vault>: <message>".
+        hidden_check_errors: Vec<String>,
     },
     /// `asm login`: sign in on the Mac with this vault login; the agent receives the
     /// site's cookies and `url`'s origin's localStorage.
@@ -1412,6 +1444,9 @@ pub enum VaultConfig {
         expose_personal: bool,
         /// `None` = default `bw` path.
         bw_path: Option<String>,
+        /// Agents see the names of the exposed collections that hold each item, and an
+        /// approved add reports the collection chosen.
+        share_collection_names: bool,
     },
     EnvFile {
         path: String,
@@ -1429,6 +1464,7 @@ impl From<crate::vault::VaultConfig> for VaultConfig {
                 collection_ids: b.collections,
                 expose_personal: b.personal,
                 bw_path: b.bw_path,
+                share_collection_names: b.share_collection_names,
             },
             crate::vault::VaultConfig::EnvFile { path } => Self::EnvFile { path },
             crate::vault::VaultConfig::Keychain => Self::Keychain,
@@ -1446,6 +1482,7 @@ impl From<VaultConfig> for crate::vault::VaultConfig {
                 collection_ids,
                 expose_personal,
                 bw_path,
+                share_collection_names,
             } => Self::Bitwarden(crate::vault::BitwardenConfig {
                 server_url,
                 email,
@@ -1454,6 +1491,7 @@ impl From<VaultConfig> for crate::vault::VaultConfig {
                 personal: expose_personal,
                 bw_path: bw_path.filter(|p| !p.trim().is_empty()),
                 collection_names: Default::default(),
+                share_collection_names,
             }),
             VaultConfig::EnvFile { path } => Self::EnvFile { path },
             VaultConfig::Keychain => Self::Keychain,
@@ -1992,6 +2030,20 @@ impl Manager {
     /// wrong one throws with a message for the operator.
     pub fn unlock_vault(&self, vault_id: String, master_password: String) -> FfiResult<()> {
         Ok(self.core.unlock_vault(&vault_id, &master_password)?)
+    }
+
+    /// Items agents can list that share a vault item name, within one vault or across
+    /// vaults. Blocking provider calls.
+    pub fn name_conflicts(&self) -> Vec<NameConflict> {
+        self.core.name_conflicts().unwrap_or_else(|e| {
+            log::error!("name conflicts: {}", e.message);
+            Vec::new()
+        })
+    }
+
+    /// Rename a Bitwarden item agents can see, to a name no listed secret uses.
+    pub fn rename_secret(&self, vault_id: String, key: String, new_name: String) -> FfiResult<()> {
+        Ok(self.core.rename_secret(&vault_id, &key, &new_name)?)
     }
 
     pub fn list_hosts(&self) -> Vec<HostRecord> {

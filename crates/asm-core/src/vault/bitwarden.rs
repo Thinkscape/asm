@@ -16,7 +16,7 @@
 //! `Connection: close`. A hand-rolled client keeps this provider free of a second async
 //! runtime and works identically for both transports.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
@@ -431,6 +431,7 @@ fn map_item(item: &Value) -> Option<SecretMeta> {
         kind,
         fields,
         uri_hosts,
+        collections: Vec::new(),
     })
 }
 
@@ -440,13 +441,16 @@ fn is_visible(item: &Value, cfg: &BitwardenConfig) -> bool {
     if org.is_none() && cfg.personal {
         return true;
     }
+    item_collections(item).any(|c| cfg.collections.iter().any(|e| e == c))
+}
+
+/// The collection ids an item belongs to.
+fn item_collections(item: &Value) -> impl Iterator<Item = &str> {
     item.get("collectionIds")
         .and_then(Value::as_array)
-        .is_some_and(|ids| {
-            ids.iter()
-                .filter_map(Value::as_str)
-                .any(|c| cfg.collections.iter().any(|e| e == c))
-        })
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
 }
 
 /// Set `field` of a fetched item to `value` in place.
@@ -1440,7 +1444,15 @@ impl VaultProvider for BitwardenVault {
         Ok(list_data(&data)
             .iter()
             .filter(|i| is_visible(i, &cfg))
-            .filter_map(map_item)
+            .filter_map(|i| {
+                let mut meta = map_item(i)?;
+                // Hidden collections of a visible item stay hidden.
+                meta.collections = item_collections(i)
+                    .filter(|c| cfg.collections.iter().any(|e| e == c))
+                    .map(str::to_owned)
+                    .collect();
+                Some(meta)
+            })
             .filter(|m| seen.insert(m.key.clone()))
             .collect())
     }
@@ -1465,6 +1477,51 @@ impl VaultProvider for BitwardenVault {
         set_field(&mut item, field, value)?;
         self.request(&ep, "PUT", &format!("/object/item/{key}"), Some(&item))?;
         Ok(())
+    }
+
+    fn rename(&self, key: &str, new_name: &str) -> Result<()> {
+        let ep = self.endpoint()?;
+        let mut item = self.fetch_visible(&ep, key)?;
+        item["name"] = json!(new_name);
+        self.request(&ep, "PUT", &format!("/object/item/{key}"), Some(&item))?;
+        Ok(())
+    }
+
+    fn hidden_items_named(&self, name: &str) -> Result<Vec<String>> {
+        // Both lists are fetched whether or not anything matches: the add request this
+        // serves must take the same time either way.
+        let ep = self.endpoint()?;
+        let data = self.request(&ep, "GET", "/list/object/items", None)?;
+        let names: HashMap<String, String> = list_data(&self.request(&ep, "GET", "/list/object/collections", None)?)
+            .iter()
+            .filter_map(|c| Some((c.get("id")?.as_str()?.to_owned(), c.get("name")?.as_str()?.to_owned())))
+            .collect();
+        let items = list_data(&data);
+        let hidden: Vec<&Value> = {
+            let cfg = self.cfg();
+            items.iter()
+                .filter(|i| i.get("name").and_then(Value::as_str) == Some(name) && !is_visible(i, &cfg))
+                .collect()
+        };
+        let mut places: Vec<String> = hidden
+            .iter()
+            .map(|i| {
+                if i.get("organizationId").is_none_or(Value::is_null) {
+                    return "personal vault".to_owned();
+                }
+                let collections: Vec<&str> = item_collections(i)
+                    .map(|c| names.get(c).map_or(c, String::as_str))
+                    .collect();
+                match collections.as_slice() {
+                    [] => "an organization item in no collection".to_owned(),
+                    [one] => format!("collection {one}"),
+                    many => format!("collections {}", many.join(", ")),
+                }
+            })
+            .collect();
+        places.sort();
+        places.dedup();
+        Ok(places)
     }
 
     fn add(&self, name: &str, value: &str, target: &AddTarget) -> Result<()> {
@@ -1745,6 +1802,7 @@ while (my $c = $srv->accept) {
             personal: false,
             bw_path: Some(bw_path.into()),
             collection_names: Default::default(),
+            share_collection_names: false,
         }
     }
 
@@ -1770,6 +1828,7 @@ mod tests {
             personal,
             bw_path: None,
             collection_names: Default::default(),
+            share_collection_names: false,
         }
     }
 

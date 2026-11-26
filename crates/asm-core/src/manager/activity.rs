@@ -602,6 +602,7 @@ fn vault_detail(id: &str, name: &str, config: &VaultConfig) -> Value {
             d["email"] = json!(b.email);
             d["collections"] = json!(b.collections);
             d["personal"] = json!(b.personal);
+            d["share_collection_names"] = json!(b.share_collection_names);
         }
         VaultConfig::EnvFile { path } => d["path"] = json!(path),
         VaultConfig::Keychain => {}
