@@ -1,6 +1,6 @@
 //! `asm ssh request HOSTS REASON (--privileged | --as USER | --grant G...) [-- command...]`.
 
-use super::store::{self, CONFIG_FILE, LocalSshLease, cert_blob, lease_dir};
+use super::store::{self, CONFIG_FILE, LocalSshLease, cert_ok, lease_dir};
 use super::{agent, install, require_ssh, ssh_dir};
 use crate::api::Api;
 use crate::error::CliError;
@@ -14,6 +14,7 @@ use asm_proto::ssh::{
 use asm_proto::time::fmt_unix;
 use asm_proto::wire::{RequestBody, RequestResult};
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -41,7 +42,7 @@ pub struct RequestArgs {
     /// Shell access as another user on the host (see asm ssh hosts)
     #[arg(long = "as", value_name = "USER", conflicts_with_all = ["privileged", "grant"])]
     pub as_user: Option<String>,
-    /// Restricted access: logs:<unit> or restart:<unit>. Repeatable.
+    /// Restricted access: logs:<unit>, restart:<unit>, reload:<unit> or read:<path>. Repeatable.
     #[arg(long = "grant", value_name = "GRANT")]
     pub grant: Vec<String>,
     /// Ask for a new lease even if a matching one is active.
@@ -67,7 +68,7 @@ pub fn request(a: RequestArgs) -> Result<(), CliError> {
         (SshAccess::Restricted, None)
     } else {
         return Err(CliError::invalid(
-            "choose --privileged, --as <user> or at least one --grant (logs:<unit>, restart:<unit>)",
+            "choose --privileged, --as <user> or at least one --grant (logs:<unit>, restart:<unit>, reload:<unit> or read:<path>)",
         ));
     };
     let mut body = RequestBody::Ssh {
@@ -106,15 +107,11 @@ pub fn request(a: RequestArgs) -> Result<(), CliError> {
         return Err(invalid());
     };
     let lease = validate(result, targets).ok_or_else(invalid)?;
-    if lease.access != access || lease.user != *user {
-        eprintln!(
-            "asm: the operator approved {}, not the {} requested",
-            access_name(lease.access, lease.user.as_deref()),
-            access_name(access, user.as_deref())
-        );
+    for note in notes(&lease, targets, access, user.as_deref()) {
+        eprintln!("{note}");
     }
     ensure_private_dir(&dir)?;
-    let lease = store::store(&dir, &lease)?;
+    let store::Stored { lease, hosts_conf_names } = store::store(&dir, &lease)?;
     agent::ensure_running(&dir);
 
     let config = lease_dir(&dir, &lease.lease_id).join(CONFIG_FILE);
@@ -122,43 +119,92 @@ pub fn request(a: RequestArgs) -> Result<(), CliError> {
         run_command(&dir, &lease.lease_id, &lease.targets[0].name, &a.command);
     }
     let installed = install::installed();
+    // Plain `ssh <name>` uses the hosts conf, which may map a name to another lease.
+    let plain = if installed { hosts_conf_names } else { HashSet::new() };
     let mut out = std::io::stdout().lock();
     if a.json {
-        let targets: Vec<_> = lease
-            .targets
-            .iter()
-            .map(|t| serde_json::json!({"name": t.name, "login": t.login}))
-            .collect();
-        let doc = serde_json::json!({
-            "lease_id": lease.lease_id,
-            "expires_at": fmt_unix(lease.expires_at),
-            "access": lease.access,
-            "grants": lease.grants,
-            "user": lease.user,
-            "config": config.to_string_lossy(),
-            "installed": installed,
-            "targets": targets,
-        });
+        let doc = render_json(&lease, targets, &config, installed, &plain);
         let _ = writeln!(out, "{doc}");
     } else {
-        let _ = writeln!(
-            out,
-            "ssh lease {} until {} ({})",
-            lease.lease_id,
-            fmt_unix(lease.expires_at),
-            access_text(&lease, ", ")
-        );
-        let as_user = lease.user.as_deref().map(|u| format!(" as {u}")).unwrap_or_default();
-        for t in &lease.targets {
-            let ssh = if installed {
-                format!("ssh {}", t.name)
-            } else {
-                format!("ssh -F {} {}", config.display(), t.name)
-            };
-            let _ = writeln!(out, "{}: {ssh}   (login {}{as_user})", t.name, t.login);
-        }
+        let _ = out.write_all(render_text(&lease, targets, &config, &plain).as_bytes());
     }
     Ok(())
+}
+
+/// The command that connects to `name` with this lease: `ssh <name>` for the names in
+/// `plain`, otherwise `ssh -F <config> <name>`.
+fn connect_command(name: &str, config: &Path, plain: &HashSet<String>) -> String {
+    if plain.contains(name) {
+        format!("ssh {name}")
+    } else {
+        format!("ssh -F {} {name}", config.display())
+    }
+}
+
+/// `ssh lease <id> until <time>`, then per requested host in request order its connect
+/// command and access, or `<name>: denied`.
+fn render_text(lease: &LocalSshLease, requested: &[String], config: &Path, plain: &HashSet<String>) -> String {
+    let mut out = format!("ssh lease {} until {}\n", lease.lease_id, fmt_unix(lease.expires_at));
+    for name in requested {
+        match lease.targets.iter().find(|t| t.name == *name) {
+            Some(t) => {
+                let _ = writeln!(out, "{name}: {}   ({})", connect_command(name, config, plain), access_text(t));
+            }
+            None => {
+                let _ = writeln!(out, "{name}: denied");
+            }
+        }
+    }
+    out
+}
+
+/// The `--json` document: the approved hosts with their access and connect command,
+/// and the denied ones.
+fn render_json(
+    lease: &LocalSshLease,
+    requested: &[String],
+    config: &Path,
+    installed: bool,
+    plain: &HashSet<String>,
+) -> serde_json::Value {
+    let targets: Vec<serde_json::Value> = lease
+        .targets
+        .iter()
+        .map(|t| {
+            let mut v = target_json(t);
+            v["connect"] = connect_command(&t.name, config, plain).into();
+            v
+        })
+        .collect();
+    let denied: Vec<&String> = requested
+        .iter()
+        .filter(|name| !lease.targets.iter().any(|t| t.name == **name))
+        .collect();
+    serde_json::json!({
+        "lease_id": lease.lease_id,
+        "expires_at": fmt_unix(lease.expires_at),
+        "config": config.to_string_lossy(),
+        "installed": installed,
+        "targets": targets,
+        "denied": denied,
+    })
+}
+
+/// The stderr lines for requested hosts the operator approved with other access than
+/// requested, or denied.
+fn notes(lease: &LocalSshLease, requested: &[String], access: SshAccess, user: Option<&str>) -> Vec<String> {
+    requested
+        .iter()
+        .filter_map(|name| match lease.targets.iter().find(|t| t.name == *name) {
+            Some(t) if t.access != access || t.user.as_deref() != user => Some(format!(
+                "asm: {name}: the operator approved {}, not the {} requested",
+                access_name(t.access, t.user.as_deref()),
+                access_name(access, user)
+            )),
+            Some(_) => None,
+            None => Some(format!("asm: {name}: denied by the operator")),
+        })
+        .collect()
 }
 
 /// `privileged access`, `restricted access` or `access as <user>`.
@@ -170,45 +216,57 @@ fn access_name(access: SshAccess, user: Option<&str>) -> String {
     }
 }
 
-/// `privileged`, `restricted: <grants joined by sep>`, or `as <user>`.
-pub(super) fn access_text(lease: &LocalSshLease, sep: &str) -> String {
-    match lease.access {
+/// `privileged`, `restricted: <grants joined by ", ">`, or `as <user>`.
+pub(super) fn access_text(t: &SshTargetAccess) -> String {
+    match t.access {
         SshAccess::Privileged => "privileged".to_owned(),
-        SshAccess::Restricted => format!("restricted: {}", lease.grants.join(sep)),
-        SshAccess::User => format!("as {}", lease.user.as_deref().unwrap_or("-")),
+        SshAccess::Restricted => format!("restricted: {}", t.grants.join(", ")),
+        SshAccess::User => format!("as {}", t.user.as_deref().unwrap_or("-")),
     }
 }
 
+/// One host of a lease in JSON output.
+pub(super) fn target_json(t: &SshTargetAccess) -> serde_json::Value {
+    serde_json::json!({"name": t.name, "login": t.login, "access": t.access, "grants": t.grants, "user": t.user})
+}
+
 /// Check an approved result against the request; `None` when anything is off. The
-/// operator may approve a subset of the hosts and any access (and any user). Everything
-/// that ends up in a config or `known_hosts` is checked so the manager cannot inject ssh
-/// options.
+/// operator may approve a subset of the hosts and any access (and any user) per host.
+/// Everything that ends up in a config, `known_hosts` or a certificate file is checked
+/// so the manager cannot inject ssh options. The targets come back in request order.
 fn validate(r: SshResult, requested: &[String]) -> Option<LocalSshLease> {
     let expires_at = asm_proto::time::parse_unix(&r.expires_at)?;
     let mut names = HashSet::new();
+    let mut ids = HashSet::new();
     let ok = is_uuid(&r.lease_id)
-        && cert_blob(&r.certificate).is_some()
-        && !r.certificate.contains(|c: char| c.is_control())
-        && validate_access(r.access, &r.grants, r.user.as_deref()).is_ok()
         && expires_at > unix_now()
         && !r.targets.is_empty()
-        && r.targets.iter().all(|t| names.insert(t.name.as_str()) && requested.contains(&t.name))
-        && r.targets.iter().all(|t| target_ok(t, r.access));
-    ok.then_some(LocalSshLease {
+        && r.targets.iter().all(|t| {
+            names.insert(t.name.as_str())
+                && ids.insert(t.target_id.as_str())
+                && requested.contains(&t.name)
+                && target_ok(t)
+        });
+    if !ok {
+        return None;
+    }
+    let mut targets = r.targets;
+    targets.sort_by_key(|t| requested.iter().position(|n| *n == t.name));
+    Some(LocalSshLease {
         lease_id: r.lease_id,
         expires_at,
-        access: r.access,
-        grants: r.grants,
-        user: r.user,
         requested_at: 0,
-        certificate: r.certificate,
-        targets: r.targets,
+        targets,
     })
 }
 
-fn target_ok(t: &SshTargetAccess, access: SshAccess) -> bool {
+/// One approved host: its access, login and certificate agree, and its name, id,
+/// address and host keys are safe to write into ssh files.
+fn target_ok(t: &SshTargetAccess) -> bool {
     validate_target_name(&t.name).is_ok()
-        && t.login == access.login()
+        && validate_access(t.access, &t.grants, t.user.as_deref()).is_ok()
+        && t.login == t.access.login()
+        && cert_ok(&t.certificate)
         && t.target_id.len() == 8
         && t.target_id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
         && !t.hostname.is_empty()
@@ -342,31 +400,35 @@ fn warning(lease_id: &str, name: &str, expires_at: i64, minutes: i64) -> String 
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::tests::lease;
     use super::*;
-    use asm_proto::ssh::{PRIVILEGED_LOGIN, RESTRICTED_LOGIN};
+    use asm_proto::ssh::PRIVILEGED_LOGIN;
 
     const ID: &str = "11111111-2222-4333-8444-555555555555";
 
-    fn target(name: &str, login: &str) -> SshTargetAccess {
+    /// Target `name` (id `tid`) with `access`, the login it needs, and a certificate.
+    fn target(name: &str, tid: &str, access: SshAccess, grants: &[&str], user: Option<&str>) -> SshTargetAccess {
         SshTargetAccess {
             name: name.into(),
-            target_id: "0123abcd".into(),
-            login: login.into(),
+            target_id: tid.into(),
+            login: access.login().into(),
             hostname: format!("{name}.example.com"),
             port: 22,
             host_keys: vec!["ssh-ed25519 AAAA".into()],
+            access,
+            grants: grants.iter().map(|g| (*g).to_owned()).collect(),
+            user: user.map(str::to_owned),
+            certificate: format!("{} AAAA asm-lease-{ID}", store::CERT_TYPE),
         }
     }
 
-    fn result(access: SshAccess, grants: &[&str], targets: Vec<SshTargetAccess>) -> SshResult {
+    fn privileged(name: &str) -> SshTargetAccess {
+        target(name, "0123abcd", SshAccess::Privileged, &[], None)
+    }
+
+    fn result(targets: Vec<SshTargetAccess>) -> SshResult {
         SshResult {
             lease_id: ID.into(),
             expires_at: "2999-01-01T00:00:00Z".into(),
-            access,
-            grants: grants.iter().map(|g| (*g).to_owned()).collect(),
-            user: None,
-            certificate: format!("{} AAAA", store::CERT_TYPE),
             targets,
         }
     }
@@ -375,89 +437,130 @@ mod tests {
         n.iter().map(|s| (*s).to_owned()).collect()
     }
 
+    /// t1 privileged, t2 restricted, t3 as deploy, t4 denied, in another order than requested.
+    fn mixed() -> SshResult {
+        result(vec![
+            target("t3", "0000000c", SshAccess::User, &[], Some("deploy")),
+            target("t1", "0000000a", SshAccess::Privileged, &[], None),
+            target("t2", "0000000b", SshAccess::Restricted, &["logs:a.service", "read:/etc/a.conf"], None),
+        ])
+    }
+
     #[test]
-    fn validate_accepts_a_subset_and_either_access() {
-        let priv_t1 = || vec![target("t1", PRIVILEGED_LOGIN)];
-        let r = result(SshAccess::Privileged, &[], priv_t1());
-        let lease = validate(r, &names(&["t1", "t2"])).unwrap();
-        assert_eq!(lease.targets.len(), 1);
+    fn validate_accepts_other_access_per_host_in_request_order() {
+        let requested = names(&["t1", "t2", "t3", "t4"]);
+        let lease = validate(mixed(), &requested).unwrap();
         assert_eq!(lease.requested_at, 0);
+        let got: Vec<(&str, &str)> = lease.targets.iter().map(|t| (t.name.as_str(), t.login.as_str())).collect();
+        assert_eq!(got, [("t1", "asm-priv"), ("t2", "asm-ops"), ("t3", "asm-priv")]);
 
-        let r = result(SshAccess::Restricted, &["logs:nginx.service"], vec![target("t1", RESTRICTED_LOGIN)]);
-        let lease = validate(r, &names(&["t1", "t2"])).unwrap();
-        assert_eq!(lease.access, SshAccess::Restricted);
-        assert_eq!(lease.grants, ["logs:nginx.service"]);
-    }
+        assert_eq!(
+            render_text(&lease, &requested, Path::new("/c/config"), &HashSet::new()),
+            format!(
+                "ssh lease {ID} until 2999-01-01T00:00:00Z\nt1: ssh -F /c/config t1   (privileged)\nt2: ssh -F /c/config t2   (restricted: logs:a.service, read:/etc/a.conf)\nt3: ssh -F /c/config t3   (as deploy)\nt4: denied\n"
+            )
+        );
+        // Plain `ssh` only for the names the hosts conf maps to this lease.
+        let plain = HashSet::from(["t1".to_owned(), "t3".to_owned()]);
+        let text = render_text(&lease, &requested, Path::new("/c/config"), &plain);
+        assert!(text.contains("\nt1: ssh t1   (privileged)\nt2: ssh -F /c/config t2   "), "{text}");
+        assert!(text.contains("\nt3: ssh t3   (as deploy)\n"), "{text}");
+        let doc = render_json(&lease, &requested, Path::new("/c/config"), true, &plain);
+        let connect: Vec<&str> = doc["targets"].as_array().unwrap().iter().map(|t| t["connect"].as_str().unwrap()).collect();
+        assert_eq!(connect, ["ssh t1", "ssh -F /c/config t2", "ssh t3"]);
+        assert_eq!(doc["denied"], serde_json::json!(["t4"]));
 
-    fn as_user(user: Option<&str>, grants: &[&str], login: &str) -> SshResult {
-        let mut r = result(SshAccess::User, grants, vec![target("t1", login)]);
-        r.user = user.map(str::to_owned);
-        r
+        assert_eq!(
+            notes(&lease, &requested, SshAccess::Privileged, None),
+            [
+                "asm: t2: the operator approved restricted access, not the privileged access requested",
+                "asm: t3: the operator approved access as deploy, not the privileged access requested",
+                "asm: t4: denied by the operator",
+            ]
+        );
+        assert_eq!(
+            notes(&lease, &requested, SshAccess::User, Some("deploy")),
+            [
+                "asm: t1: the operator approved privileged access, not the access as deploy requested",
+                "asm: t2: the operator approved restricted access, not the access as deploy requested",
+                "asm: t4: denied by the operator",
+            ]
+        );
+        // Other grants than requested are no note: the output line shows them.
+        assert_eq!(notes(&lease, &names(&["t2"]), SshAccess::Restricted, None), Vec::<String>::new());
     }
 
     #[test]
-    fn validate_accepts_access_as_a_user() {
-        let lease = validate(as_user(Some("deploy"), &[], PRIVILEGED_LOGIN), &names(&["t1"])).unwrap();
-        assert_eq!(lease.access, SshAccess::User);
-        assert_eq!(lease.user.as_deref(), Some("deploy"));
-        assert_eq!(access_text(&lease, ","), "as deploy");
-    }
-
-    #[test]
-    fn validate_rejects_a_bad_user() {
+    fn validate_rejects_a_bad_target() {
         let requested = names(&["t1"]);
-        // Access as a user without a user, with grants, through asm-ops, or as an invalid user.
-        assert!(validate(as_user(None, &[], PRIVILEGED_LOGIN), &requested).is_none());
-        assert!(validate(as_user(Some("deploy"), &["logs:a.service"], PRIVILEGED_LOGIN), &requested).is_none());
-        assert!(validate(as_user(Some("deploy"), &[], RESTRICTED_LOGIN), &requested).is_none());
-        assert!(validate(as_user(Some("asm-ops"), &[], PRIVILEGED_LOGIN), &requested).is_none());
-        assert!(validate(as_user(Some("Deploy;x"), &[], PRIVILEGED_LOGIN), &requested).is_none());
-        // A user on privileged or restricted access.
-        let mut r = result(SshAccess::Privileged, &[], vec![target("t1", PRIVILEGED_LOGIN)]);
-        r.user = Some("deploy".into());
-        assert!(validate(r, &requested).is_none());
-        let mut r = result(SshAccess::Restricted, &["logs:a.service"], vec![target("t1", RESTRICTED_LOGIN)]);
-        r.user = Some("deploy".into());
-        assert!(validate(r, &requested).is_none());
+        let bad = |edit: &dyn Fn(&mut SshTargetAccess)| {
+            let mut t = privileged("t1");
+            edit(&mut t);
+            validate(result(vec![t]), &requested).is_none()
+        };
+        assert!(!bad(&|_| {}));
+        assert_eq!(privileged("t1").login, PRIVILEGED_LOGIN);
+        // A login that doesn't match the access.
+        assert!(bad(&|t| t.login = "asm-ops".into()));
+        assert!(bad(&|t| t.login = "root".into()));
+        assert!(bad(&|t| {
+            t.access = SshAccess::Restricted;
+            t.grants = vec!["logs:a.service".into()];
+        }));
+        // A certificate that is not a certificate line, or holds a control character.
+        assert!(bad(&|t| t.certificate = "ssh-ed25519 AAAA".into()));
+        assert!(bad(&|t| t.certificate = format!("{} !!", store::CERT_TYPE)));
+        assert!(bad(&|t| t.certificate = format!("{} AAAA\nx", store::CERT_TYPE)));
+        // Access as a user without a user, with grants or as an invalid user; a user on
+        // privileged access; grants on privileged access; restricted access without
+        // grants or with the bare grant `logs`.
+        assert!(bad(&|t| t.access = SshAccess::User));
+        for user in ["Deploy;x", "asm-ops"] {
+            assert!(bad(&|t| {
+                t.access = SshAccess::User;
+                t.user = Some(user.into());
+            }));
+        }
+        assert!(bad(&|t| {
+            t.access = SshAccess::User;
+            t.user = Some("deploy".into());
+            t.grants = vec!["logs:a.service".into()];
+        }));
+        assert!(bad(&|t| t.user = Some("deploy".into())));
+        assert!(bad(&|t| t.grants = vec!["logs:a.service".into()]));
+        assert!(bad(&|t| {
+            t.access = SshAccess::Restricted;
+            t.login = "asm-ops".into();
+        }));
+        assert!(bad(&|t| {
+            t.access = SshAccess::Restricted;
+            t.login = "asm-ops".into();
+            t.grants = vec!["logs".into()];
+        }));
+        // Fields that end up in ssh files.
+        assert!(bad(&|t| t.hostname = "db\n  ProxyCommand x".into()));
+        assert!(bad(&|t| t.target_id = "../x".into()));
+        assert!(bad(&|t| t.host_keys = vec!["ssh-ed25519".into()]));
+        assert!(bad(&|t| t.port = 0));
     }
 
     #[test]
     fn validate_rejects_what_was_not_requested() {
-        let requested = names(&["t1"]);
-        // An extra target.
-        let r = result(
-            SshAccess::Privileged,
-            &[],
-            vec![target("t1", PRIVILEGED_LOGIN), target("t2", PRIVILEGED_LOGIN)],
-        );
+        let requested = names(&["t1", "t2"]);
+        let other_id = |name: &str| target(name, "4567cdef", SshAccess::Privileged, &[], None);
+        assert!(validate(result(vec![privileged("t1"), other_id("t2")]), &requested).is_some());
+        // An extra target, a duplicate name, a duplicate target id, no target at all.
+        assert!(validate(result(vec![privileged("t1"), other_id("t3")]), &requested).is_none());
+        assert!(validate(result(vec![privileged("t1"), other_id("t1")]), &requested).is_none());
+        assert!(validate(result(vec![privileged("t1"), privileged("t2")]), &requested).is_none());
+        assert!(validate(result(vec![]), &requested).is_none());
+        // A bad lease id, or an end in the past.
+        let mut r = result(vec![privileged("t1")]);
+        r.lease_id = "x".into();
         assert!(validate(r, &requested).is_none());
-        // A duplicate target.
-        let r = result(
-            SshAccess::Privileged,
-            &[],
-            vec![target("t1", PRIVILEGED_LOGIN), target("t1", PRIVILEGED_LOGIN)],
-        );
+        let mut r = result(vec![privileged("t1")]);
+        r.expires_at = "2000-01-01T00:00:00Z".into();
         assert!(validate(r, &requested).is_none());
-        // The bare grant `logs`.
-        let r = result(SshAccess::Restricted, &["logs"], vec![target("t1", RESTRICTED_LOGIN)]);
-        assert!(validate(r, &requested).is_none());
-        // Restricted access without grants, and privileged access with grants.
-        let r = result(SshAccess::Restricted, &[], vec![target("t1", RESTRICTED_LOGIN)]);
-        assert!(validate(r, &requested).is_none());
-        let r = result(SshAccess::Privileged, &["logs:a.service"], vec![target("t1", PRIVILEGED_LOGIN)]);
-        assert!(validate(r, &requested).is_none());
-        // A privileged target whose login is root.
-        let r = result(SshAccess::Privileged, &[], vec![target("t1", "root")]);
-        assert!(validate(r, &requested).is_none());
-    }
-
-    #[test]
-    fn hostile_target_fields_are_rejected() {
-        let mut t = lease(ID, 1, "db").targets.remove(0);
-        assert!(target_ok(&t, SshAccess::Privileged));
-        assert!(!target_ok(&t, SshAccess::Restricted));
-        t.hostname = "db\n  ProxyCommand x".into();
-        assert!(!target_ok(&t, SshAccess::Privileged));
     }
 
     #[test]

@@ -32,8 +32,8 @@ struct Call {
     cert: Option<String>,
 }
 
-/// Answers from `handler` when set, else from `answers`, else `asm-end-ok 0`. A
-/// `route` error refuses every target's route.
+/// Answers from `handler` when set, else from `answers`, else a clean `asm-end-ok` (two
+/// counts for `end`). A `route` error refuses every target's route.
 #[derive(Default)]
 struct FakeRemote {
     calls: Mutex<Vec<Call>>,
@@ -64,7 +64,8 @@ impl SshRemote for FakeRemote {
         if let Some(handler) = handler {
             return handler(&call);
         }
-        lock(&self.answers).pop_front().unwrap_or_else(|| out(0, "asm-end-ok 0\n", ""))
+        let ok = if stdin.starts_with("end ") { "asm-end-ok 0 0\n" } else { "asm-end-ok 0\n" };
+        lock(&self.answers).pop_front().unwrap_or_else(|| out(0, ok, ""))
     }
 
     fn check_route(&self, _target: &SshTargetRecord, _dir: &Path) -> std::result::Result<(), RemoteError> {
@@ -78,6 +79,13 @@ fn out(status: i32, stdout: &str, stderr: &str) -> Answer {
 
 fn host_key() -> String {
     SshKey::generate().openssh_line()
+}
+
+fn decision(target_id: &str, access: ffi::SshAccess, grants: &[&str], user: Option<&str>) -> ffi::SshTargetDecision {
+    ffi::SshTargetDecision {
+        target_id: target_id.into(), access, grants: grants.iter().map(|g| (*g).into()).collect(),
+        user: user.map(Into::into),
+    }
 }
 
 struct Fixture {
@@ -130,15 +138,22 @@ impl Fixture {
             id: None, expected_revision: None, name: name.into(), destination: String::new(),
             agent_hostname: String::new(), agent_port: 22, privileged_login: "root".into(), allow_privileged,
             host_keys: vec![key.into()], log_units: vec!["web.service".into()],
-            restart_units: vec!["web.service".into()], max_duration_secs: 3600, users: vec![],
+            restart_units: vec!["web.service".into()], reload_units: vec![], read_files: vec![], max_duration_secs: 3600,
+            users: vec![],
         }
     }
 
     /// An enrolled target.
     fn add_target(&self, name: &str, allow_privileged: bool, key: &str) -> String {
-        let target = self.core.save_ssh_target(Self::draft(name, allow_privileged, key)).unwrap();
+        self.add_draft(Self::draft(name, allow_privileged, key))
+    }
+
+    /// An enrolled target saved from `draft`.
+    fn add_draft(&self, draft: ffi::SshTargetDraft) -> String {
+        let name = draft.name.clone();
+        let target = self.core.save_ssh_target(draft).unwrap();
         assert_eq!(target.state, ffi::SshTargetState::NotEnrolled);
-        assert_eq!((target.destination.as_str(), target.agent_hostname.as_str()), (name, name));
+        assert_eq!((target.destination.as_str(), target.agent_hostname.as_str()), (name.as_str(), name.as_str()));
         self.core.install_ssh_target_enrollment(&target.id).unwrap();
         target.id
     }
@@ -165,6 +180,7 @@ impl Fixture {
         })
     }
 
+    /// The same access on every target in `target_ids`.
     fn approve(&self, request_id: &str, target_ids: &[&str], access: ffi::SshAccess, grants: &[&str], duration_secs: u64)
         -> Result<()>
     {
@@ -174,10 +190,17 @@ impl Fixture {
     fn approve_as(&self, request_id: &str, target_ids: &[&str], access: ffi::SshAccess, grants: &[&str],
         user: Option<&str>, duration_secs: u64) -> Result<()>
     {
-        self.core.resolve_request(request_id, ffi::Decision::ApproveSsh {
-            target_ids: target_ids.iter().map(|t| (*t).into()).collect(), access,
-            grants: grants.iter().map(|g| (*g).into()).collect(), user: user.map(Into::into), duration_secs,
-        })
+        let targets = target_ids.iter().map(|id| decision(id, access, grants, user)).collect();
+        self.decide(request_id, targets, duration_secs)
+    }
+
+    fn decide(&self, request_id: &str, targets: Vec<ffi::SshTargetDecision>, duration_secs: u64) -> Result<()> {
+        self.core.resolve_request(request_id, ffi::Decision::ApproveSsh { targets, duration_secs })
+    }
+
+    fn ssh_activity(&self) -> Vec<ffi::ActivityEntry> {
+        self.core.list_activity(ffi::ActivityQuery { categories: vec!["ssh".into()], host_id: None,
+            search: String::new(), before_id: None, limit: 100 })
     }
 
     /// Saves the fixture target with these users, then marks it enrolled.
@@ -281,14 +304,14 @@ fn approved_privileged_lease_signs_pinned_logins_until_revoked() {
     let result = f.lease();
     assert_eq!(result.targets[0].login, "asm-priv");
     let lease = f.core.store.get_ssh_lease(&result.lease_id).unwrap().unwrap();
-    let text = keygen_list(&result.certificate);
+    let text = keygen_list(&result.targets[0].certificate);
     assert!(text.contains(&format!("asm-{}-privileged", f.target_id)), "{text}");
     assert!(text.contains(&format!("force-command asm-shell lease={} until={}", lease.id, lease.expires_at)), "{text}");
     assert!(text.contains(&format!("Key ID: \"asm-lease-{}\"", lease.id)), "{text}");
     assert!(text.contains("permit-pty"), "{text}");
 
     // A hostbound login to the pinned host is signed with the certified key.
-    let cert = certificate_blob(&result.certificate).unwrap();
+    let cert = certificate_blob(&result.targets[0].certificate).unwrap();
     let pinned = host_key_blob(&f.host_key).unwrap();
     let data = hostbound_payload("asm-priv", CERT_TYPE, &cert, &pinned);
     let signed = f.sign(&result.lease_id, &data).unwrap();
@@ -296,7 +319,7 @@ fn approved_privileged_lease_signs_pinned_logins_until_revoked() {
     let mut r = Reader::new(&blob);
     assert_eq!(r.string().unwrap(), b"ssh-ed25519");
     let sig: [u8; 64] = r.string().unwrap().try_into().unwrap();
-    VerifyingKey::from_bytes(&certified_key(&result.certificate)).unwrap()
+    VerifyingKey::from_bytes(&certified_key(&result.targets[0].certificate)).unwrap()
         .verify(&data, &Signature::from_bytes(&sig)).unwrap();
     f.sign(&result.lease_id, &payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"")).unwrap();
 
@@ -324,7 +347,7 @@ fn approved_privileged_lease_signs_pinned_logins_until_revoked() {
 fn signing_is_rate_limited_per_lease() {
     let f = Fixture::new();
     let result = f.lease();
-    let cert = certificate_blob(&result.certificate).unwrap();
+    let cert = certificate_blob(&result.targets[0].certificate).unwrap();
     let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
     for _ in 0..30 {
         f.sign(&result.lease_id, &data).unwrap();
@@ -338,7 +361,7 @@ fn signing_is_rate_limited_per_lease() {
 fn signing_rechecks_the_token() {
     let f = Fixture::new();
     let result = f.lease();
-    let cert = certificate_blob(&result.certificate).unwrap();
+    let cert = certificate_blob(&result.targets[0].certificate).unwrap();
     let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
     let stale = f.core.ssh_sign(&f.host, &[0; 32],
         SshSignRequest { lease_id: result.lease_id.clone(), data: b64_encode(&data) });
@@ -352,7 +375,7 @@ fn signing_rechecks_the_token() {
 fn only_the_owner_of_a_lease_uses_its_signing_budget() {
     let f = Fixture::new();
     let result = f.lease();
-    let cert = certificate_blob(&result.certificate).unwrap();
+    let cert = certificate_blob(&result.targets[0].certificate).unwrap();
     let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
     let other = HostRecord { id: new_uuid_v4(), ..f.host.clone() };
     let other_token = asm_proto::crypto::sha256(other.id.as_bytes());
@@ -373,7 +396,7 @@ fn only_the_owner_of_a_lease_uses_its_signing_budget() {
 fn signing_stops_when_a_lease_target_changes_or_goes() {
     let f = Fixture::new();
     let result = f.lease();
-    let cert = certificate_blob(&result.certificate).unwrap();
+    let cert = certificate_blob(&result.targets[0].certificate).unwrap();
     let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
     f.sign(&result.lease_id, &data).unwrap();
     // A change that did not end the lease still stops it signing.
@@ -384,7 +407,7 @@ fn signing_stops_when_a_lease_target_changes_or_goes() {
 
     f.core.install_ssh_target_enrollment(&f.target_id).unwrap();
     let result = f.lease();
-    let cert = certificate_blob(&result.certificate).unwrap();
+    let cert = certificate_blob(&result.targets[0].certificate).unwrap();
     let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
     f.sign(&result.lease_id, &data).unwrap();
     assert!(f.core.store.delete_ssh_target(&f.target_id).unwrap());
@@ -404,8 +427,8 @@ fn approvals_stay_within_the_requested_grants_and_the_targets() {
     let result = f.result(&pending.request_id);
     let lease = f.core.store.get_ssh_lease(&result.lease_id).unwrap().unwrap();
     assert_eq!(lease.grant.targets[0].login, "asm-ops");
-    assert_eq!(lease.grant.grants, ["logs:web.service"]);
-    let cert = Certificate::from_openssh(&lease.certificate).unwrap();
+    assert_eq!(lease.grant.targets[0].grants, ["logs:web.service"]);
+    let cert = Certificate::from_openssh(&lease.certificates[&f.target_id]).unwrap();
     assert_eq!(cert.valid_principals(), [format!("asm-{}-restricted", f.target_id)]);
     assert_eq!(force_command(&cert),
         Some(format!("asm-grant lease={} until={} logs:web.service", lease.id, lease.expires_at).as_str()));
@@ -414,13 +437,213 @@ fn approvals_stay_within_the_requested_grants_and_the_targets() {
     // A privileged request narrowed to restricted may choose any grant the target allows.
     let pending = f.request(&["web.example.com"], SshAccess::Privileged, &[]).unwrap();
     f.approve(&pending.request_id, &[&f.target_id], ffi::SshAccess::Restricted, &["restart:web.service"], 600).unwrap();
-    assert_eq!(f.result(&pending.request_id).grants, ["restart:web.service"]);
+    assert_eq!(f.result(&pending.request_id).targets[0].grants, ["restart:web.service"]);
 
     // The operator may widen a restricted request to privileged access.
     let pending = f.request(&["web.example.com"], SshAccess::Restricted, &["logs:web.service"]).unwrap();
     f.approve(&pending.request_id, &[&f.target_id], ffi::SshAccess::Privileged, &[], 600).unwrap();
     let result = f.result(&pending.request_id);
-    assert_eq!((result.access, result.targets[0].login.as_str()), (SshAccess::Privileged, "asm-priv"));
+    assert_eq!((result.targets[0].access, result.targets[0].login.as_str()), (SshAccess::Privileged, "asm-priv"));
+}
+
+/// A second target `db.example.com`: no privileged access, a reload unit and a file, and
+/// leases of at most 10 minutes.
+fn add_db(f: &Fixture, key: &str) -> String {
+    f.add_draft(ffi::SshTargetDraft {
+        reload_units: vec![" nginx.service ".into()], read_files: vec!["/etc/app.conf".into()], max_duration_secs: 600,
+        ..Fixture::draft("db.example.com", false, key)
+    })
+}
+
+#[test]
+fn each_host_gets_the_access_the_operator_chose_for_it() {
+    let f = Fixture::new();
+    f.set_users(true, &[("deploy", None)]).unwrap();
+    let db_key = host_key();
+    let db = add_db(&f, &db_key);
+    let cache = f.add_target("cache.example.com", true, &host_key());
+    let summaries = f.core.ssh_target_summaries().unwrap();
+    let db_summary = summaries.iter().find(|s| s.name == "db.example.com").unwrap();
+    assert_eq!(db_summary.grants, ["logs:web.service", "restart:web.service", "reload:nginx.service", "read:/etc/app.conf"]);
+
+    // Requests list their hosts sorted by name; so do the popup, the lease and its result.
+    let hosts = ["web.example.com", "db.example.com", "cache.example.com"];
+    let pending = f.request(&hosts, SshAccess::Restricted, &["logs:web.service"]).unwrap();
+    let detail = f.core.snapshot().pending.into_iter().find(|p| p.id == pending.request_id).unwrap().detail;
+    let ffi::RequestDetail::Ssh { targets, max_duration_secs, .. } = detail else { panic!("{detail:?}") };
+    let shown: Vec<_> = targets.iter().map(|t| (t.name.as_str(), t.max_duration_secs, t.ready)).collect();
+    assert_eq!(shown, [("cache.example.com", 3600, true), ("db.example.com", 600, true), ("web.example.com", 3600, true)]);
+    assert_eq!((targets[1].reload_units.as_slice(), targets[1].read_files.as_slice(), max_duration_secs),
+        (["nginx.service".to_string()].as_slice(), ["/etc/app.conf".to_string()].as_slice(), 600));
+
+    let web_as_deploy = || decision(&f.target_id, ffi::SshAccess::User, &[], Some("deploy"));
+    let db_logs = || decision(&db, ffi::SshAccess::Restricted, &["logs:web.service"], None);
+    let refused = |targets: Vec<ffi::SshTargetDecision>, duration| {
+        f.decide(&pending.request_id, targets, duration).unwrap_err().message
+    };
+    assert_eq!(refused(vec![], 600), "choose at least one of the requested SSH targets");
+    assert_eq!(refused(vec![db_logs(), db_logs()], 600), "approve only the requested SSH targets, each at most once");
+    assert_eq!(refused(vec![decision("0badf00d", ffi::SshAccess::Privileged, &[], None)], 600),
+        "approve only the requested SSH targets, each at most once");
+    // Privileged access and users only where the target allows them; restricted grants
+    // no wider than the request.
+    assert_eq!(refused(vec![web_as_deploy(), decision(&db, ffi::SshAccess::Privileged, &[], None)], 600),
+        "SSH target db.example.com does not allow privileged access");
+    assert_eq!(refused(vec![decision(&db, ffi::SshAccess::User, &[], Some("deploy"))], 600),
+        "SSH target db.example.com does not allow access as deploy; see asm ssh hosts");
+    assert_eq!(refused(vec![decision(&db, ffi::SshAccess::Restricted, &["reload:nginx.service"], None)], 600),
+        "approve only grants the request asked for");
+    assert_eq!(refused(vec![decision(&cache, ffi::SshAccess::User, &[], Some("deploy"))], 600),
+        "SSH target cache.example.com does not allow access as deploy; see asm ssh hosts");
+    // The longest lease is the smallest limit of the approved targets.
+    assert_eq!(refused(vec![web_as_deploy(), db_logs()], 1200), "choose a duration between 1 minute and 10 minutes");
+    assert_eq!(f.core.request_state(&f.host.id, &pending.request_id).unwrap().status, RequestStatus::Pending);
+
+    // cache.example.com is denied: it is left out.
+    f.decide(&pending.request_id, vec![db_logs(), web_as_deploy()], 600).unwrap();
+    let result = f.result(&pending.request_id);
+    let access: Vec<_> = result.targets.iter()
+        .map(|t| (t.name.as_str(), t.login.as_str(), t.access, t.grants.clone(), t.user.as_deref())).collect();
+    assert_eq!(access, [("db.example.com", "asm-ops", SshAccess::Restricted, vec!["logs:web.service".to_string()], None),
+        ("web.example.com", "asm-priv", SshAccess::User, vec![], Some("deploy"))]);
+    let lease = f.core.store.get_ssh_lease(&result.lease_id).unwrap().unwrap();
+    let mut target_ids = vec![f.target_id.clone(), db.clone(), cache.clone()];
+    target_ids.sort();
+    assert_eq!(lease.grant.requested, SshRequested {
+        access: SshAccess::Restricted, grants: vec!["logs:web.service".into()], user: None, target_ids,
+    });
+
+    // One certificate per target, all for the lease's one key, each with its own
+    // principal and forced command.
+    let web_text = keygen_list(&result.targets[1].certificate);
+    assert!(web_text.contains(&format!("asm-{}-user", f.target_id)) && !web_text.contains(&db), "{web_text}");
+    assert!(web_text.contains(&format!("force-command asm-shell lease={} until={} as=deploy", lease.id, lease.expires_at)),
+        "{web_text}");
+    assert!(web_text.contains("permit-pty"), "{web_text}");
+    let db_text = keygen_list(&result.targets[0].certificate);
+    assert!(db_text.contains(&format!("asm-{db}-restricted")) && !db_text.contains(&f.target_id), "{db_text}");
+    assert!(db_text.contains(&format!("force-command asm-grant lease={} until={} logs:web.service", lease.id,
+        lease.expires_at)), "{db_text}");
+    assert!(!db_text.contains("permit-pty"), "{db_text}");
+    for text in [&web_text, &db_text] {
+        assert!(text.contains(&format!("Key ID: \"asm-lease-{}\"", lease.id)), "{text}");
+    }
+    assert_eq!(certified_key(&result.targets[0].certificate), certified_key(&result.targets[1].certificate));
+
+    let created: Vec<_> = f.ssh_activity().into_iter().filter(|e| e.kind == "lease_created").collect();
+    assert_eq!(created[0].summary, "SSH lease on db.example.com (restricted), web.example.com (as deploy), 10 min");
+    let approved = f.core.list_activity(ffi::ActivityQuery { categories: vec!["requests".into()], host_id: None,
+        search: String::new(), before_id: None, limit: 100 }).into_iter().find(|e| e.kind == "approved").unwrap();
+    assert!(approved.summary.ends_with("approved: SSH on db.example.com (restricted), web.example.com (as deploy), 10 min"),
+        "{}", approved.summary);
+    let ui = f.core.list_leases().into_iter().find(|l| l.lease_id == lease.id).unwrap().ssh.unwrap();
+    let rows: Vec<_> = ui.targets.iter().map(|t| (t.name.as_str(), t.access, t.user.as_deref())).collect();
+    assert_eq!(rows, [("db.example.com", ffi::SshAccess::Restricted, None),
+        ("web.example.com", ffi::SshAccess::User, Some("deploy"))]);
+
+    // A denied target does not count toward the duration limit.
+    let pending = f.request(&["web.example.com", "db.example.com"], SshAccess::Restricted, &["logs:web.service"]).unwrap();
+    f.decide(&pending.request_id, vec![decision(&f.target_id, ffi::SshAccess::Privileged, &[], None)], 1200).unwrap();
+    let result = f.result(&pending.request_id);
+    assert_eq!((result.targets.len(), result.targets[0].access), (1, SshAccess::Privileged));
+}
+
+#[test]
+fn each_certificate_signs_only_for_its_own_target() {
+    let f = Fixture::new();
+    let db_key = host_key();
+    let db = add_db(&f, &db_key);
+    let pending = f.request(&["web.example.com", "db.example.com"], SshAccess::Restricted, &["logs:web.service"]).unwrap();
+    f.decide(&pending.request_id, vec![decision(&f.target_id, ffi::SshAccess::Privileged, &[], None),
+        decision(&db, ffi::SshAccess::Restricted, &["logs:web.service"], None)], 600).unwrap();
+    let result = f.result(&pending.request_id);
+    let web_cert = certificate_blob(&result.targets[1].certificate).unwrap();
+    let db_cert = certificate_blob(&result.targets[0].certificate).unwrap();
+    let web_pin = host_key_blob(&f.host_key).unwrap();
+    let db_pin = host_key_blob(&db_key).unwrap();
+
+    f.sign(&result.lease_id, &hostbound_payload("asm-priv", CERT_TYPE, &web_cert, &web_pin)).unwrap();
+    f.sign(&result.lease_id, &hostbound_payload("asm-ops", CERT_TYPE, &db_cert, &db_pin)).unwrap();
+    let signed: Vec<String> = f.ssh_activity().into_iter().filter(|e| e.kind == "signed").map(|e| e.summary).collect();
+    assert!(signed.contains(&"SSH signature for asm-priv on web.example.com".to_string()), "{signed:?}");
+    assert!(signed.contains(&"SSH signature for asm-ops on db.example.com".to_string()), "{signed:?}");
+
+    let refused = |data: Vec<u8>| f.sign(&result.lease_id, &data).unwrap_err().message;
+    assert_eq!(refused(hostbound_payload("asm-priv", CERT_TYPE, &db_cert, &db_pin)), "login asm-priv is not part of this lease");
+    assert_eq!(refused(hostbound_payload("asm-ops", CERT_TYPE, &web_cert, &web_pin)), "login asm-ops is not part of this lease");
+    assert_eq!(refused(hostbound_payload("asm-ops", CERT_TYPE, &db_cert, &web_pin)),
+        "the request is for a host this lease does not pin");
+    assert_eq!(refused(hostbound_payload("asm-priv", CERT_TYPE, &web_cert, &db_pin)),
+        "the request is for a host this lease does not pin");
+    let other = f.lease();
+    let other_cert = certificate_blob(&other.targets[0].certificate).unwrap();
+    assert_eq!(refused(payload("asm-priv", "publickey", true, CERT_TYPE, &other_cert, b"")),
+        "the request is not for this lease's certificate");
+
+    // A change to one target stops only its certificate.
+    let target = f.core.store.get_ssh_target(&db).unwrap().unwrap();
+    f.core.store.update_ssh_target(&db, &target.name, &target.config, target.revision).unwrap();
+    assert_eq!(refused(payload("asm-ops", "publickey", true, CERT_TYPE, &db_cert, b"")),
+        "the SSH target changed; request a new lease");
+    f.sign(&result.lease_id, &payload("asm-priv", "publickey", true, CERT_TYPE, &web_cert, b"")).unwrap();
+}
+
+#[test]
+fn the_same_request_reuses_the_lease_the_operator_decided() {
+    let f = Fixture::new();
+    add_db(&f, &host_key());
+    let ask = |targets: &[&str], access, grants: &[&str]| f.core.create_request(&f.host, "127.0.0.1", RequestBody::Ssh {
+        targets: targets.iter().map(|t| (*t).into()).collect(), access,
+        grants: grants.iter().map(|g| (*g).into()).collect(), user: None, new_lease: false,
+        reason: "again".into(), agent: "claude".into(),
+    }).unwrap();
+    let first = ask(&["web.example.com", "db.example.com"], SshAccess::Restricted, &["logs:web.service"]);
+    assert_eq!(first.status, RequestStatus::Pending);
+    // The operator widened web.example.com and denied db.example.com.
+    f.decide(&first.request_id, vec![decision(&f.target_id, ffi::SshAccess::Privileged, &[], None)], 600).unwrap();
+    let lease_id = f.result(&first.request_id).lease_id;
+
+    for targets in [["web.example.com", "db.example.com"], ["db.example.com", "web.example.com"]] {
+        let again = ask(&targets, SshAccess::Restricted, &["logs:web.service"]);
+        assert_eq!(again.status, RequestStatus::Approved, "{targets:?}");
+        let result = f.result(&again.request_id);
+        assert_eq!((result.lease_id.as_str(), result.targets.len(), result.targets[0].access),
+            (lease_id.as_str(), 1, SshAccess::Privileged));
+    }
+    // Anything else asks the operator again, even what the lease already allows.
+    assert_eq!(ask(&["web.example.com"], SshAccess::Privileged, &[]).status, RequestStatus::Pending);
+    assert_eq!(ask(&["web.example.com", "db.example.com"], SshAccess::Restricted, &["restart:web.service"]).status,
+        RequestStatus::Pending);
+    // A change to a granted target ends reuse.
+    let target = f.core.store.get_ssh_target(&f.target_id).unwrap().unwrap();
+    f.core.store.update_ssh_target(&f.target_id, &target.name, &target.config, target.revision).unwrap();
+    f.core.install_ssh_target_enrollment(&f.target_id).unwrap();
+    assert_eq!(ask(&["web.example.com", "db.example.com"], SshAccess::Restricted, &["logs:web.service"]).status,
+        RequestStatus::Pending);
+}
+
+#[test]
+fn targets_enrolled_with_other_host_scripts_need_enrolling_again() {
+    let f = Fixture::new();
+    let target = f.core.store.get_ssh_target(&f.target_id).unwrap().unwrap();
+    assert_eq!(target.enrolled_scripts.as_deref(), Some(scripts_version()));
+    let info = f.core.list_ssh_targets().unwrap().remove(0);
+    assert_eq!((info.state, info.scripts_outdated), (ffi::SshTargetState::Enrolled, false));
+
+    let ca = f.core.ssh_ca().unwrap().fingerprint();
+    assert!(f.core.store.set_ssh_enrollment(&f.target_id, &[SshEnrollState::Enrolled], SshEnrollState::Enrolled,
+        Some(target.revision), Some(&ca), Some("0123456789abcdef"), None, f.now()).unwrap());
+    let info = f.core.list_ssh_targets().unwrap().remove(0);
+    assert_eq!((info.state, info.scripts_outdated), (ffi::SshTargetState::NeedsReenroll, true));
+    assert_eq!(f.request(&["web.example.com"], SshAccess::Privileged, &[]).unwrap_err().message,
+        "SSH target web.example.com is not enrolled");
+    assert!(f.core.ssh_target_summaries().unwrap().is_empty());
+
+    // Enrolling again records the current scripts.
+    f.remote.answer(out(0, "asm-enroll-ok\n", ""));
+    let info = f.core.enroll_ssh_target(&f.target_id, target.revision).unwrap();
+    assert_eq!((info.state, info.scripts_outdated), (ffi::SshTargetState::Enrolled, false));
+    assert!(f.core.ssh_enroll_script(&f.target_id).unwrap().contains("put \"$LIB\" asm-read 0755"));
 }
 
 #[test]
@@ -437,7 +660,7 @@ fn privileged_access_needs_a_target_that_allows_it() {
 }
 
 #[test]
-fn access_as_a_user_runs_as_a_user_every_target_allows() {
+fn access_as_a_user_runs_as_a_user_the_target_allows() {
     let f = Fixture::new();
     let info = f.set_users(true, &[("ops", Some("in group sudo")), ("deploy", None)]).unwrap();
     let names: Vec<_> = info.users.iter().map(|u| u.name.as_str()).collect();
@@ -448,10 +671,10 @@ fn access_as_a_user_runs_as_a_user_every_target_allows() {
     let pending = f.request_as(&["web.example.com"], SshAccess::User, &[], Some("deploy")).unwrap();
     f.approve_as(&pending.request_id, &[&f.target_id], ffi::SshAccess::User, &[], Some("deploy"), 600).unwrap();
     let result = f.result(&pending.request_id);
-    assert_eq!((result.access, result.user.as_deref(), result.targets[0].login.as_str()),
+    assert_eq!((result.targets[0].access, result.targets[0].user.as_deref(), result.targets[0].login.as_str()),
         (SshAccess::User, Some("deploy"), "asm-priv"));
     let lease = f.core.store.get_ssh_lease(&result.lease_id).unwrap().unwrap();
-    let cert = Certificate::from_openssh(&lease.certificate).unwrap();
+    let cert = Certificate::from_openssh(&lease.certificates[&f.target_id]).unwrap();
     assert_eq!(cert.valid_principals(), [format!("asm-{}-user", f.target_id)]);
     assert_eq!(force_command(&cert),
         Some(format!("asm-shell lease={} until={} as=deploy", lease.id, lease.expires_at).as_str()));
@@ -467,7 +690,7 @@ fn access_as_a_user_runs_as_a_user_every_target_allows() {
     assert!(decide(ffi::SshAccess::Privileged, Some("deploy")).is_err());
     // The operator may choose another user.
     decide(ffi::SshAccess::User, Some("ops")).unwrap();
-    assert_eq!(f.result(&pending.request_id).user.as_deref(), Some("ops"));
+    assert_eq!(f.result(&pending.request_id).targets[0].user.as_deref(), Some("ops"));
 
     // A user that can become root needs privileged access allowed on its target.
     assert_eq!(f.set_users(false, &[("ops", Some("in group sudo"))]).unwrap_err().message,
@@ -485,16 +708,15 @@ fn enrollment_checks_a_login_as_each_user() {
     let f = Fixture::new();
     let revision = f.set_users(false, &[("deploy", None)]).unwrap().revision;
     f.remote.answer(out(0, "asm-enroll-ok\n", ""));
-    f.remote.answer(out(0, "asm-end-ok 0\n", ""));
     f.remote.answer(out(126, "", "asm: sudo: a password is required\n"));
     let error = f.core.enroll_ssh_target(&f.target_id, revision).unwrap_err();
     assert_eq!(error.message,
         "enrolled, but a test login as asm-priv as deploy failed: host reported an unexpected result: asm: sudo: a password is required");
     let calls = f.remote.calls();
-    assert_eq!(calls.len(), 3, "no privileged check without privileged access: {calls:?}");
-    let RemoteAuth::Certificate { login, command, .. } = &calls[2].auth else { panic!("{calls:?}") };
+    assert_eq!(calls.len(), 2, "no privileged check without privileged access, no cleanup login after a failure: {calls:?}");
+    let RemoteAuth::Certificate { login, command, .. } = &calls[1].auth else { panic!("{calls:?}") };
     assert_eq!((*login, *command), ("asm-priv", Some("true")));
-    let cert = Certificate::from_openssh(calls[2].cert.as_deref().unwrap()).unwrap();
+    let cert = Certificate::from_openssh(calls[1].cert.as_deref().unwrap()).unwrap();
     assert!(force_command(&cert).unwrap().ends_with(" as=deploy"), "{:?}", force_command(&cert));
     assert_eq!(cert.valid_principals(), [format!("asm-{}-user", f.target_id)]);
 }
@@ -539,11 +761,15 @@ fn targets_need_their_own_host_keys_and_keep_destination_while_enrolled() {
 // ---- extensions ----
 
 #[test]
-fn approved_extension_replaces_the_certificate() {
+fn approved_extension_reissues_every_certificate() {
     let f = Fixture::new();
-    let result = f.lease();
+    let db = f.add_target("db.example.com", false, &host_key());
+    let pending = f.request(&["web.example.com", "db.example.com"], SshAccess::Restricted, &["logs:web.service"]).unwrap();
+    f.decide(&pending.request_id, vec![decision(&f.target_id, ffi::SshAccess::Privileged, &[], None),
+        decision(&db, ffi::SshAccess::Restricted, &["logs:web.service"], None)], 600).unwrap();
+    let result = f.result(&pending.request_id);
     let before = f.core.store.get_ssh_lease(&result.lease_id).unwrap().unwrap();
-    let old_cert = certificate_blob(&result.certificate).unwrap();
+    let old_cert = certificate_blob(&result.targets[1].certificate).unwrap();
     let first = f.extend(&result.lease_id).unwrap();
     assert_eq!(first.status, RequestStatus::Pending);
     let second = f.extend(&result.lease_id).unwrap();
@@ -552,7 +778,11 @@ fn approved_extension_replaces_the_certificate() {
     let ffi::RequestDetail::SshExtend { lease_id, issue, targets, max_duration_secs, .. } = detail else {
         panic!("not an extension: {detail:?}")
     };
-    assert_eq!((lease_id.as_str(), issue, targets.len(), max_duration_secs), (result.lease_id.as_str(), None, 1, 3600));
+    assert_eq!((lease_id.as_str(), issue, max_duration_secs), (result.lease_id.as_str(), None, 3600));
+    let shown: Vec<_> = targets.iter()
+        .map(|t| (t.target.name.as_str(), t.access, t.grants.clone(), t.target.max_duration_secs)).collect();
+    assert_eq!(shown, [("db.example.com", ffi::SshAccess::Restricted, vec!["logs:web.service".to_string()], 3600),
+        ("web.example.com", ffi::SshAccess::Privileged, vec![], 3600)]);
 
     f.advance(100);
     f.core.resolve_request(&first.request_id, ffi::Decision::ApproveSshExtend { duration_secs: 1200 }).unwrap();
@@ -561,15 +791,25 @@ fn approved_extension_replaces_the_certificate() {
     let lease = f.core.store.get_ssh_lease(&result.lease_id).unwrap().unwrap();
     assert_eq!(lease.expires_at, f.now() + 1200);
     assert!(lease.expires_at > before.expires_at);
-    let old = Certificate::from_openssh(&before.certificate).unwrap();
-    let new = Certificate::from_openssh(&extended.certificate).unwrap();
-    assert_eq!((new.valid_principals(), new.key_id()), (old.valid_principals(), old.key_id()));
-    assert_eq!(new.public_key(), old.public_key());
-    assert_eq!(force_command(&new), Some(format!("asm-shell lease={} until={}", lease.id, lease.expires_at).as_str()));
+    for (target, command) in [(&f.target_id, format!("asm-shell lease={} until={}", lease.id, lease.expires_at)),
+        (&db, format!("asm-grant lease={} until={} logs:web.service", lease.id, lease.expires_at))]
+    {
+        let old = Certificate::from_openssh(&before.certificates[target]).unwrap();
+        let new = Certificate::from_openssh(&lease.certificates[target]).unwrap();
+        assert_ne!(before.certificates[target], lease.certificates[target], "{target}");
+        assert_eq!((new.valid_principals(), new.key_id()), (old.valid_principals(), old.key_id()));
+        assert_eq!(new.public_key(), old.public_key());
+        assert_eq!(force_command(&new), Some(command.as_str()));
+        assert_eq!(extended.targets.iter().find(|t| &t.target_id == target).unwrap().certificate,
+            lease.certificates[target]);
+    }
 
-    let new_cert = certificate_blob(&extended.certificate).unwrap();
+    let new_cert = certificate_blob(&extended.targets[1].certificate).unwrap();
     assert!(f.sign(&lease.id, &payload("asm-priv", "publickey", true, CERT_TYPE, &old_cert, b"")).is_err());
     f.sign(&lease.id, &payload("asm-priv", "publickey", true, CERT_TYPE, &new_cert, b"")).unwrap();
+    let events: Vec<_> = f.ssh_activity().into_iter().filter(|e| e.kind == "lease_extended").collect();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].detail.as_deref().unwrap().contains("\"access\":\"restricted\""), "{:?}", events[0].detail);
 }
 
 #[test]
@@ -620,7 +860,7 @@ fn revoked_lease_is_cleaned_up_with_a_short_cleanup_certificate() {
     let f = Fixture::new();
     let result = f.lease();
     let lease = f.core.store.get_ssh_lease(&result.lease_id).unwrap().unwrap();
-    f.remote.answer(out(0, &format!("ending 3 asm-priv {}\nasm-end-ok 1\n", lease.id), ""));
+    f.remote.answer(out(0, &format!("ending 3 asm-priv {}\nasm-end-ok 1 0\n", lease.id), ""));
     f.core.revoke_lease(&lease.id).unwrap();
     let done = f.wait_settled(&lease.id);
     assert_eq!((done.state, done.detail.as_str()), (SshCleanupState::Done, "host reported: ended 1 sessions"));
@@ -653,7 +893,7 @@ fn unreachable_hosts_are_retried_with_backoff() {
     assert_eq!(f.ui_cleanup(&result.lease_id), Some(ffi::SshCleanupState::Retrying));
     assert_eq!(f.core.next_ssh_wake(f.now()), Some(ended_at + 60));
 
-    f.remote.answer(out(0, "asm-end-ok 0\n", ""));
+    f.remote.answer(out(0, "asm-end-ok 0 0\n", ""));
     let later = f.advance(61);
     f.core.sweep_ssh_at(later);
     let done = f.wait_cleanup(&result.lease_id, &f.target_id, |c| c.state == SshCleanupState::Done);
@@ -696,8 +936,11 @@ fn host_errors_and_malformed_results_fail() {
     let f = Fixture::new();
     let cases = [
         ("asm-end-error sessions could not end 1 of 1 sessions\n", "host reported: could not end 1 of 1 sessions (sessions)"),
-        ("asm-end-ok 1 2\n", "host reported an unexpected result"),
-        ("asm-end-ok x\n", "host reported an unexpected result"),
+        ("asm-end-ok 1\n", "host reported an unexpected result: asm-end-ok 1"),
+        ("asm-end-ok 1 2 3\n", "host reported an unexpected result"),
+        ("asm-end-ok x 0\n", "host reported an unexpected result"),
+        ("changed /etc/cron.d/a\nasm-end-ok 1 3\n", "host reported an unexpected result: 3 changed files, but 1 listed"),
+        ("changed /etc/cron.d/a\nasm-end-ok 1 0\n", "host reported an unexpected result: 0 changed files, but 1 listed"),
     ];
     for (answer, expected) in cases {
         let result = f.lease();
@@ -738,7 +981,7 @@ fn a_slow_target_does_not_delay_another() {
         if call.target_id == slow {
             lock(&blocked).recv().unwrap();
         }
-        out(0, "asm-end-ok 1\n", "")
+        out(0, "asm-end-ok 1 0\n", "")
     }));
     f.core.revoke_lease(&result.lease_id).unwrap();
     let fast = f.wait_cleanup(&result.lease_id, &db, |c| c.state == SshCleanupState::Done);
@@ -746,6 +989,51 @@ fn a_slow_target_does_not_delay_another() {
     assert_eq!(f.cleanup(&result.lease_id, &f.target_id).state, SshCleanupState::Pending);
     release.send(()).unwrap();
     f.wait_cleanup(&result.lease_id, &f.target_id, |c| c.state == SshCleanupState::Done);
+}
+
+#[test]
+fn a_lease_end_keeps_the_hosts_change_report_and_logs_it_only_when_files_changed() {
+    let f = Fixture::new();
+    let done = |answer: &str| {
+        let result = f.lease();
+        f.remote.answer(out(0, answer, ""));
+        f.core.revoke_lease(&result.lease_id).unwrap();
+        let done = f.wait_settled(&result.lease_id);
+        assert_eq!((done.state, done.detail.as_str()), (SshCleanupState::Done, "host reported: ended 1 sessions"));
+        (result.lease_id, done)
+    };
+    let changed_events = || f.ssh_activity().into_iter().filter(|e| e.kind == "files_changed").collect::<Vec<_>>();
+
+    let (_, quiet) = done("ending 3 asm-priv x\nasm-end-ok 1 0\n");
+    assert_eq!((quiet.changes.len(), quiet.changes_total), (0, 0));
+    assert!(changed_events().is_empty());
+
+    let (few, report) = done("ending 3 asm-priv x\nchanged /etc/cron.d/asm-test\nchanged /root/.ssh/\x1b[31mkeys\nasm-end-ok 1 2\n");
+    assert_eq!((report.changes.clone(), report.changes_total),
+        (vec!["/etc/cron.d/asm-test".to_string(), "/root/.ssh/?[31mkeys".into()], 2));
+    let lease = f.core.list_leases().into_iter().find(|l| l.lease_id == few).unwrap();
+    let target = &lease.ssh.unwrap().targets[0];
+    assert_eq!((target.changes.clone(), target.changes_total), (report.changes.clone(), 2));
+    let events = changed_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].summary, "Files changed on web.example.com during an SSH lease: /etc/cron.d/asm-test and 1 more");
+    let detail: serde_json::Value = serde_json::from_str(events[0].detail.as_deref().unwrap()).unwrap();
+    assert_eq!((detail["lease_id"].as_str(), detail["target_id"].as_str(), detail["total"].as_u64()),
+        (Some(few.as_str()), Some(f.target_id.as_str()), Some(2)));
+    assert_eq!(detail["changes"], json!(["/etc/cron.d/asm-test", "/root/.ssh/?[31mkeys"]));
+
+    let listed: String = (0..20).map(|i| format!("changed /etc/cron.d/f{i:02}\n")).collect();
+    let (_, many) = done(&format!("{listed}asm-end-ok 1 25\n"));
+    assert_eq!((many.changes.len(), many.changes.last().map(String::as_str), many.changes_total),
+        (20, Some("/etc/cron.d/f19"), 25));
+    let summaries: Vec<String> = changed_events().into_iter().map(|e| e.summary).collect();
+    assert_eq!(summaries.len(), 2);
+    assert!(summaries.contains(&"Files changed on web.example.com during an SSH lease: /etc/cron.d/f00 and 24 more".into()),
+        "{summaries:?}");
+
+    let (_, one) = done("changed /etc/passwd\nasm-end-ok 1 1\n");
+    assert_eq!(one.changes_total, 1);
+    assert!(changed_events().iter().any(|e| e.summary == "Files changed on web.example.com during an SSH lease: /etc/passwd"));
 }
 
 // ---- enrollment and removal ----
@@ -767,35 +1055,78 @@ fn removal_ends_pending_cleanup() {
 }
 
 #[test]
-fn enrollment_finishes_with_test_logins() {
+fn enrollment_finishes_with_test_logins_under_one_run_id_that_the_cleanup_login_ends() {
     let f = Fixture::new();
-    let revision = f.core.list_ssh_targets().unwrap()[0].revision;
+    let revision = f.set_users(true, &[("deploy", None)]).unwrap().revision;
     f.remote.answer(out(0, "installing\nasm-enroll-ok\n", ""));
-    f.remote.answer(out(0, "asm-end-ok 0\n", ""));
     f.remote.answer(out(0, "", ""));
+    f.remote.answer(out(0, "", ""));
+    f.remote.answer(out(0, "ending 7 asm-priv x\nchanged /etc/passwd\nasm-end-ok 1 1\n", ""));
     let info = f.core.enroll_ssh_target(&f.target_id, revision).unwrap();
     assert_eq!(info.state, ffi::SshTargetState::Enrolled);
     let calls = f.remote.calls();
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.len(), 4);
     assert!(matches!(calls[0].auth, RemoteAuth::Operator { .. }), "{calls:?}");
     assert!(calls[0].stdin.contains(&format!("TID='{}'", f.target_id)));
-    let RemoteAuth::Certificate { login, command, .. } = &calls[1].auth else { panic!("{calls:?}") };
-    assert_eq!((*login, *command, calls[1].stdin.as_str()), ("asm-ops", None, "check\n"));
-    let RemoteAuth::Certificate { login, command, .. } = &calls[2].auth else { panic!("{calls:?}") };
-    assert_eq!((*login, *command), ("asm-priv", Some("true")));
-    let cert = Certificate::from_openssh(calls[2].cert.as_deref().unwrap()).unwrap();
-    assert!(force_command(&cert).unwrap().starts_with("asm-shell lease="));
-    assert_eq!(cert.valid_principals(), [format!("asm-{}-privileged", f.target_id)]);
-    assert!(cert.key_id().starts_with("asm-check-"));
+    // The shell checks first, sharing one run id and end.
+    let cert = |call: &Call| Certificate::from_openssh(call.cert.as_deref().unwrap()).unwrap();
+    let (privileged, user) = (cert(&calls[1]), cert(&calls[2]));
+    for (call, principal) in [(&calls[1], "privileged"), (&calls[2], "user")] {
+        let RemoteAuth::Certificate { login, command, .. } = &call.auth else { panic!("{calls:?}") };
+        assert_eq!((*login, *command, call.stdin.as_str()), ("asm-priv", Some("true"), ""));
+        assert_eq!(cert(call).valid_principals(), [format!("asm-{}-{principal}", f.target_id)]);
+    }
+    let command = force_command(&privileged).unwrap().to_owned();
+    let run = command.strip_prefix("asm-shell lease=").unwrap().split(' ').next().unwrap().to_owned();
+    let until = privileged.valid_before();
+    assert_eq!(command, format!("asm-shell lease={run} until={until}"));
+    assert_eq!(force_command(&user), Some(format!("asm-shell lease={run} until={until} as=deploy").as_str()));
+    assert!(privileged.key_id().starts_with("asm-check-") && user.key_id() == privileged.key_id());
+    assert_eq!(user.valid_before(), until);
+    // Then the cleanup login ends that id like a lease; its change report is ignored.
+    let RemoteAuth::Certificate { login, command, .. } = &calls[3].auth else { panic!("{calls:?}") };
+    assert_eq!((*login, *command, calls[3].stdin.clone()), ("asm-ops", None, format!("end {run} {until}\n")));
+    assert_eq!((cert(&calls[3]).valid_principals(), cert(&calls[3]).valid_before()),
+        ([format!("asm-{}-cleanup", f.target_id)].as_slice(), until));
 
+    // A failed shell check stops before the cleanup login.
+    let revision = f.core.list_ssh_targets().unwrap()[0].revision;
     f.remote.answer(out(0, "asm-enroll-ok\n", ""));
-    f.remote.answer(out(0, "asm-end-ok 0\n", ""));
     f.remote.answer(out(255, "", "asm-priv@web.example.com: Permission denied (publickey).\n"));
     let error = f.core.enroll_ssh_target(&f.target_id, revision).unwrap_err();
     assert!(error.message.starts_with("enrolled, but a test login as asm-priv failed"), "{}", error.message);
+    assert_eq!(f.remote.calls().len(), 6);
     let target = f.core.list_ssh_targets().unwrap().remove(0);
     assert_eq!(target.state, ffi::SshTargetState::Failed);
     assert!(target.error.unwrap().contains("Permission denied"));
+
+    // The cleanup login's `end` must report both counts.
+    f.remote.answer(out(0, "asm-enroll-ok\n", ""));
+    f.remote.answer(out(0, "", ""));
+    f.remote.answer(out(0, "", ""));
+    f.remote.answer(out(0, "asm-end-ok 0\n", ""));
+    let error = f.core.enroll_ssh_target(&f.target_id, revision).unwrap_err();
+    assert_eq!(error.message,
+        "enrolled, but a test login as asm-ops failed: host reported an unexpected result: asm-end-ok 0");
+}
+
+#[test]
+fn enrollment_without_shell_logins_checks_the_cleanup_login() {
+    let f = Fixture::new();
+    let db = f.add_target("db.example.com", false, &host_key());
+    let revision = f.core.list_ssh_targets().unwrap().into_iter().find(|t| t.id == db).unwrap().revision;
+    f.remote.answer(out(0, "asm-enroll-ok\n", ""));
+    f.remote.answer(out(0, "asm-end-ok 0\n", ""));
+    assert_eq!(f.core.enroll_ssh_target(&db, revision).unwrap().state, ffi::SshTargetState::Enrolled);
+    let calls = f.remote.calls();
+    assert_eq!(calls.len(), 2);
+    let RemoteAuth::Certificate { login, command, .. } = &calls[1].auth else { panic!("{calls:?}") };
+    assert_eq!((*login, *command, calls[1].stdin.as_str()), ("asm-ops", None, "check\n"));
+
+    f.remote.answer(out(0, "asm-enroll-ok\n", ""));
+    f.remote.answer(out(0, "asm-end-ok 1\n", ""));
+    assert_eq!(f.core.enroll_ssh_target(&db, revision).unwrap_err().message,
+        "enrolled, but a test login as asm-ops failed: host reported an unexpected result: asm-end-ok 1");
 }
 
 #[test]
@@ -825,7 +1156,7 @@ fn enrollment_refuses_an_unusable_route_before_changing_the_host() {
 fn enrolling_again_ends_the_targets_leases() {
     let f = Fixture::new();
     let result = f.lease();
-    let cert = certificate_blob(&result.certificate).unwrap();
+    let cert = certificate_blob(&result.targets[0].certificate).unwrap();
     let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
     let revision = f.core.list_ssh_targets().unwrap()[0].revision;
     f.remote.answer(out(3, "asm-enroll-error sshd sshd refused the configuration\n", ""));
@@ -841,11 +1172,11 @@ fn enrolling_again_ends_the_targets_leases() {
 fn removing_a_failed_target_ends_its_leases() {
     let f = Fixture::new();
     let result = f.lease();
-    let cert = certificate_blob(&result.certificate).unwrap();
+    let cert = certificate_blob(&result.targets[0].certificate).unwrap();
     let data = payload("asm-priv", "publickey", true, CERT_TYPE, &cert, b"");
     // As after an interrupted removal: the target failed with the lease still active.
     assert!(f.core.store.set_ssh_enrollment(&f.target_id, &[SshEnrollState::Enrolled], SshEnrollState::Failed,
-        None, None, Some("interrupted; run it again"), f.now()).unwrap());
+        None, None, None, Some("interrupted; run it again"), f.now()).unwrap());
     f.sign(&result.lease_id, &data).unwrap();
     f.core.remove_ssh_target(&f.target_id).unwrap();
     assert!(f.core.list_ssh_targets().unwrap().is_empty());

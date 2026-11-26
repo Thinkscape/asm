@@ -1,10 +1,12 @@
 //! SSH targets, the user CA, SSH leases, signing and session cleanup.
 //!
-//! An SSH lease is a per-lease Ed25519 key with an OpenSSH user certificate whose
-//! principals name role principals of exact enrolled targets. The key never leaves the
-//! manager: the CLI's ssh-agent forwards sign requests to `/v1/ssh/sign` while the lease
-//! is active. When a lease ends, the manager logs in to each target as `asm-ops` with a
-//! short-lived cleanup certificate, and the host ends the lease's recorded sessions.
+//! An SSH lease is a per-lease Ed25519 key with one OpenSSH user certificate per
+//! approved target, each naming that target's role principal for the access the
+//! operator chose there. The key never leaves the manager: the CLI's ssh-agent forwards
+//! sign requests to `/v1/ssh/sign` while the lease is active. When a lease ends, the
+//! manager logs in to each target as `asm-ops` with a short-lived cleanup certificate,
+//! and the host ends the lease's recorded sessions and reports watched files that
+//! changed during the lease.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
@@ -38,11 +40,13 @@ use crate::process::{OutputErrors, collect_output};
 use crate::proxy::write_private_atomic;
 use crate::ssh::cert::{CERT_TYPE, CertSpec, build_user_cert, cert_line};
 use crate::ssh::keys::SshKey;
-use crate::ssh::scripts::{EnrollParams, cleanup_stdin, is_target_id, render_enroll, render_remove, render_users};
+use crate::ssh::scripts::{
+    EnrollParams, cleanup_stdin, is_target_id, render_enroll, render_remove, render_users, scripts_version,
+};
 use crate::ssh::userauth::parse_userauth;
 use crate::store::{
     HostRecord, SshCleanup, SshCleanupState, SshEnrollState, SshGrant, SshGrantTarget, SshLeaseRecord,
-    SshTargetConfig, SshTargetRecord, validate_destination,
+    SshRequested, SshTargetConfig, SshTargetRecord, validate_destination,
 };
 
 const CA_NAMESPACE: &str = "ssh-ca-v1";
@@ -73,6 +77,8 @@ const SIGN_WINDOW: i64 = 60;
 const RETRY_MAX_SECS: i64 = 1800;
 const RETRY_FOR_SECS: i64 = 86_400;
 const HOST_TEXT_MAX: usize = 200;
+/// At most this many changed paths of a lease's end on one target are listed.
+const MAX_CHANGES: usize = 20;
 
 const SSH_OUTPUT: OutputErrors = OutputErrors {
     read: "Could not read ssh output",
@@ -822,6 +828,28 @@ fn host_result(
     Err(RemoteError::Host { code: "unexpected".into(), message: what })
 }
 
+/// What a host reported when a lease ended there.
+#[derive(Debug, PartialEq, Eq)]
+struct EndReport {
+    sessions: u64,
+    /// The watched paths that changed during the lease, at most `MAX_CHANGES`.
+    changes: Vec<String>,
+    changes_total: u32,
+}
+
+/// The output of `end LEASE VB`: `changed <path>` lines, then `asm-end-ok <ended> <changed>`.
+fn end_report(target: &SshTargetRecord, out: RemoteOutput) -> std::result::Result<EndReport, RemoteError> {
+    let changes: Vec<String> = out.stdout.lines().filter_map(|l| l.strip_prefix("changed ")).map(host_text)
+        .take(MAX_CHANGES + 1).collect();
+    let counts = host_result(target, out, "asm-end-ok", "asm-end-error", 2)?;
+    let changes_total = u32::try_from(counts[1]).unwrap_or(u32::MAX);
+    if changes.len() != (changes_total as usize).min(MAX_CHANGES) {
+        return Err(RemoteError::Host { code: "unexpected".into(),
+            message: format!("{changes_total} changed files, but {} listed", changes.len()) });
+    }
+    Ok(EndReport { sessions: counts[0], changes, changes_total })
+}
+
 pub(crate) struct SshState {
     ca: Mutex<Option<Arc<SshKey>>>,
     keys: Mutex<HashMap<String, Arc<SshKey>>>,
@@ -899,32 +927,49 @@ enum CertRole {
     CheckUser(String),
 }
 
-/// The operator's decision on an SSH request, as passed over FFI.
+/// The id and end that certificate runs present to the host: a check login's "lease".
+struct CertRun {
+    id: String,
+    until: i64,
+}
+
+/// The operator's decision on an SSH request, as passed over FFI: the access of each
+/// approved target, and the duration.
 pub(crate) struct SshApproval {
-    pub target_ids: Vec<String>,
-    pub access: SshAccess,
-    pub grants: Vec<String>,
-    pub user: Option<String>,
+    pub targets: Vec<ffi::SshTargetDecision>,
     pub duration_secs: u64,
 }
 
 fn target_allows(target: &SshTargetRecord, grant: &str) -> bool {
     let c = &target.config;
+    let listed = |list: &[String], value: &str| list.iter().any(|v| v == value);
     if let Some(unit) = grant.strip_prefix("logs:") {
-        return c.log_units.iter().any(|u| u == unit);
+        listed(&c.log_units, unit)
+    } else if let Some(unit) = grant.strip_prefix("restart:") {
+        listed(&c.restart_units, unit)
+    } else if let Some(unit) = grant.strip_prefix("reload:") {
+        listed(&c.reload_units, unit)
+    } else {
+        grant.strip_prefix("read:").is_some_and(|path| listed(&c.read_files, path))
     }
-    grant.strip_prefix("restart:").is_some_and(|unit| c.restart_units.iter().any(|u| u == unit))
 }
 
 fn target_grants(config: &SshTargetConfig) -> Vec<String> {
     config.log_units.iter().map(|u| format!("logs:{u}"))
         .chain(config.restart_units.iter().map(|u| format!("restart:{u}")))
+        .chain(config.reload_units.iter().map(|u| format!("reload:{u}")))
+        .chain(config.read_files.iter().map(|f| format!("read:{f}")))
         .collect()
 }
 
 /// Agents may log in to `target` as `user`.
 fn target_has_user(target: &SshTargetRecord, user: &str) -> bool {
     target.config.users.iter().any(|u| u.name == user)
+}
+
+/// `target` is enrolled with other host scripts than this asm ships.
+fn scripts_outdated(target: &SshTargetRecord) -> bool {
+    target.enroll_state == SshEnrollState::Enrolled && target.enrolled_scripts.as_deref() != Some(scripts_version())
 }
 
 /// `privileged`, the grants of restricted access, or `as <user>`.
@@ -934,6 +979,14 @@ pub(crate) fn access_summary(access: SshAccess, grants: &[String], user: Option<
         SshAccess::Restricted => grants.join(", "),
         SshAccess::User => format!("as {}", user.unwrap_or("-")),
     }
+}
+
+/// `nuk1 (as deploy), db (restricted)`: each target of a lease with its access.
+pub(crate) fn targets_text<'a>(targets: impl IntoIterator<Item = (&'a str, SshAccess, Option<&'a str>)>) -> String {
+    targets.into_iter().map(|(name, access, user)| match access {
+        SshAccess::User => format!("{name} (as {})", user.unwrap_or("-")),
+        access => format!("{name} ({})", access.as_str()),
+    }).collect::<Vec<_>>().join(", ")
 }
 
 fn host_key_fingerprint(line: &str) -> String {
@@ -958,39 +1011,39 @@ fn role_principal(target_id: &str, access: SshAccess) -> String {
     }
 }
 
-/// The forced command of a lease certificate valid until `until`.
-fn lease_command(id: &str, until: i64, grant: &SshGrant) -> String {
-    match grant.access {
+/// The forced command of a lease certificate for `target`, valid until `until`.
+fn lease_command(id: &str, until: i64, target: &SshGrantTarget) -> String {
+    match target.access {
         SshAccess::Privileged => format!("asm-shell lease={id} until={until}"),
-        SshAccess::User => format!("asm-shell lease={id} until={until} as={}", grant.user.as_deref().unwrap_or_default()),
-        SshAccess::Restricted => format!("asm-grant lease={id} until={until} {}", grant.grants.join(" ")),
+        SshAccess::User => format!("asm-shell lease={id} until={until} as={}", target.user.as_deref().unwrap_or_default()),
+        SshAccess::Restricted => format!("asm-grant lease={id} until={until} {}", target.grants.join(" ")),
     }
 }
 
-/// A lease certificate line for `key`, valid from `now - 60` until `until`.
-fn lease_certificate(ca: &SshKey, key: &SshKey, id: &str, grant: &SshGrant, now: i64, until: i64) -> Result<String> {
+/// One certificate line per lease target, all for `key` and valid from `now - 60` until
+/// `until`: target id → certificate.
+fn lease_certificates(ca: &SshKey, key: &SshKey, id: &str, grant: &SshGrant, now: i64, until: i64)
+    -> Result<BTreeMap<String, String>>
+{
     let key_id = format!("asm-lease-{id}");
-    let principals: Vec<String> = grant.targets.iter().map(|t| role_principal(&t.target_id, grant.access)).collect();
-    let command = lease_command(id, until, grant);
-    let blob = build_user_cert(ca, &key.public_key(), &CertSpec {
-        key_id: &key_id,
-        principals: &principals,
-        valid_after: now.saturating_sub(60).max(0) as u64,
-        valid_before: until.max(0) as u64,
-        force_command: Some(&command),
-        permit_pty: grant.access != SshAccess::Restricted,
-    })?;
-    Ok(cert_line(&blob, &key_id))
+    grant.targets.iter().map(|target| {
+        let command = lease_command(id, until, target);
+        let blob = build_user_cert(ca, &key.public_key(), &CertSpec {
+            key_id: &key_id,
+            principals: &[role_principal(&target.target_id, target.access)],
+            valid_after: now.saturating_sub(60).max(0) as u64,
+            valid_before: until.max(0) as u64,
+            force_command: Some(&command),
+            permit_pty: target.access != SshAccess::Restricted,
+        })?;
+        Ok((target.target_id.clone(), cert_line(&blob, &key_id)))
+    }).collect()
 }
 
 pub(crate) fn ssh_result(lease: &SshLeaseRecord) -> SshResult {
     SshResult {
         lease_id: lease.id.clone(),
         expires_at: fmt_unix(lease.expires_at),
-        access: lease.grant.access,
-        grants: lease.grant.grants.clone(),
-        user: lease.grant.user.clone(),
-        certificate: lease.certificate.clone(),
         targets: lease.grant.targets.iter().map(|t| SshTargetAccess {
             name: t.name.clone(),
             target_id: t.target_id.clone(),
@@ -998,6 +1051,10 @@ pub(crate) fn ssh_result(lease: &SshLeaseRecord) -> SshResult {
             hostname: t.hostname.clone(),
             port: t.port,
             host_keys: t.host_keys.clone(),
+            access: t.access,
+            grants: t.grants.clone(),
+            user: t.user.clone(),
+            certificate: lease.certificates.get(&t.target_id).cloned().unwrap_or_default(),
         }).collect(),
     }
 }
@@ -1006,11 +1063,27 @@ fn lease_names(lease: &SshLeaseRecord) -> String {
     lease.grant.targets.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
 }
 
-/// `privileged SSH lease`, `restricted SSH lease` or `SSH lease as <user>`.
-fn lease_kind(grant: &SshGrant) -> String {
-    match grant.access {
-        SshAccess::User => format!("SSH lease as {}", grant.user.as_deref().unwrap_or("-")),
-        access => format!("{} SSH lease", access.as_str()),
+/// Each target of a lease with its access (`targets_text`).
+fn lease_targets_text(grant: &SshGrant) -> String {
+    targets_text(grant.targets.iter().map(|t| (t.name.as_str(), t.access, t.user.as_deref())))
+}
+
+/// Per target of a lease, what its activity events record.
+fn lease_targets_detail(grant: &SshGrant) -> serde_json::Value {
+    json!(grant.targets.iter().map(|t| json!({
+        "name": t.name, "login": t.login, "access": t.access, "grants": t.grants, "user": t.user,
+    })).collect::<Vec<_>>())
+}
+
+impl SshRequested {
+    /// The request `d` as a lease records it: grants and target ids sorted.
+    fn of(d: &SshDetail) -> Self {
+        let mut grants = d.grants.clone();
+        grants.sort_unstable();
+        grants.dedup();
+        let mut target_ids: Vec<String> = d.targets.iter().map(|t| t.target_id.clone()).collect();
+        target_ids.sort_unstable();
+        Self { access: d.access, grants, user: d.user.clone(), target_ids }
     }
 }
 
@@ -1084,6 +1157,7 @@ impl Core {
             SshEnrollState::Enrolled if t.enrolled_ca.as_deref() != Some(self.ssh_ca()?.fingerprint().as_str()) => {
                 Some("enrolled with another CA key; enroll again")
             }
+            SshEnrollState::Enrolled if scripts_outdated(t) => Some("asm updated its host scripts; enroll again"),
             SshEnrollState::Enrolled => None,
         };
         Ok(issue.map(str::to_owned))
@@ -1109,7 +1183,7 @@ impl Core {
         let t = self.generation_now();
         for target in self.store.list_ssh_targets()? {
             self.store.set_ssh_enrollment(&target.id, &[SshEnrollState::Enrolling, SshEnrollState::Removing],
-                SshEnrollState::Failed, None, None, Some("interrupted; run it again"), t)?;
+                SshEnrollState::Failed, None, None, None, Some("interrupted; run it again"), t)?;
         }
         self.write_ssh_known_hosts()
     }
@@ -1124,6 +1198,7 @@ impl Core {
             SshEnrollState::Failed => ffi::SshTargetState::Failed,
             SshEnrollState::Removing => ffi::SshTargetState::Removing,
         };
+        let scripts_outdated = scripts_outdated(&t);
         let c = t.config;
         Ok(ffi::SshTargetInfo {
             active_leases: active.get(&t.id).copied().unwrap_or(0),
@@ -1140,11 +1215,14 @@ impl Core {
             }).collect(),
             log_units: c.log_units,
             restart_units: c.restart_units,
+            reload_units: c.reload_units,
+            read_files: c.read_files,
             max_duration_secs: c.max_duration_secs,
             users: c.users.into_iter().map(Into::into).collect(),
             revision: t.revision,
             state,
             error: t.enroll_error,
+            scripts_outdated,
         })
     }
 
@@ -1429,8 +1507,8 @@ impl Core {
             let value = value.trim();
             if value.is_empty() { name.clone() } else { value.to_owned() }
         };
-        let units = |units: &[String]| -> Vec<String> {
-            units.iter().map(|u| u.trim().to_owned()).filter(|u| !u.is_empty()).collect()
+        let trimmed = |values: &[String]| -> Vec<String> {
+            values.iter().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty()).collect()
         };
         let mut config = SshTargetConfig {
             destination: or_name(&draft.destination),
@@ -1439,8 +1517,10 @@ impl Core {
             privileged_login: draft.privileged_login.trim().to_owned(),
             allow_privileged: draft.allow_privileged,
             host_keys: draft.host_keys,
-            log_units: units(&draft.log_units),
-            restart_units: units(&draft.restart_units),
+            log_units: trimmed(&draft.log_units),
+            restart_units: trimmed(&draft.restart_units),
+            reload_units: trimmed(&draft.reload_units),
+            read_files: trimmed(&draft.read_files),
             max_duration_secs: draft.max_duration_secs,
             users: draft.users.into_iter().map(Into::into).collect(),
         };
@@ -1467,7 +1547,7 @@ impl Core {
                 self.store.insert_ssh_target(&SshTargetRecord {
                     id: id.clone(), name: name.clone(), config: config.clone(), revision: 1,
                     enroll_state: SshEnrollState::NotEnrolled, enrolled_revision: 0, enrolled_ca: None,
-                    enroll_at: None, enroll_error: None, created_at: t,
+                    enroll_at: None, enroll_error: None, created_at: t, enrolled_scripts: None,
                 })?;
                 (id, 1)
             }
@@ -1527,6 +1607,8 @@ impl Core {
             ca_fingerprint: &ca.fingerprint(),
             log_units: &c.log_units,
             restart_units: &c.restart_units,
+            reload_units: &c.reload_units,
+            read_files: &c.read_files,
             users: &c.users.iter().map(|u| (u.name.clone(), u.admin.is_some())).collect::<Vec<_>>(),
             agent_hostname: &c.agent_hostname,
             agent_port: c.agent_port,
@@ -1550,14 +1632,19 @@ impl Core {
         self.remote().run(target, &RemoteAuth::Operator { dir: run.0.clone() }, stdin, timeout)
     }
 
-    /// Log in to `target` with a fresh short-lived certificate for `role`.
-    fn certificate_run(&self, target: &SshTargetRecord, role: CertRole, stdin: &str)
+    /// A new run id, ending `RUN_CERT_SECS` from now.
+    fn cert_run(&self) -> CertRun {
+        CertRun { id: new_uuid_v4(), until: self.generation_now().saturating_add(RUN_CERT_SECS) }
+    }
+
+    /// Log in to `target` with a fresh short-lived certificate for `role`, valid until
+    /// `run.until`; a check login presents `run.id` as its lease.
+    fn certificate_run(&self, target: &SshTargetRecord, role: CertRole, run: &CertRun, stdin: &str)
         -> std::result::Result<RemoteOutput, RemoteError>
     {
         let local = |e: CoreError| RemoteError::Local(e.message);
         let now = self.generation_now();
-        let run_id = new_uuid_v4();
-        let until = now.saturating_add(RUN_CERT_SECS);
+        let (run_id, until) = (&run.id, run.until);
         let (key_id, principal, command, login, remote_command) = match role {
             CertRole::Cleanup => (format!("asm-cleanup-{run_id}"), format!("asm-{}-cleanup", target.id), None,
                 RESTRICTED_LOGIN, None),
@@ -1575,7 +1662,7 @@ impl Core {
             force_command: command.as_deref(),
             permit_pty: false,
         }).map_err(local)?;
-        let dir = self.dirs.ssh_run.join(&run_id);
+        let dir = self.dirs.ssh_run.join(new_uuid_v4());
         std::fs::DirBuilder::new().mode(0o700).create(&dir)
             .map_err(|e| RemoteError::Local(format!("could not create {}: {e}", dir.display())))?;
         let guard = RunDir(dir);
@@ -1587,18 +1674,13 @@ impl Core {
         self.remote().run(target, &auth, stdin, CLEANUP_TIMEOUT)
     }
 
-    /// Enrollment's test logins: the cleanup login, `asm-priv` when privileged access is
-    /// allowed, and `asm-priv` as each user. The error names the login that failed.
+    /// Enrollment's test logins, all under one run id: `asm-priv` when privileged access is
+    /// allowed and `asm-priv` as each user (each registers under the id, so the host also
+    /// records the files it watches), then the cleanup login, which ends the id like a
+    /// lease and so drops that record (`check` when there was no shell login). The error
+    /// names the login that failed.
     fn check_enrollment(&self, target: &SshTargetRecord) -> std::result::Result<(), (String, RemoteError)> {
-        let ops = || RESTRICTED_LOGIN.to_owned();
-        let out = self.certificate_run(target, CertRole::Cleanup, "check\n").map_err(|e| (ops(), e))?;
-        match self.track_host_key(target, host_result(target, out, "asm-end-ok", "asm-end-error", 1)) {
-            Ok(n) if n == [0] => {}
-            Ok(n) => return Err((ops(), RemoteError::Host {
-                code: "unexpected".into(), message: format!("asm-end-ok {}", n[0]),
-            })),
-            Err(e) => return Err((ops(), e)),
-        }
+        let run = self.cert_run();
         let mut shells = Vec::new();
         if target.config.allow_privileged {
             shells.push((CertRole::CheckPrivileged, PRIVILEGED_LOGIN.to_owned()));
@@ -1606,8 +1688,15 @@ impl Core {
         for user in &target.config.users {
             shells.push((CertRole::CheckUser(user.name.clone()), format!("{PRIVILEGED_LOGIN} as {}", user.name)));
         }
+        let ops = || RESTRICTED_LOGIN.to_owned();
+        let ending = !shells.is_empty();
+        let stdin = if ending {
+            cleanup_stdin(&run.id, run.until).map_err(|e| (ops(), RemoteError::Local(e.message)))?
+        } else {
+            "check\n".to_owned()
+        };
         for (role, login) in shells {
-            let out = self.certificate_run(target, role, "").map_err(|e| (login.clone(), e))?;
+            let out = self.certificate_run(target, role, &run, "").map_err(|e| (login.clone(), e))?;
             let why = || last_line(&out.stderr).map_or_else(|| format!("exit status {}", out.status), host_text);
             match out.status {
                 0 => {}
@@ -1619,7 +1708,16 @@ impl Core {
                 _ => return Err((login, RemoteError::Host { code: "unexpected".into(), message: why() })),
             }
         }
-        Ok(())
+        let out = self.certificate_run(target, CertRole::Cleanup, &run, &stdin).map_err(|e| (ops(), e))?;
+        // `end` reports two counts (sessions ended, files changed; the paths are left
+        // out), `check` one zero.
+        let counts = if ending { 2 } else { 1 };
+        match self.track_host_key(target, host_result(target, out, "asm-end-ok", "asm-end-error", counts)) {
+            Ok(_) if ending => Ok(()),
+            Ok(n) if n == [0] => Ok(()),
+            Ok(n) => Err((ops(), RemoteError::Host { code: "unexpected".into(), message: format!("asm-end-ok {}", n[0]) })),
+            Err(e) => Err((ops(), e)),
+        }
     }
 
     pub fn enroll_ssh_target(&self, id: &str, expected_revision: u64) -> Result<ffi::SshTargetInfo> {
@@ -1633,7 +1731,7 @@ impl Core {
         // A route certificate runs refuse must fail enrollment before the host is changed.
         self.remote().check_route(&target, &self.ssh_run_dir()?.0)?;
         if !self.store.set_ssh_enrollment(id, &[SshEnrollState::NotEnrolled, SshEnrollState::Failed, SshEnrollState::Enrolled],
-            SshEnrollState::Enrolling, None, None, None, self.generation_now())?
+            SshEnrollState::Enrolling, None, None, None, None, self.generation_now())?
         {
             return Err(CoreError::invalid("this SSH target is being enrolled or removed"));
         }
@@ -1654,14 +1752,15 @@ impl Core {
         let result = match outcome {
             Ok(()) => {
                 self.store.set_ssh_enrollment(id, &[SshEnrollState::Enrolling], SshEnrollState::Enrolled,
-                    Some(target.revision), Some(&ca), None, t)?;
+                    Some(target.revision), Some(&ca), Some(scripts_version()), None, t)?;
                 self.log(ssh_event("enrolled", format!("SSH target {} enrolled", target.name))
-                    .detail(json!({ "target_id": id, "name": target.name, "revision": target.revision, "ca": ca })));
+                    .detail(json!({ "target_id": id, "name": target.name, "revision": target.revision, "ca": ca,
+                        "scripts": scripts_version() })));
                 Ok(())
             }
             Err(message) => {
                 self.store.set_ssh_enrollment(id, &[SshEnrollState::Enrolling], SshEnrollState::Failed,
-                    None, None, Some(&message), t)?;
+                    None, None, None, Some(&message), t)?;
                 self.log(ssh_event("enroll_failed", format!("enrolling SSH target {} failed: {message}", target.name))
                     .detail(json!({ "target_id": id, "name": target.name, "message": message })));
                 Err(CoreError::vault_unavailable(message))
@@ -1681,7 +1780,7 @@ impl Core {
             let authority = lock(&self.authorization);
             if !self.store.set_ssh_enrollment(id,
                 &[SshEnrollState::NotEnrolled, SshEnrollState::Enrolled, SshEnrollState::Failed],
-                SshEnrollState::Removing, None, None, None, self.generation_now())?
+                SshEnrollState::Removing, None, None, None, None, self.generation_now())?
             {
                 return Err(CoreError::invalid("this SSH target is being enrolled or removed"));
             }
@@ -1706,7 +1805,7 @@ impl Core {
         let result = match outcome {
             Ok(n) => {
                 self.store.set_ssh_enrollment(id, &[SshEnrollState::Removing], SshEnrollState::NotEnrolled,
-                    None, None, None, t)?;
+                    None, None, None, None, t)?;
                 let detail = format!("host reported: asm removed; ended {} sessions", n[0]);
                 {
                     let _authority = lock(&self.authorization);
@@ -1715,8 +1814,7 @@ impl Core {
                         if entry.state != SshCleanupState::Pending {
                             continue;
                         }
-                        *entry = SshCleanup { state: SshCleanupState::Done, at: t, detail: detail.clone(),
-                            attempts: entry.attempts, due: 0 };
+                        *entry = SshCleanup::new(SshCleanupState::Done, t, detail.clone(), entry.attempts, 0);
                         self.store.set_ssh_cleanup(&lease.id, &lease.cleanup)?;
                     }
                 }
@@ -1726,7 +1824,7 @@ impl Core {
             }
             Err(message) => {
                 self.store.set_ssh_enrollment(id, &[SshEnrollState::Removing], SshEnrollState::Failed,
-                    None, None, Some(&message), t)?;
+                    None, None, None, Some(&message), t)?;
                 self.log(ssh_event("unenroll_failed",
                     format!("removing asm from SSH target {} failed: {message}", target.name))
                     .detail(json!({ "target_id": id, "name": target.name, "message": message })));
@@ -1738,15 +1836,16 @@ impl Core {
         result
     }
 
-    /// Test seam: mark a target enrolled for its current revision and CA without
-    /// touching the host.
+    /// Test seam: mark a target enrolled for its current revision, CA and host scripts
+    /// without touching the host.
     #[doc(hidden)]
     pub fn install_ssh_target_enrollment(&self, id: &str) -> Result<()> {
         let target = self.store.get_ssh_target(id)?.ok_or_else(|| CoreError::not_found("no such SSH target"))?;
         let ca = self.ssh_ca()?.fingerprint();
         self.store.set_ssh_enrollment(id, &[SshEnrollState::NotEnrolled, SshEnrollState::Enrolling,
             SshEnrollState::Enrolled, SshEnrollState::Failed, SshEnrollState::Removing],
-            SshEnrollState::Enrolled, Some(target.revision), Some(&ca), None, self.generation_now())?;
+            SshEnrollState::Enrolled, Some(target.revision), Some(&ca), Some(scripts_version()), None,
+            self.generation_now())?;
         self.notify(TOPIC_SSH_TARGETS);
         Ok(())
     }
@@ -1815,20 +1914,15 @@ impl Core {
         self.push_pending(pending, move |q| q.agent == agent && matches!(&q.detail, Detail::Ssh(d) if d.same_request(&detail)))
     }
 
-    /// An active lease of this host with exactly the requested access, targets and
-    /// grants, at the targets' current revisions, with at least a minute left.
+    /// An active lease of this host made for exactly this request (access, grants, user
+    /// and targets), whatever the operator approved then, with every granted target at
+    /// its current revision and at least a minute left.
     fn reusable_ssh_lease(&self, host_id: &str, detail: &SshDetail) -> Result<Option<SshLeaseRecord>> {
         let now = self.generation_now();
-        let mut wanted: Vec<&str> = detail.targets.iter().map(|t| t.target_id.as_str()).collect();
-        wanted.sort_unstable();
+        let requested = SshRequested::of(detail);
         let mut best: Option<SshLeaseRecord> = None;
         for lease in self.store.active_ssh_leases(now)? {
-            let mut have: Vec<&str> = lease.grant.targets.iter().map(|t| t.target_id.as_str()).collect();
-            have.sort_unstable();
-            if lease.host_id != host_id || lease.grant.access != detail.access || have != wanted
-                || lease.grant.grants != detail.grants || lease.grant.user != detail.user
-                || lease.expires_at - now < MIN_LEASE_LEFT
-            {
+            if lease.host_id != host_id || lease.grant.requested != requested || lease.expires_at - now < MIN_LEASE_LEFT {
                 continue;
             }
             let mut current = true;
@@ -1842,8 +1936,9 @@ impl Core {
         Ok(best)
     }
 
-    /// One target of an approval popup as configured now, and its longest lease.
-    fn ssh_approval_target(&self, target_id: &str, name: &str, revision: u64) -> (ffi::SshApprovalTarget, Option<u64>) {
+    /// One target of an approval popup as configured now (`max_duration_secs` 0 when it
+    /// was removed).
+    fn ssh_approval_target(&self, target_id: &str, name: &str, revision: u64) -> ffi::SshApprovalTarget {
         match self.store.get_ssh_target(target_id).ok().flatten() {
             Some(t) => {
                 let issue = if t.revision != revision {
@@ -1851,8 +1946,7 @@ impl Core {
                 } else {
                     self.ssh_target_issue(&t).unwrap_or_else(|e| Some(e.message))
                 };
-                let max = t.config.max_duration_secs;
-                (ffi::SshApprovalTarget {
+                ffi::SshApprovalTarget {
                     ready: issue.is_none(),
                     issue,
                     host_key_fingerprints: t.config.host_keys.iter().map(|k| host_key_fingerprint(k)).collect(),
@@ -1864,99 +1958,112 @@ impl Core {
                     allow_privileged: t.config.allow_privileged,
                     log_units: t.config.log_units,
                     restart_units: t.config.restart_units,
+                    reload_units: t.config.reload_units,
+                    read_files: t.config.read_files,
                     users: t.config.users.into_iter().map(Into::into).collect(),
-                }, Some(max))
+                    max_duration_secs: t.config.max_duration_secs,
+                }
             }
-            None => (ffi::SshApprovalTarget {
+            None => ffi::SshApprovalTarget {
                 target_id: target_id.to_owned(), name: name.to_owned(), hostname: String::new(), port: 0,
                 privileged_login: String::new(), allow_privileged: false, log_units: Vec::new(),
-                restart_units: Vec::new(), users: Vec::new(), ready: false, issue: Some("target was removed".into()),
-                host_key_fingerprints: Vec::new(),
-            }, None),
+                restart_units: Vec::new(), reload_units: Vec::new(), read_files: Vec::new(), users: Vec::new(),
+                ready: false, issue: Some("target was removed".into()), host_key_fingerprints: Vec::new(),
+                max_duration_secs: 0,
+            },
         }
     }
 
+    /// The longest lease all `targets` allow (removed ones aside), and the default
+    /// duration within it.
+    fn ssh_durations<'a>(targets: impl IntoIterator<Item = &'a ffi::SshApprovalTarget>, default_duration: Option<u64>)
+        -> (u64, u64)
+    {
+        let max = targets.into_iter().map(|t| t.max_duration_secs).filter(|m| *m > 0).min().unwrap_or(DEFAULT_LEASE_SECS);
+        (default_duration.unwrap_or(DEFAULT_LEASE_SECS).min(max), max)
+    }
+
     pub(super) fn ssh_approval_detail(&self, d: &SshDetail, default_duration: Option<u64>) -> ffi::RequestDetail {
-        let mut targets = Vec::with_capacity(d.targets.len());
-        let mut max: Option<u64> = None;
-        for wanted in &d.targets {
-            let (target, target_max) = self.ssh_approval_target(&wanted.target_id, &wanted.name, wanted.revision);
-            if let Some(m) = target_max {
-                max = Some(max.map_or(m, |x| x.min(m)));
-            }
-            targets.push(target);
-        }
-        let max = max.unwrap_or(DEFAULT_LEASE_SECS);
+        let targets: Vec<ffi::SshApprovalTarget> = d.targets.iter()
+            .map(|t| self.ssh_approval_target(&t.target_id, &t.name, t.revision)).collect();
+        let (default_duration_secs, max_duration_secs) = Self::ssh_durations(&targets, default_duration);
         ffi::RequestDetail::Ssh {
             reason: d.reason.clone(),
             access: d.access.into(),
             grants: d.grants.clone(),
             user: d.user.clone(),
             targets,
-            default_duration_secs: default_duration.unwrap_or(DEFAULT_LEASE_SECS).min(max),
-            max_duration_secs: max,
+            default_duration_secs,
+            max_duration_secs,
         }
     }
 
-    /// The operator may approve a subset of the targets and any access they all allow:
-    /// privileged, restricted with grants, or a user. A restricted request's grants are a
-    /// ceiling for restricted access.
+    /// The operator decides per requested target: left out (denied), or approved with its
+    /// own access (privileged, restricted with grants, or one of its users). A restricted
+    /// request's grants are a ceiling for restricted access.
     pub(super) fn approve_ssh(&self, p: &Pending, d: &SshDetail, a: SshApproval) -> std::result::Result<(), Fail> {
-        // 1. The decision itself.
-        let selected: Vec<&SshDetailTarget> = d.targets.iter().filter(|t| a.target_ids.contains(&t.target_id)).collect();
-        if selected.is_empty() || a.target_ids.iter().any(|id| !d.targets.iter().any(|t| &t.target_id == id)) {
+        // 1. The decisions themselves, in request order.
+        if a.targets.is_empty() {
             return Err(CoreError::invalid("choose at least one of the requested SSH targets").into());
         }
-        let mut grants = a.grants;
-        asm_proto::ssh::validate_access(a.access, &grants, a.user.as_deref())?;
-        if a.access == SshAccess::Restricted && d.access == SshAccess::Restricted
-            && grants.iter().any(|g| !d.grants.contains(g))
-        {
-            return Err(CoreError::invalid("approve only grants the request asked for").into());
+        let mut decisions: Vec<(&SshDetailTarget, SshAccess, Vec<String>, Option<String>)> = Vec::new();
+        for decision in a.targets {
+            let wanted = d.targets.iter().find(|t| t.target_id == decision.target_id)
+                .filter(|w| !decisions.iter().any(|(t, ..)| t.target_id == w.target_id))
+                .ok_or_else(|| CoreError::invalid("approve only the requested SSH targets, each at most once"))?;
+            let access = SshAccess::from(decision.access);
+            let mut grants = decision.grants;
+            asm_proto::ssh::validate_access(access, &grants, decision.user.as_deref())?;
+            if access == SshAccess::Restricted && d.access == SshAccess::Restricted
+                && grants.iter().any(|g| !d.grants.contains(g))
+            {
+                return Err(CoreError::invalid("approve only grants the request asked for").into());
+            }
+            grants.sort_unstable();
+            grants.dedup();
+            decisions.push((wanted, access, grants, decision.user));
         }
-        grants.sort_unstable();
-        grants.dedup();
+        decisions.sort_by_key(|(wanted, ..)| d.targets.iter().position(|t| t.target_id == wanted.target_id));
 
-        // 2. Under authorization: current targets, the grant, the key and the certificate.
+        // 2. Under authorization: current targets, the grant, the key and the certificates.
         let (lease, key, result) = {
             let _authority = lock(&self.authorization);
-            let mut targets = Vec::with_capacity(selected.len());
-            for wanted in &selected {
+            let mut targets = Vec::with_capacity(decisions.len());
+            let mut max = u64::MAX;
+            for (wanted, access, grants, user) in decisions {
                 let changed = || Fail::Keep(CoreError::invalid(
                     format!("SSH target {} changed; review the request again", wanted.name)));
                 let target = self.store.get_ssh_target(&wanted.target_id)?.ok_or_else(changed)?;
                 if target.revision != wanted.revision || !self.ssh_target_ready(&target)? {
                     return Err(changed());
                 }
-                target_refusal(&target, a.access, &grants, a.user.as_deref())?;
-                targets.push(target);
+                target_refusal(&target, access, &grants, user.as_deref())?;
+                max = max.min(target.config.max_duration_secs);
+                targets.push(SshGrantTarget {
+                    target_id: target.id,
+                    name: target.name,
+                    revision: target.revision,
+                    login: access.login().to_owned(),
+                    hostname: target.config.agent_hostname,
+                    port: target.config.agent_port,
+                    host_keys: target.config.host_keys,
+                    access,
+                    grants,
+                    user,
+                });
             }
-            let max = targets.iter().map(|t| t.config.max_duration_secs).min().unwrap_or(60);
             if a.duration_secs < 60 || a.duration_secs > max {
                 return Err(CoreError::invalid(format!("choose a duration between 1 minute and {} minutes", max / 60)).into());
             }
             let now = self.generation_now();
             let id = new_uuid_v4();
             let expires_at = now.saturating_add(a.duration_secs as i64);
-            let grant = SshGrant {
-                access: a.access,
-                targets: targets.iter().map(|t| SshGrantTarget {
-                    target_id: t.id.clone(),
-                    name: t.name.clone(),
-                    revision: t.revision,
-                    login: a.access.login().to_owned(),
-                    hostname: t.config.agent_hostname.clone(),
-                    port: t.config.agent_port,
-                    host_keys: t.config.host_keys.clone(),
-                }).collect(),
-                grants,
-                user: a.user,
-            };
+            let grant = SshGrant { requested: SshRequested::of(d), targets };
             let key = SshKey::generate();
-            let certificate = lease_certificate(&*self.ssh_ca()?, &key, &id, &grant, now, expires_at)?;
+            let certificates = lease_certificates(&*self.ssh_ca()?, &key, &id, &grant, now, expires_at)?;
             let lease = SshLeaseRecord {
                 id: id.clone(), host_id: p.host_id.clone().unwrap_or_default(), agent: p.agent.clone(),
-                reason: d.reason.clone(), grant, certificate, created_at: now, expires_at,
+                reason: d.reason.clone(), grant, certificates, created_at: now, expires_at,
                 revoked_at: None, ended_at: None, cleanup: BTreeMap::new(),
             };
             let sealed_key = self.resume.seal(KEY_NAMESPACE, &id, &SavedSeed { seed: key.seed_b64().to_string() })?;
@@ -1975,12 +2082,10 @@ impl Core {
         lock(&self.ssh.keys).insert(lease.id.clone(), Arc::new(key));
         self.lease_wake.notify_one();
         self.notify(TOPIC_LEASES);
-        self.log(ssh_event("lease_created", format!("{} on {}, {}", lease_kind(&lease.grant),
-            lease_names(&lease), activity::fmt_duration(Some(lease.expires_at - lease.created_at))))
+        self.log(ssh_event("lease_created", format!("SSH lease on {}, {}", lease_targets_text(&lease.grant),
+            activity::fmt_duration(Some(lease.expires_at - lease.created_at))))
             .host(Some(&lease.host_id))
-            .detail(json!({ "lease_id": lease.id, "access": lease.grant.access, "grants": lease.grant.grants,
-                "user": lease.grant.user,
-                "targets": lease.grant.targets.iter().map(|t| json!({ "name": t.name, "login": t.login })).collect::<Vec<_>>(),
+            .detail(json!({ "lease_id": lease.id, "targets": lease_targets_detail(&lease.grant),
                 "expires_at": fmt_unix(lease.expires_at) })));
         self.log(activity::approved(p, Some(&RequestResult::Ssh(result)), self.generation_now()));
         self.notify_request_ended();
@@ -2015,30 +2120,23 @@ impl Core {
     {
         let now = self.generation_now();
         let lease = self.store.get_ssh_lease(&d.lease_id).ok().flatten();
-        let mut targets = Vec::new();
-        let mut max: Option<u64> = None;
-        if let Some(lease) = &lease {
-            for t in &lease.grant.targets {
-                let (target, target_max) = self.ssh_approval_target(&t.target_id, &t.name, t.revision);
-                if let Some(m) = target_max {
-                    max = Some(max.map_or(m, |x| x.min(m)));
-                }
-                targets.push(target);
-            }
-        }
-        let max = max.unwrap_or(DEFAULT_LEASE_SECS);
+        let targets: Vec<ffi::SshExtendTarget> = lease.iter().flat_map(|l| &l.grant.targets).map(|t| ffi::SshExtendTarget {
+            target: self.ssh_approval_target(&t.target_id, &t.name, t.revision),
+            access: t.access.into(),
+            grants: t.grants.clone(),
+            user: t.user.clone(),
+        }).collect();
+        let (default_duration_secs, max_duration_secs) =
+            Self::ssh_durations(targets.iter().map(|t| &t.target), default_duration);
         let active = lease.as_ref().is_some_and(|l| l.is_active(now));
         ffi::RequestDetail::SshExtend {
             lease_id: d.lease_id.clone(),
             reason: d.reason.clone(),
-            access: lease.as_ref().map_or(SshAccess::Restricted, |l| l.grant.access).into(),
-            grants: lease.as_ref().map(|l| l.grant.grants.clone()).unwrap_or_default(),
-            user: lease.as_ref().and_then(|l| l.grant.user.clone()),
             targets,
             expires_at: super::to_system_time(lease.as_ref().map_or(now, |l| l.expires_at)),
             issue: (!active).then(|| "the lease has ended".to_owned()),
-            default_duration_secs: default_duration.unwrap_or(DEFAULT_LEASE_SECS).min(max),
-            max_duration_secs: max,
+            default_duration_secs,
+            max_duration_secs,
         }
     }
 
@@ -2057,7 +2155,7 @@ impl Core {
                 let changed = || Fail::Deny(format!("SSH target {} changed; request a new lease", t.name));
                 let target = self.store.get_ssh_target(&t.target_id)?.ok_or_else(changed)?;
                 if target.revision != t.revision || !self.ssh_target_ready(&target)?
-                    || (lease.grant.access == SshAccess::Privileged && !target.config.allow_privileged)
+                    || target_refusal(&target, t.access, &t.grants, t.user.as_deref()).is_err()
                 {
                     return Err(changed());
                 }
@@ -2071,9 +2169,9 @@ impl Core {
                 return Err(CoreError::invalid("the lease already ends later; choose a longer duration").into());
             }
             let key = self.ssh_lease_key(&lease.id)?;
-            let certificate = lease_certificate(&*self.ssh_ca()?, &key, &lease.id, &lease.grant, now, expires_at)?;
+            let certificates = lease_certificates(&*self.ssh_ca()?, &key, &lease.id, &lease.grant, now, expires_at)?;
             let from = lease.expires_at;
-            let lease = SshLeaseRecord { expires_at, certificate, ..lease };
+            let lease = SshLeaseRecord { expires_at, certificates, ..lease };
             let result = ssh_result(&lease);
             let mut state = p.state_for(&p.id, RequestStatus::Approved);
             state.result = Some(RequestResult::Ssh(result.clone()));
@@ -2081,7 +2179,7 @@ impl Core {
             let sealed_done = self.seal_done(&p.id, &done)?;
             let history = p.history(RequestStatus::Approved, None, now);
             self.complete_pending_locked(&mut lock(&self.book), done, [sealed_done], |rows|
-                self.store.extend_ssh_lease_with_request(&lease.id, from, expires_at, &lease.certificate, rows,
+                self.store.extend_ssh_lease_with_request(&lease.id, from, expires_at, &lease.certificates, rows,
                     &history))?;
             (lease, from, result)
         };
@@ -2090,7 +2188,8 @@ impl Core {
         self.log(ssh_event("lease_extended", format!("SSH lease on {} extended to {}", lease_names(&lease),
             fmt_unix(lease.expires_at)))
             .host(Some(&lease.host_id))
-            .detail(json!({ "lease_id": lease.id, "from": fmt_unix(from), "to": fmt_unix(lease.expires_at) })));
+            .detail(json!({ "lease_id": lease.id, "from": fmt_unix(from), "to": fmt_unix(lease.expires_at),
+                "targets": lease_targets_detail(&lease.grant) })));
         self.log(activity::approved(p, Some(&RequestResult::Ssh(result)), self.generation_now()));
         self.notify_request_ended();
         Ok(())
@@ -2161,28 +2260,25 @@ impl Core {
         if auth.alg != CERT_TYPE {
             return Err(refuse("unexpected key algorithm"));
         }
-        if certificate_blob(&lease.certificate).as_deref() != Some(auth.key_blob) {
-            return Err(refuse("the request is not for this lease's certificate"));
-        }
-        let logins: Vec<&SshGrantTarget> = lease.grant.targets.iter().filter(|t| t.login == auth.user).collect();
-        if logins.is_empty() {
+        let target = lease.grant.targets.iter()
+            .find(|t| lease.certificates.get(&t.target_id).and_then(|c| certificate_blob(c)).as_deref() == Some(auth.key_blob))
+            .ok_or_else(|| refuse("the request is not for this lease's certificate"))?;
+        if target.login != auth.user {
             return Err(refuse(&format!("login {} is not part of this lease", auth.user)));
         }
-        for target in &logins {
-            if self.store.get_ssh_target(&target.target_id)?.is_none_or(|t| t.revision != target.revision) {
-                return Err(refuse("the SSH target changed; request a new lease"));
-            }
+        if self.store.get_ssh_target(&target.target_id)?.is_none_or(|t| t.revision != target.revision) {
+            return Err(refuse("the SSH target changed; request a new lease"));
         }
         if let Some(host_key) = auth.host_key
-            && !logins.iter().any(|t| t.host_keys.iter().any(|k| host_key_blob(k).as_deref() == Some(host_key)))
+            && !target.host_keys.iter().any(|k| host_key_blob(k).as_deref() == Some(host_key))
         {
             return Err(refuse("the request is for a host this lease does not pin"));
         }
         let key = self.ssh_lease_key(&lease.id)?;
         let signature = key.sign_blob(&data);
-        let event = ssh_event("signed", format!("SSH signature for {} on {}", auth.user, lease_names(&lease)))
+        let event = ssh_event("signed", format!("SSH signature for {} on {}", auth.user, target.name))
             .host(Some(&host.id))
-            .detail(json!({ "lease_id": lease.id, "login": auth.user }));
+            .detail(json!({ "lease_id": lease.id, "target_id": target.target_id, "login": auth.user }));
         Ok((SshSignResponse { signature: b64_encode(&signature) }, event))
     }
 
@@ -2204,9 +2300,9 @@ impl Core {
     pub(crate) fn end_ssh_lease_locked(&self, id: &str, reason: &str, _authority: &MutexGuard<'_, ()>) -> Result<bool> {
         let Some(lease) = self.store.get_ssh_lease(id)? else { return Ok(false) };
         let now = self.generation_now();
-        let cleanup: BTreeMap<String, SshCleanup> = lease.grant.targets.iter().map(|t| (t.target_id.clone(), SshCleanup {
-            state: SshCleanupState::Pending, at: now, detail: String::new(), attempts: 0, due: 0,
-        })).collect();
+        let cleanup: BTreeMap<String, SshCleanup> = lease.grant.targets.iter()
+            .map(|t| (t.target_id.clone(), SshCleanup::new(SshCleanupState::Pending, now, String::new(), 0, 0)))
+            .collect();
         let expired = reason == "expired";
         if !self.store.end_ssh_lease(id, (!expired).then_some(now), now, &cleanup)? {
             return Ok(false);
@@ -2283,7 +2379,7 @@ impl Core {
             let now = self.generation_now();
             let mut changed = false;
             for entry in lease.cleanup.values_mut().filter(|c| c.state == SshCleanupState::Failed) {
-                *entry = SshCleanup { state: SshCleanupState::Pending, at: now, detail: String::new(), attempts: 0, due: 0 };
+                *entry = SshCleanup::new(SshCleanupState::Pending, now, String::new(), 0, 0);
                 changed = true;
             }
             if !changed {
@@ -2356,28 +2452,29 @@ impl Core {
         let outcome = match self.store.get_ssh_target(target_id) {
             Ok(Some(target)) => cleanup_stdin(&lease.id, lease.expires_at)
                 .map_err(|e| RemoteError::Local(e.message))
-                .and_then(|stdin| self.certificate_run(&target, CertRole::Cleanup, &stdin))
-                .and_then(|out| self.track_host_key(&target, host_result(&target, out, "asm-end-ok", "asm-end-error", 1)))
-                .map(|n| n[0]),
+                .and_then(|stdin| self.certificate_run(&target, CertRole::Cleanup, &self.cert_run(), &stdin))
+                .and_then(|out| self.track_host_key(&target, end_report(&target, out))),
             Ok(None) => Err(RemoteError::Local("the target was removed from asm".into())),
             Err(error) => Err(RemoteError::Local(error.message)),
         };
         let now = self.generation_now();
         let next = match outcome {
-            Ok(n) => SshCleanup { state: SshCleanupState::Done, at: now,
-                detail: format!("host reported: ended {n} sessions"), attempts: previous.attempts, due: 0 },
+            Ok(report) => SshCleanup {
+                changes: report.changes,
+                changes_total: report.changes_total,
+                ..SshCleanup::new(SshCleanupState::Done, now, format!("host reported: ended {} sessions", report.sessions),
+                    previous.attempts, 0)
+            },
             Err(e) if e.is_transient() && lease.ended_at.is_some_and(|ended| now > ended + RETRY_FOR_SECS) => {
-                SshCleanup { state: SshCleanupState::Failed, at: now,
-                    detail: format!("could not reach the host for 24 hours: {e}"), attempts: previous.attempts + 1, due: 0 }
+                SshCleanup::new(SshCleanupState::Failed, now, format!("could not reach the host for 24 hours: {e}"),
+                    previous.attempts + 1, 0)
             }
             Err(e) if e.is_transient() => {
                 let attempts = previous.attempts + 1;
                 let backoff = 60i64.saturating_mul(1i64 << (attempts - 1).min(20)).min(RETRY_MAX_SECS);
-                SshCleanup { state: SshCleanupState::Pending, at: now, detail: e.to_string(), attempts,
-                    due: now + backoff }
+                SshCleanup::new(SshCleanupState::Pending, now, e.to_string(), attempts, now + backoff)
             }
-            Err(e) => SshCleanup { state: SshCleanupState::Failed, at: now, detail: e.to_string(),
-                attempts: previous.attempts, due: 0 },
+            Err(e) => SshCleanup::new(SshCleanupState::Failed, now, e.to_string(), previous.attempts, 0),
         };
         let recorded = (|| -> Result<bool> {
             let _authority = lock(&self.authorization);
@@ -2409,6 +2506,18 @@ impl Core {
             "lease_id": lease.id, "target_id": target_id, "name": name, "state": next.state,
             "attempts": next.attempts, "detail": next.detail,
         })));
+        if let Some(first) = next.changes.first() {
+            let more = next.changes_total.saturating_sub(1);
+            let summary = if more > 0 {
+                format!("Files changed on {name} during an SSH lease: {first} and {more} more")
+            } else {
+                format!("Files changed on {name} during an SSH lease: {first}")
+            };
+            self.log(ssh_event("files_changed", summary).host(Some(&lease.host_id)).detail(json!({
+                "lease_id": lease.id, "target_id": target_id, "name": name, "changes": next.changes,
+                "total": next.changes_total,
+            })));
+        }
     }
 
     // ---- lease list ----
@@ -2443,16 +2552,18 @@ impl Core {
                 credential_version: None,
                 suspension_reason: None,
                 ssh: Some(ffi::SshLeaseDetail {
-                    access: l.grant.access.into(),
-                    grants: l.grant.grants.clone(),
-                    user: l.grant.user.clone(),
                     targets: l.grant.targets.iter().map(|target| {
                         let cleanup = l.cleanup.get(&target.target_id);
                         ffi::SshLeaseTarget {
                             name: target.name.clone(),
                             login: target.login.clone(),
+                            access: target.access.into(),
+                            grants: target.grants.clone(),
+                            user: target.user.clone(),
                             cleanup: cleanup.map(Into::into),
                             cleanup_detail: cleanup.map(|c| c.detail.clone()).unwrap_or_default(),
+                            changes: cleanup.map(|c| c.changes.clone()).unwrap_or_default(),
+                            changes_total: cleanup.map_or(0, |c| c.changes_total),
                         }
                     }).collect(),
                 }),

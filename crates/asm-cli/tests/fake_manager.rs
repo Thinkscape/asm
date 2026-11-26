@@ -4033,6 +4033,7 @@ fn gh_install_writes_an_updatable_shim_and_uninstall_removes_only_it() {
 // ---- SSH leases ----
 
 const SSH_TARGET_ID: &str = "0123abcd";
+const SSH_LEASE2: &str = "22222222-2222-4333-8444-555555555555";
 const SSH_HOST_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";
 const SSH_EXPIRES: &str = "2999-01-01T00:00:00Z";
 const SSH_EXTENDED: &str = "2999-02-01T00:00:00Z";
@@ -4069,27 +4070,45 @@ fn ssh_signature_blob() -> Vec<u8> {
     blob
 }
 
-fn ssh_target(login: &str) -> Value {
-    json!({"name":"t1","target_id":SSH_TARGET_ID,"login":login,"hostname":"t1.example.com",
-        "port":2222,"host_keys":[SSH_HOST_KEY]})
+/// Target `name` (id `tid`) with `access` (`privileged`, `restricted` or `user`), the
+/// login it needs and a certificate of `fill`.
+fn ssh_target(name: &str, tid: &str, access: &str, fill: u8) -> Value {
+    let login = if access == "restricted" { "asm-ops" } else { "asm-priv" };
+    json!({"name":name,"target_id":tid,"login":login,"hostname":format!("{name}.example.com"),
+        "port":2222,"host_keys":[SSH_HOST_KEY],"access":access,"certificate":ssh_cert_line_with(fill)})
+}
+
+fn ssh_lease(lease_id: &str, expires_at: &str, targets: Vec<Value>) -> Value {
+    json!({"lease_id":lease_id,"expires_at":expires_at,"targets":targets})
 }
 
 /// A privileged lease on t1.
 fn ssh_result(expires_at: &str) -> Value {
-    json!({"lease_id":LEASE,"expires_at":expires_at,"access":"privileged","grants":[],
-        "certificate":ssh_cert_line(),"targets":[ssh_target("asm-priv")]})
+    ssh_lease(LEASE, expires_at, vec![ssh_target("t1", SSH_TARGET_ID, "privileged", 7)])
 }
 
 /// A restricted lease on t1 that may read the logs of nginx.service.
 fn ssh_restricted_result(expires_at: &str) -> Value {
-    json!({"lease_id":LEASE,"expires_at":expires_at,"access":"restricted","grants":["logs:nginx.service"],
-        "certificate":ssh_cert_line(),"targets":[ssh_target("asm-ops")]})
+    let mut t = ssh_target("t1", SSH_TARGET_ID, "restricted", 7);
+    t["grants"] = json!(["logs:nginx.service"]);
+    ssh_lease(LEASE, expires_at, vec![t])
 }
 
 /// A lease on t1 as `user`.
 fn ssh_user_result(expires_at: &str, user: &str) -> Value {
-    json!({"lease_id":LEASE,"expires_at":expires_at,"access":"user","grants":[],"user":user,
-        "certificate":ssh_cert_line(),"targets":[ssh_target("asm-priv")]})
+    let mut t = ssh_target("t1", SSH_TARGET_ID, "user", 7);
+    t["user"] = json!(user);
+    ssh_lease(LEASE, expires_at, vec![t])
+}
+
+/// A lease on t1 (privileged, certificate 1), t2 (restricted, certificate 2) and t3 (as
+/// deploy, certificate 3), each certificate's fill plus `bump`; the operator denied t4.
+fn ssh_mixed_result(expires_at: &str, bump: u8) -> Value {
+    let mut t2 = ssh_target("t2", "0000000b", "restricted", 2 + bump);
+    t2["grants"] = json!(["logs:web.service", "read:/etc/nginx/nginx.conf", "reload:web.service"]);
+    let mut t3 = ssh_target("t3", "0000000c", "user", 3 + bump);
+    t3["user"] = json!("deploy");
+    ssh_lease(LEASE, expires_at, vec![t3, ssh_target("t1", "0000000a", "privileged", 1 + bump), t2])
 }
 
 /// What the fake manager answers; a test may change it between commands.
@@ -4109,7 +4128,7 @@ fn approved_ssh(result: Value) -> Value {
 fn ssh_handler(capable: bool, script: Arc<SshScript>) -> Arc<Handler> {
     Arc::new(move |method, path, body| match (method, path) {
         ("GET", "/v1/health") => {
-            let capabilities: Vec<&str> = if capable { vec!["ssh_leases_v1"] } else { vec![] };
+            let capabilities: Vec<&str> = if capable { vec!["ssh_leases_v2"] } else { vec![] };
             (200, json!({"name":"asm-manager","version":"0.1.0","capabilities":capabilities}))
         }
         ("POST", "/v1/requests") if body["kind"] == "ssh" => {
@@ -4122,14 +4141,15 @@ fn ssh_handler(capable: bool, script: Arc<SshScript>) -> Arc<Handler> {
             200,
             json!({"targets":[
                 {"name":"t1","privileged_login":"root","users":["deploy","postgres"],
-                    "grants":["logs:nginx.service","restart:nginx.service"]},
+                    "grants":["logs:nginx.service","restart:nginx.service","reload:nginx.service",
+                        "read:/etc/nginx/nginx.conf"]},
                 {"name":"t2","grants":["logs:web.service"]}]}),
         ),
         ("POST", "/v1/ssh/sign") if script.sign_ended.load(std::sync::atomic::Ordering::SeqCst) => (
             404,
             json!({"error":{"code":"not_found","message":"SSH lease has ended"}}),
         ),
-        ("POST", "/v1/ssh/sign") if body["lease_id"] == LEASE => (
+        ("POST", "/v1/ssh/sign") => (
             200,
             json!({"signature":asm_proto::ssh::b64_encode(&ssh_signature_blob())}),
         ),
@@ -4307,11 +4327,17 @@ fn agent_call(sock: &Path, msg: &[u8]) -> Vec<u8> {
 
 /// The IDENTITIES_ANSWER listing `blobs` of lease LEASE.
 fn identities_answer(blobs: &[Vec<u8>]) -> Vec<u8> {
+    let ids: Vec<(Vec<u8>, &str)> = blobs.iter().map(|b| (b.clone(), LEASE)).collect();
+    leases_identities_answer(&ids)
+}
+
+/// The IDENTITIES_ANSWER listing each certificate blob with its lease.
+fn leases_identities_answer(ids: &[(Vec<u8>, &str)]) -> Vec<u8> {
     let mut want = vec![12u8];
-    want.extend_from_slice(&(blobs.len() as u32).to_be_bytes());
-    for blob in blobs {
+    want.extend_from_slice(&(ids.len() as u32).to_be_bytes());
+    for (blob, lease) in ids {
         asm_proto::ssh::put_string(&mut want, blob);
-        asm_proto::ssh::put_string(&mut want, format!("asm-lease-{LEASE}").as_bytes());
+        asm_proto::ssh::put_string(&mut want, format!("asm-lease-{lease}").as_bytes());
     }
     want
 }
@@ -4337,7 +4363,7 @@ fn ssh_writes_lease_files_and_the_agent_signs_through_the_manager() {
     assert_eq!(
         text(&out.stdout),
         format!(
-            "ssh lease {LEASE} until {SSH_EXPIRES} (privileged)\nt1: ssh -F {} t1   (login asm-priv)\n",
+            "ssh lease {LEASE} until {SSH_EXPIRES}\nt1: ssh -F {} t1   (privileged)\n",
             config.display()
         )
     );
@@ -4351,13 +4377,13 @@ fn ssh_writes_lease_files_and_the_agent_signs_through_the_manager() {
     assert!(config_text.contains("\nHost t1 t1.example.com\n  HostName t1.example.com\n  Port 2222\n  User asm-priv\n  HostKeyAlias asm-target-0123abcd\n"), "{config_text}");
     assert!(config_text.contains(&format!("  UserKnownHostsFile \"{}\"\n", ldir.join("known_hosts").display())), "{config_text}");
     assert!(config_text.contains(&format!("  IdentityAgent \"{}\"\n", dir.join("agent.sock").display())), "{config_text}");
-    assert!(config_text.contains(&format!("  IdentityFile \"{}\"\n", ldir.join("cert.pub").display())), "{config_text}");
+    assert!(config_text.contains(&format!("  IdentityFile \"{}\"\n", ldir.join("0123abcd-cert.pub").display())), "{config_text}");
     assert_eq!(
         std::fs::read_to_string(ldir.join("known_hosts")).unwrap(),
         format!("asm-target-{SSH_TARGET_ID} {SSH_HOST_KEY}\n")
     );
     assert_eq!(
-        std::fs::read_to_string(ldir.join("cert.pub")).unwrap(),
+        std::fs::read_to_string(ldir.join("0123abcd-cert.pub")).unwrap(),
         format!("{}\n", ssh_cert_line())
     );
     let leases = read_json(&dir.join("leases.json"));
@@ -4403,7 +4429,7 @@ fn ssh_hosts_lists_users_and_grants() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(
         text(&out.stdout),
-        "t1\tprivileged:root\tusers:deploy,postgres\tgrants:logs:nginx.service,restart:nginx.service\nt2\tprivileged:-\tusers:-\tgrants:logs:web.service\n"
+        "t1\tprivileged:root\tusers:deploy,postgres\tgrants:logs:nginx.service,restart:nginx.service,reload:nginx.service,read:/etc/nginx/nginx.conf\nt2\tprivileged:-\tusers:-\tgrants:logs:web.service\n"
     );
     let out = asm(&e, &["ssh", "hosts", "--json"], "");
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -4431,14 +4457,16 @@ fn ssh_requires_manager_support() {
 #[test]
 fn ssh_rejects_invalid_access_before_contacting_the_manager() {
     let (f, e) = ssh_paired(true);
-    let cases: [(&[&str], &str); 7] = [
+    let cases: [(&[&str], &str); 9] = [
         (&["ssh", "request", "t1", "r", "--grant", "logs:nginx.service", "--privileged"], "cannot be used with"),
         (&["ssh", "request", "t1", "r", "--as", "deploy", "--privileged"], "cannot be used with"),
         (&["ssh", "request", "t1", "r", "--as", "deploy", "--grant", "logs:nginx.service"], "cannot be used with"),
-        (&["ssh", "request", "t1", "r"], "choose --privileged, --as <user> or at least one --grant (logs:<unit>, restart:<unit>)"),
+        (&["ssh", "request", "t1", "r"], "choose --privileged, --as <user> or at least one --grant (logs:<unit>, restart:<unit>, reload:<unit> or read:<path>)"),
         (&["ssh", "request", "t1,t2", "r", "--privileged", "--", "uptime"], "a command needs exactly one host"),
         (&["ssh", "request", "t1", "r", "--grant", "restart:nginx"], "invalid"),
         (&["ssh", "request", "t1", "r", "--grant", "logs"], "invalid"),
+        (&["ssh", "request", "t1", "r", "--grant", "reload:nginx"], "invalid"),
+        (&["ssh", "request", "t1", "r", "--grant", "read:etc/nginx/nginx.conf"], "invalid file"),
     ];
     for (args, message) in cases {
         let out = asm(&e, args, "");
@@ -4457,9 +4485,13 @@ fn ssh_accepts_a_narrowed_approval() {
     assert_eq!(
         text(&out.stdout),
         format!(
-            "ssh lease {LEASE} until {SSH_EXPIRES} (restricted: logs:nginx.service)\nt1: ssh -F {} t1   (login asm-ops)\n",
+            "ssh lease {LEASE} until {SSH_EXPIRES}\nt1: ssh -F {} t1   (restricted: logs:nginx.service)\nt2: denied\n",
             lease_config(&e).display()
         )
+    );
+    assert_eq!(
+        text(&out.stderr),
+        "asm: t1: the operator approved restricted access, not the privileged access requested\nasm: t2: denied by the operator\n"
     );
 }
 
@@ -4472,7 +4504,7 @@ fn ssh_requests_access_as_a_user() {
     assert_eq!(
         text(&out.stdout),
         format!(
-            "ssh lease {LEASE} until {SSH_EXPIRES} (as deploy)\nt1: ssh -F {} t1   (login asm-priv as deploy)\n",
+            "ssh lease {LEASE} until {SSH_EXPIRES}\nt1: ssh -F {} t1   (as deploy)\n",
             lease_config(&e).display()
         )
     );
@@ -4485,7 +4517,7 @@ fn ssh_requests_access_as_a_user() {
     let out = asm_ssh(&e, &["ssh", "leases", "--json"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(doc[0]["user"], "deploy");
+    assert_eq!(doc[0]["targets"][0]["user"], "deploy");
 }
 
 #[test]
@@ -4495,10 +4527,198 @@ fn ssh_reports_an_approval_of_other_access() {
     let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--as", "deploy"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(
-        text(&out.stderr).contains("asm: the operator approved privileged access, not the access as deploy requested\n"),
+        text(&out.stderr).contains("asm: t1: the operator approved privileged access, not the access as deploy requested\n"),
         "{}",
         text(&out.stderr)
     );
+}
+
+#[test]
+fn ssh_reused_older_lease_prints_its_own_config_for_hosts_a_newer_lease_holds() {
+    let (_f, e, script) = ssh_paired_with(true, ssh_restricted_result(SSH_EXPIRES));
+    let _agents = Agents::new(&e);
+    let out = asm_ssh(&e, &["ssh", "install"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--grant", "logs:nginx.service"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("\nt1: ssh t1   (restricted: logs:nginx.service)\n"), "{}", text(&out.stdout));
+
+    // A newer privileged lease on t1 takes `ssh t1` in the hosts conf.
+    *script.result.lock().unwrap() =
+        ssh_lease(SSH_LEASE2, SSH_EXPIRES, vec![ssh_target("t1", SSH_TARGET_ID, "privileged", 8)]);
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--privileged"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("\nt1: ssh t1   (privileged)\n"), "{}", text(&out.stdout));
+
+    // The manager reuses the older restricted lease: its line names its own config.
+    *script.result.lock().unwrap() = ssh_restricted_result(SSH_EXPIRES);
+    let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--grant", "logs:nginx.service"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "ssh lease {LEASE} until {SSH_EXPIRES}\nt1: ssh -F {} t1   (restricted: logs:nginx.service)\n",
+            lease_config(&e).display()
+        )
+    );
+    let hosts_conf = std::fs::read_to_string(ssh_state_dir(&e).join("asm-ssh-hosts.conf")).unwrap();
+    assert!(hosts_conf.contains(&format!("/{SSH_LEASE2}/{SSH_TARGET_ID}-cert.pub")), "{hosts_conf}");
+
+    // The JSON connect command follows the same rule.
+    let connect = |args: &[&str]| {
+        let out = asm_ssh(&e, args);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["installed"], true, "{doc}");
+        doc["targets"][0]["connect"].as_str().unwrap().to_owned()
+    };
+    assert_eq!(
+        connect(&["ssh", "request", "t1", "r", "--grant", "logs:nginx.service", "--json"]),
+        format!("ssh -F {} t1", lease_config(&e).display())
+    );
+    *script.result.lock().unwrap() =
+        ssh_lease(SSH_LEASE2, SSH_EXPIRES, vec![ssh_target("t1", SSH_TARGET_ID, "privileged", 8)]);
+    assert_eq!(connect(&["ssh", "request", "t1", "r", "--privileged", "--json"]), "ssh t1");
+}
+
+#[test]
+fn ssh_mixed_approval_writes_one_certificate_per_host() {
+    let (_f, e, script) = ssh_paired_with(true, ssh_mixed_result(SSH_EXPIRES, 0));
+    let ldir = ssh_state_dir(&e).join(LEASE);
+    let _agents = Agents::new(&e);
+    fake_ssh(&e, "exit 0");
+    let out = asm_ssh(&e, &["ssh", "request", "t4,t3,t2,t1", "r", "--privileged"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let config = lease_config(&e);
+    let c = config.display();
+    let t2_grants = "logs:web.service, read:/etc/nginx/nginx.conf, reload:web.service";
+    assert_eq!(
+        text(&out.stdout),
+        format!(
+            "ssh lease {LEASE} until {SSH_EXPIRES}\nt1: ssh -F {c} t1   (privileged)\nt2: ssh -F {c} t2   (restricted: {t2_grants})\nt3: ssh -F {c} t3   (as deploy)\nt4: denied\n"
+        )
+    );
+    assert_eq!(
+        text(&out.stderr),
+        "asm: t2: the operator approved restricted access, not the privileged access requested\nasm: t3: the operator approved access as deploy, not the privileged access requested\nasm: t4: denied by the operator\n"
+    );
+
+    // One certificate file per host; each config block names its own.
+    let hosts = [("t1", "0000000a", "asm-priv", 1u8), ("t2", "0000000b", "asm-ops", 2), ("t3", "0000000c", "asm-priv", 3)];
+    let config_text = std::fs::read_to_string(&config).unwrap();
+    let blocks: Vec<&str> = config_text.split("\nHost ").skip(1).collect();
+    assert_eq!(blocks.len(), 3, "{config_text}");
+    for (block, (name, tid, login, fill)) in blocks.iter().zip(hosts) {
+        let cert = ldir.join(format!("{tid}-cert.pub"));
+        assert_eq!(std::fs::read_to_string(&cert).unwrap(), format!("{}\n", ssh_cert_line_with(fill)));
+        assert!(block.starts_with(&format!("{name} {name}.example.com\n")), "{config_text}");
+        assert!(block.contains(&format!("\n  User {login}\n")), "{config_text}");
+        assert!(block.contains(&format!("\n  IdentityFile \"{}\"\n", cert.display())), "{config_text}");
+    }
+    assert!(!ldir.join("cert.pub").exists());
+
+    let out = asm_ssh(&e, &["ssh", "request", "t1,t2,t3,t4", "r", "--privileged", "--json"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let targets = json!([
+        {"name":"t1","login":"asm-priv","access":"privileged","grants":[],"user":null},
+        {"name":"t2","login":"asm-ops","access":"restricted",
+            "grants":["logs:web.service","read:/etc/nginx/nginx.conf","reload:web.service"],"user":null},
+        {"name":"t3","login":"asm-priv","access":"user","grants":[],"user":"deploy"}]);
+    let mut with_connect = targets.clone();
+    for (t, name) in with_connect.as_array_mut().unwrap().iter_mut().zip(["t1", "t2", "t3"]) {
+        t["connect"] = json!(format!("ssh -F {c} {name}"));
+    }
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        doc,
+        json!({"lease_id":LEASE,"expires_at":SSH_EXPIRES,"config":config.to_str().unwrap(),"installed":false,
+            "targets":with_connect,"denied":["t4"]})
+    );
+    let out = asm_ssh(&e, &["ssh", "leases"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!("{LEASE}\tuntil {SSH_EXPIRES}\tt1 (privileged), t2 (restricted: {t2_grants}), t3 (as deploy)\t{c}\n")
+    );
+    let out = asm_ssh(&e, &["ssh", "leases", "--json"]);
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        doc,
+        json!([{"lease_id":LEASE,"expires_at":SSH_EXPIRES,"config":config.to_str().unwrap(),"targets":targets}])
+    );
+
+    // An extension rewrites every certificate file and logs in to each host except the
+    // restricted one.
+    *script.extend.lock().unwrap() = ssh_mixed_result(SSH_EXTENDED, 10);
+    let out = asm_ssh(&e, &["ssh", "extend", LEASE, "more time"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        format!("ssh lease {LEASE} extended until {SSH_EXTENDED}\nt1: confirmed\nt3: confirmed\n")
+    );
+    for (_, tid, _, fill) in hosts {
+        assert_eq!(
+            std::fs::read_to_string(ldir.join(format!("{tid}-cert.pub"))).unwrap(),
+            format!("{}\n", ssh_cert_line_with(fill + 10))
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), config_text);
+    let touch = |name: &str| format!("-F {c} -o BatchMode=yes -o ConnectTimeout=10 -- {name} true");
+    assert_eq!(ssh_calls(&e), [touch("t1"), touch("t3")]);
+
+    // An extension that changes a host's access is refused.
+    let mut changed = ssh_mixed_result("2999-03-01T00:00:00Z", 20);
+    changed["targets"][2]["grants"] = json!(["logs:web.service"]);
+    *script.extend.lock().unwrap() = changed;
+    let out = asm_ssh(&e, &["ssh", "extend", LEASE, "more time"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr), "error: the manager sent an invalid SSH result\n");
+}
+
+#[test]
+fn ssh_refuses_a_result_with_a_wrong_login_or_certificate() {
+    let (_f, e, script) = ssh_paired_with(true, Value::Null);
+    let mut bad_login = ssh_result(SSH_EXPIRES);
+    bad_login["targets"][0]["login"] = json!("asm-ops");
+    let mut bad_cert = ssh_result(SSH_EXPIRES);
+    bad_cert["targets"][0]["certificate"] = json!(format!("ssh-ed25519 {}", asm_proto::ssh::b64_encode(&[1; 32])));
+    for result in [bad_login, bad_cert] {
+        *script.result.lock().unwrap() = result;
+        let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--privileged"]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+        assert_eq!(text(&out.stderr), "error: the manager sent an invalid SSH result\n");
+        assert!(!ssh_state_dir(&e).join(LEASE).exists());
+    }
+}
+
+#[test]
+fn ssh_agent_signs_with_the_lease_holding_each_certificate() {
+    let (f, e, script) = ssh_paired_with(true, ssh_mixed_result(SSH_EXPIRES, 0));
+    let mut agents = Agents::new(&e);
+    let out = asm_ssh(&e, &["ssh", "request", "t1,t2,t3", "r", "--privileged"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let mut t4 = ssh_target("t4", "0000000d", "restricted", 4);
+    t4["grants"] = json!(["logs:web.service"]);
+    *script.result.lock().unwrap() =
+        ssh_lease(SSH_LEASE2, SSH_EXPIRES, vec![t4, ssh_target("t5", "0000000e", "privileged", 5)]);
+    let out = asm_ssh(&e, &["ssh", "request", "t4,t5", "r", "--privileged", "--new-lease"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+
+    let sock = foreground_agent(&e, &mut agents);
+    let ids: Vec<(Vec<u8>, &str)> = [(1, LEASE), (2, LEASE), (3, LEASE), (4, SSH_LEASE2), (5, SSH_LEASE2)]
+        .into_iter()
+        .map(|(fill, lease)| (ssh_cert_blob_with(fill), lease))
+        .collect();
+    assert_eq!(agent_call(&sock, &[11]), leases_identities_answer(&ids));
+
+    let mut want = vec![14u8];
+    asm_proto::ssh::put_string(&mut want, &ssh_signature_blob());
+    for (fill, lease) in [(4, SSH_LEASE2), (2, LEASE), (5, SSH_LEASE2), (3, LEASE)] {
+        let data = format!("data {fill}");
+        assert_eq!(agent_call(&sock, &sign_request(&ssh_cert_blob_with(fill), data.as_bytes())), want);
+        let signed = f.log.lock().unwrap().iter().rfind(|(m, p, _)| m == "POST" && p == "/v1/ssh/sign").unwrap().2.clone();
+        assert_eq!(signed, json!({"lease_id":lease,"data":asm_proto::ssh::b64_encode(data.as_bytes())}));
+    }
 }
 
 #[test]
@@ -4530,7 +4750,7 @@ fn ssh_agent_serves_a_replaced_certificate_at_once() {
 
     // `asm ssh extend` stores the new certificate for the same lease.
     let mut extended = ssh_result(SSH_EXTENDED);
-    extended["certificate"] = json!(ssh_cert_line_with(8));
+    extended["targets"][0]["certificate"] = json!(ssh_cert_line_with(8));
     *script.extend.lock().unwrap() = extended;
     let out = asm_ssh(&e, &["ssh", "extend", LEASE, "more time"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -4623,7 +4843,7 @@ fn ssh_hosts_conf_tracks_leases() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     let out = asm_ssh(&e, &["ssh", "request", "t1", "r", "--privileged"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(text(&out.stdout).contains("\nt1: ssh t1   (login asm-priv)\n"), "{}", text(&out.stdout));
+    assert!(text(&out.stdout).contains("\nt1: ssh t1   (privileged)\n"), "{}", text(&out.stdout));
 
     let resolved = ssh_g("t1");
     assert!(resolved.lines().any(|l| l == "user asm-priv"), "{resolved}");
@@ -4709,7 +4929,7 @@ fn ssh_extend_updates_the_lease_and_confirms_targets() {
     let requested_at = read_json(&dir.join("leases.json"))[0]["requested_at"].clone();
 
     let mut extended = ssh_result(SSH_EXTENDED);
-    extended["certificate"] = json!(ssh_cert_line_with(8));
+    extended["targets"][0]["certificate"] = json!(ssh_cert_line_with(8));
     *script.extend.lock().unwrap() = extended;
     let out = asm_ssh(&e, &["ssh", "extend", LEASE, "more time"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -4721,10 +4941,10 @@ fn ssh_extend_updates_the_lease_and_confirms_targets() {
     assert_eq!(sent, json!({"kind":"ssh_extend","lease_id":LEASE,"reason":"more time","agent":"test-agent"}));
     let leases = read_json(&dir.join("leases.json"));
     assert_eq!(leases[0]["expires_at"], asm_proto::time::parse_unix(SSH_EXTENDED).unwrap());
-    assert_eq!(leases[0]["certificate"], ssh_cert_line_with(8));
+    assert_eq!(leases[0]["targets"][0]["certificate"], ssh_cert_line_with(8));
     assert_eq!(leases[0]["requested_at"], requested_at);
     assert_eq!(
-        std::fs::read_to_string(dir.join(LEASE).join("cert.pub")).unwrap(),
+        std::fs::read_to_string(dir.join(LEASE).join("0123abcd-cert.pub")).unwrap(),
         format!("{}\n", ssh_cert_line_with(8))
     );
     assert_eq!(std::fs::read(lease_config(&e)).unwrap(), config);
@@ -4812,14 +5032,14 @@ fn ssh_leases_lists_local_leases() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(
         text(&out.stdout),
-        format!("{LEASE}\tuntil {SSH_EXPIRES}\tprivileged\tt1\t{}\n", config.display())
+        format!("{LEASE}\tuntil {SSH_EXPIRES}\tt1 (privileged)\t{}\n", config.display())
     );
     let out = asm_ssh(&e, &["ssh", "leases", "--json"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
         doc,
-        json!([{"lease_id":LEASE,"expires_at":SSH_EXPIRES,"access":"privileged","grants":[],"user":null,
-            "targets":[{"name":"t1","login":"asm-priv"}],"config":config.to_str().unwrap()}])
+        json!([{"lease_id":LEASE,"expires_at":SSH_EXPIRES,"config":config.to_str().unwrap(),
+            "targets":[{"name":"t1","login":"asm-priv","access":"privileged","grants":[],"user":null}]}])
     );
 }

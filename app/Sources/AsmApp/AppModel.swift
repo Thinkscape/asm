@@ -109,6 +109,7 @@ final class AppModel {
             Task { _ = await self?.restartProxy() }
         }
         proxyAlerts.onShowDetails = { [weak self] in self?.showProxyDetails() }
+        proxyAlerts.onShowLease = { [weak self] id in self?.showLeaseDetails(id) }
         proxyAlerts.install()
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
@@ -159,7 +160,7 @@ final class AppModel {
             case "leases":
                 gcloudOwnedAccountsRevision &+= 1
                 leases = try await call { try $0.listLeases() }
-                proxyAlerts.updateSshCleanup(leases)
+                proxyAlerts.updateSsh(leases)
                 hosts = try await call { try $0.listHosts() }
                 // Hosts and SSH targets show how many active leases they have.
                 sshTargets = try await call { try $0.listSshTargets() }
@@ -619,6 +620,12 @@ final class AppModel {
     func showSshTarget(_ id: String) {
         sshTargetFocus = id
         showSettings(.sshTargets)
+    }
+
+    /// Opens Settings → Leases with one lease selected (SSH lease notification).
+    func showLeaseDetails(_ leaseID: String) {
+        leaseFocus = LeaseFocus(leaseID: leaseID, search: "")
+        showSettings(.leases)
     }
 
     private func showSettings(_ pane: SettingsPane) {

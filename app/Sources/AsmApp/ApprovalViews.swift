@@ -270,12 +270,15 @@ struct ApprovalScaffold<Header: View, Content: View, Details: View, Actions: Vie
 struct ApprovalHeader<Icon: View>: View {
     let title: Text
     let subtitle: Text
+    /// Longer subtitles end in an ellipsis.
+    let subtitleLineLimit: Int
     let queue: QueueInfo
     let icon: Icon
 
-    init(title: Text, subtitle: Text, queue: QueueInfo, @ViewBuilder icon: () -> Icon) {
+    init(title: Text, subtitle: Text, subtitleLineLimit: Int = 4, queue: QueueInfo, @ViewBuilder icon: () -> Icon) {
         self.title = title
         self.subtitle = subtitle
+        self.subtitleLineLimit = subtitleLineLimit
         self.queue = queue
         self.icon = icon()
     }
@@ -290,7 +293,7 @@ struct ApprovalHeader<Icon: View>: View {
                     .lineLimit(2)
                 subtitle
                     .font(.system(size: 13))
-                    .lineLimit(4)
+                    .lineLimit(subtitleLineLimit)
             }
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -707,8 +710,8 @@ private struct DenySplitButton: View {
             SegmentDivider(style: AnyShapeStyle(.separator))
             SplitChevron(label: "Deny with a reason") {
                 cannedReasons.map { reason in
-                    SplitMenuItem(title: "Deny (\(reason))") { deny(reason) }
-                } + [SplitMenuItem(title: "Deny with custom reason…", action: customReason)]
+                    PanelMenuItem(title: "Deny (\(reason))") { deny(reason) }
+                } + [PanelMenuItem(title: "Deny with custom reason…", action: customReason)]
             }
         }
         .font(PanelButtonMetrics.font)
@@ -748,12 +751,12 @@ private struct AllowSplitButton: View {
             SegmentDivider(style: realValue ? AnyShapeStyle(.black.opacity(0.25)) : AnyShapeStyle(.white.opacity(0.45)))
             SplitChevron(label: "Approval mode") {
                 var items = [
-                    SplitMenuItem(title: "Allow through proxy (hidden)", checked: mode == .proxied) {
+                    PanelMenuItem(title: "Allow through proxy (hidden)", checked: mode == .proxied) {
                         mode = .proxied
                     },
                 ]
                 if !sentinelRequired {
-                    items.append(SplitMenuItem(title: "Allow real value…", checked: mode == .realValue, tint: .systemOrange) {
+                    items.append(PanelMenuItem(title: "Allow real value…", checked: mode == .realValue, tint: .systemOrange) {
                         mode = .realValue
                     })
                 }
@@ -800,11 +803,17 @@ private struct SegmentDivider: View {
     }
 }
 
-/// One item of a split button's menu.
-private struct SplitMenuItem {
+/// One item of a menu the panel opens (a split button's chevron, an SSH host's access).
+struct PanelMenuItem {
     let title: String
     var checked = false
     var tint: NSColor? = nil
+    /// Secondary text after the title, such as `(logs, restart)`.
+    var detail: String? = nil
+    /// A native badge at the trailing edge, such as `sudo`.
+    var badge: String? = nil
+    /// A separator goes before the item (unless it is the first).
+    var startsSection = false
     let action: () -> Void
 }
 
@@ -814,7 +823,7 @@ private struct SplitMenuItem {
 /// it is given.
 private struct SplitChevron: View {
     let label: String
-    let items: () -> [SplitMenuItem]
+    let items: () -> [PanelMenuItem]
     @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
@@ -823,16 +832,18 @@ private struct SplitChevron: View {
             .frame(width: 44, height: PanelButtonMetrics.height)
             .opacity(isEnabled ? 1 : 0.55)
             .accessibilityHidden(true)
-            .overlay(SplitMenuHitArea(label: label, items: items))
+            .overlay(PanelMenuHitArea(label: label, items: items))
     }
 }
 
-private struct SplitMenuHitArea: NSViewRepresentable {
+/// A transparent AppKit button that opens a menu of `items` below itself; lay it over the
+/// SwiftUI view that draws the control.
+struct PanelMenuHitArea: NSViewRepresentable {
     let label: String
-    let items: () -> [SplitMenuItem]
+    let items: () -> [PanelMenuItem]
 
-    func makeNSView(context: Context) -> SplitMenuButton {
-        let button = SplitMenuButton()
+    func makeNSView(context: Context) -> PanelMenuButton {
+        let button = PanelMenuButton()
         button.isBordered = false
         button.title = ""
         button.setButtonType(.momentaryChange)
@@ -840,11 +851,11 @@ private struct SplitMenuHitArea: NSViewRepresentable {
         return button
     }
 
-    func updateNSView(_ button: SplitMenuButton, context: Context) {
+    func updateNSView(_ button: PanelMenuButton, context: Context) {
         update(button, enabled: context.environment.isEnabled)
     }
 
-    private func update(_ button: SplitMenuButton, enabled: Bool) {
+    private func update(_ button: PanelMenuButton, enabled: Bool) {
         button.isEnabled = enabled
         button.items = items
         button.setAccessibilityLabel(label)
@@ -853,8 +864,8 @@ private struct SplitMenuHitArea: NSViewRepresentable {
 }
 
 /// Transparent button that opens its menu below itself on click, Space or AX press.
-private final class SplitMenuButton: NSButton {
-    var items: () -> [SplitMenuItem] = { [] }
+final class PanelMenuButton: NSButton {
+    var items: () -> [PanelMenuItem] = { [] }
     private var actions: [() -> Void] = []
 
     // The approval panel is non-activating: the first click must work without making it key.
@@ -879,15 +890,28 @@ private final class SplitMenuButton: NSButton {
         menu.autoenablesItems = false
         actions = []
         for (index, spec) in items().enumerated() {
+            if spec.startsSection, !menu.items.isEmpty {
+                menu.addItem(.separator())
+            }
             let item = NSMenuItem(title: spec.title, action: #selector(pick(_:)), keyEquivalent: "")
             item.target = self
             item.tag = index
             item.state = spec.checked ? .on : .off
-            if let tint = spec.tint {
-                item.attributedTitle = NSAttributedString(
-                    string: spec.title,
-                    attributes: [.foregroundColor: tint, .font: NSFont.menuFont(ofSize: 0)]
-                )
+            if spec.tint != nil || spec.detail != nil {
+                let font = NSFont.menuFont(ofSize: 0)
+                var main: [NSAttributedString.Key: Any] = [.font: font]
+                main[.foregroundColor] = spec.tint
+                let title = NSMutableAttributedString(string: spec.title, attributes: main)
+                if let detail = spec.detail {
+                    title.append(NSAttributedString(
+                        string: " \(detail)",
+                        attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
+                    ))
+                }
+                item.attributedTitle = title
+            }
+            if let badge = spec.badge {
+                item.badge = NSMenuItemBadge(string: badge)
             }
             menu.addItem(item)
             actions.append(spec.action)

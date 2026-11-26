@@ -146,10 +146,10 @@ CREATE TABLE IF NOT EXISTS ssh_targets(
     enroll_state TEXT NOT NULL DEFAULT 'not_enrolled'
         CHECK (enroll_state IN ('not_enrolled','enrolling','enrolled','failed','removing')),
     enrolled_revision INTEGER NOT NULL DEFAULT 0, enrolled_ca TEXT, enroll_at INTEGER, enroll_error TEXT,
-    created_at INTEGER NOT NULL);
+    created_at INTEGER NOT NULL, enrolled_scripts TEXT);
 CREATE TABLE IF NOT EXISTS ssh_leases(
     id TEXT PRIMARY KEY, host_id TEXT NOT NULL, agent TEXT NOT NULL, reason TEXT NOT NULL,
-    grant_json TEXT NOT NULL, certificate TEXT NOT NULL, created_at INTEGER NOT NULL,
+    grant_json TEXT NOT NULL, certificates TEXT NOT NULL, created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL, revoked_at INTEGER, ended_at INTEGER, cleanup TEXT NOT NULL DEFAULT '{}');
 CREATE INDEX IF NOT EXISTS ssh_leases_host ON ssh_leases(host_id);
 ";
@@ -1312,7 +1312,78 @@ fn migrate(conn: &Connection) -> Result<()> {
              AND (config -> '$.installation_id') = (config -> '$.ceiling.installation_id')
          ELSE 0 END;",
     )?;
+    migrate_ssh(conn)?;
     Ok(())
+}
+
+/// 0.9.0 SSH tables: `ssh_targets` gains `enrolled_scripts`, and each `ssh_leases` row
+/// moves from one access and certificate for the whole lease to an access and a
+/// certificate per target (`migrate_ssh_lease`).
+fn migrate_ssh(conn: &Connection) -> Result<()> {
+    let has_column = |db: &Connection, table: &str, column: &str| -> rusqlite::Result<bool> {
+        db.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?.exists([table, column])
+    };
+    if !has_column(conn, "ssh_targets", "enrolled_scripts")? {
+        conn.execute_batch("ALTER TABLE ssh_targets ADD COLUMN enrolled_scripts TEXT;")?;
+    }
+    if !has_column(conn, "ssh_leases", "certificate")? {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if has_column(&tx, "ssh_leases", "certificate")? {
+        if !has_column(&tx, "ssh_leases", "certificates")? {
+            tx.execute_batch("ALTER TABLE ssh_leases ADD COLUMN certificates TEXT NOT NULL DEFAULT '{}';")?;
+        }
+        let rows: Vec<(String, String, String)> = tx
+            .prepare("SELECT id, grant_json, certificate FROM ssh_leases")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, grant, certificate) in rows {
+            // A row that doesn't have the 0.9.0 shape stays as it is (and fails to load).
+            if let Some((grant, certificates)) = migrate_ssh_lease(&grant, &certificate) {
+                tx.execute("UPDATE ssh_leases SET grant_json = ?2, certificates = ?3 WHERE id = ?1",
+                    params![id, grant, certificates])?;
+            }
+        }
+        tx.execute_batch("ALTER TABLE ssh_leases DROP COLUMN certificate;")?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// A 0.9.0 lease grant (`access`, `grants`, `user` and `targets` at the top) and its one
+/// certificate, as the grant JSON with `requested` and per-target access, and the
+/// `certificates` JSON (every target with the old certificate).
+fn migrate_ssh_lease(grant: &str, certificate: &str) -> Option<(String, String)> {
+    use serde_json::{Map, Value};
+    let mut grant: Map<String, Value> = serde_json::from_str(grant).ok()?;
+    let access = grant.remove("access")?;
+    let grants = grant.remove("grants")?;
+    let user = grant.remove("user");
+    let mut target_ids = Vec::new();
+    let mut certificates = Map::new();
+    for target in grant.get_mut("targets")?.as_array_mut()? {
+        let target = target.as_object_mut()?;
+        let id = target.get("target_id")?.as_str()?.to_owned();
+        target.insert("access".into(), access.clone());
+        target.insert("grants".into(), grants.clone());
+        if let Some(user) = &user {
+            target.insert("user".into(), user.clone());
+        }
+        certificates.insert(id.clone(), Value::String(certificate.to_owned()));
+        target_ids.push(id);
+    }
+    target_ids.sort_unstable();
+    let mut requested = Map::from_iter([
+        ("access".to_owned(), access),
+        ("grants".to_owned(), grants),
+        ("target_ids".to_owned(), target_ids.into()),
+    ]);
+    if let Some(user) = user {
+        requested.insert("user".into(), user);
+    }
+    grant.insert("requested".into(), Value::Object(requested));
+    Some((Value::Object(grant).to_string(), Value::Object(certificates).to_string()))
 }
 
 /// `pairing_codes.networks` (a JSON array of CIDR strings). Unreadable text yields a
@@ -2232,6 +2303,11 @@ pub struct SshTargetConfig {
     /// Units whose journal restricted leases may read (`logs:<unit>`).
     pub log_units: Vec<String>,
     pub restart_units: Vec<String>,
+    #[serde(default)]
+    pub reload_units: Vec<String>,
+    /// Files restricted leases may read (`read:<path>`).
+    #[serde(default)]
+    pub read_files: Vec<String>,
     pub max_duration_secs: u64,
     /// Other users agents may log in as (through `asm-priv` and sudo), sorted by name.
     #[serde(default)]
@@ -2259,8 +2335,10 @@ impl SshTargetConfig {
         self.host_keys.dedup();
         self.log_units.sort_unstable();
         self.log_units.dedup();
-        self.restart_units.sort_unstable();
-        self.restart_units.dedup();
+        for list in [&mut self.restart_units, &mut self.reload_units, &mut self.read_files] {
+            list.sort_unstable();
+            list.dedup();
+        }
         self.users.sort_by(|a, b| a.name.cmp(&b.name));
         self.users.dedup_by(|a, b| a.name == b.name);
     }
@@ -2283,7 +2361,7 @@ impl SshTargetConfig {
         for key in &self.host_keys {
             validate_host_key(key)?;
         }
-        for (units, what) in [(&self.log_units, "log"), (&self.restart_units, "restart")] {
+        for (units, what) in [(&self.log_units, "log"), (&self.restart_units, "restart"), (&self.reload_units, "reload")] {
             if units.len() > 32 {
                 return Err(CoreError::invalid(format!("at most 32 {what} units")));
             }
@@ -2293,6 +2371,15 @@ impl SshTargetConfig {
             if units.windows(2).any(|w| w[0] >= w[1]) {
                 return Err(CoreError::invalid(format!("{what} units must be sorted and unique")));
             }
+        }
+        if self.read_files.len() > 32 {
+            return Err(CoreError::invalid("at most 32 files"));
+        }
+        for file in &self.read_files {
+            asm_proto::ssh::validate_read_path(file)?;
+        }
+        if self.read_files.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(CoreError::invalid("files must be sorted and unique"));
         }
         if !(60..=604_800).contains(&self.max_duration_secs) {
             return Err(CoreError::invalid("the longest lease must be between 1 minute and 7 days"));
@@ -2396,18 +2483,30 @@ pub struct SshTargetRecord {
     pub enroll_at: Option<i64>,
     pub enroll_error: Option<String>,
     pub created_at: i64,
+    /// `ssh::scripts::scripts_version()` of the last successful enrollment.
+    pub enrolled_scripts: Option<String>,
 }
 
-/// The authority of one SSH lease, fixed at approval.
+/// The authority of one SSH lease, fixed at approval: per target, the access the
+/// operator chose.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SshGrant {
-    pub access: asm_proto::ssh::SshAccess,
+    /// What the agent asked for; an identical request reuses the lease.
+    pub requested: SshRequested,
     pub targets: Vec<SshGrantTarget>,
+}
+
+/// One SSH request as the agent made it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshRequested {
+    pub access: asm_proto::ssh::SshAccess,
     pub grants: Vec<String>,
-    /// The user an access-as-a-user lease runs as.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Sorted.
+    pub target_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2420,6 +2519,13 @@ pub struct SshGrantTarget {
     pub hostname: String,
     pub port: u16,
     pub host_keys: Vec<String>,
+    pub access: asm_proto::ssh::SshAccess,
+    /// The operations of restricted access.
+    #[serde(default)]
+    pub grants: Vec<String>,
+    /// The user access as a user runs as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2442,6 +2548,20 @@ pub struct SshCleanup {
     /// Unix time the next attempt is due; 0 means now.
     #[serde(default)]
     pub due: i64,
+    /// Watched files that changed on the host during the lease (at most 20), as the
+    /// host reported them when the lease ended there.
+    #[serde(default)]
+    pub changes: Vec<String>,
+    /// How many watched files changed in all.
+    #[serde(default)]
+    pub changes_total: u32,
+}
+
+impl SshCleanup {
+    /// A cleanup entry without a change report.
+    pub fn new(state: SshCleanupState, at: i64, detail: String, attempts: u32, due: i64) -> Self {
+        Self { state, at, detail, attempts, due, changes: Vec::new(), changes_total: 0 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2451,8 +2571,8 @@ pub struct SshLeaseRecord {
     pub agent: String,
     pub reason: String,
     pub grant: SshGrant,
-    /// One OpenSSH certificate line.
-    pub certificate: String,
+    /// Target id → that target's OpenSSH certificate line.
+    pub certificates: std::collections::BTreeMap<String, String>,
     pub created_at: i64,
     pub expires_at: i64,
     pub revoked_at: Option<i64>,
@@ -2477,19 +2597,22 @@ impl SshLeaseRecord {
     }
 }
 
-const SSH_TARGET_COLUMNS: &str =
-    "id, name, config, revision, enroll_state, enrolled_revision, enrolled_ca, enroll_at, enroll_error, created_at";
+const SSH_TARGET_COLUMNS: &str = "id, name, config, revision, enroll_state, enrolled_revision, enrolled_ca, enroll_at, \
+     enroll_error, created_at, enrolled_scripts";
 const SSH_LEASE_COLUMNS: &str =
-    "id, host_id, agent, reason, grant_json, certificate, created_at, expires_at, revoked_at, ended_at, cleanup";
+    "id, host_id, agent, reason, grant_json, certificates, created_at, expires_at, revoked_at, ended_at, cleanup";
 
-type SshTargetRow = (String, String, String, i64, String, i64, Option<String>, Option<i64>, Option<String>, i64);
+type SshTargetRow =
+    (String, String, String, i64, String, i64, Option<String>, Option<i64>, Option<String>, i64, Option<String>);
 
 fn ssh_target_row(r: &Row<'_>) -> rusqlite::Result<SshTargetRow> {
-    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?,
+        r.get(10)?))
 }
 
 fn decode_ssh_target(row: SshTargetRow) -> Result<SshTargetRecord> {
-    let (id, name, config, revision, state, enrolled_revision, enrolled_ca, enroll_at, enroll_error, created_at) = row;
+    let (id, name, config, revision, state, enrolled_revision, enrolled_ca, enroll_at, enroll_error, created_at,
+        enrolled_scripts) = row;
     let config: SshTargetConfig = serde_json::from_str(&config)?;
     config.validate().map_err(|_| CoreError::internal("invalid persisted SSH target"))?;
     Ok(SshTargetRecord {
@@ -2498,7 +2621,7 @@ fn decode_ssh_target(row: SshTargetRow) -> Result<SshTargetRecord> {
         enroll_state: SshEnrollState::parse(&state)?,
         enrolled_revision: u64::try_from(enrolled_revision)
             .map_err(|_| CoreError::internal("invalid persisted SSH enrollment revision"))?,
-        enrolled_ca, enroll_at, enroll_error, created_at,
+        enrolled_ca, enroll_at, enroll_error, created_at, enrolled_scripts,
     })
 }
 
@@ -2509,16 +2632,18 @@ fn ssh_lease_row(r: &Row<'_>) -> rusqlite::Result<SshLeaseRow> {
 }
 
 fn decode_ssh_lease(row: SshLeaseRow) -> Result<SshLeaseRecord> {
-    let (id, host_id, agent, reason, grant, certificate, created_at, expires_at, revoked_at, ended_at, cleanup) = row;
+    let (id, host_id, agent, reason, grant, certificates, created_at, expires_at, revoked_at, ended_at, cleanup) = row;
     let grant: SshGrant = serde_json::from_str(&grant)?;
+    let certificates: std::collections::BTreeMap<String, String> = serde_json::from_str(&certificates)?;
     if !asm_proto::crypto::is_uuid(&id)
         || !grant.targets.iter().all(|t| crate::ssh::scripts::is_target_id(&t.target_id))
+        || !certificates.keys().all(|id| grant.targets.iter().any(|t| &t.target_id == id))
     {
         return Err(CoreError::internal("invalid persisted SSH lease"));
     }
     Ok(SshLeaseRecord {
         id, host_id, agent, reason, grant,
-        certificate, created_at, expires_at, revoked_at, ended_at,
+        certificates, created_at, expires_at, revoked_at, ended_at,
         cleanup: serde_json::from_str(&cleanup)?,
     })
 }
@@ -2538,10 +2663,10 @@ impl Store {
         asm_proto::ssh::validate_target_name(&t.name)?;
         let config = serde_json::to_string(&t.config)?;
         self.db().execute(
-            &format!("INSERT INTO ssh_targets({SSH_TARGET_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
+            &format!("INSERT INTO ssh_targets({SSH_TARGET_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
             params![t.id, t.name, config, sqlite_u64(t.revision, "SSH target revision")?, t.enroll_state.as_str(),
                 sqlite_u64(t.enrolled_revision, "SSH enrollment revision")?, t.enrolled_ca, t.enroll_at,
-                t.enroll_error, t.created_at],
+                t.enroll_error, t.created_at, t.enrolled_scripts],
         ).map_err(|e| ssh_target_name_error(e, &t.name))?;
         Ok(())
     }
@@ -2587,12 +2712,13 @@ impl Store {
         Ok(self.db().execute("DELETE FROM ssh_targets WHERE id = ?1", [id])? > 0)
     }
 
-    /// Compare-and-swap on the enrollment state. `enrolled_revision` and `enrolled_ca`
-    /// are written as given (`None` = 0 / NULL): only `enrolled` carries them.
+    /// Compare-and-swap on the enrollment state. `enrolled_revision`, `enrolled_ca` and
+    /// `enrolled_scripts` are written as given (`None` = 0 / NULL): only `enrolled`
+    /// carries them.
     #[allow(clippy::too_many_arguments)]
     pub fn set_ssh_enrollment(
         &self, id: &str, from: &[SshEnrollState], to: SshEnrollState, enrolled_revision: Option<u64>,
-        enrolled_ca: Option<&str>, error: Option<&str>, at: i64,
+        enrolled_ca: Option<&str>, enrolled_scripts: Option<&str>, error: Option<&str>, at: i64,
     ) -> Result<bool> {
         if from.is_empty() {
             return Ok(false);
@@ -2600,9 +2726,10 @@ impl Store {
         let states: Vec<String> = from.iter().map(|s| format!("'{}'", s.as_str())).collect();
         let n = self.db().execute(
             &format!("UPDATE ssh_targets SET enroll_state = ?2, enrolled_revision = ?3, enrolled_ca = ?4,
-                      enroll_error = ?5, enroll_at = ?6 WHERE id = ?1 AND enroll_state IN ({})", states.join(",")),
+                      enroll_error = ?5, enroll_at = ?6, enrolled_scripts = ?7
+                      WHERE id = ?1 AND enroll_state IN ({})", states.join(",")),
             params![id, to.as_str(), sqlite_u64(enrolled_revision.unwrap_or(0), "SSH enrollment revision")?,
-                enrolled_ca, error, at],
+                enrolled_ca, error, at, enrolled_scripts],
         )?;
         Ok(n > 0)
     }
@@ -2616,26 +2743,26 @@ impl Store {
         tx.execute(
             &format!("INSERT INTO ssh_leases({SSH_LEASE_COLUMNS}) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
             params![lease.id, lease.host_id, lease.agent, lease.reason, serde_json::to_string(&lease.grant)?,
-                lease.certificate, lease.created_at, lease.expires_at, lease.revoked_at, lease.ended_at,
-                serde_json::to_string(&lease.cleanup)?],
+                serde_json::to_string(&lease.certificates)?, lease.created_at, lease.expires_at, lease.revoked_at,
+                lease.ended_at, serde_json::to_string(&lease.cleanup)?],
         )?;
         Self::insert_history_with(&tx, history)?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Replace an active lease's certificate and end, if it still ends at `from_expires_at`.
+    /// Replace an active lease's certificates and end, if it still ends at `from_expires_at`.
     pub(crate) fn extend_ssh_lease_with_request(
-        &self, id: &str, from_expires_at: i64, expires_at: i64, certificate: &str, rows: &[SealedResume],
-        history: &HistoryRecord,
+        &self, id: &str, from_expires_at: i64, expires_at: i64,
+        certificates: &std::collections::BTreeMap<String, String>, rows: &[SealedResume], history: &HistoryRecord,
     ) -> Result<()> {
         let mut db = self.db();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         Self::apply_resume(&tx, rows)?;
         let n = tx.execute(
-            "UPDATE ssh_leases SET expires_at = ?2, certificate = ?3
+            "UPDATE ssh_leases SET expires_at = ?2, certificates = ?3
              WHERE id = ?1 AND expires_at = ?4 AND ended_at IS NULL AND revoked_at IS NULL",
-            params![id, expires_at, certificate, from_expires_at],
+            params![id, expires_at, serde_json::to_string(certificates)?, from_expires_at],
         )?;
         if n == 0 {
             tx.rollback()?;

@@ -561,20 +561,16 @@ pub(crate) fn approved(p: &Pending, result: Option<&RequestResult>, t: i64) -> E
         }
         (_, Some(RequestResult::Ssh(s))) => {
             let secs = parse_unix(&s.expires_at).map(|e| e - t);
-            let names: Vec<&str> = s.targets.iter().map(|t| t.name.as_str()).collect();
+            let hosts = super::ssh::targets_text(s.targets.iter().map(|t| (t.name.as_str(), t.access, t.user.as_deref())));
             request_event(
                 p,
                 "approved",
-                format!("{} approved: {} to {}, {}", subject(p), match s.access {
-                    asm_proto::ssh::SshAccess::User => format!("SSH as {}", s.user.as_deref().unwrap_or("-")),
-                    access => format!("{} SSH", access.as_str()),
-                }, names.join(", "), fmt_duration(secs)),
+                format!("{} approved: SSH on {hosts}, {}", subject(p), fmt_duration(secs)),
                 json!({
                     "lease_id": s.lease_id,
-                    "access": s.access,
-                    "grants": s.grants,
-                    "user": s.user,
-                    "targets": names,
+                    "targets": s.targets.iter().map(|t| json!({
+                        "name": t.name, "login": t.login, "access": t.access, "grants": t.grants, "user": t.user,
+                    })).collect::<Vec<_>>(),
                     "duration_secs": secs,
                     "expires_at": s.expires_at,
                 }),

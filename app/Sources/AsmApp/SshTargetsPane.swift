@@ -334,8 +334,8 @@ private struct SshTargetStateCell: View {
         if target.hostKeyChanged {
             return String(localized: "Host key changed: review it")
         }
-        guard let error = target.error, !error.isEmpty else { return target.state.title }
-        return "\(target.state.title): \(error)"
+        guard let error = target.error, !error.isEmpty else { return target.stateTitle }
+        return "\(target.stateTitle): \(error)"
     }
 
     private var icon: String {
@@ -418,6 +418,8 @@ private struct SshTargetSheet: View {
     @State private var trustedKeys: [String]?
     @State private var logUnits = ""
     @State private var restartUnits = ""
+    @State private var reloadUnits = ""
+    @State private var readFiles = ""
     @State private var maxDuration: UInt64 = 3600
     /// Other users agents may log in as, sorted by name.
     @State private var users: [SshTargetUserItem] = []
@@ -618,10 +620,13 @@ private struct SshTargetSheet: View {
                 Section {
                     TextField("Log units", text: $logUnits, prompt: Text(verbatim: "web.service, worker.service"))
                     TextField("Restart units", text: $restartUnits, prompt: Text(verbatim: "web.service, worker.service"))
+                    TextField("Reload units", text: $reloadUnits, prompt: Text(verbatim: "nginx.service"))
+                    TextField("Files", text: $readFiles, prompt: Text(verbatim: "/etc/nginx/nginx.conf"))
+                        .help("Files agents may read: comma-separated absolute paths")
                 } header: {
                     Text("Restricted access (asm-ops)")
                 } footer: {
-                    Text("Comma-separated systemd units: agents with restricted access may read the logs of the log units and restart the restart units.")
+                    Text("Comma-separated systemd units and absolute paths: agents with restricted access may read the logs of the log units, restart the restart units, reload the reload units and read the files. They may see the status of any of these units. asm reads a file only when only root can write the directories above it.")
                 }
                 Section {
                     Picker("Max lease", selection: $maxDuration) {
@@ -747,8 +752,8 @@ private struct SshTargetSheet: View {
         return "\(type) \(key.fingerprint)"
     }
 
-    /// Comma-separated units, trimmed, empty entries dropped.
-    private static func units(_ text: String) -> [String] {
+    /// Comma-separated entries, trimmed, empty entries dropped.
+    private static func commaList(_ text: String) -> [String] {
         text.split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
@@ -776,6 +781,8 @@ private struct SshTargetSheet: View {
         keySource = .saved
         logUnits = target.logUnits.joined(separator: ", ")
         restartUnits = target.restartUnits.joined(separator: ", ")
+        reloadUnits = target.reloadUnits.joined(separator: ", ")
+        readFiles = target.readFiles.joined(separator: ", ")
         maxDuration = target.maxDurationSecs
         users = target.users
     }
@@ -901,8 +908,10 @@ private struct SshTargetSheet: View {
             privilegedLogin: trimmedLogin,
             hostKeys: hostKeys.map(\.line),
             allowPrivileged: allowPrivileged,
-            logUnits: Self.units(logUnits),
-            restartUnits: Self.units(restartUnits),
+            logUnits: Self.commaList(logUnits),
+            restartUnits: Self.commaList(restartUnits),
+            reloadUnits: Self.commaList(reloadUnits),
+            readFiles: Self.commaList(readFiles),
             users: users,
             maxDurationSecs: maxDuration
         )
@@ -1155,7 +1164,12 @@ private struct SshEnrollReview: View {
             "asm-ops ALL=(root) NOPASSWD: /usr/lib/asm-ssh/asm-end-lease \"\"",
         ]
         rules += target.logUnits.map { "asm-ops ALL=(root) NOPASSWD: /usr/lib/asm-ssh/asm-logs \($0) *" }
+        // status works for every unit restricted leases may read the logs of, restart or reload.
+        let statusUnits = Set(target.logUnits + target.restartUnits + target.reloadUnits).sorted()
+        rules += statusUnits.map { "asm-ops ALL=(root) NOPASSWD: /usr/lib/asm-ssh/asm-status \($0)" }
         rules += target.restartUnits.map { "asm-ops ALL=(root) NOPASSWD: <systemctl> restart \($0)" }
+        rules += target.reloadUnits.map { "asm-ops ALL=(root) NOPASSWD: <systemctl> reload \($0)" }
+        rules += target.readFiles.map { "asm-ops ALL=(root) NOPASSWD: /usr/lib/asm-ssh/asm-read \($0)" }
         // asm-priv runs shells as the privileged login (when allowed) and as each user.
         let runAs = (target.allowPrivileged ? [target.privilegedLogin] : []) + target.users.map(\.name)
         if !runAs.isEmpty {
@@ -1166,9 +1180,11 @@ private struct SshEnrollReview: View {
         }
         var files = [
             InstalledFile(path: "/usr/lib/asm-ssh/", owner: "root 0755",
-                          content: String(localized: "asm-dispatch, asm-shell, asm-end-lease, asm-logs, asm-remove (root 0755 each)")),
+                          content: String(localized: "asm-dispatch, asm-shell, asm-end-lease, asm-logs, asm-status, asm-read, asm-remove (root 0755 each)")),
             InstalledFile(path: "/var/lib/asm-ssh/manifest", owner: "root 0600",
                           content: String(localized: "tid=, ca=, priv_login=, priv_trust=, port=, ops_uid=, priv_uid=, state=, one user= line per user, and one ops_ak= / priv_ak= line per key file asm may have written")),
+            InstalledFile(path: "/var/lib/asm-ssh/baselines/", owner: "root 0700",
+                          content: String(localized: "created at the first login of a lease that can change the host: the checksums of the files asm watches, compared when the lease ends to report what changed")),
             InstalledFile(path: "/run/asm-ssh/", owner: "root 0700",
                           content: String(localized: "lock, sessions/, leases/ and ended: the sessions of asm leases and the leases that ended")),
             InstalledFile(path: "/etc/sudoers.d/asm-ssh", owner: "root 0440",

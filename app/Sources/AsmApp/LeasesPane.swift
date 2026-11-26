@@ -289,14 +289,16 @@ private struct SshLeaseSummary: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            LabeledContent("Access", value: ssh.access.title)
-            LabeledContent("Logins", value: Array(Set(ssh.targets.map(\.login))).sorted().formatted())
-            LabeledContent("Grants", value: ssh.grants.isEmpty ? "—" : ssh.grants.formatted())
             Text("Targets").font(.subheadline.weight(.semibold)).accessibilityAddTraits(.isHeader)
             ForEach(Array(ssh.targets.enumerated()), id: \.offset) { _, target in
-                Text(verbatim: Self.line(target))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: Self.line(target))
+                        .fixedSize(horizontal: false, vertical: true)
+                    if target.changesTotal > 0 {
+                        SshChangesList(target: target)
+                    }
+                }
+                .textSelection(.enabled)
             }
             if ssh.targets.contains(where: { $0.cleanup == .failed }) {
                 HStack {
@@ -307,13 +309,22 @@ private struct SshLeaseSummary: View {
         }
     }
 
-    /// `name — login — <cleanup state>`; no cleanup part while the lease is active.
+    /// `name — access — <cleanup state>`; no cleanup part while the lease is active.
     private static func line(_ target: SshLeaseTargetItem) -> String {
-        var parts = [target.name, target.login]
+        var parts = [target.name, access(target)]
         if let cleanup = target.cleanup {
             parts.append(cleanupLabel(cleanup, detail: target.cleanupDetail))
         }
         return parts.joined(separator: " — ")
+    }
+
+    /// `Privileged`, `Restricted: <grants>` or the user's name.
+    private static func access(_ target: SshLeaseTargetItem) -> String {
+        switch target.access {
+        case .privileged: String(localized: "Privileged")
+        case .restricted: String(localized: "Restricted: \(target.grants.joined(separator: ", "))")
+        case let .user(name): name
+        }
     }
 
     private static func cleanupLabel(_ state: SshCleanupStateItem, detail: String) -> String {
@@ -322,6 +333,27 @@ private struct SshLeaseSummary: View {
         case .retrying: String(localized: "Retrying: \(detail)")
         case .done, .failed: detail
         }
+    }
+}
+
+/// The watched files that changed on a target during the lease, as the host reported them.
+private struct SshChangesList: View {
+    let target: SshLeaseTargetItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("Changed during the lease:")
+            ForEach(target.changes, id: \.self) { path in
+                Text(verbatim: path).font(.callout.monospaced())
+            }
+            let more = Int(target.changesTotal) - target.changes.count
+            if more > 0 {
+                Text("and \(more) more")
+            }
+        }
+        .foregroundStyle(.orange)
+        .padding(.leading, 12)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

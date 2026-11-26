@@ -35,8 +35,8 @@ pub const CAPABILITY_BROADER_LEASE_REUSE_V1: &str = "broader_lease_reuse_v1";
 pub const CAPABILITY_LOGIN_GRANT_V1: &str = "login_grant_v1";
 /// Operator-assisted sign-in handing over a browser storage state (`asm login`).
 pub const CAPABILITY_LOGIN_BROKER_V1: &str = "login_broker_v1";
-/// SSH targets, SSH leases and `/v1/ssh/*`.
-pub const CAPABILITY_SSH_LEASES_V1: &str = "ssh_leases_v1";
+/// SSH targets, SSH leases with per-host access and `/v1/ssh/*`.
+pub const CAPABILITY_SSH_LEASES_V2: &str = "ssh_leases_v2";
 /// Lease duration choices: label and seconds (`None` = unlimited).
 pub const LEASE_DURATIONS: &[(&str, Option<u64>)] = &[
     ("5 min", Some(300)),
@@ -929,13 +929,22 @@ mod tests {
         }
 
         let ssh = json!({"request_id":"r","kind":"ssh","status":"approved","deny_reason":null,
-            "result":{"lease_id":"l","expires_at":"2026-11-16T12:10:00Z","access":"privileged","grants":[],
-                "certificate":"ssh-ed25519-cert-v01@openssh.com AAAA asm-lease-l",
+            "result":{"lease_id":"l","expires_at":"2026-11-16T12:10:00Z",
                 "targets":[{"name":"web","target_id":"0a1b2c3d","login":"asm-priv","hostname":"web.example",
-                    "port":22,"host_keys":["ssh-ed25519 AAAA"]}]},
+                    "port":22,"host_keys":["ssh-ed25519 AAAA"],"access":"privileged",
+                    "certificate":"ssh-ed25519-cert-v01@openssh.com AAAA asm-lease-l"},
+                    {"name":"db","target_id":"0a1b2c3e","login":"asm-ops","hostname":"db.example",
+                    "port":2222,"host_keys":["ssh-ed25519 BBBB"],"access":"restricted","grants":["logs:pg.service"],
+                    "certificate":"ssh-ed25519-cert-v01@openssh.com BBBB asm-lease-l"},
+                    {"name":"app","target_id":"0a1b2c3f","login":"asm-priv","hostname":"app.example",
+                    "port":22,"host_keys":["ssh-ed25519 CCCC"],"access":"user","user":"deploy",
+                    "certificate":"ssh-ed25519-cert-v01@openssh.com CCCC asm-lease-l"}]},
             "expires_at":null,"pending_lifetime_secs":600});
         let s: RequestState = serde_json::from_value(ssh.clone()).unwrap();
-        assert!(matches!(&s.result, Some(RequestResult::Ssh(r)) if r.access == SshAccess::Privileged));
+        let Some(RequestResult::Ssh(r)) = &s.result else { panic!("not an SSH result") };
+        let access: Vec<_> = r.targets.iter().map(|t| (t.access, t.grants.len(), t.user.as_deref())).collect();
+        assert_eq!(access, [(SshAccess::Privileged, 0, None), (SshAccess::Restricted, 1, None),
+            (SshAccess::User, 0, Some("deploy"))]);
         assert_eq!(to_value(&s).unwrap(), ssh);
     }
 

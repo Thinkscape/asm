@@ -47,9 +47,9 @@ systemctl daemon-reload >/dev/null 2>&1 || fail systemd "systemctl daemon-reload
 # 4. The accounts this enrollment created.
 drop_account asm-priv "$PRIV_UID"
 drop_account asm-ops "$OPS_UID"
-# 5. Files. The lock file stays.
+# 5. Files, and what asm-end-lease recorded for change reports. The lock file stays.
 rm -f /etc/sudoers.d/asm-ssh || fail io "cannot remove /etc/sudoers.d/asm-ssh"
-rm -rf "$LIB" "$RUN/sessions" "$RUN/leases" "$RUN/ended" || fail io "cannot remove $LIB and $RUN"
+rm -rf "$LIB" "$RUN/sessions" "$RUN/leases" "$RUN/ended" "$STATE/baselines" || fail io "cannot remove $LIB, $RUN and $STATE/baselines"
 # 6. Check, then forget the installation.
 for f in $OPS_AKS $PRIV_AKS; do [ ! -e "$f" ] || fail trust-remains "$f still exists"; done
 for f in $UNITS /etc/sudoers.d/asm-ssh "$LIB"; do [ ! -e "$f" ] || fail io "$f still exists"; done

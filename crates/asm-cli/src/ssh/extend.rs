@@ -1,14 +1,14 @@
 //! `asm ssh extend LEASE_ID REASON`: ask the operator to extend one of this machine's
-//! SSH leases, store the new certificate, and for privileged leases and leases as a user
-//! log in once to each host so it records the new end.
+//! SSH leases, store the new certificates, and log in once to each host the lease
+//! reaches as the privileged login or a user, so it records the new end.
 
-use super::store::{self, CONFIG_FILE, LocalSshLease, cert_blob, lease_dir};
+use super::store::{self, CONFIG_FILE, LocalSshLease, cert_ok, lease_dir};
 use super::{agent, require_ssh, ssh_dir};
 use crate::api::Api;
 use crate::error::CliError;
 use crate::requests::{self, unix_now};
 use crate::{hostinfo, state};
-use asm_proto::ssh::{SshAccess, SshResult};
+use asm_proto::ssh::{SshAccess, SshResult, SshTargetAccess};
 use asm_proto::time::fmt_unix;
 use asm_proto::wire::{RequestBody, RequestResult};
 use std::io::{Read, Write as _};
@@ -62,17 +62,16 @@ pub fn extend(a: ExtendArgs) -> Result<(), CliError> {
         return Err(invalid());
     };
     let lease = validate_extension(result, &local).ok_or_else(invalid)?;
-    let stored = store::store(&dir, &lease)?;
+    let stored = store::store(&dir, &lease)?.lease;
     agent::ensure_running(&dir);
 
-    let touched: Vec<(String, Result<(), String>)> = match stored.access {
-        SshAccess::Privileged | SshAccess::User => stored
-            .targets
-            .iter()
-            .map(|t| (t.name.clone(), touch(&dir, &stored.lease_id, &t.name)))
-            .collect(),
-        SshAccess::Restricted => Vec::new(),
-    };
+    // A restricted login runs only the granted operations; its host needs no touch.
+    let touched: Vec<(String, Result<(), String>)> = stored
+        .targets
+        .iter()
+        .filter(|t| t.access != SshAccess::Restricted)
+        .map(|t| (t.name.clone(), touch(&dir, &stored.lease_id, &t.name)))
+        .collect();
     let previous = fmt_unix(local.expires_at);
     for (name, outcome) in &touched {
         if let Err(why) = outcome {
@@ -112,21 +111,32 @@ pub fn extend(a: ExtendArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// The extended lease, when the result is the local lease with a later end and a new
-/// certificate; `None` when anything else changed.
+/// The extended lease, when the result is the local lease (same id; the same targets
+/// with the same access, grants, user, address and keys) with a later end and a valid
+/// certificate for every target; `None` when anything else changed.
 fn validate_extension(r: SshResult, local: &LocalSshLease) -> Option<LocalSshLease> {
     let expires_at = asm_proto::time::parse_unix(&r.expires_at)?;
-    let ok = r.lease_id == local.lease_id
-        && r.access == local.access
-        && r.grants == local.grants
-        && r.user == local.user
-        && r.targets == local.targets
-        && expires_at > local.expires_at
-        && cert_blob(&r.certificate).is_some()
-        && !r.certificate.contains(|c: char| c.is_control());
-    ok.then(|| LocalSshLease {
+    if r.lease_id != local.lease_id || expires_at <= local.expires_at || r.targets.len() != local.targets.len() {
+        return None;
+    }
+    let targets = local
+        .targets
+        .iter()
+        .map(|old| {
+            let new = r.targets.iter().find(|t| t.target_id == old.target_id)?;
+            let same = SshTargetAccess {
+                certificate: old.certificate.clone(),
+                ..new.clone()
+            } == *old;
+            (same && cert_ok(&new.certificate)).then(|| SshTargetAccess {
+                certificate: new.certificate.clone(),
+                ..old.clone()
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(LocalSshLease {
         expires_at,
-        certificate: r.certificate,
+        targets,
         ..local.clone()
     })
 }
@@ -180,20 +190,25 @@ fn touch(dir: &Path, lease_id: &str, name: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::tests::lease;
+    use super::super::store::tests::{lease, target};
     use super::*;
 
     const ID: &str = "11111111-2222-4333-8444-555555555555";
 
+    /// `local` extended to `expires_at`, every certificate replaced.
     fn result_for(local: &LocalSshLease, expires_at: &str) -> SshResult {
         SshResult {
             lease_id: local.lease_id.clone(),
             expires_at: expires_at.into(),
-            access: local.access,
-            grants: local.grants.clone(),
-            user: local.user.clone(),
-            certificate: format!("{} BBBB", store::CERT_TYPE),
-            targets: local.targets.clone(),
+            targets: local
+                .targets
+                .iter()
+                .map(|t| SshTargetAccess {
+                    certificate: format!("{} BBBB {}", store::CERT_TYPE, t.name),
+                    ..t.clone()
+                })
+                .rev()
+                .collect(),
         }
     }
 
@@ -201,26 +216,41 @@ mod tests {
     fn extension_needs_a_later_end_and_the_same_lease() {
         let mut local = lease(ID, 1_000, "db");
         local.requested_at = 7;
-        let extended = validate_extension(result_for(&local, "1970-01-01T00:20:00Z"), &local).unwrap();
+        let mut web = target("web", "4567cdef", "AQID");
+        web.access = SshAccess::Restricted;
+        web.login = "asm-ops".into();
+        web.grants = vec!["logs:a.service".into()];
+        local.targets.push(web);
+        let later = "1970-01-01T00:20:00Z";
+        let extended = validate_extension(result_for(&local, later), &local).unwrap();
         assert_eq!(extended.expires_at, 1_200);
         assert_eq!(extended.requested_at, 7);
-        assert_eq!(extended.certificate, format!("{} BBBB", store::CERT_TYPE));
+        let certs: Vec<(&str, &str)> =
+            extended.targets.iter().map(|t| (t.name.as_str(), t.certificate.as_str())).collect();
+        let want_db = format!("{} BBBB db", store::CERT_TYPE);
+        let want_web = format!("{} BBBB web", store::CERT_TYPE);
+        assert_eq!(certs, [("db", want_db.as_str()), ("web", want_web.as_str())]);
 
         assert!(validate_extension(result_for(&local, "1970-01-01T00:16:40Z"), &local).is_none());
-        let mut r = result_for(&local, "1970-01-01T00:20:00Z");
-        r.targets[0].port = 2222;
-        assert!(validate_extension(r, &local).is_none());
-        let mut r = result_for(&local, "1970-01-01T00:20:00Z");
-        r.access = SshAccess::Restricted;
-        assert!(validate_extension(r, &local).is_none());
-        let mut r = result_for(&local, "1970-01-01T00:20:00Z");
-        r.user = Some("deploy".into());
-        assert!(validate_extension(r, &local).is_none());
-        let mut r = result_for(&local, "1970-01-01T00:20:00Z");
-        r.lease_id = "22222222-2222-4333-8444-555555555555".into();
-        assert!(validate_extension(r, &local).is_none());
-        let mut r = result_for(&local, "1970-01-01T00:20:00Z");
-        r.certificate = "ssh-ed25519 AAAA".into();
-        assert!(validate_extension(r, &local).is_none());
+        let refused = |edit: &dyn Fn(&mut SshResult)| {
+            let mut r = result_for(&local, later);
+            edit(&mut r);
+            validate_extension(r, &local).is_none()
+        };
+        assert!(!refused(&|_| {}));
+        assert!(refused(&|r| r.targets[1].port = 2222));
+        assert!(refused(&|r| r.targets[1].host_keys.push("ssh-ed25519 AQID".into())));
+        assert!(refused(&|r| r.targets[0].grants.push("restart:a.service".into())));
+        assert!(refused(&|r| {
+            r.targets[1].access = SshAccess::User;
+            r.targets[1].user = Some("deploy".into());
+        }));
+        assert!(refused(&|r| {
+            r.targets.pop();
+        }));
+        assert!(refused(&|r| r.targets[0].target_id = "89abcdef".into()));
+        assert!(refused(&|r| r.lease_id = "22222222-2222-4333-8444-555555555555".into()));
+        assert!(refused(&|r| r.targets[0].certificate = "ssh-ed25519 AAAA".into()));
+        assert!(refused(&|r| r.targets[1].certificate = format!("{} AAAA\nx", store::CERT_TYPE)));
     }
 }

@@ -5,7 +5,9 @@ import UserNotifications
 /// (Down, or unhealthy for 30 s) with a Restart action. Without notification permission
 /// it opens the menu bar panel, whose banner says the same. Recovery removes the
 /// notification and posts nothing. The macOS Firewall blocking a listener meant for other
-/// machines is reported the same way, with an Open Firewall Settings action.
+/// machines is reported the same way, with an Open Firewall Settings action. SSH lease
+/// cleanup failures and change reports get one notification per target; a click shows
+/// the lease.
 @MainActor
 final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
     private static let category = "net.thinkscape.asm.proxy-problem"
@@ -14,6 +16,8 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
     private static let firewallCategory = "net.thinkscape.asm.firewall-blocked"
     private static let openFirewallAction = "open-firewall"
     private static let firewallRequestID = "firewall-blocked"
+    /// `userInfo` key of SSH lease notifications.
+    nonisolated private static let leaseIDKey = "leaseID"
     /// An unhealthy (running but not answering) proxy is reported after this long.
     private static let unhealthyNotifyAfter: TimeInterval = 30
 
@@ -21,6 +25,8 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
     var onRestart: () -> Void = {}
     /// Click on the notification body: show Settings → Proxy.
     var onShowDetails: () -> Void = {}
+    /// Click on an SSH lease notification: show the lease in Settings → Leases.
+    var onShowLease: (String) -> Void = { _ in }
 
     /// The current incident was reported (reset when the proxy runs again).
     private var reported = false
@@ -30,6 +36,9 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
     /// `<lease id>/<target name>` of every SSH cleanup problem seen; `nil` until the first
     /// lease list.
     private var sshCleanupSeen: Set<String>?
+    /// `<lease id>/<target name>` of every SSH change report seen; `nil` until the first
+    /// lease list.
+    private var sshChangesSeen: Set<String>?
 
     /// `nil` when the process has no bundle (`swift run`): the API then traps.
     private var center: UNUserNotificationCenter? {
@@ -99,28 +108,46 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
         Task { await post(id: Self.firewallRequestID, category: Self.firewallCategory, title: title, body: body) }
     }
 
-    /// Feed every new lease list: one notification per target of a privileged or
-    /// another-user SSH lease whose session cleanup is retrying or failed. The first call
-    /// only records the problems that already exist.
-    func updateSshCleanup(_ leases: [LeaseItem]) {
+    /// Feed every new lease list: one notification per target of an SSH lease whose session
+    /// cleanup is retrying or failed (privileged and other-user logins only), and one per
+    /// target whose host reported changed files when the lease ended there. The first call
+    /// only records what already exists.
+    func updateSsh(_ leases: [LeaseItem]) {
         var problems: [(key: String, leaseID: String, target: SshLeaseTargetItem)] = []
+        var changes: [(key: String, leaseID: String, target: SshLeaseTargetItem)] = []
         for lease in leases {
-            guard let ssh = lease.ssh, ssh.access != .restricted else { continue }
-            for target in ssh.targets where target.cleanup == .retrying || target.cleanup == .failed {
-                problems.append(("\(lease.id)/\(target.name)", lease.id, target))
+            guard let ssh = lease.ssh else { continue }
+            for target in ssh.targets {
+                let key = "\(lease.id)/\(target.name)"
+                if target.access != .restricted, target.cleanup == .retrying || target.cleanup == .failed {
+                    problems.append((key, lease.id, target))
+                }
+                if target.cleanup == .done, target.changesTotal > 0 {
+                    changes.append((key, lease.id, target))
+                }
             }
         }
-        guard var seen = sshCleanupSeen else {
+        guard var cleanupSeen = sshCleanupSeen, var changesSeen = sshChangesSeen else {
             sshCleanupSeen = Set(problems.map(\.key))
+            sshChangesSeen = Set(changes.map(\.key))
             return
         }
-        for problem in problems where seen.insert(problem.key).inserted {
+        for problem in problems where cleanupSeen.insert(problem.key).inserted {
             let title = "Ending SSH sessions on \(problem.target.name) failed"
             let body = "\(problem.target.cleanupDetail). Sessions of this lease may stay open; the host ends them when the lease expires."
             let id = "ssh-cleanup-\(problem.leaseID)-\(problem.target.name)"
-            Task { await post(id: id, category: "", title: title, body: body) }
+            Task { await post(id: id, category: "", title: title, body: body, leaseID: problem.leaseID) }
         }
-        sshCleanupSeen = seen
+        for change in changes where changesSeen.insert(change.key).inserted {
+            let title = "Files changed on \(change.target.name) during an SSH lease"
+            let more = Int(change.target.changesTotal) - 1
+            let first = change.target.changes.first ?? ""
+            let body = more > 0 ? "\(first) and \(more) more" : first
+            let id = "ssh-changes-\(change.leaseID)-\(change.target.name)"
+            Task { await post(id: id, category: "", title: title, body: body, leaseID: change.leaseID) }
+        }
+        sshCleanupSeen = cleanupSeen
+        sshChangesSeen = changesSeen
     }
 
     private func report(title: String, body: String) {
@@ -129,7 +156,8 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
         Task { await post(id: Self.requestID, category: Self.category, title: title, body: body) }
     }
 
-    private func post(id: String, category: String, title: String, body: String) async {
+    /// `leaseID`: a click on the notification shows that lease.
+    private func post(id: String, category: String, title: String, body: String, leaseID: String? = nil) async {
         guard let center, await authorized(center) else {
             Self.openMenuBarPanel()
             return
@@ -138,6 +166,9 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
         content.title = title
         content.body = body
         content.categoryIdentifier = category
+        if let leaseID {
+            content.userInfo = [Self.leaseIDKey: leaseID]
+        }
         content.sound = .default
         do {
             try await center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
@@ -191,11 +222,13 @@ final class ProxyAlerts: NSObject, UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse
     ) async {
         let action = response.actionIdentifier
+        let leaseID = response.notification.request.content.userInfo[Self.leaseIDKey] as? String
         await MainActor.run {
             switch action {
             case Self.restartAction: onRestart()
             case Self.openFirewallAction: Self.openFirewallSettings()
-            case UNNotificationDefaultActionIdentifier: onShowDetails()
+            case UNNotificationDefaultActionIdentifier:
+                if let leaseID { onShowLease(leaseID) } else { onShowDetails() }
             default: break
             }
         }

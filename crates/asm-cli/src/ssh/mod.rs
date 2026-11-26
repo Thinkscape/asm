@@ -13,7 +13,7 @@ use crate::requests::unix_now;
 use crate::state;
 use asm_proto::ssh::SshTargetsResponse;
 use asm_proto::time::fmt_unix;
-use asm_proto::wire::{CAPABILITY_SSH_LEASES_V1, HealthResponse};
+use asm_proto::wire::{CAPABILITY_SSH_LEASES_V2, HealthResponse};
 use clap::Subcommand;
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -67,7 +67,7 @@ pub fn ssh_dir() -> Result<PathBuf, CliError> {
 /// Fail with exit 2 unless the manager advertises SSH leases.
 fn require_ssh(api: &Api) -> Result<(), CliError> {
     let health: HealthResponse = api.get("/health")?;
-    health.require_capability(CAPABILITY_SSH_LEASES_V1).map_err(|_| {
+    health.require_capability(CAPABILITY_SSH_LEASES_V2).map_err(|_| {
         CliError::invalid("the manager does not support SSH leases; upgrade Agents Secrets Manager")
     })
 }
@@ -113,33 +113,28 @@ fn leases(json: bool) -> Result<(), CliError> {
         let doc: Vec<_> = leases
             .iter()
             .map(|l| {
-                let targets: Vec<_> = l
-                    .targets
-                    .iter()
-                    .map(|t| serde_json::json!({"name": t.name, "login": t.login}))
-                    .collect();
                 serde_json::json!({
                     "lease_id": l.lease_id,
                     "expires_at": fmt_unix(l.expires_at),
-                    "access": l.access,
-                    "grants": l.grants,
-                    "user": l.user,
-                    "targets": targets,
                     "config": config(&l.lease_id).to_string_lossy(),
+                    "targets": l.targets.iter().map(request::target_json).collect::<Vec<_>>(),
                 })
             })
             .collect();
         let _ = writeln!(out, "{}", serde_json::Value::Array(doc));
     } else {
         for l in &leases {
-            let names: Vec<&str> = l.targets.iter().map(|t| t.name.as_str()).collect();
+            let targets: Vec<String> = l
+                .targets
+                .iter()
+                .map(|t| format!("{} ({})", t.name, request::access_text(t)))
+                .collect();
             let _ = writeln!(
                 out,
-                "{}\tuntil {}\t{}\t{}\t{}",
+                "{}\tuntil {}\t{}\t{}",
                 l.lease_id,
                 fmt_unix(l.expires_at),
-                request::access_text(l, ","),
-                names.join(","),
+                targets.join(", "),
                 config(&l.lease_id).display()
             );
         }

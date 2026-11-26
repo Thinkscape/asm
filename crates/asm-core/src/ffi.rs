@@ -141,28 +141,56 @@ pub struct SshApprovalTarget {
     pub allow_privileged: bool,
     pub log_units: Vec<String>,
     pub restart_units: Vec<String>,
+    pub reload_units: Vec<String>,
+    pub read_files: Vec<String>,
     pub users: Vec<SshTargetUser>,
     /// Enrolled at the requested revision with the current CA.
     pub ready: bool,
     pub issue: Option<String>,
     pub host_key_fingerprints: Vec<String>,
+    /// The longest lease this target allows.
+    pub max_duration_secs: u64,
+}
+
+/// The operator's decision for one requested target of an SSH request; a target the
+/// operator denied has none.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SshTargetDecision {
+    pub target_id: String,
+    pub access: SshAccess,
+    /// The operations of restricted access.
+    pub grants: Vec<String>,
+    /// The user access as a user runs as.
+    pub user: Option<String>,
+}
+
+/// One target of a lease an extension request names, with the access the lease has there.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SshExtendTarget {
+    pub target: SshApprovalTarget,
+    pub access: SshAccess,
+    pub grants: Vec<String>,
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SshLeaseTarget {
     pub name: String,
     pub login: String,
+    pub access: SshAccess,
+    pub grants: Vec<String>,
+    /// The user access as a user runs as.
+    pub user: Option<String>,
     /// `None` while the lease is active.
     pub cleanup: Option<SshCleanupState>,
     pub cleanup_detail: String,
+    /// Watched files that changed on the host during the lease (at most 20), reported when it ended there.
+    pub changes: Vec<String>,
+    pub changes_total: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SshLeaseDetail {
-    pub access: SshAccess,
-    pub grants: Vec<String>,
-    /// The user an access-as-a-user lease runs as.
-    pub user: Option<String>,
     pub targets: Vec<SshLeaseTarget>,
 }
 
@@ -213,6 +241,8 @@ pub struct SshTargetDraft {
     pub host_keys: Vec<String>,
     pub log_units: Vec<String>,
     pub restart_units: Vec<String>,
+    pub reload_units: Vec<String>,
+    pub read_files: Vec<String>,
     pub max_duration_secs: u64,
     pub users: Vec<SshTargetUser>,
 }
@@ -240,11 +270,15 @@ pub struct SshTargetInfo {
     pub host_keys: Vec<SshHostKey>,
     pub log_units: Vec<String>,
     pub restart_units: Vec<String>,
+    pub reload_units: Vec<String>,
+    pub read_files: Vec<String>,
     pub max_duration_secs: u64,
     pub users: Vec<SshTargetUser>,
     pub revision: u64,
     pub state: SshTargetState,
     pub error: Option<String>,
+    /// Enrolled with older host scripts than this asm ships: enroll again.
+    pub scripts_outdated: bool,
     /// The last run on the target failed its host key check: review it.
     pub host_key_changed: bool,
     pub active_leases: u32,
@@ -1074,15 +1108,12 @@ pub enum Decision {
         duration_secs: Option<u64>,
         fill_origins: Vec<String>,
     },
-    /// An SSH request: the targets (a subset of the request's), the access (any the
-    /// targets allow: privileged, restricted with grants, or a user every target allows),
-    /// restricted grants (no more than a restricted request asked for), the user for
-    /// access as a user, and the duration (60 s up to the targets' limit).
+    /// An SSH request: one decision per approved target (a requested target at most once;
+    /// at least one; a target left out is denied), each with the access that target
+    /// allows (restricted grants no more than a restricted request asked for), and the
+    /// duration (60 s up to the smallest limit of the approved targets).
     ApproveSsh {
-        target_ids: Vec<String>,
-        access: SshAccess,
-        grants: Vec<String>,
-        user: Option<String>,
+        targets: Vec<SshTargetDecision>,
         duration_secs: u64,
     },
     /// An SSH lease extension: the lease then ends `duration_secs` from now.
@@ -1273,10 +1304,7 @@ pub enum RequestDetail {
     SshExtend {
         lease_id: String,
         reason: String,
-        access: SshAccess,
-        grants: Vec<String>,
-        user: Option<String>,
-        targets: Vec<SshApprovalTarget>,
+        targets: Vec<SshExtendTarget>,
         expires_at: SystemTime,
         issue: Option<String>,
         default_duration_secs: u64,

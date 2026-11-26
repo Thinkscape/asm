@@ -1,12 +1,12 @@
 //! The CLI's SSH files in `<config_dir>/ssh/` (mode 0700): `leases.json` with its lock,
-//! one folder per lease (`cert.pub`, `known_hosts`, `config`), and `asm-ssh-hosts.conf`,
-//! the file `asm ssh install` includes from `~/.ssh/config`.
+//! one folder per lease (`<target id>-cert.pub` per target, `known_hosts`, `config`), and
+//! `asm-ssh-hosts.conf`, the file `asm ssh install` includes from `~/.ssh/config`.
 
 use crate::error::CliError;
 use crate::files::{ensure_private_dir, lock_file, write_file_atomic};
 use crate::requests::unix_now;
 use asm_proto::crypto::is_uuid;
-use asm_proto::ssh::{SshAccess, SshTargetAccess, b64_decode};
+use asm_proto::ssh::{SshTargetAccess, b64_decode};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
@@ -20,7 +20,8 @@ pub const AGENT_SOCK: &str = "agent.sock";
 pub const HOSTS_CONF: &str = "asm-ssh-hosts.conf";
 pub const CONFIG_FILE: &str = "config";
 const KNOWN_HOSTS_FILE: &str = "known_hosts";
-const CERT_FILE: &str = "cert.pub";
+/// `<target id>-cert.pub`: the certificate of one target.
+const CERT_SUFFIX: &str = "-cert.pub";
 
 const HOSTS_CONF_HEADER: &str = "# Managed by asm: rewritten whenever this machine's SSH leases change. Don't edit.\n# `asm ssh install` includes it from ~/.ssh/config; `asm ssh uninstall` stops that.\n";
 
@@ -30,17 +31,9 @@ pub struct LocalSshLease {
     pub lease_id: String,
     /// Unix seconds.
     pub expires_at: i64,
-    pub access: SshAccess,
-    #[serde(default)]
-    pub grants: Vec<String>,
-    /// The user a `User` lease runs as.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
     /// Unix seconds: when `store` first saved this lease; an extension keeps it.
-    #[serde(default)]
     pub requested_at: i64,
-    /// One OpenSSH certificate line.
-    pub certificate: String,
+    /// The hosts the operator approved, each with its own access and certificate.
     pub targets: Vec<SshTargetAccess>,
 }
 
@@ -50,13 +43,25 @@ pub fn cert_blob(line: &str) -> Option<Vec<u8>> {
     b64_decode(rest.split(' ').next()?)
 }
 
+/// Whether `line` is a certificate line of `CERT_TYPE` without control characters, so
+/// it can be written as a certificate file.
+pub fn cert_ok(line: &str) -> bool {
+    cert_blob(line).is_some() && !line.contains(|c: char| c.is_control())
+}
+
 /// The folder of one lease.
 pub fn lease_dir(dir: &Path, id: &str) -> PathBuf {
     dir.join(id)
 }
 
-/// Read `leases.json`; a missing file is an empty list. Entries whose id is not a
-/// UUID are dropped: the id names a folder in the directory.
+/// The name of one target's certificate file in its lease folder.
+pub fn cert_file(target_id: &str) -> String {
+    format!("{target_id}{CERT_SUFFIX}")
+}
+
+/// Read `leases.json`; a missing file is an empty list. Entries that don't decode (such
+/// as those of an older asm) and entries whose id is not a UUID are dropped: the id
+/// names a folder in the directory.
 pub fn read_leases(dir: &Path) -> Result<Vec<LocalSshLease>, String> {
     let path = dir.join(LEASES_FILE);
     let data = match std::fs::read(&path) {
@@ -64,10 +69,13 @@ pub fn read_leases(dir: &Path) -> Result<Vec<LocalSshLease>, String> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
-    let mut leases: Vec<LocalSshLease> = serde_json::from_slice(&data)
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&data)
         .map_err(|e| format!("reading {}: {e}", path.display()))?;
-    leases.retain(|l| is_uuid(&l.lease_id));
-    Ok(leases)
+    Ok(entries
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<LocalSshLease>(v).ok())
+        .filter(|l| is_uuid(&l.lease_id))
+        .collect())
 }
 
 fn io_failure(what: &str, path: &Path, e: std::io::Error) -> CliError {
@@ -112,11 +120,19 @@ fn save_leases(dir: &Path, leases: &[LocalSshLease]) -> Result<(), CliError> {
     write_file_atomic(dir, LEASES_FILE, &json).map(drop)
 }
 
+/// What `store` saved.
+pub struct Stored {
+    pub lease: LocalSshLease,
+    /// The host names `asm-ssh-hosts.conf` now maps to this lease: plain `ssh <name>`
+    /// uses this lease only for these.
+    pub hosts_conf_names: HashSet<String>,
+}
+
 /// Under the lease lock: drop expired leases and their folders, then save `lease`
-/// (its folder, `cert.pub`, and `known_hosts` and `config` once), `leases.json` and
-/// `asm-ssh-hosts.conf`. A stored lease with a later end wins over `lease`, so a slower,
-/// older response never rolls a lease back. Returns the stored lease.
-pub fn store(dir: &Path, lease: &LocalSshLease) -> Result<LocalSshLease, CliError> {
+/// (its folder, every target's certificate file, and `known_hosts` and `config` once),
+/// `leases.json` and `asm-ssh-hosts.conf`. A stored lease with a later end wins over
+/// `lease`, so a slower, older response never rolls a lease back.
+pub fn store(dir: &Path, lease: &LocalSshLease) -> Result<Stored, CliError> {
     let _lock = lock(dir)?;
     let mut leases = drop_expired(dir, read_leases(dir).map_err(CliError::failure)?)?;
     let existing = leases.iter().find(|l| l.lease_id == lease.lease_id).cloned();
@@ -130,8 +146,10 @@ pub fn store(dir: &Path, lease: &LocalSshLease) -> Result<LocalSshLease, CliErro
             let config = render_config(dir, &stored)?;
             let ldir = lease_dir(dir, &stored.lease_id);
             ensure_private_dir(&ldir)?;
-            write_file_atomic(&ldir, CERT_FILE, format!("{}\n", stored.certificate).as_bytes())?;
-            // Written once: an extension changes only the certificate.
+            for t in &stored.targets {
+                write_file_atomic(&ldir, &cert_file(&t.target_id), format!("{}\n", t.certificate).as_bytes())?;
+            }
+            // Written once: an extension changes only the certificates.
             if !ldir.join(KNOWN_HOSTS_FILE).exists() {
                 write_file_atomic(&ldir, KNOWN_HOSTS_FILE, render_known_hosts(&stored).as_bytes())?;
             }
@@ -146,7 +164,11 @@ pub fn store(dir: &Path, lease: &LocalSshLease) -> Result<LocalSshLease, CliErro
     };
     save_leases(dir, &leases)?;
     write_hosts_conf(dir, &leases)?;
-    Ok(stored)
+    let hosts_conf_names = hosts_conf_names(&leases, &stored.lease_id).into_iter().map(str::to_owned).collect();
+    Ok(Stored {
+        lease: stored,
+        hosts_conf_names,
+    })
 }
 
 /// Under the lease lock: forget one lease (the manager no longer knows it).
@@ -209,7 +231,7 @@ pub fn render_block(
     let ldir = lease_dir(dir, &lease.lease_id);
     let known_hosts = config_path(&ldir.join(KNOWN_HOSTS_FILE))?;
     let agent = config_path(&dir.join(AGENT_SOCK))?;
-    let identity = config_path(&ldir.join(CERT_FILE))?;
+    let identity = config_path(&ldir.join(cert_file(&t.target_id)))?;
     let also = if alias {
         format!(" {}", t.hostname)
     } else {
@@ -246,6 +268,18 @@ pub fn render_config(dir: &Path, lease: &LocalSshLease) -> Result<String, CliErr
 /// `asm-ssh-hosts.conf`: one block per host name of an unexpired lease, from the lease
 /// requested last (ties: the larger lease id).
 pub fn render_hosts_conf(dir: &Path, leases: &[LocalSshLease]) -> Result<String, CliError> {
+    let newest = newest_per_name(leases);
+    let targets: Vec<&SshTargetAccess> = newest.values().map(|(_, t)| *t).collect();
+    let mut out = String::from(HOSTS_CONF_HEADER);
+    for (l, t) in newest.values() {
+        let _ = write!(out, "\n{}", render_block(dir, l, t, address_alias(t, &targets))?);
+    }
+    Ok(out)
+}
+
+/// Per host name of an unexpired lease, the lease and target `asm-ssh-hosts.conf` uses:
+/// the lease requested last (ties: the larger lease id).
+fn newest_per_name(leases: &[LocalSshLease]) -> BTreeMap<&str, (&LocalSshLease, &SshTargetAccess)> {
     let now = unix_now();
     let mut newest: BTreeMap<&str, (&LocalSshLease, &SshTargetAccess)> = BTreeMap::new();
     for l in leases.iter().filter(|l| l.expires_at > now) {
@@ -256,12 +290,16 @@ pub fn render_hosts_conf(dir: &Path, leases: &[LocalSshLease]) -> Result<String,
             }
         }
     }
-    let targets: Vec<&SshTargetAccess> = newest.values().map(|(_, t)| *t).collect();
-    let mut out = String::from(HOSTS_CONF_HEADER);
-    for (l, t) in newest.values() {
-        let _ = write!(out, "\n{}", render_block(dir, l, t, address_alias(t, &targets))?);
-    }
-    Ok(out)
+    newest
+}
+
+/// The host names `asm-ssh-hosts.conf` maps to lease `lease_id`, for `leases` as stored.
+fn hosts_conf_names<'a>(leases: &'a [LocalSshLease], lease_id: &str) -> HashSet<&'a str> {
+    newest_per_name(leases)
+        .into_iter()
+        .filter(|(_, (l, _))| l.lease_id == lease_id)
+        .map(|(name, _)| name)
+        .collect()
 }
 
 /// Rewrite `asm-ssh-hosts.conf` (0600) atomically.
@@ -273,23 +311,28 @@ pub fn write_hosts_conf(dir: &Path, leases: &[LocalSshLease]) -> Result<(), CliE
 pub(super) mod tests {
     use super::*;
 
+    /// A privileged target `name` (id `tid`) whose certificate blob is `cert_b64`.
+    pub fn target(name: &str, tid: &str, cert_b64: &str) -> SshTargetAccess {
+        SshTargetAccess {
+            name: name.into(),
+            target_id: tid.into(),
+            login: "asm-priv".into(),
+            hostname: "db.example.com".into(),
+            port: 22,
+            host_keys: vec!["ssh-ed25519 AAAA".into()],
+            access: asm_proto::ssh::SshAccess::Privileged,
+            grants: Vec::new(),
+            user: None,
+            certificate: format!("{CERT_TYPE} {cert_b64}"),
+        }
+    }
+
     pub fn lease(id: &str, expires_at: i64, name: &str) -> LocalSshLease {
         LocalSshLease {
             lease_id: id.into(),
             expires_at,
-            access: SshAccess::Privileged,
-            grants: Vec::new(),
-            user: None,
             requested_at: 0,
-            certificate: format!("{CERT_TYPE} AAAA"),
-            targets: vec![SshTargetAccess {
-                name: name.into(),
-                target_id: "0123abcd".into(),
-                login: "asm-priv".into(),
-                hostname: "db.example.com".into(),
-                port: 22,
-                host_keys: vec!["ssh-ed25519 AAAA".into()],
-            }],
+            targets: vec![target(name, "0123abcd", "AAAA")],
         }
     }
 
@@ -301,7 +344,7 @@ pub(super) mod tests {
         let config = render_config(Path::new("/d"), &lease(A, 100, "db")).unwrap();
         assert!(config.starts_with(&format!("# Written by asm ssh for lease {A}.\n\nHost db db.example.com\n")), "{config}");
         assert!(config.contains("\n  User asm-priv\n"), "{config}");
-        assert!(config.contains(&format!("\n  IdentityFile \"/d/{A}/cert.pub\"\n")), "{config}");
+        assert!(config.contains(&format!("\n  IdentityFile \"/d/{A}/0123abcd-cert.pub\"\n")), "{config}");
         assert!(config.contains(&format!("\n  UserKnownHostsFile \"/d/{A}/known_hosts\"\n")), "{config}");
         assert!(config.contains("\n  IdentityAgent \"/d/agent.sock\"\n"), "{config}");
 
@@ -309,6 +352,23 @@ pub(super) mod tests {
         same.targets[0].hostname = "db".into();
         let config = render_config(Path::new("/d"), &same).unwrap();
         assert!(config.contains("\nHost db\n  HostName db\n"), "{config}");
+    }
+
+    #[test]
+    fn each_target_block_names_its_own_certificate() {
+        let mut two = lease(A, 100, "db");
+        let mut web = target("web", "4567cdef", "BBBB");
+        web.hostname = "web.example.com".into();
+        web.login = "asm-ops".into();
+        two.targets.push(web);
+        let config = render_config(Path::new("/d"), &two).unwrap();
+        let blocks: Vec<&str> = config.split("\nHost ").skip(1).collect();
+        assert_eq!(blocks.len(), 2, "{config}");
+        assert!(blocks[0].starts_with("db db.example.com\n"), "{config}");
+        assert!(blocks[0].contains(&format!("\n  IdentityFile \"/d/{A}/0123abcd-cert.pub\"\n")), "{config}");
+        assert!(blocks[1].starts_with("web web.example.com\n"), "{config}");
+        assert!(blocks[1].contains("\n  User asm-ops\n"), "{config}");
+        assert!(blocks[1].contains(&format!("\n  IdentityFile \"/d/{A}/4567cdef-cert.pub\"\n")), "{config}");
     }
 
     #[test]
@@ -321,15 +381,15 @@ pub(super) mod tests {
         let conf = render_hosts_conf(Path::new("/d"), &[a.clone(), b.clone()]).unwrap();
         assert!(conf.starts_with(HOSTS_CONF_HEADER));
         assert_eq!(conf.matches("\nHost ").count(), 1, "{conf}");
-        assert!(conf.contains(&format!("/d/{A}/cert.pub")), "{conf}");
+        assert!(conf.contains(&format!("/d/{A}/0123abcd-cert.pub")), "{conf}");
         // Equal request times: the larger lease id wins.
         b.requested_at = 20;
         let conf = render_hosts_conf(Path::new("/d"), &[b.clone(), a.clone()]).unwrap();
-        assert!(conf.contains(&format!("/d/{B}/cert.pub")), "{conf}");
+        assert!(conf.contains(&format!("/d/{B}/0123abcd-cert.pub")), "{conf}");
         // Expired leases are skipped; with none left only the header remains.
         b.expires_at = now - 1;
         let conf = render_hosts_conf(Path::new("/d"), &[b.clone(), a.clone()]).unwrap();
-        assert!(conf.contains(&format!("/d/{A}/cert.pub")), "{conf}");
+        assert!(conf.contains(&format!("/d/{A}/0123abcd-cert.pub")), "{conf}");
         a.expires_at = now - 1;
         assert_eq!(render_hosts_conf(Path::new("/d"), &[a, b]).unwrap(), HOSTS_CONF_HEADER);
     }
@@ -366,31 +426,58 @@ pub(super) mod tests {
         let dir = tmp.path().join("ssh");
         ensure_private_dir(&dir).unwrap();
         let now = unix_now();
-        let first = store(&dir, &lease(A, now + 100, "db")).unwrap();
+        let two = |expires_at: i64, db: &str, web: &str| LocalSshLease {
+            targets: vec![target("db", "0123abcd", db), target("web", "4567cdef", web)],
+            ..lease(A, expires_at, "db")
+        };
+        let first = store(&dir, &two(now + 100, "AAAA", "AQID")).unwrap().lease;
         assert!(first.requested_at >= now);
         let ldir = lease_dir(&dir, A);
         let config = std::fs::read(ldir.join(CONFIG_FILE)).unwrap();
+        let cert = |tid: &str| std::fs::read_to_string(ldir.join(cert_file(tid))).unwrap();
+        assert_eq!(cert("0123abcd"), format!("{CERT_TYPE} AAAA\n"));
+        assert_eq!(cert("4567cdef"), format!("{CERT_TYPE} AQID\n"));
 
-        let mut later = lease(A, now + 200, "db");
-        later.certificate = format!("{CERT_TYPE} BBBB");
+        // An extension rewrites every certificate file and keeps the config.
+        let mut later = two(now + 200, "BBBB", "BAUG");
         later.targets[0].hostname = "elsewhere".into();
-        let stored = store(&dir, &later).unwrap();
+        let stored = store(&dir, &later).unwrap().lease;
         assert_eq!(stored.expires_at, now + 200);
         assert_eq!(stored.requested_at, first.requested_at);
         assert_eq!(std::fs::read(ldir.join(CONFIG_FILE)).unwrap(), config);
-        assert_eq!(std::fs::read_to_string(ldir.join(CERT_FILE)).unwrap(), format!("{CERT_TYPE} BBBB\n"));
+        assert_eq!(cert("0123abcd"), format!("{CERT_TYPE} BBBB\n"));
+        assert_eq!(cert("4567cdef"), format!("{CERT_TYPE} BAUG\n"));
 
         // An older response keeps the stored lease.
-        let stored = store(&dir, &lease(A, now + 150, "db")).unwrap();
+        let stored = store(&dir, &two(now + 150, "AAAA", "AQID")).unwrap().lease;
         assert_eq!(stored.expires_at, now + 200);
         assert_eq!(read_leases(&dir).unwrap(), vec![stored]);
-        assert_eq!(std::fs::read_to_string(ldir.join(CERT_FILE)).unwrap(), format!("{CERT_TYPE} BBBB\n"));
+        assert_eq!(cert("0123abcd"), format!("{CERT_TYPE} BBBB\n"));
+        assert_eq!(cert("4567cdef"), format!("{CERT_TYPE} BAUG\n"));
 
         // Forgetting removes the folder and the hosts block; the file stays.
         forget_lease(&dir, A).unwrap();
         assert!(!ldir.exists());
         assert!(read_leases(&dir).unwrap().is_empty());
         assert_eq!(std::fs::read_to_string(dir.join(HOSTS_CONF)).unwrap(), HOSTS_CONF_HEADER);
+    }
+
+    #[test]
+    fn read_leases_skips_entries_that_do_not_decode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let current = lease(A, 100, "db");
+        // An entry as asm 0.9.0 wrote it: one access and certificate for the whole lease.
+        let old = serde_json::json!({"lease_id": B, "expires_at": 100, "access": "privileged",
+            "grants": [], "requested_at": 1, "certificate": format!("{CERT_TYPE} AAAA"),
+            "targets": [{"name": "web", "target_id": "4567cdef", "login": "asm-priv",
+                "hostname": "web.example.com", "port": 22, "host_keys": ["ssh-ed25519 AAAA"]}]});
+        let file = serde_json::json!([old, current]);
+        std::fs::write(dir.join(LEASES_FILE), serde_json::to_vec(&file).unwrap()).unwrap();
+        assert_eq!(read_leases(dir).unwrap(), vec![current]);
+        // A file that is not a list still fails.
+        std::fs::write(dir.join(LEASES_FILE), b"{}").unwrap();
+        assert!(read_leases(dir).is_err());
     }
 
     #[test]
@@ -401,14 +488,35 @@ pub(super) mod tests {
         let now = unix_now();
         store(&dir, &lease(A, now + 100, "db")).unwrap();
         store(&dir, &lease(B, now + 100, "web")).unwrap();
+        assert!(lease_dir(&dir, A).join(cert_file("0123abcd")).exists());
         let mut leases = read_leases(&dir).unwrap();
         leases[0].expires_at = now - 1;
         save_leases(&dir, &leases).unwrap();
         prune(&dir).unwrap();
         assert!(!lease_dir(&dir, A).exists());
-        assert!(lease_dir(&dir, B).exists());
+        assert!(lease_dir(&dir, B).join(cert_file("0123abcd")).exists());
         let conf = std::fs::read_to_string(dir.join(HOSTS_CONF)).unwrap();
         assert!(conf.contains("\nHost web ") && !conf.contains("\nHost db "), "{conf}");
+    }
+
+    #[test]
+    fn store_reports_the_names_the_hosts_conf_maps_to_the_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ssh");
+        ensure_private_dir(&dir).unwrap();
+        let now = unix_now();
+        let names = |s: &Stored| {
+            let mut n: Vec<String> = s.hosts_conf_names.iter().cloned().collect();
+            n.sort();
+            n
+        };
+        let mut a = lease(A, now + 100, "db");
+        a.targets.push(target("web", "4567cdef", "AQID"));
+        assert_eq!(names(&store(&dir, &a).unwrap()), ["db", "web"]);
+        // A newer lease on db takes that name (equal request times: the larger id).
+        assert_eq!(names(&store(&dir, &lease(B, now + 100, "db")).unwrap()), ["db"]);
+        // Storing the older lease again keeps its request time: it keeps only web.
+        assert_eq!(names(&store(&dir, &a).unwrap()), ["web"]);
     }
 
     #[test]

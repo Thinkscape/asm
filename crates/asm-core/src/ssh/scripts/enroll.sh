@@ -6,6 +6,10 @@ LOG_UNITS='@@LOG_UNITS@@'
 # operator chose the user knowing it can become root.
 USERS='@@USERS@@'
 RESTART_UNITS='@@RESTART_UNITS@@'
+RELOAD_UNITS='@@RELOAD_UNITS@@'
+# Files restricted leases may read; their grammar (asm_proto::ssh::validate_read_path)
+# leaves out every character sudoers or the shell would interpret.
+READ_FILES='@@READ_FILES@@'
 AGENT_HOST='@@AGENT_HOST@@'; PORT='@@AGENT_PORT@@'
 MARK="asm-ca-$TID"; TAIL="asm managed CA $CA_FP $MARK"
 set -f
@@ -13,7 +17,7 @@ set -f
 # ---- 1. Preflight. Nothing changes until every check passes. ----
 [ "$(id -u)" = 0 ] || fail not-root "enrollment must run as root"
 [ "$(uname -s)" = Linux ] && [ -d /run/systemd/system ] || fail unsupported-os "only Linux hosts running systemd are supported"
-for tool in sshd systemctl journalctl loginctl useradd usermod userdel getent flock mktemp stat awk sed grep id install sudo visudo pgrep pkill timeout date; do
+for tool in sshd systemctl journalctl loginctl useradd usermod userdel getent flock mktemp stat awk sed grep id install sudo visudo pgrep pkill timeout date find sha256sum sort head readlink; do
   command -v "$tool" >/dev/null 2>&1 || fail missing-tool "$tool not found"
 done
 SYSTEMCTL=$(command -v systemctl)
@@ -145,6 +149,12 @@ ASM_EOF
 put "$LIB" asm-logs 0755 <<'ASM_EOF'
 @@LOGS@@
 ASM_EOF
+put "$LIB" asm-status 0755 <<'ASM_EOF'
+@@STATUS@@
+ASM_EOF
+put "$LIB" asm-read 0755 <<'ASM_EOF'
+@@READ@@
+ASM_EOF
 put "$LIB" asm-remove 0755 <<'ASM_EOF'
 @@REMOVE@@
 ASM_EOF
@@ -168,12 +178,17 @@ else
   drop_account asm-priv "$PRIV_UID"; PRIV_UID=; OLD_PRIV_AK=; manifest installing
 fi
 tmp=; tmp=$(mktemp /etc/sudoers.d/.asm-ssh.XXXXXX) || fail io "cannot write /etc/sudoers.d"
+# status works for every unit restricted leases may read the logs of, restart or reload.
+STATUS_UNITS=$(printf '%s\n' $LOG_UNITS $RESTART_UNITS $RELOAD_UNITS | sort -u)
 {
   echo "# Installed by asm for SSH target $TID; $LIB/asm-remove removes it."
   echo "asm-ops ALL=(root) NOPASSWD: $LIB/asm-end-lease register *"
   echo "asm-ops ALL=(root) NOPASSWD: $LIB/asm-end-lease \"\""
   for u in $LOG_UNITS; do echo "asm-ops ALL=(root) NOPASSWD: $LIB/asm-logs $u *"; done
+  for u in $STATUS_UNITS; do echo "asm-ops ALL=(root) NOPASSWD: $LIB/asm-status $u"; done
   for u in $RESTART_UNITS; do echo "asm-ops ALL=(root) NOPASSWD: $SYSTEMCTL restart $u"; done
+  for u in $RELOAD_UNITS; do echo "asm-ops ALL=(root) NOPASSWD: $SYSTEMCTL reload $u"; done
+  for f in $READ_FILES; do echo "asm-ops ALL=(root) NOPASSWD: $LIB/asm-read $f"; done
   if [ "$PRIV_ACCT" = 1 ]; then
     RUNAS=; [ "$PRIV_TRUST" = 0 ] || RUNAS=$PRIV
     for n in $NAMES; do RUNAS="${RUNAS:+$RUNAS, }$n"; done
@@ -188,7 +203,10 @@ sudo_ok() { u=$1; shift; sudo -n -l -U "$u" "$@" >/dev/null 2>&1 || fail sudoers
 sudo_ok asm-ops "$LIB/asm-end-lease" register 00000000-0000-4000-8000-000000000000 1 -
 sudo_ok asm-ops "$LIB/asm-end-lease"
 for u in $LOG_UNITS; do sudo_ok asm-ops "$LIB/asm-logs" "$u" 1; done
+for u in $STATUS_UNITS; do sudo_ok asm-ops "$LIB/asm-status" "$u"; done
 for u in $RESTART_UNITS; do sudo_ok asm-ops "$SYSTEMCTL" restart "$u"; done
+for u in $RELOAD_UNITS; do sudo_ok asm-ops "$SYSTEMCTL" reload "$u"; done
+for f in $READ_FILES; do sudo_ok asm-ops "$LIB/asm-read" "$f"; done
 if [ "$PRIV_ACCT" = 1 ]; then
   sudo_ok asm-priv "$LIB/asm-end-lease" register 00000000-0000-4000-8000-000000000000 1 -
 fi

@@ -217,21 +217,48 @@ struct SshApprovalTargetItem: Identifiable, Equatable, Sendable {
     var allowPrivileged: Bool
     var logUnits: [String]
     var restartUnits: [String]
+    var reloadUnits: [String]
+    var readFiles: [String]
     var users: [SshTargetUserItem]
     /// Enrolled at the requested revision with the current CA.
     var ready: Bool
     var issue: String?
     var hostKeyFingerprints: [String]
+    /// The longest lease this target allows (0 when it was removed).
+    var maxDurationSecs: UInt64
+
+    /// Every restricted grant the target allows: logs, restart, reload, read, in that order.
+    var grants: [String] {
+        logUnits.map { "logs:\($0)" } + restartUnits.map { "restart:\($0)" }
+            + reloadUnits.map { "reload:\($0)" } + readFiles.map { "read:\($0)" }
+    }
 }
 
 struct SshRequestItem: Equatable, Sendable {
     var reason: String
     var access: SshAccessItem
-    /// `logs:<unit>`, `restart:<unit>` (restricted access only).
+    /// `logs:<unit>`, `restart:<unit>`, `reload:<unit>`, `read:<path>` (restricted access only).
     var grants: [String]
     var targets: [SshApprovalTargetItem]
     var defaultDurationSecs: UInt64
     var maxDurationSecs: UInt64
+}
+
+/// The operator's decision for one approved target of an SSH request.
+struct SshTargetDecisionItem: Equatable, Sendable {
+    var targetID: String
+    var access: SshAccessItem
+    /// The operations of restricted access.
+    var grants: [String]
+}
+
+/// One target of a lease an extension request names, with the access the lease has there.
+struct SshExtendTargetItem: Identifiable, Equatable, Sendable {
+    var target: SshApprovalTargetItem
+    var access: SshAccessItem
+    var grants: [String]
+
+    var id: String { target.id }
 }
 
 /// An agent asks to extend one of its active SSH leases. Access, grants and targets are the
@@ -239,9 +266,7 @@ struct SshRequestItem: Equatable, Sendable {
 struct SshExtendRequestItem: Equatable, Sendable {
     var leaseID: String
     var reason: String
-    var access: SshAccessItem
-    var grants: [String]
-    var targets: [SshApprovalTargetItem]
+    var targets: [SshExtendTargetItem]
     var expiresAt: Date
     /// Set when the lease can no longer be extended.
     var issue: String?
@@ -256,14 +281,18 @@ enum SshCleanupStateItem: Equatable, Sendable {
 struct SshLeaseTargetItem: Equatable, Sendable {
     var name: String
     var login: String
+    var access: SshAccessItem
+    var grants: [String]
     /// `nil` while the lease is active.
     var cleanup: SshCleanupStateItem?
     var cleanupDetail: String
+    /// Watched files that changed on the host during the lease (at most 20), reported when
+    /// it ended there.
+    var changes: [String]
+    var changesTotal: UInt32
 }
 
 struct SshLeaseDetailItem: Equatable, Sendable {
-    var access: SshAccessItem
-    var grants: [String]
     var targets: [SshLeaseTargetItem]
 }
 
@@ -320,14 +349,24 @@ struct SshTargetItem: Identifiable, Equatable, Sendable {
     var allowPrivileged: Bool
     var logUnits: [String]
     var restartUnits: [String]
+    var reloadUnits: [String]
+    var readFiles: [String]
     var users: [SshTargetUserItem]
     var maxDurationSecs: UInt64
     var revision: UInt64
     var state: SshTargetStateItem
     var error: String?
+    /// Enrolled with older host scripts than this asm ships.
+    var scriptsOutdated: Bool
     var activeLeases: UInt32
     /// The last run on the target failed its host key check.
     var hostKeyChanged: Bool
+
+    /// The state as Settings shows it.
+    var stateTitle: String {
+        state == .needsReenroll && scriptsOutdated
+            ? String(localized: "Enroll again (asm updated its host scripts)") : state.title
+    }
 }
 
 /// `id` nil adds a target; an edit passes its id and the revision it was read at.
@@ -343,6 +382,8 @@ struct SshTargetDraftItem: Sendable {
     var allowPrivileged: Bool
     var logUnits: [String]
     var restartUnits: [String]
+    var reloadUnits: [String]
+    var readFiles: [String]
     var users: [SshTargetUserItem]
     var maxDurationSecs: UInt64
 }
@@ -1137,7 +1178,8 @@ enum DecisionItem: Sendable {
     case approveWrite(vaultID: String, collectionID: String?)
     /// `durationSecs`: how long the handed-over session stays valid (`nil` = 1 hour).
     case approveLogin(durationSecs: UInt64?, fillOrigins: [String])
-    case approveSsh(targetIDs: [String], access: SshAccessItem, grants: [String], durationSecs: UInt64)
+    /// One decision per approved target; a requested target left out is denied.
+    case approveSsh(targets: [SshTargetDecisionItem], durationSecs: UInt64)
     case approveSshExtend(durationSecs: UInt64)
 }
 

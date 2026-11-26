@@ -118,9 +118,10 @@ final class CoreBridge: @unchecked Sendable {
                         generation: generation.map(GenerationSelection.init))
         case let .approveWrite(vaultID, collectionID): .approveWrite(vaultId: vaultID, collectionId: collectionID)
         case let .approveLogin(durationSecs, fillOrigins): .approveLogin(durationSecs: durationSecs, fillOrigins: fillOrigins)
-        case let .approveSsh(targetIDs, access, grants, durationSecs):
-            .approveSsh(targetIds: targetIDs, access: SshAccess(access), grants: grants, user: access.user,
-                        durationSecs: durationSecs)
+        case let .approveSsh(targets, durationSecs):
+            .approveSsh(targets: targets.map { d in
+                SshTargetDecision(targetId: d.targetID, access: SshAccess(d.access), grants: d.grants, user: d.access.user)
+            }, durationSecs: durationSecs)
         case let .approveSshExtend(durationSecs): .approveSshExtend(durationSecs: durationSecs)
         }
     }
@@ -549,11 +550,14 @@ private extension PendingItem {
                 targets: targets.map(SshApprovalTargetItem.init),
                 defaultDurationSecs: defaultDurationSecs, maxDurationSecs: maxDurationSecs
             ))
-        case let .sshExtend(leaseID, reason, access, grants, user, targets, expiresAt, issue, defaultDurationSecs,
-                            maxDurationSecs):
+        case let .sshExtend(leaseID, reason, targets, expiresAt, issue, defaultDurationSecs, maxDurationSecs):
             .sshExtend(SshExtendRequestItem(
-                leaseID: leaseID, reason: reason, access: SshAccessItem(access, user: user), grants: grants,
-                targets: targets.map(SshApprovalTargetItem.init), expiresAt: expiresAt, issue: issue,
+                leaseID: leaseID, reason: reason,
+                targets: targets.map { t in
+                    SshExtendTargetItem(target: SshApprovalTargetItem(t.target), access: SshAccessItem(t.access, user: t.user),
+                                        grants: t.grants)
+                },
+                expiresAt: expiresAt, issue: issue,
                 defaultDurationSecs: defaultDurationSecs, maxDurationSecs: maxDurationSecs
             ))
         }
@@ -741,8 +745,9 @@ private extension SshApprovalTargetItem {
         self.init(
             id: t.targetId, name: t.name, hostname: t.hostname, port: t.port, privilegedLogin: t.privilegedLogin,
             allowPrivileged: t.allowPrivileged, logUnits: t.logUnits, restartUnits: t.restartUnits,
+            reloadUnits: t.reloadUnits, readFiles: t.readFiles,
             users: t.users.map(SshTargetUserItem.init), ready: t.ready, issue: t.issue,
-            hostKeyFingerprints: t.hostKeyFingerprints
+            hostKeyFingerprints: t.hostKeyFingerprints, maxDurationSecs: t.maxDurationSecs
         )
     }
 }
@@ -760,13 +765,13 @@ private extension SshCleanupStateItem {
 
 private extension SshLeaseDetailItem {
     init(_ d: SshLeaseDetail) {
-        self.init(
-            access: SshAccessItem(d.access, user: d.user), grants: d.grants,
-            targets: d.targets.map { t in
-                SshLeaseTargetItem(name: t.name, login: t.login, cleanup: t.cleanup.map(SshCleanupStateItem.init),
-                                   cleanupDetail: t.cleanupDetail)
-            }
-        )
+        self.init(targets: d.targets.map { t in
+            SshLeaseTargetItem(
+                name: t.name, login: t.login, access: SshAccessItem(t.access, user: t.user), grants: t.grants,
+                cleanup: t.cleanup.map(SshCleanupStateItem.init), cleanupDetail: t.cleanupDetail,
+                changes: t.changes, changesTotal: t.changesTotal
+            )
+        })
     }
 }
 
@@ -812,10 +817,11 @@ private extension SshTargetItem {
             id: t.id, name: t.name, destination: t.destination, agentHostname: t.agentHostname, agentPort: t.agentPort,
             privilegedLogin: t.privilegedLogin, hostKeys: t.hostKeys.map(SshHostKeyItem.init),
             allowPrivileged: t.allowPrivileged, logUnits: t.logUnits,
-            restartUnits: t.restartUnits, users: t.users.map(SshTargetUserItem.init), maxDurationSecs: t.maxDurationSecs,
+            restartUnits: t.restartUnits, reloadUnits: t.reloadUnits, readFiles: t.readFiles,
+            users: t.users.map(SshTargetUserItem.init), maxDurationSecs: t.maxDurationSecs,
             revision: t.revision,
-            state: SshTargetStateItem(t.state), error: t.error, activeLeases: t.activeLeases,
-            hostKeyChanged: t.hostKeyChanged
+            state: SshTargetStateItem(t.state), error: t.error, scriptsOutdated: t.scriptsOutdated,
+            activeLeases: t.activeLeases, hostKeyChanged: t.hostKeyChanged
         )
     }
 }
@@ -826,6 +832,7 @@ private extension SshTargetDraft {
             id: d.id, expectedRevision: d.expectedRevision, name: d.name, destination: d.destination,
             agentHostname: d.agentHostname, agentPort: d.agentPort, privilegedLogin: d.privilegedLogin,
             allowPrivileged: d.allowPrivileged, hostKeys: d.hostKeys, logUnits: d.logUnits, restartUnits: d.restartUnits,
+            reloadUnits: d.reloadUnits, readFiles: d.readFiles,
             maxDurationSecs: d.maxDurationSecs, users: d.users.map(SshTargetUser.init)
         )
     }

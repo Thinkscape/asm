@@ -4,8 +4,11 @@
 #                             before a lease session does anything. It records the
 #                             caller's systemd-logind session, refuses an ended lease and,
 #                             for a login as USER, an account that changed since enrollment.
+#                             An asm-priv login also records the files asm watches (below).
 #   (no arguments)            asm-dispatch runs this through sudo for the manager's cleanup
 #                             login. Reads one line: "end LEASE VALID_BEFORE" or "check".
+#                             "end" prints "changed <path>" for at most 20 watched paths that
+#                             changed during the lease, then "asm-end-ok <ended> <changed>".
 #   --sweep                   asm-end-lease.timer: ends sessions past their lease's end or
 #                             of ended leases, and warns lease terminals 10 and 2 minutes
 #                             before the end.
@@ -14,6 +17,9 @@
 #   sessions/<id>  lease=, user=, mono= (the session's start) and tty= of one logind session
 #   leases/<id>    the latest end any login of that lease presented
 #   ended          "<lease> <valid before>" for each lease the manager ended
+# and in /var/lib/asm-ssh/baselines (root-only, kept across reboots until the lease's end
+# reaches this host, or 30 days after it):
+#   <lease>        the files asm watches as the lease's first login found them
 set -u
 set -f
 PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH
@@ -37,6 +43,141 @@ prop() { loginctl show-session "$1" -p "$2" --value 2>/dev/null; }
 own_session() { sed -n 's|.*/session-\([A-Za-z0-9][A-Za-z0-9]*\)\.scope$|\1|p' /proc/$$/cgroup | head -n 1; }
 is_ended() { grep -q "^$1 " "$RUN/ended" 2>/dev/null; }
 @@ADMIN@@
+
+# ---- Change report ----
+# A login that can leave things behind (asm-priv, as the privileged login or as a user)
+# records a snapshot of the places its scope watches at the lease's first login:
+# $BASE/<lease> holds "until=<end>", "scope=<root or user:NAME>", "complete=<1 or 0>",
+# then the snapshot. When the manager ends the lease, the scope is listed again, and
+# every path whose line was added, removed or changed is reported.
+#
+# A snapshot reads metadata only (no file is opened): one GNU `find -P` walk, which does
+# not follow symbolic links, with one line per entry, sorted with LC_ALL=C:
+#   <type> <device>:<inode> <size> <ctime> <mtime> <mode> <uid>:<gid> <path>
+# Any write by an account other than root changes the ctime, so contents need no hash. A
+# directory prints "-" for size, ctime and mtime, so only a change to the directory
+# itself (mode, owner, a new inode) reports it, not one inside it. A path with a line
+# break prints "(a name with a line break)" instead (its inode keeps it apart). The whole
+# line is compared; the reported path is everything after the seventh field.
+#
+# The walk stops after 20 seconds, 20000 lines or 4 MiB; then the snapshot is incomplete
+# (complete=0) and the lease's end reports that asm could not check every file.
+BASE=$STATE/baselines
+NL='
+'
+INCOMPLETE="changed (asm could not check every watched file: too many files or too slow)"
+# home_entries HOME: the watched entries of one home directory that exist, each only
+# when no symbolic link leads into it below HOME (the entry itself may be one).
+home_entries() {
+  rh=$(readlink -f "$1") || return 0
+  for f in .ssh .config/systemd/user .profile .bash_profile .bash_login .bashrc .bash_logout .zshrc .zprofile \
+      .zshenv .zlogin; do
+    e="${1%/}/$f"
+    [ -e "$e" ] || [ -L "$e" ] || continue
+    d=${f%/*}; want=$rh; [ "$d" = "$f" ] || want="${rh%/}/$d"
+    [ "$(readlink -f "$(dirname "$e")")" = "$want" ] && printf '%s\n' "$e"
+  done
+  return 0
+}
+# watched SCOPE: the paths SCOPE watches, one per line. root: every home and the places
+# that decide who logs in, what runs at boot or on a schedule, and what every shell
+# loads. user:NAME: what NAME itself can change to keep access.
+watched() {
+  if [ "$1" = root ]; then
+    getent passwd | head -n 500 | cut -d: -f6 | while IFS= read -r h; do
+      case "$h" in /|/var/lib/asm-*) continue ;; /*) ;; *) continue ;; esac
+      [ ! -d "$h" ] || home_entries "$h"
+    done
+    printf '%s\n' /var/spool/cron /var/spool/at /var/lib/systemd/linger /etc/passwd /etc/group /etc/shadow \
+      /etc/gshadow /etc/sudoers /etc/sudoers.d /etc/crontab /etc/cron.d /etc/cron.hourly /etc/cron.daily \
+      /etc/cron.weekly /etc/cron.monthly /etc/anacrontab /etc/systemd/system /etc/systemd/user \
+      /usr/lib/systemd/system /lib/systemd/system /etc/ssh /etc/pam.d /etc/security /etc/ld.so.preload \
+      /etc/profile /etc/profile.d /etc/environment /etc/bash.bashrc /etc/rc.local
+  else
+    wu=${1#user:}
+    wh=$(getent passwd "$wu" | cut -d: -f6)
+    case "$wh" in /*) [ ! -d "$wh" ] || home_entries "$wh" ;; esac
+    printf '%s\n' "/var/spool/cron/crontabs/$wu" "/var/spool/cron/$wu" "/var/lib/systemd/linger/$wu"
+    for d in /var/spool/cron/atjobs /var/spool/at; do
+      [ ! -d "$d" ] || timeout 20 find -P "$d" -type f -user "$wu" ! -path "*$NL*" 2>/dev/null | head -n 1000
+    done
+  fi
+}
+# start_paths: the paths on stdin that exist, each once. A path that resolves to one
+# already listed (/lib on a usr-merged host) is left out; a symbolic link counts as itself.
+start_paths() {
+  seen=
+  while IFS= read -r p; do
+    [ -e "$p" ] || [ -L "$p" ] || continue
+    if [ -L "$p" ]; then r="$(readlink -f "$(dirname "$p")")/${p##*/}"; else r=$(readlink -f "$p") || r=$p; fi
+    case "$seen$NL" in *"$NL$r$NL"*) continue ;; esac
+    seen="$seen$NL$r"
+    printf '%s\n' "$p"
+  done
+}
+# walk PATH...: the snapshot lines of one bounded walk, unsorted; a last line "incomplete"
+# when it stopped early.
+walk() {
+  m='%m %U:%G'
+  { timeout 20 find -P "$@" \
+      \( -path "*$NL*" \( -type d -printf "%y %D:%i - - - $m (a name with a line break)\n" \
+          -o -printf "%y %D:%i %s %C@ %T@ $m (a name with a line break)\n" \) \) \
+      -o \( -type d -printf "%y %D:%i - - - $m %p\n" \) \
+      -o -printf "%y %D:%i %s %C@ %T@ $m %p\n" 2>/dev/null
+    [ "$?" -lt 124 ] || echo incomplete; } \
+    | LC_ALL=C awk '$0 == "incomplete" { print; exit }
+        { n++; b += length($0) + 1; if (n > 20000 || b > 4194304) { print "incomplete"; exit } print }'
+}
+# snapshot SCOPE: "complete=1" (or 0), then the sorted snapshot of SCOPE (nothing when
+# incomplete).
+snapshot() {
+  starts=$(watched "$1" | start_paths)
+  oifs=$IFS; IFS=$NL; set -- $starts; IFS=$oifs
+  [ "$#" -gt 0 ] || { echo complete=1; return 0; }
+  snap=$(walk "$@")
+  case "$NL$snap$NL" in *"${NL}incomplete$NL"*) echo complete=0; return 0 ;; esac
+  echo complete=1
+  [ -z "$snap" ] || printf '%s\n' "$snap" | LC_ALL=C sort
+}
+# baseline LEASE UNTIL SCOPE: record SCOPE's snapshot for LEASE once; a later end of the
+# lease only moves its "until" line.
+baseline() {
+  bfile=$BASE/$1
+  if [ -f "$bfile" ]; then
+    bold=$(sed -n '1s/^until=//p' "$bfile")
+    case "$bold" in ''|*[!0-9]*) bold=0 ;; esac
+    [ "$2" -gt "$bold" ] || return 0
+    sed "1s/.*/until=$2/" "$bfile" > "$BASE/.$1" && mv -f "$BASE/.$1" "$bfile"
+    return
+  fi
+  { [ -d "$BASE" ] || mkdir -m 0700 "$BASE"; } || return 1
+  bsnap=$(snapshot "$3")
+  printf 'until=%s\nscope=%s\n%s\n' "$2" "$3" "$bsnap" > "$BASE/.$1" && mv -f "$BASE/.$1" "$bfile"
+}
+# changed_paths BASELINE: the paths whose lines differ between the snapshot in BASELINE
+# (after its three header lines) and the one on stdin, sorted, each once.
+changed_paths() {
+  awk 'part == 1 { if (FNR > 3) old[$0] = 1; next }
+    $0 == "" { next }
+    $0 in old { delete old[$0]; next }
+    { print }
+    END { for (l in old) print l }' part=1 "$1" part=2 - | sed 's/^\([^ ]* \)\{7\}//' | LC_ALL=C sort -u
+}
+# report BASELINE SNAPSHOT: print "changed <path>" for at most 20 watched paths that
+# changed since BASELINE and set TOTAL to how many changed; when either snapshot is
+# incomplete, one line that says so, counted as 1.
+report() {
+  TOTAL=0
+  if [ "$(sed -n '3p' "$1")" = complete=1 ] && [ "${2%%"$NL"*}" = complete=1 ]; then
+    changed=$(printf '%s\n' "$2" | sed 1d | changed_paths "$1")
+    [ -n "$changed" ] || return 0
+    TOTAL=$(printf '%s\n' "$changed" | awk 'END { print NR }')
+    printf '%s\n' "$changed" | head -n 20 | sed 's/^/changed /'
+  else
+    TOTAL=1; echo "$INCOMPLETE"
+  fi
+}
+# ---- End of the change report ----
 
 if [ "$MODE" = register ]; then
   { [ "$#" -eq 4 ] || [ "$#" -eq 5 ]; } || fail usage "asm-end-lease register LEASE UNTIL TTY [USER]"
@@ -83,6 +224,16 @@ if [ "$MODE" = register ]; then
     printf '%s\n' "$until" > "$RUN/leases/.$lease" && mv -f "$RUN/leases/.$lease" "$RUN/leases/$lease" \
       || fail io "cannot record the lease"
   fi
+  # Change report: a login that can leave things behind records the watched files once.
+  # asm-ops runs only the restricted operations; a user that can become root leaves
+  # things anywhere.
+  scope=
+  if [ "$SUDO_UID" = "$priv" ]; then
+    if [ -z "$as" ] || [ "${rec##*:}" = 1 ]; then scope=root; else scope="user:$as"; fi
+  fi
+  [ -z "$scope" ] || baseline "$lease" "$until" "$scope" || fail io "cannot record the files asm watches"
+  # Recording took a while: the lease must still be on.
+  { [ "$until" -gt "$(date +%s)" ] && ! is_ended "$lease"; } || fail ended "the SSH lease has ended"
   echo "asm-end-ok 0"; exit 0
 fi
 
@@ -156,6 +307,14 @@ if [ "$MODE" = --sweep ]; then
     dl=$(cat "$f" 2>/dev/null) || dl=0
     [ "$dl" -gt "$NOW" ] || grep -rqx "lease=$l" "$RUN/sessions" || rm -f "$f"
   done
+  # Change reports of leases whose end never reached this host go 30 days after the end.
+  set +f; BASELINES=$(printf '%s\n' "$BASE"/[0-9a-f]*); set -f
+  for f in $BASELINES; do
+    [ -f "$f" ] || continue
+    u=$(sed -n '1s/^until=//p' "$f")
+    case "$u" in ''|*[!0-9]*) u=0 ;; esac
+    [ "$((NOW - u))" -le 2592000 ] || rm -f "$f"
+  done
 fi
 for s in $kill; do loginctl terminate-session "$s" 2>/dev/null; done
 # New logins of an ended or expired lease are refused under the lock, so it can go now.
@@ -183,4 +342,20 @@ for s in $kill; do
   esac
 done
 [ "$failed" -eq 0 ] || fail sessions "could not end $failed of $((ended + failed)) sessions"
-echo "asm-end-ok $ended"
+if [ "$MODE" != stdin ]; then echo "asm-end-ok $ended"; exit 0; fi
+# The lease's sessions are over: report the watched paths that changed during it, then
+# forget its baseline.
+total=0
+if [ -f "$BASE/$LEASE" ]; then
+  scope=$(sed -n '2s/^scope=//p' "$BASE/$LEASE")
+  case "$scope" in
+    root) ;;
+    user:*) printf '%s\n' "${scope#user:}" | grep -Eqx '[a-z_][a-z0-9_-]{0,31}' || scope= ;;
+    *) scope= ;;
+  esac
+  [ -n "$scope" ] || { rm -f "$BASE/$LEASE"; fail baseline "the record of the files asm watches was damaged; asm removed it"; }
+  report "$BASE/$LEASE" "$(snapshot "$scope")"
+  total=$TOTAL
+  rm -f "$BASE/$LEASE" || fail io "cannot remove $BASE/$LEASE"
+fi
+echo "asm-end-ok $ended $total"

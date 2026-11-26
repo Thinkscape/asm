@@ -1617,13 +1617,8 @@ impl Core {
             (Detail::Login(l), ffi::Decision::ApproveLogin { duration_secs, fill_origins }) => self
                 .approve_login(&p, l, duration_secs, &fill_origins)
                 .map(|()| None),
-            (
-                Detail::Ssh(d),
-                ffi::Decision::ApproveSsh { target_ids, access, grants, user, duration_secs },
-            ) => self
-                .approve_ssh(&p, d, super::ssh::SshApproval {
-                    target_ids, access: access.into(), grants, user, duration_secs,
-                })
+            (Detail::Ssh(d), ffi::Decision::ApproveSsh { targets, duration_secs }) => self
+                .approve_ssh(&p, d, super::ssh::SshApproval { targets, duration_secs })
                 .map(|_| None),
             (Detail::SshExtend(d), ffi::Decision::ApproveSshExtend { duration_secs }) => self
                 .approve_ssh_extend(&p, d, duration_secs)

@@ -2,7 +2,10 @@
 //! (`cargo test -p asm-core --test e2e ssh_host_scripts_on_linux -- --ignored --nocapture`).
 
 use super::*;
-use asm_core::ffi::{LeaseInfo, SourceKind, SshCleanupState, SshTargetDraft, SshTargetState, SshTargetUser};
+use asm_core::ffi::{
+    ActivityEntry, ActivityQuery, LeaseInfo, SourceKind, SshCleanupState, SshLeaseTarget, SshTargetDraft, SshTargetState,
+    SshTargetUser,
+};
 use asm_core::manager::ssh::{OpenSshRemote, RemoteAuth, RemoteError, RemoteOutput, SshRemote, list_host_users};
 use asm_core::store::SshTargetRecord;
 use std::process::{Child, ChildStdin};
@@ -173,11 +176,25 @@ fn expires_at(m: &Manager, reason: &str) -> u64 {
     unix(ssh_lease(m, reason).and_then(|l| l.expires_at).expect("SSH lease end"))
 }
 
+/// `lin` in lease `reason`.
+fn lease_target(m: &Manager, reason: &str) -> SshLeaseTarget {
+    let lease = ssh_lease(m, reason).expect("SSH lease");
+    lease.ssh.expect("SSH detail").targets.into_iter().find(|t| t.name == "lin").expect("lin")
+}
+
 /// The cleanup state and detail of `lin` in lease `reason`.
 fn cleanup(m: &Manager, reason: &str) -> (Option<SshCleanupState>, String) {
-    let lease = ssh_lease(m, reason).expect("SSH lease");
-    let target = lease.ssh.expect("SSH detail").targets.into_iter().find(|t| t.name == "lin").expect("lin");
+    let target = lease_target(m, reason);
     (target.cleanup, target.cleanup_detail)
+}
+
+/// The SSH activity events of kind `kind` about lease `lease_id`.
+fn ssh_events(m: &Manager, kind: &str, lease_id: &str) -> Vec<ActivityEntry> {
+    m.list_activity(ActivityQuery { categories: vec!["ssh".into()], host_id: None, search: String::new(),
+        before_id: None, limit: 1000 })
+        .into_iter()
+        .filter(|e| e.kind == kind && e.detail.as_deref().is_some_and(|d| d.contains(lease_id)))
+        .collect()
 }
 
 fn wait_cleanup(m: &Manager, reason: &str, secs: u64, ok: impl Fn(Option<SshCleanupState>, &str) -> bool)
@@ -371,6 +388,11 @@ fn host_scripts_on(base: &str, sudo: &str, cli: &Path, bin_dir: &Path) {
     // Users agents may log in as: a plain account, one that can become root and a daemon
     // account without a login shell.
     c.ok("useradd -m -s /bin/bash deploy && useradd -m -s /bin/bash -G sudo ops");
+    // A file in a directory deploy can write: listed on the target, refused by asm-read.
+    c.ok("install -d -o deploy -g deploy /srv/deploy && echo 'deploy config' > /srv/deploy/app.conf");
+    // deploy's own key file, where a lease as deploy adds a key.
+    c.ok("install -d -m 0700 -o deploy -g deploy /home/deploy/.ssh \
+          && install -m 0600 -o deploy -g deploy /dev/null /home/deploy/.ssh/authorized_keys");
     let listed = list_host_users("lin-target", "root", std::slice::from_ref(&host_key), Some(&ssh_config),
         &{ let d = t.join("users-run"); std::fs::create_dir(&d).unwrap(); d }).expect("list the host's users");
     let user = |name: &str| listed.iter().find(|u| u.name == name).unwrap_or_else(|| panic!("{name}: {listed:?}"));
@@ -384,11 +406,13 @@ fn host_scripts_on(base: &str, sudo: &str, cli: &Path, bin_dir: &Path) {
         .map(|name| SshTargetUser { name: (*name).into(), admin: user(name).admin.clone() }).collect();
 
     let units = vec!["asm-test.service".to_owned()];
+    let files: Vec<String> = ["/etc/asm-test/app.conf", "/etc/asm-test/shadow", "/srv/deploy/app.conf", "/proc/version"]
+        .map(str::to_owned).into();
     let target = manager.save_ssh_target(SshTargetDraft {
         id: None, expected_revision: None, name: "lin".into(), destination: "lin-target".into(),
         agent_hostname: "127.0.0.1".into(), agent_port: port, privileged_login: "root".into(),
         allow_privileged: true, host_keys: vec![host_key.clone()], log_units: units.clone(),
-        restart_units: units, max_duration_secs: 60, users,
+        restart_units: units.clone(), reload_units: units, read_files: files.clone(), max_duration_secs: 60, users,
     }).expect("save SSH target");
     let tid = target.id.clone();
 
@@ -427,6 +451,18 @@ fn host_scripts_on(base: &str, sudo: &str, cli: &Path, bin_dir: &Path) {
     assert_eq!(c.ok("sed -n 's/^user=//p' /var/lib/asm-ssh/manifest | cut -d: -f1,3"), "deploy:0\nops:1\nwww-data:0");
     assert_eq!(c.ok("sed -n 's/^user=www-data://p' /var/lib/asm-ssh/manifest"), "33:0");
     assert_eq!(c.ok(&format!("grep -c '{marker}' /var/lib/asm-priv/.ssh/authorized_keys")), "2");
+    let rules = c.ok("cat /etc/sudoers.d/asm-ssh");
+    let rule = |suffix: &str| rules.lines().any(|l| l.starts_with("asm-ops ALL=(root) NOPASSWD: ") && l.ends_with(suffix));
+    assert!(rule(" /usr/lib/asm-ssh/asm-status asm-test.service"), "{rules}");
+    assert!(rule("/systemctl reload asm-test.service"), "{rules}");
+    for file in &files {
+        assert!(rule(&format!(" /usr/lib/asm-ssh/asm-read {file}")), "{file}: {rules}");
+    }
+    for helper in ["asm-status", "asm-read"] {
+        assert_eq!(c.ok(&format!("stat -c '%U %a' /usr/lib/asm-ssh/{helper}")), "root 755");
+    }
+    // Enrolling records no baseline: only lease logins do.
+    assert_eq!(c.ok("ls -A /var/lib/asm-ssh/baselines 2>/dev/null || true"), "");
 
     // ---- 3. Privileged command, sftp, and plain ssh through the Include. ----
     let r1 = asm.run(&["ssh", "request", "lin", "r1", "--privileged", "--", "id", "-u"]);
@@ -499,6 +535,93 @@ fn host_scripts_on(base: &str, sudo: &str, cli: &Path, bin_dir: &Path) {
     let out = output(ssh(&r3_config, &["lin", "restart", "ssh.service"]), None);
     assert_eq!(out.code, 126, "{}{}", out.stdout, out.stderr);
     assert!(out.stderr.contains("not granted"), "{}", out.stderr);
+
+    // ---- 5b. Status, reload, logs since, and files. ----
+    let grants = ["--grant", "logs:asm-test.service", "--grant", "reload:asm-test.service",
+        "--grant", "read:/etc/asm-test/app.conf", "--grant", "read:/etc/asm-test/shadow",
+        "--grant", "read:/srv/deploy/app.conf", "--grant", "read:/proc/version"];
+    let restricted = |reason: &str, op: &[&str]| {
+        let mut args = vec!["ssh", "request", "lin", reason, "--new-lease"];
+        args.extend_from_slice(&grants);
+        args.push("--");
+        args.extend_from_slice(op);
+        asm.run(&args)
+    };
+    let s1 = restricted("s1", &["status", "asm-test.service"]);
+    assert_eq!(s1.code, 0, "{}{}", s1.stdout, s1.stderr);
+    assert!(s1.stdout.lines().any(|l| l == "ActiveState=active"), "{}", s1.stdout);
+    assert!(s1.stdout.lines().any(|l| l == "Id=asm-test.service"), "{}", s1.stdout);
+    let s2 = restricted("s2", &["reload", "asm-test.service"]);
+    assert_eq!(s2.code, 0, "{}{}", s2.stdout, s2.stderr);
+    let s3 = restricted("s3", &["logs", "asm-test.service", "5", "--since", "10m"]);
+    assert_eq!(s3.code, 0, "{}{}", s3.stdout, s3.stderr);
+    let s4 = restricted("s4", &["read", "/etc/asm-test/app.conf"]);
+    assert_eq!((s4.code, s4.stdout.as_str()), (0, "asm-test config 42\n"), "{}", s4.stderr);
+    for (reason, op, message) in [
+        ("s5", &["read", "/etc/passwd"][..], "asm: read of /etc/passwd not granted"),
+        ("s6", &["read", "/etc/asm-test/shadow"], "asm: /etc/asm-test/shadow is not a regular file"),
+        ("s7", &["read", "/srv/deploy/app.conf"],
+            "asm: /srv/deploy/app.conf is not in a directory only root can write; asm can't read it safely"),
+        ("s8", &["restart", "asm-test.service"], "asm: restart of asm-test.service not granted"),
+        ("s9", &["logs", "asm-test.service", "5", "--since", "yesterday"],
+            "asm: WHEN must look like 30m, 2h, 1d or 2026-11-25T10:00"),
+        ("s10", &["read", "/proc/version"], "asm: /proc/version is on a virtual filesystem; asm can't read it safely"),
+    ] {
+        let out = restricted(reason, op);
+        assert_eq!((out.code, out.stdout.as_str()), (126, ""), "{op:?}: {}", out.stderr);
+        assert!(out.stderr.contains(message), "{op:?}: {}", out.stderr);
+    }
+    // Restricted logins record no baseline.
+    for reason in ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"] {
+        let id = lease_id(manager, reason);
+        c.ok(&format!("test ! -e /var/lib/asm-ssh/baselines/{id}"));
+    }
+
+    // ---- 5c. Change report. ----
+    // A privileged lease that adds a cron job reports it when it ends.
+    let c1 = asm.run(&["ssh", "request", "lin", "c1", "--privileged", "--new-lease", "--",
+        "echo '# asm e2e' > /etc/cron.d/asm-test"]);
+    assert_eq!(c1.code, 0, "{}{}", c1.stdout, c1.stderr);
+    let c1_id = lease_id(manager, "c1");
+    assert_eq!(c.ok(&format!("sed -n 2,3p /var/lib/asm-ssh/baselines/{c1_id}")), "scope=root\ncomplete=1");
+    manager.revoke_lease(c1_id.clone()).unwrap();
+    wait_cleanup(manager, "c1", 30, |s, _| s == Some(SshCleanupState::Done));
+    let target = lease_target(manager, "c1");
+    eprintln!("c1 changes: {} {:?}", target.changes_total, target.changes);
+    // Only the new file: its directory is not reported for it.
+    assert_eq!((target.changes.as_slice(), target.changes_total), (&["/etc/cron.d/asm-test".to_owned()][..], 1));
+    wait_for("files_changed for c1", 10, || !ssh_events(manager, "files_changed", &c1_id).is_empty());
+    c.ok(&format!("test ! -e /var/lib/asm-ssh/baselines/{c1_id}"));
+    c.ok("rm /etc/cron.d/asm-test");
+    // A lease as deploy that adds a key to its own authorized_keys reports that file.
+    let c2 = asm.run(&["ssh", "request", "lin", "c2", "--as", "deploy", "--new-lease", "--",
+        "echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAasme2e asm-e2e-key' >> ~/.ssh/authorized_keys"]);
+    assert_eq!(c2.code, 0, "{}{}", c2.stdout, c2.stderr);
+    let c2_id = lease_id(manager, "c2");
+    assert_eq!(c.ok(&format!("sed -n 2,3p /var/lib/asm-ssh/baselines/{c2_id}")), "scope=user:deploy\ncomplete=1");
+    manager.revoke_lease(c2_id.clone()).unwrap();
+    wait_cleanup(manager, "c2", 30, |s, _| s == Some(SshCleanupState::Done));
+    let target = lease_target(manager, "c2");
+    eprintln!("c2 changes: {} {:?}", target.changes_total, target.changes);
+    assert_eq!((target.changes.as_slice(), target.changes_total),
+        (&["/home/deploy/.ssh/authorized_keys".to_owned()][..], 1));
+    wait_for("files_changed for c2", 10, || !ssh_events(manager, "files_changed", &c2_id).is_empty());
+    c.ok(&format!("test ! -e /var/lib/asm-ssh/baselines/{c2_id}"));
+    c.ok("sed -i '/asm-e2e-key/d' /home/deploy/.ssh/authorized_keys");
+    // A privileged lease that changes nothing reports nothing.
+    let c3 = asm.run(&["ssh", "request", "lin", "c3", "--privileged", "--new-lease", "--", "true"]);
+    assert_eq!(c3.code, 0, "{}{}", c3.stdout, c3.stderr);
+    let c3_id = lease_id(manager, "c3");
+    c.ok(&format!("test -f /var/lib/asm-ssh/baselines/{c3_id}"));
+    manager.revoke_lease(c3_id.clone()).unwrap();
+    wait_cleanup(manager, "c3", 30, |s, _| s == Some(SshCleanupState::Done));
+    let target = lease_target(manager, "c3");
+    assert!(target.changes.is_empty() && target.changes_total == 0, "{target:?}");
+    // files_changed follows sessions_ended for the same cleanup.
+    wait_for("sessions_ended for c3", 10, || !ssh_events(manager, "sessions_ended", &c3_id).is_empty());
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(ssh_events(manager, "files_changed", &c3_id).is_empty(), "{:?}", ssh_events(manager, "files_changed", &c3_id));
+    c.ok(&format!("test ! -e /var/lib/asm-ssh/baselines/{c3_id}"));
 
     // ---- 6. Ending a live session without touching anything else. ----
     assert_eq!(docker(&["exec", "-d", &c.0, "sleep", "7777"], None).code, 0);
@@ -580,12 +703,14 @@ fn host_scripts_on(base: &str, sudo: &str, cli: &Path, bin_dir: &Path) {
         "sleep", "600"], t, "r7"));
     wait_for("sleep 600 (r7) in the container", 30, || c.running("sleep 600"));
     let r7_id = lease_id(manager, "r7");
-    manager.revoke_lease(r7_id).unwrap();
+    manager.revoke_lease(r7_id.clone()).unwrap();
     wait_cleanup(manager, "r7", 20,
         |s, d| s == Some(SshCleanupState::Retrying) && d.contains("Permission denied"));
     c.write(ops_keys, &without_cleanup);
 
     // ---- 10. Remove. ----
+    // r7's cleanup failed, so its baseline is still there for asm-remove to delete.
+    c.ok(&format!("test -f /var/lib/asm-ssh/baselines/{r7_id}"));
     manager.unenroll_ssh_target(tid.clone()).expect("remove asm from the host");
     let info = manager.list_ssh_targets().unwrap().into_iter().find(|i| i.id == tid).unwrap();
     assert_eq!(info.state, SshTargetState::NotEnrolled, "{:?}", info.error);
@@ -597,8 +722,9 @@ fn host_scripts_on(base: &str, sudo: &str, cli: &Path, bin_dir: &Path) {
     for user in ["asm-ops", "asm-priv"] {
         assert_ne!(c.exec(&["getent", "passwd", user]).code, 0, "{user} still exists");
     }
-    for path in ["/etc/sudoers.d/asm-ssh", "/usr/lib/asm-ssh", "/var/lib/asm-ssh", "/var/lib/asm-ops",
-        "/var/lib/asm-priv", "/etc/systemd/system/asm-end-lease.timer"]
+    for path in ["/etc/sudoers.d/asm-ssh", "/usr/lib/asm-ssh/asm-status", "/usr/lib/asm-ssh/asm-read", "/usr/lib/asm-ssh",
+        "/var/lib/asm-ssh/baselines", "/var/lib/asm-ssh", "/var/lib/asm-ops", "/var/lib/asm-priv",
+        "/etc/systemd/system/asm-end-lease.timer", "/etc/systemd/system/asm-end-lease.service"]
     {
         assert_ne!(c.exec(&["test", "-e", path]).code, 0, "{path} still exists");
     }

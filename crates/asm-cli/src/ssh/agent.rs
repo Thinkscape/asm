@@ -1,6 +1,7 @@
 //! The asm ssh agent (`asm ssh agent --dir DIR`, hidden): an ssh-agent protocol
 //! server on `<dir>/agent.sock` that offers the certificates of unexpired SSH leases
-//! and has the manager sign with their keys. The private keys never leave the manager.
+//! (one per target) and has the manager sign with their keys. The private keys never
+//! leave the manager.
 //!
 //! `asm ssh request` and `asm ssh extend` start one detached agent per directory; an
 //! exclusive `flock` on `<dir>/agent.lock` keeps it single. It exits after 60 s without
@@ -42,7 +43,7 @@ const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
 const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
 const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 
-/// One lease's certificate as offered to ssh.
+/// One target certificate of one lease as offered to ssh.
 struct Identity {
     lease_id: String,
     expires_at: i64,
@@ -192,11 +193,14 @@ fn refresh(dir: &Path, identities: &Identities, loaded: &Mutex<Stamp>) {
     *loaded = Some(stamp);
     let fresh: Vec<Identity> = leases
         .into_iter()
-        .filter_map(|l| {
-            Some(Identity {
-                blob: store::cert_blob(&l.certificate)?,
-                lease_id: l.lease_id,
-                expires_at: l.expires_at,
+        .flat_map(|l| {
+            let (lease_id, expires_at) = (l.lease_id, l.expires_at);
+            l.targets.into_iter().filter_map(move |t| {
+                Some(Identity {
+                    blob: store::cert_blob(&t.certificate)?,
+                    lease_id: lease_id.clone(),
+                    expires_at,
+                })
             })
         })
         .collect();

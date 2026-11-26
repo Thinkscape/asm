@@ -49,19 +49,13 @@ impl SshAccess {
     }
 }
 
-/// Result of an approved SSH request.
+/// Result of an approved SSH request: the hosts the operator approved, each with its own
+/// access. Hosts the operator denied are absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshResult {
     pub lease_id: String,
     /// RFC 3339.
     pub expires_at: String,
-    pub access: SshAccess,
-    pub grants: Vec<String>,
-    /// The user a `User` lease runs as.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    /// One OpenSSH certificate line.
-    pub certificate: String,
     pub targets: Vec<SshTargetAccess>,
 }
 
@@ -69,11 +63,21 @@ pub struct SshResult {
 pub struct SshTargetAccess {
     pub name: String,
     pub target_id: String,
+    /// The account the certificate logs in as (`asm-ops` or `asm-priv`).
     pub login: String,
     pub hostname: String,
     pub port: u16,
     /// `"<type> <b64>"`.
     pub host_keys: Vec<String>,
+    pub access: SshAccess,
+    /// The operations of restricted access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grants: Vec<String>,
+    /// The user access as a user runs as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// One OpenSSH certificate line, for this host only.
+    pub certificate: String,
 }
 
 /// `POST /v1/ssh/sign`.
@@ -235,11 +239,40 @@ pub fn validate_unit(unit: &str) -> Result<(), ApiError> {
     }
 }
 
-/// `logs:<unit>` or `restart:<unit>`.
+/// `logs:<unit>`, `restart:<unit>`, `reload:<unit>` or `read:<path>`.
 pub fn validate_grant(grant: &str) -> Result<(), ApiError> {
-    match grant.strip_prefix("logs:").or_else(|| grant.strip_prefix("restart:")) {
-        Some(unit) => validate_unit(unit),
-        None => Err(ApiError::invalid(format!("unknown grant {grant:?}; use logs:<unit> or restart:<unit>"))),
+    if let Some(unit) = grant_unit(grant) {
+        return validate_unit(unit);
+    }
+    match grant.strip_prefix("read:") {
+        Some(path) => validate_read_path(path),
+        None => Err(ApiError::invalid(format!(
+            "unknown grant {grant:?}; use logs:<unit>, restart:<unit>, reload:<unit> or read:<path>"
+        ))),
+    }
+}
+
+/// The unit of a `logs:`, `restart:` or `reload:` grant.
+pub fn grant_unit(grant: &str) -> Option<&str> {
+    grant.strip_prefix("logs:").or_else(|| grant.strip_prefix("restart:")).or_else(|| grant.strip_prefix("reload:"))
+}
+
+/// A file restricted access may read: absolute, at most 255 bytes, components of
+/// `[A-Za-z0-9._@+-]` that are neither empty, `.` nor `..`.
+pub fn validate_read_path(path: &str) -> Result<(), ApiError> {
+    let ok = path.len() <= 255
+        && path.strip_prefix('/').is_some_and(|rest| {
+            rest.split('/').all(|c| {
+                !c.is_empty()
+                    && c != "."
+                    && c != ".."
+                    && c.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'@' | b'+' | b'-'))
+            })
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::invalid(format!("invalid file {path:?}: use an absolute path such as /etc/nginx/nginx.conf")))
     }
 }
 
@@ -293,10 +326,23 @@ mod tests {
         for bad in [".service", "web", "web.socket", "-a.service", "a:b.service", "a b.service", too_long.as_str()] {
             assert!(validate_unit(bad).is_err(), "{bad}");
         }
-        assert!(validate_grant("logs:web.service").is_ok());
-        assert!(validate_grant("restart:web.service").is_ok());
-        for bad in ["logs", "logs:", "log", "restart:", "restart:web", "shell", "restart:web.service x"] {
+        for good in ["logs:web.service", "restart:web.service", "reload:web.service", "read:/etc/nginx/nginx.conf"] {
+            assert!(validate_grant(good).is_ok(), "{good}");
+        }
+        for bad in ["logs", "logs:", "log", "restart:", "restart:web", "reload:web", "shell", "restart:web.service x",
+            "read:", "read:etc/x", "status:web.service"] {
             assert!(validate_grant(bad).is_err(), "{bad}");
+        }
+        assert_eq!(grant_unit("reload:a.service"), Some("a.service"));
+        assert_eq!(grant_unit("read:/a"), None);
+        let max = format!("/{}", "a".repeat(254));
+        for good in ["/a", "/etc/nginx/nginx.conf", "/srv/app/.env", "/var/log/a@b+c-d_e.log", "/a/..b", max.as_str()] {
+            assert!(validate_read_path(good).is_ok(), "{good}");
+        }
+        let too_long = format!("/{}", "a".repeat(255));
+        for bad in ["", "/", "a", "//a", "/a/", "/a//b", "/a/./b", "/a/../b", "/..", "/a b", "/a*", "/a\nb", "/a:b",
+            "/a,b", "/a\\b", too_long.as_str()] {
+            assert!(validate_read_path(bad).is_err(), "{bad:?}");
         }
     }
 

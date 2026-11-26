@@ -238,29 +238,40 @@ commands perform cleanup. File-free exec never starts a reaper or reconciles sec
 ## SSH hosts
 
 `asm ssh hosts` lists hosts you can request, the privileged login each allows (`-` for
-none), the other users you may log in as and the restricted grants each allows. The
-manager signs logins with a short-lived certificate; you never receive a key.
+none), the other users you may log in as and the restricted grants each allows
+(`logs:<unit>`, `restart:<unit>`, `reload:<unit>`, `read:<path>`). The manager signs
+logins with a short-lived certificate; you never receive a key.
 
 ```bash
-asm ssh request web.example.com "Read nginx errors" --grant logs:nginx.service -- logs nginx.service 200
-asm ssh request web.example.com "Restart the API after the config fix" --grant restart:api.service -- restart api.service
+asm ssh request web.example.com "Read nginx errors" --grant logs:nginx.service -- logs nginx.service 200 --since 1h
+asm ssh request web.example.com "Check the API after the deploy" --grant restart:api.service -- status api.service
+asm ssh request web.example.com "Apply the nginx config fix" --grant reload:nginx.service -- reload nginx.service
+asm ssh request web.example.com "Check the nginx config" --grant read:/etc/nginx/nginx.conf -- read /etc/nginx/nginx.conf
 asm ssh request web.example.com "Debug the failing deploy" --privileged -- systemctl status api.service
-asm ssh request web.example.com "Debug the failing deploy" --privileged   # prints a connect line
+asm ssh request web.example.com,db.example.com "Debug the failing deploy" --privileged   # prints a line per host
 asm ssh request web.example.com "Check the app's file permissions" --as deploy -- ls -la /srv/app
 ssh web.example.com uptime            # after asm ssh install, while the lease is active
 ```
 
-Prefer `--grant` (restricted account `asm-ops`: only `logs UNIT [LINES]` and
-`restart UNIT` for the granted units). When you need a shell, prefer `--as <user>` with
-the account that owns what you work on (listed under users in `asm ssh hosts`) over
-`--privileged`, which works only on hosts that list a privileged login. The operator may
-approve other access than you asked for, including another user; asm then prints `the
-operator approved …` to stderr, and the lease output shows the access. A command after
-`--` needs exactly one host. To connect, use the line `asm ssh request`
-prints: `ssh <host>` after `asm ssh install`, otherwise `ssh -F <config path> <host>`.
-After `asm ssh install`, plain `ssh <host>`, `scp`, `git` and Ansible work while the lease
-is active. For Ansible, use the asm host name as the inventory host and don't set
-`ansible_user`. Restricted leases can't run Ansible.
+Prefer `--grant` (restricted account `asm-ops`: only `logs UNIT [LINES] [--since WHEN]`,
+`status UNIT`, `restart UNIT`, `reload UNIT` and `read PATH` for what was granted;
+`status` works for any unit you may read the logs of, restart or reload; WHEN is like
+`30m`, `2h`, `1d` or `2026-11-25T10:00`, host time). When you need a shell, prefer
+`--as <user>` with the account that owns what you work on (listed under users in
+`asm ssh hosts`) over `--privileged`, which works only on hosts that list a privileged
+login.
+
+The operator decides each host separately: they may deny it or approve other access
+than you asked for, such as another user or other operations. `asm ssh request` prints
+one line per host: `<host>: <connect command>   (<access>)` or `<host>: denied`, and on
+stderr `asm: <host>: the operator approved …` or `asm: <host>: denied by the operator`.
+Use each host only with the access its line shows. The same request again reuses the
+lease and its decisions; `--new-lease` asks again. A command after `--` needs exactly one
+host. To connect, use exactly the command `asm ssh request` prints: `ssh <host>` or
+`ssh -F <config path> <host>` (the latter when plain `ssh <host>` would use another
+lease). After `asm ssh install`, plain `ssh <host>`, `scp`, `git` and Ansible use the
+host's most recently requested active lease. For Ansible, use the asm host name as the
+inventory host and don't set `ansible_user`. Restricted hosts can't run Ansible.
 
 Before a job that may outlast the lease, check `asm ssh leases`. Run
 `asm ssh extend <id> "<reason>"` at least 10 minutes before the end; every extension

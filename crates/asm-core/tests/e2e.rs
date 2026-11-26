@@ -125,10 +125,12 @@ impl AutoApprover {
                 }
                 RequestDetail::Login { .. } => Decision::Deny { reason: "e2e does not sign in".into() },
                 RequestDetail::Ssh { targets, access, grants, user, max_duration_secs, .. } => Decision::ApproveSsh {
-                    target_ids: targets.iter().filter(|t| t.ready).map(|t| t.target_id.clone()).collect(),
-                    access: *access,
-                    grants: grants.clone(),
-                    user: user.clone(),
+                    targets: targets.iter().filter(|t| t.ready).map(|t| asm_core::ffi::SshTargetDecision {
+                        target_id: t.target_id.clone(),
+                        access: *access,
+                        grants: grants.clone(),
+                        user: user.clone(),
+                    }).collect(),
                     duration_secs: 300.min(*max_duration_secs),
                 },
                 RequestDetail::SshExtend { max_duration_secs, .. } => Decision::ApproveSshExtend {

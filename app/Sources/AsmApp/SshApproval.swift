@@ -1,15 +1,18 @@
+import AppKit
 import SwiftUI
 
-/// An SSH access request: which targets, privileged or restricted access, the restricted
-/// grants and the lease length. The panel stays unshareable.
+/// An SSH access request: what each requested host gets (denied, restricted operations,
+/// the privileged login or another user) and the lease length. The panel stays
+/// unshareable.
 struct SshApproval: View {
     let context: RequestContext
     let detail: SshRequestItem
     let model: AppModel
 
-    @State private var selectedTargets: Set<String>
-    @State private var access: SshAccessItem
-    @State private var grants: Set<String>
+    /// Access per target ID; a target without one is denied.
+    @State private var access: [String: SshAccessItem]
+    /// Checked restricted operations per target ID.
+    @State private var checked: [String: Set<String>]
     @State private var duration: UInt64
     @State private var editingReason = false
 
@@ -17,96 +20,96 @@ struct SshApproval: View {
         self.context = context
         self.detail = detail
         self.model = model
-        _selectedTargets = State(initialValue: Set(detail.targets.filter(\.ready).map(\.id)))
-        _access = State(initialValue: detail.access)
-        _grants = State(initialValue: Set(detail.grants))
+        var access: [String: SshAccessItem] = [:]
+        var checked: [String: Set<String>] = [:]
+        for target in detail.targets where target.ready {
+            let available = Self.availableGrants(target, request: detail)
+            checked[target.id] = Set(detail.grants).intersection(available)
+            if Self.offers(detail.access, on: target, available: available) {
+                access[target.id] = detail.access
+            }
+        }
+        _access = State(initialValue: access)
+        _checked = State(initialValue: checked)
         _duration = State(initialValue: detail.defaultDurationSecs)
     }
 
-    /// Checked targets that can be approved now, in request order.
-    private var chosen: [SshApprovalTargetItem] {
-        detail.targets.filter { $0.ready && selectedTargets.contains($0.id) }
+    /// Restricted operations the operator may approve on `target`: what the target allows,
+    /// and for a restricted request no more than it asked for.
+    private static func availableGrants(_ target: SshApprovalTargetItem, request: SshRequestItem) -> [String] {
+        request.access == .restricted ? target.grants.filter(request.grants.contains) : target.grants
     }
 
-    /// Every chosen target allows privileged access.
-    private var privilegedAllowed: Bool {
-        !chosen.isEmpty && chosen.allSatisfy(\.allowPrivileged)
-    }
-
-    /// Users every chosen target allows, in the first target's order; a user is noted as
-    /// able to become root when any chosen target says so.
-    private var commonUsers: [SshTargetUserItem] {
-        guard let first = chosen.first else { return [] }
-        return first.users.compactMap { user in
-            let matches = chosen.compactMap { t in t.users.first { $0.name == user.name } }
-            guard matches.count == chosen.count else { return nil }
-            return SshTargetUserItem(name: user.name, admin: matches.lazy.compactMap(\.admin).first)
+    /// The access menu of `target` lists `access`.
+    private static func offers(_ access: SshAccessItem, on target: SshApprovalTargetItem, available: [String]) -> Bool {
+        switch access {
+        case .restricted: !available.isEmpty
+        case .privileged: target.allowPrivileged
+        case let .user(name): target.users.contains { $0.name == name }
         }
     }
 
-    /// Users the access menu lists: every common user, plus the chosen one so the menu
-    /// never holds a choice it doesn't show.
-    private var userChoices: [SshTargetUserItem] {
-        var users = commonUsers
-        if case let .user(name) = access, !users.contains(where: { $0.name == name }) {
-            users.append(SshTargetUserItem(name: name, admin: nil))
+    /// Targets the operator approves, with their access, in request order.
+    private var approved: [(target: SshApprovalTargetItem, access: SshAccessItem)] {
+        detail.targets.compactMap { target in
+            guard target.ready, let access = access[target.id] else { return nil }
+            return (target, access)
         }
-        return users
     }
 
-    /// Units whose logs every chosen target allows reading.
-    private var commonLogUnits: [String] {
-        guard let first = chosen.first else { return [] }
-        return first.logUnits.filter { unit in chosen.allSatisfy { $0.logUnits.contains(unit) } }
+    /// Checked operations of `target`, in the target's order.
+    private func approvedGrants(_ target: SshApprovalTargetItem) -> [String] {
+        let checked = checked[target.id] ?? []
+        return Self.availableGrants(target, request: detail).filter(checked.contains)
     }
 
-    /// Units every chosen target allows restarting.
-    private var commonUnits: [String] {
-        guard let first = chosen.first else { return [] }
-        return first.restartUnits.filter { unit in chosen.allSatisfy { $0.restartUnits.contains(unit) } }
+    /// Restricted rows without an operation.
+    private var missingOperations: [SshApprovalTargetItem] {
+        approved.filter { $0.access == .restricted && approvedGrants($0.target).isEmpty }.map(\.target)
     }
 
-    /// Grants the operator may approve: a restricted request only gets what it asked for.
-    private var availableGrants: [String] {
-        let all = commonLogUnits.map { "logs:\($0)" } + commonUnits.map { "restart:\($0)" }
-        return detail.access == .restricted ? all.filter(detail.grants.contains) : all
-    }
-
-    private var approvedGrants: [String] {
-        access == .restricted ? availableGrants.filter(grants.contains) : []
+    /// The longest lease every approved target allows.
+    private var durationCap: UInt64 {
+        approved.map(\.target.maxDurationSecs).filter { $0 > 0 }.min() ?? detail.maxDurationSecs
     }
 
     private var durations: [LeaseDuration] {
-        SshDurations.approvalChoices(max: detail.maxDurationSecs, default: detail.defaultDurationSecs)
+        let cap = durationCap
+        return SshDurations.approvalChoices(max: cap, default: min(detail.defaultDurationSecs, cap))
     }
 
     private var canAllow: Bool {
-        guard context.armed, !model.isResolving(context.request.id), !chosen.isEmpty else { return false }
-        return switch access {
-        case .privileged: privilegedAllowed
-        case .restricted: !approvedGrants.isEmpty
-        case let .user(name): commonUsers.contains { $0.name == name }
-        }
+        context.armed && !model.isResolving(context.request.id) && !approved.isEmpty && missingOperations.isEmpty
     }
 
     var body: some View {
         let names = Text(verbatim: detail.targets.map(\.name).joined(separator: ", ")).fontWeight(.bold)
-        let host = Text(verbatim: context.request.hostLabel)
-        ApprovalScaffold(
-            error: context.error,
-            footnote: Text("Any process on \(host) can use this access. Ending the lease stops new logins at once; asm then ends its sessions on each target the Mac can reach.")
-        ) {
-            ApprovalHeader(title: SshRequester.line(context), subtitle: Text("wants SSH access to \(names)"), queue: context.queue) {
+        ApprovalScaffold(error: context.error, footnote: nil) {
+            ApprovalHeader(
+                title: SshRequester.line(context), subtitle: Text("wants SSH access to \(names)"),
+                subtitleLineLimit: 2, queue: context.queue
+            ) {
                 AppIconImage()
             }
         } content: {
             ReasonBlock(reason: detail.reason)
-            targetsSection
-            accessSection
-            if access == .restricted {
-                grantsSection
+            SshHostTable(
+                targets: detail.targets, model: model,
+                rootCapable: { target in access[target.id].flatMap { SshRoot.badge($0, on: target) } != nil },
+                denied: { target in access[target.id] == nil }
+            ) { target in
+                accessMenu(target)
+            } below: { target in
+                if access[target.id] == .restricted {
+                    operations(target)
+                }
             }
             GetDurationPicker(durations: durations, duration: $duration)
+                .onChange(of: durationCap) {
+                    if !durations.contains(where: { $0.seconds == duration }) {
+                        duration = min(detail.defaultDurationSecs, durationCap)
+                    }
+                }
         } details: {
             InfoRow(label: "Requested access", value: detail.access.title)
             InfoRow(label: "Requested grants", value: detail.grants.joined(separator: ", "))
@@ -126,154 +129,140 @@ struct SshApproval: View {
                     .keyboardShortcut(editingReason ? nil : .defaultAction)
                     .disabled(!canAllow)
             }
+            footer
         }
     }
 
-    private var targetsSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            SectionLabel("Targets")
-            ForEach(detail.targets) { target in
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Toggle(isOn: Binding(
-                            get: { target.ready && selectedTargets.contains(target.id) },
-                            set: { checked in
-                                if checked { selectedTargets.insert(target.id) } else { selectedTargets.remove(target.id) }
-                            }
-                        )) {
-                            Text(verbatim: target.name)
-                        }
-                        .toggleStyle(.checkbox)
-                        .labelsHidden()
-                        .disabled(!target.ready)
-                        SshTargetLink(target: target, model: model)
-                    }
-                    SshTargetIssue(target: target)
+    /// The access menu of one row; a target that isn't ready stays denied.
+    private func accessMenu(_ target: SshApprovalTargetItem) -> some View {
+        let current = target.ready ? access[target.id] : nil
+        return SshAccessMenu(
+            title: current.map { SshRoot.label($0, on: target) } ?? String(localized: "Denied"),
+            rootCapable: current.flatMap { SshRoot.badge($0, on: target) } != nil,
+            denied: current == nil,
+            accessibilityLabel: String(localized: "Access on \(target.name)")
+        ) {
+            menuItems(target)
+        }
+        .disabled(!target.ready)
+    }
+
+    /// Denied | Restricted (kinds) | the privileged login | the other users.
+    private func menuItems(_ target: SshApprovalTargetItem) -> [PanelMenuItem] {
+        let current = access[target.id]
+        var items = [PanelMenuItem(title: String(localized: "Denied"), checked: current == nil) {
+            access[target.id] = nil
+        }]
+        let kinds = Self.kinds(Self.availableGrants(target, request: detail))
+        if !kinds.isEmpty {
+            items.append(PanelMenuItem(
+                title: String(localized: "Restricted"), checked: current == .restricted,
+                detail: "(\(kinds.joined(separator: ", ")))", startsSection: true
+            ) {
+                access[target.id] = .restricted
+            })
+        }
+        if target.allowPrivileged {
+            items.append(PanelMenuItem(
+                title: target.privilegedLogin, checked: current == .privileged,
+                badge: SshRoot.badge(.privileged, on: target), startsSection: true
+            ) {
+                access[target.id] = .privileged
+            })
+        }
+        for (index, user) in target.users.enumerated() {
+            items.append(PanelMenuItem(
+                title: user.name, checked: current == .user(user.name),
+                badge: user.admin.map(SshRoot.badge(admin:)), startsSection: index == 0
+            ) {
+                access[target.id] = .user(user.name)
+            })
+        }
+        return items
+    }
+
+    /// `logs`, `restart`, `reload`, `read`: the kinds of `grants`, in that order.
+    private static func kinds(_ grants: [String]) -> [String] {
+        ["logs", "restart", "reload", "read"].filter { kind in grants.contains { $0.hasPrefix("\(kind):") } }
+    }
+
+    /// The checkboxes of a Restricted row, and an error while none is checked.
+    private func operations(_ target: SshApprovalTargetItem) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(Self.availableGrants(target, request: detail), id: \.self) { grant in
+                Toggle(isOn: grantBinding(grant, of: target)) {
+                    SshRequester.grantTitle(grant)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+                .toggleStyle(.checkbox)
+            }
+            if approvedGrants(target).isEmpty {
+                Label {
+                    Text("Choose at least one operation for \(Text(verbatim: target.name))")
+                        .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
                 }
             }
         }
+        .font(.system(size: 12))
+        .padding(.leading, 16)
+        .padding(.bottom, 6)
     }
 
-    /// Privileged access is offered when every chosen target allows it, and stays listed
-    /// once picked so the picker never holds a choice it doesn't show.
-    private var privilegedOffered: Bool {
-        privilegedAllowed || access == .privileged
-    }
-
-    private var accessSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                SectionLabel("Access")
-                if privilegedOffered || !userChoices.isEmpty {
-                    Picker("Access", selection: $access) {
-                        Text("Restricted").tag(SshAccessItem.restricted)
-                        ForEach(userChoices, id: \.name) { user in
-                            Text("As \(Text(verbatim: user.name))").tag(SshAccessItem.user(user.name))
-                        }
-                        if privilegedOffered {
-                            Text("Privileged").tag(SshAccessItem.privileged)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                    .fixedSize()
-                } else {
-                    Text("Restricted")
-                }
-                Spacer(minLength: 0)
-            }
-            accessExplanation
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            accessWarning
-        }
-    }
-
-    /// What the chosen access risks, or why the chosen targets don't allow it.
-    @ViewBuilder private var accessWarning: some View {
-        switch access {
-        case .restricted:
-            EmptyView()
-        case .privileged:
-            if privilegedAllowed {
-                WarningLine(Text("An admin login can keep access after the lease ends, for example by adding its own key."))
-            } else {
-                let names = chosen.filter { !$0.allowPrivileged }.map(\.name).joined(separator: ", ")
-                ErrorLine(message: String(localized: "Privileged access isn't allowed on \(names)."))
-            }
-        case let .user(name):
-            if let user = commonUsers.first(where: { $0.name == name }) {
-                if let why = user.admin {
-                    WarningLine(Text("\(Text(verbatim: name)) can become root (\(Text(verbatim: why))): this is the same as privileged access."))
-                }
-                WarningLine(Text("\(Text(verbatim: name)) can keep access after the lease ends, for example by adding its own key or a cron job."))
-            } else {
-                let names = chosen.filter { t in !t.users.contains { $0.name == name } }.map(\.name).joined(separator: ", ")
-                ErrorLine(message: String(localized: "Access as \(name) isn't allowed on \(names)."))
-            }
-        }
-    }
-
-    /// Which account the lease logs in as, and what that account can do.
-    private var accessExplanation: Text {
-        switch access {
-        case .restricted:
-            return Text("Logs in as asm-ops, an account asm created on the target that can only run the operations checked below.")
-        case .privileged:
-            let logins = Set(chosen.map(\.privilegedLogin))
-            let login = logins.count == 1 ? Text(verbatim: logins.first!) : Text("each target's privileged login")
-            return Text("Logs in as asm-priv, an account asm created on the target, and runs a shell as \(login) through sudo.")
-        case let .user(name):
-            return Text("Logs in as asm-priv, an account asm created on the target, and runs a shell as \(Text(verbatim: name)) through sudo.")
-        }
-    }
-
-    private var grantsSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            SectionLabel("Allowed operations")
-            if availableGrants.isEmpty {
-                Text("The selected targets allow no common operation.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(availableGrants, id: \.self) { grant in
-                Toggle(isOn: grantBinding(grant)) { Self.grantTitle(grant) }
-                    .toggleStyle(.checkbox)
-            }
-        }
-    }
-
-    /// `Read logs of <unit>` or `Restart <unit>`.
-    private static func grantTitle(_ grant: String) -> Text {
-        if let unit = grant.unit(after: "logs:") {
-            return Text("Read logs of \(Text(verbatim: unit))")
-        }
-        if let unit = grant.unit(after: "restart:") {
-            return Text("Restart \(Text(verbatim: unit))")
-        }
-        return Text(verbatim: grant)
-    }
-
-    private func grantBinding(_ grant: String) -> Binding<Bool> {
+    private func grantBinding(_ grant: String, of target: SshApprovalTargetItem) -> Binding<Bool> {
         Binding(
-            get: { grants.contains(grant) },
-            set: { checked in
-                if checked { grants.insert(grant) } else { grants.remove(grant) }
+            get: { checked[target.id]?.contains(grant) ?? false },
+            set: { on in
+                if on {
+                    checked[target.id, default: []].insert(grant)
+                } else {
+                    checked[target.id]?.remove(grant)
+                }
             }
         )
     }
 
+    /// Root logins, logins that can keep access, and how asm logs in.
+    private var footer: some View {
+        let roots = approved.filter { SshRoot.badge($0.access, on: $0.target) != nil }.map(\.target.name)
+        let logins = approved.contains { $0.access != .restricted }
+        let host = Text(verbatim: context.request.hostLabel)
+        return VStack(alignment: .leading, spacing: 4) {
+            if !roots.isEmpty {
+                Label {
+                    Text("Root on \(Text(verbatim: roots.formatted(.list(type: .and)))). Changes there can outlast the lease anywhere on the host, including new accounts and keys.")
+                        .foregroundStyle(.primary)
+                } icon: {
+                    SshShield()
+                }
+            }
+            if logins {
+                Text("Every login except Restricted can keep access after the lease, for example with its own key or a cron job.")
+            }
+            Text("Users log in as asm-priv, then sudo switches to them; Restricted logs in as asm-ops. Any process on \(host) can use this access.")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// `<name>: <login>` per approved target.
     private var logins: String {
-        chosen.map { "\($0.name): \(SshRequester.login($0, access: access))" }
-            .joined(separator: ", ")
+        approved.map { "\($0.target.name): \(SshRequester.login($0.target, access: $0.access))" }
+            .joined(separator: "\n")
     }
 
     private func allow() {
         guard canAllow else { return }
-        context.resolve(.approveSsh(
-            targetIDs: chosen.map(\.id), access: access, grants: approvedGrants, durationSecs: duration
-        ))
+        let decisions = approved.map { row in
+            SshTargetDecisionItem(
+                targetID: row.target.id, access: row.access,
+                grants: row.access == .restricted ? approvedGrants(row.target) : []
+            )
+        }
+        context.resolve(.approveSsh(targets: decisions, durationSecs: duration))
     }
 }
 
@@ -302,42 +291,57 @@ struct SshExtendApproval: View {
         context.armed && !model.isResolving(context.request.id) && detail.issue == nil
     }
 
-    /// `Privileged` or `Restricted: <grants>`.
-    private var accessLine: String {
-        switch detail.access {
-        case .privileged: String(localized: "Privileged")
-        case .restricted: String(localized: "Restricted: \(detail.grants.joined(separator: ", "))")
-        case let .user(name): String(localized: "As \(name)")
-        }
+    private func leaseTarget(_ target: SshApprovalTargetItem) -> SshExtendTargetItem? {
+        detail.targets.first { $0.id == target.id }
     }
 
     var body: some View {
-        let names = Text(verbatim: detail.targets.map(\.name).joined(separator: ", ")).fontWeight(.bold)
+        let targets = detail.targets.map(\.target)
+        let names = Text(verbatim: targets.map(\.name).joined(separator: ", ")).fontWeight(.bold)
         ApprovalScaffold(
             error: context.error,
             footnote: Text("Any process on \(Text(verbatim: context.request.hostLabel)) can use this access. The lease keeps its targets, access and grants; only its end moves.")
         ) {
-            ApprovalHeader(title: SshRequester.line(context), subtitle: Text("wants to extend SSH access to \(names)"), queue: context.queue) {
+            ApprovalHeader(
+                title: SshRequester.line(context), subtitle: Text("wants to extend SSH access to \(names)"),
+                subtitleLineLimit: 2, queue: context.queue
+            ) {
                 AppIconImage()
             }
         } content: {
             ReasonBlock(reason: detail.reason)
-            VStack(alignment: .leading, spacing: 6) {
-                SectionLabel("Targets")
-                ForEach(detail.targets) { target in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            SshTargetLink(target: target, model: model)
-                            Text("as \(SshRequester.login(target, access: detail.access))")
-                                .foregroundStyle(.secondary)
+            SshHostTable(
+                targets: targets, model: model,
+                rootCapable: { target in
+                    leaseTarget(target).flatMap { SshRoot.badge($0.access, on: target) } != nil
+                },
+                denied: { _ in false }
+            ) { target in
+                if let lease = leaseTarget(target) {
+                    SshAccessLabel(
+                        title: SshRoot.label(lease.access, on: target),
+                        rootCapable: SshRoot.badge(lease.access, on: target) != nil,
+                        denied: false
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } below: { target in
+                if let lease = leaseTarget(target), lease.access == .restricted {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(lease.grants, id: \.self) { grant in
+                            SshRequester.grantTitle(grant)
+                                .lineLimit(2)
+                                .truncationMode(.middle)
                         }
-                        SshTargetIssue(target: target)
                     }
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 16)
+                    .padding(.bottom, 6)
                 }
             }
             TimelineView(.periodic(from: .now, by: 30)) { timeline in
                 Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 4) {
-                    InfoRow(label: "Access", value: accessLine)
                     InfoRow(label: "Ends", value: Self.endLine(detail.expiresAt, now: timeline.date))
                     InfoRow(label: "New end", value: Self.time(timeline.date.addingTimeInterval(TimeInterval(duration))))
                 }
@@ -348,7 +352,7 @@ struct SshExtendApproval: View {
             }
         } details: {
             InfoRow(label: "Lease ID", value: detail.leaseID)
-            InfoRow(label: "Host keys", value: SshRequester.hostKeys(detail.targets))
+            InfoRow(label: "Host keys", value: SshRequester.hostKeys(targets))
             RequestMetaRows(context: context)
         } actions: {
             ApprovalActions(
@@ -406,59 +410,325 @@ private enum SshRequester {
         targets.map { "\($0.name): \($0.hostKeyFingerprints.joined(separator: ", "))" }
             .joined(separator: "\n")
     }
+
+    /// `Read logs of <unit>`, `Restart <unit>`, `Reload <unit>` or `Read <path>`.
+    static func grantTitle(_ grant: String) -> Text {
+        if let unit = grant.unit(after: "logs:") {
+            return Text("Read logs of \(Text(verbatim: unit))")
+        }
+        if let unit = grant.unit(after: "restart:") {
+            return Text("Restart \(Text(verbatim: unit))")
+        }
+        if let unit = grant.unit(after: "reload:") {
+            return Text("Reload \(Text(verbatim: unit))")
+        }
+        if let path = grant.unit(after: "read:") {
+            return Text("Read \(Text(verbatim: path))")
+        }
+        return Text(verbatim: grant)
+    }
 }
 
-/// A target's name, linking to it in Settings → SSH Targets, and its address when that
-/// says more than the name.
-private struct SshTargetLink: View {
-    let target: SshApprovalTargetItem
+/// Which access can become root on a target, and how the popups name an access.
+private enum SshRoot {
+    /// The closed label of an access: the login or user name, or `Restricted`.
+    static func label(_ access: SshAccessItem, on target: SshApprovalTargetItem) -> String {
+        switch access {
+        case .privileged: target.privilegedLogin
+        case .restricted: String(localized: "Restricted")
+        case let .user(name): name
+        }
+    }
+
+    /// How `access` on `target` becomes root, as a badge word; nil when it can't.
+    static func badge(_ access: SshAccessItem, on target: SshApprovalTargetItem) -> String? {
+        switch access {
+        case .restricted: nil
+        case .privileged: target.privilegedLogin == "root" ? "superuser" : "sudo"
+        case let .user(name): target.users.first { $0.name == name }?.admin.map(badge(admin:))
+        }
+    }
+
+    /// `uid 0` → `superuser`; `in group sudo|wheel|admin` or `has sudo rules` → `sudo`;
+    /// `in group X` → `X`.
+    static func badge(admin: String) -> String {
+        switch admin {
+        case "uid 0": return "superuser"
+        case "has sudo rules": return "sudo"
+        default:
+            guard let group = admin.unit(after: "in group ") else { return admin }
+            return ["sudo", "wheel", "admin"].contains(group) ? "sudo" : group
+        }
+    }
+}
+
+/// How the host column shows target names.
+private enum SshNames {
+    /// An IPv4 address, or an IPv6 one (no DNS labels to split).
+    static func isAddress(_ name: String) -> Bool {
+        if name.contains(":") { return true }
+        let parts = name.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count == 4 && parts.allSatisfy { UInt8($0) != nil }
+    }
+
+    /// The longest suffix of at least two whole labels every name ends in, leaving at least
+    /// one label before it; nil with fewer than two names or when any is an IP address.
+    static func sharedSuffix(_ names: [String]) -> String? {
+        guard names.count >= 2, !names.contains(where: isAddress) else { return nil }
+        let labels = names.map { $0.split(separator: ".", omittingEmptySubsequences: false).map(String.init) }
+        let limit = (labels.map(\.count).min() ?? 0) - 1
+        var count = 0
+        while count < limit {
+            let label = labels[0][labels[0].count - 1 - count].lowercased()
+            guard labels.allSatisfy({ $0[$0.count - 1 - count].lowercased() == label }) else { break }
+            count += 1
+        }
+        return count >= 2 ? labels[0].suffix(count).joined(separator: ".") : nil
+    }
+
+    /// The first label, and the rest of the name from its dot without the shared suffix;
+    /// an IP address stays whole.
+    static func parts(_ name: String, suffix: String?) -> (first: String, rest: String?) {
+        guard !isAddress(name), let dot = name.firstIndex(of: ".") else { return (name, nil) }
+        var rest = String(name[dot...])
+        if let suffix, rest.lowercased().hasSuffix(".\(suffix.lowercased())") {
+            rest.removeLast(suffix.count + 1)
+        }
+        return (String(name[..<dot]), rest.isEmpty ? nil : rest)
+    }
+
+    /// `host:port` agents connect to, IPv6 in brackets; nil for a removed target.
+    static func address(_ target: SshApprovalTargetItem) -> String? {
+        guard !target.hostname.isEmpty else { return nil }
+        let host = target.hostname.contains(":") ? "[\(target.hostname)]" : target.hostname
+        return "\(host):\(target.port)"
+    }
+
+    /// The address, when it says more than the name.
+    static func extraAddress(_ target: SshApprovalTargetItem) -> String? {
+        guard target.hostname != target.name || target.port != 22 else { return nil }
+        return address(target)
+    }
+}
+
+/// The Host and Access table of both SSH approvals: one row per target, a host cell that
+/// links to the target, the access cell and what goes under the row.
+private struct SshHostTable<Access: View, Below: View>: View {
+    let targets: [SshApprovalTargetItem]
     let model: AppModel
+    /// The row's access can become root: orange tint and leading bar.
+    let rootCapable: (SshApprovalTargetItem) -> Bool
+    /// The row is denied: name struck through.
+    let denied: (SshApprovalTargetItem) -> Bool
+    @ViewBuilder let access: (SshApprovalTargetItem) -> Access
+    @ViewBuilder let below: (SshApprovalTargetItem) -> Below
 
     var body: some View {
-        HStack(spacing: 6) {
-            Button { model.showSshTarget(target.id) } label: { Text(verbatim: target.name) }
-                .buttonStyle(.link)
-                .help("Show \(target.name) in Settings → SSH Targets")
-            if let address {
-                Text(verbatim: address).foregroundStyle(.secondary)
+        let suffix = SshNames.sharedSuffix(targets.map(\.name))
+        VStack(alignment: .leading, spacing: 8) {
+            if let suffix {
+                Text("All hosts end in \(Text(verbatim: ".\(suffix)").fontWeight(.semibold))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                SshColumns {
+                    Text("Host").frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Access").frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.leading, SshRowMetrics.leading)
+                .padding(.bottom, 5)
+                Divider()
+                ForEach(targets) { target in
+                    row(target, suffix: suffix)
+                    Divider().opacity(0.6)
+                }
             }
         }
     }
 
-    private var address: String? {
-        guard target.hostname != target.name || target.port != 22 else { return nil }
-        let host = target.hostname.contains(":") ? "[\(target.hostname)]" : target.hostname
-        return "\(host):\(target.port)"
-    }
-}
-
-/// Why a target can't be approved now; nothing when it is ready.
-private struct SshTargetIssue: View {
-    let target: SshApprovalTargetItem
-
-    var body: some View {
-        if !target.ready {
-            Text(verbatim: target.issue ?? String(localized: "This target is not ready."))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.leading, 20)
+    private func row(_ target: SshApprovalTargetItem, suffix: String?) -> some View {
+        let root = rootCapable(target)
+        return VStack(alignment: .leading, spacing: 0) {
+            SshColumns {
+                SshHostCell(target: target, suffix: suffix, struck: denied(target), model: model)
+                access(target)
+            }
+            .padding(.vertical, 6)
+            below(target)
+        }
+        .padding(.leading, SshRowMetrics.leading)
+        .padding(.trailing, SshRowMetrics.trailing)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            if root {
+                Color.orange.opacity(0.08)
+            }
+        }
+        .overlay(alignment: .leading) {
+            if root {
+                Rectangle().fill(Color.orange).frame(width: 3)
+            }
         }
     }
 }
 
-/// A caption with a warning triangle.
-private struct WarningLine: View {
-    let text: Text
+private enum SshRowMetrics {
+    /// Room for the 3 pt bar of root-capable rows; every row keeps it so names line up.
+    static let leading: CGFloat = 8
+    static let trailing: CGFloat = 4
+}
 
-    init(_ text: Text) {
-        self.text = text
+/// Host 60 %, Access 40 % of the width with a 10 pt gap before Access; both vertically
+/// centred in the row.
+private struct SshColumns: Layout {
+    private static let gap: CGFloat = 10
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width.flatMap { $0.isFinite ? $0 : nil } ?? 340
+        let height = zip(subviews, Self.widths(width))
+            .map { $0.sizeThatFits(ProposedViewSize(width: $1, height: nil)).height }
+            .max() ?? 0
+        return CGSize(width: width, height: height)
     }
 
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        for (subview, width) in zip(subviews, Self.widths(bounds.width)) {
+            subview.place(at: CGPoint(x: x, y: bounds.midY), anchor: .leading,
+                          proposal: ProposedViewSize(width: width, height: nil))
+            x += width + Self.gap
+        }
+    }
+
+    private static func widths(_ total: CGFloat) -> [CGFloat] {
+        let host = (total * 0.6).rounded()
+        return [host, max(0, total - host - gap)]
+    }
+}
+
+/// The first label as a link to the target in Settings → SSH Targets, the rest of the
+/// domain, the address when it says more than the name, and why the target can't be
+/// approved now.
+private struct SshHostCell: View {
+    let target: SshApprovalTargetItem
+    let suffix: String?
+    let struck: Bool
+    let model: AppModel
+
     var body: some View {
-        Label { text } icon: { Image(systemName: "exclamationmark.triangle.fill") }
-            .font(.caption)
-            .fixedSize(horizontal: false, vertical: true)
+        let parts = SshNames.parts(target.name, suffix: suffix)
+        VStack(alignment: .leading, spacing: 1) {
+            Button { model.showSshTarget(target.id) } label: {
+                Text(verbatim: parts.first)
+                    .fontWeight(.medium)
+                    .strikethrough(struck)
+                    .foregroundStyle(struck ? AnyShapeStyle(.secondary) : AnyShapeStyle(.link))
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .multilineTextAlignment(.leading)
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(Text("Shows it in Settings → SSH Targets"))
+            if let rest = parts.rest {
+                Text(verbatim: rest)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            if let address = SshNames.extraAddress(target) {
+                Text(verbatim: address)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            if !target.ready {
+                Text(verbatim: target.issue ?? String(localized: "This target is not ready."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .help(help)
+    }
+
+    private var help: Text {
+        guard let address = SshNames.address(target) else { return Text(verbatim: target.name) }
+        return Text("\(Text(verbatim: target.name))\nconnects to \(Text(verbatim: address))")
+    }
+}
+
+/// An access as the popups show it: the orange shield for root-capable access, then the
+/// name (secondary when denied).
+private struct SshAccessLabel: View {
+    let title: String
+    let rootCapable: Bool
+    let denied: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if rootCapable {
+                SshShield()
+            }
+            Text(verbatim: title)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .foregroundStyle(denied ? .secondary : .primary)
+        }
+        .font(.system(size: 13))
+    }
+}
+
+/// The access cell of the approval: drawn by SwiftUI like a pop-up button, under an AppKit
+/// hit area that opens the native menu (the non-activating panel takes the first click).
+private struct SshAccessMenu: View {
+    let title: String
+    let rootCapable: Bool
+    let denied: Bool
+    let accessibilityLabel: String
+    let items: () -> [PanelMenuItem]
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        HStack(spacing: 3) {
+            SshAccessLabel(title: title, rootCapable: rootCapable, denied: denied)
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.leading, 8)
+        .padding(.trailing, 6)
+        .padding(.vertical, 3)
+        .frame(maxWidth: .infinity)
+        .background {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+                .shadow(color: .black.opacity(0.25), radius: 0.75, y: 0.5)
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(rootCapable ? Color.orange.opacity(0.55) : Color.primary.opacity(0.08),
+                              lineWidth: rootCapable ? 1 : 0.5)
+        }
+        .opacity(isEnabled ? 1 : 0.6)
+        .accessibilityHidden(true)
+        .overlay(PanelMenuHitArea(label: "\(accessibilityLabel): \(title)", items: items))
+    }
+}
+
+/// The orange shield of root-capable access.
+private struct SshShield: View {
+    var body: some View {
+        Image(systemName: "exclamationmark.shield.fill")
+            .foregroundStyle(.orange)
+            .accessibilityLabel(Text("can become root"))
     }
 }
 
