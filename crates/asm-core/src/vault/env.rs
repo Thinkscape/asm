@@ -481,6 +481,7 @@ impl VaultProvider for EnvFileVault {
                     kind: SecretKind::Single,
                     fields: vec!["value".to_owned()],
                     uri_hosts: vec![],
+                    collections: vec![],
                 })
                 .collect())
         })

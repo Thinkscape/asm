@@ -136,6 +136,10 @@ pub struct Core {
     pub generators: crate::generator::GeneratorRegistry,
     /// Generation authority linearization; never held during provider calls.
     pub(crate) authorization: Mutex<()>,
+    /// Serialises operator vault writes (add, update, rename): each checks names and
+    /// fetches an item before writing it, so two must not interleave. Held during
+    /// provider calls; never while holding `authorization` or `book`.
+    pub(crate) vault_writes: Mutex<()>,
     pub(crate) generation: Mutex<generation::GenerationState>,
     pub(crate) gcloud: gcloud::GcloudSetup,
     gcloud_profiles: gcloud_profiles::GcloudProfiles,
@@ -457,6 +461,7 @@ impl Core {
             registry,
             generators,
             authorization: Mutex::new(()),
+            vault_writes: Mutex::new(()),
             generation: Mutex::new(generation::GenerationState::new(Arc::new(now))),
             gcloud,
             gcloud_profiles: gcloud_profiles::GcloudProfiles::default(),

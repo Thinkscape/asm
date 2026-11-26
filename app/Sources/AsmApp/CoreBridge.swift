@@ -163,6 +163,16 @@ final class CoreBridge: @unchecked Sendable {
         try Self.mapped { try manager.syncVault(id: id) }
     }
 
+    /// Visible items whose names collide. Blocking provider calls: run off the main thread.
+    func nameConflicts() -> [NameConflictGroupItem] {
+        manager.nameConflicts().map(NameConflictGroupItem.init)
+    }
+
+    /// Renames a Bitwarden item agents can see.
+    func renameSecret(vaultID: String, key: String, newName: String) throws {
+        try Self.mapped { try manager.renameSecret(vaultId: vaultID, key: key, newName: newName) }
+    }
+
     func unlockVault(_ id: String, masterPassword: String) throws {
         try Self.mapped { try manager.unlockVault(vaultId: id, masterPassword: masterPassword) }
     }
@@ -542,13 +552,18 @@ private extension PendingItem {
             ))
         case let .update(name, vaultId, vaultName, field, oldValue, newValue):
             .update(name: name, vaultID: vaultId, vaultName: vaultName, field: field, oldValue: oldValue, newValue: newValue)
-        case let .add(name, value, targets):
-            .add(name: name, value: value, targets: targets.map { t in
-                AddTargetItem(
-                    vaultID: t.vaultId, vaultName: t.vaultName, kind: VaultKind(t.kind),
-                    collections: t.collections.map(CollectionItem.init), personalAllowed: t.personalAllowed
-                )
-            })
+        case let .add(name, value, targets, suggestedVault, suggestedCollection, hiddenMatches, hiddenCheckErrors):
+            .add(AddDetail(
+                name: name, value: value,
+                targets: targets.map { t in
+                    AddTargetItem(
+                        vaultID: t.vaultId, vaultName: t.vaultName, kind: VaultKind(t.kind),
+                        collections: t.collections.map(CollectionItem.init), personalAllowed: t.personalAllowed
+                    )
+                },
+                suggestedVault: suggestedVault, suggestedCollection: suggestedCollection,
+                hiddenMatches: hiddenMatches, hiddenCheckErrors: hiddenCheckErrors
+            ))
         case let .login(url, site, account, fillOrigins, reason, broker):
             .login(LoginDetail(url: url, site: site, account: account, fillOrigins: fillOrigins, reason: reason, broker: broker))
         case let .ssh(reason, access, grants, user, targets, defaultDurationSecs, maxDurationSecs):
@@ -627,10 +642,10 @@ private extension VaultState {
 private extension VaultItem {
     init(_ v: VaultInfo) {
         let config: VaultConfigItem = switch v.config {
-        case let .bitwarden(serverUrl, email, clientId, collectionIds, exposePersonal, bwPath):
+        case let .bitwarden(serverUrl, email, clientId, collectionIds, exposePersonal, bwPath, shareCollectionNames):
             .bitwarden(BitwardenConfig(
                 serverURL: serverUrl, email: email, clientID: clientId, collectionIDs: collectionIds,
-                exposePersonal: exposePersonal, bwPath: bwPath ?? ""
+                exposePersonal: exposePersonal, shareCollectionNames: shareCollectionNames, bwPath: bwPath ?? ""
             ))
         case let .envFile(path): .envFile(path: path)
         case .keychain: .keychain
@@ -639,6 +654,17 @@ private extension VaultItem {
             id: v.id, name: v.name, kind: VaultKind(v.kind), state: VaultState(v.status),
             secretCount: v.secretCount.map(Int.init), note: v.note, config: config
         )
+    }
+}
+
+private extension NameConflictGroupItem {
+    init(_ c: NameConflict) {
+        self.init(name: c.name, items: c.items.map { i in
+            NameConflictEntryItem(
+                name: c.name, vaultID: i.vaultId, vaultName: i.vaultName, key: i.key,
+                agentName: i.agentName, location: i.location, renamable: i.renamable
+            )
+        })
     }
 }
 
@@ -652,7 +678,8 @@ private extension VaultDraft {
                 config: .bitwarden(
                     serverUrl: c.serverURL.trimmingCharacters(in: .whitespaces), email: c.email.trimmingCharacters(in: .whitespaces),
                     clientId: c.clientID.trimmingCharacters(in: .whitespaces), collectionIds: c.collectionIDs,
-                    exposePersonal: c.exposePersonal, bwPath: bw.isEmpty ? nil : bw
+                    exposePersonal: c.exposePersonal, bwPath: bw.isEmpty ? nil : bw,
+                    shareCollectionNames: c.shareCollectionNames
                 ),
                 clientSecret: clientSecret, masterPassword: masterPassword
             )

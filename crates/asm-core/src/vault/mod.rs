@@ -26,6 +26,9 @@ pub struct SecretMeta {
     pub kind: SecretKind,
     pub fields: Vec<String>,
     pub uri_hosts: Vec<String>,
+    /// Bitwarden: ids of the exposed collections that hold the item (empty for a
+    /// personal item and outside Bitwarden).
+    pub collections: Vec<String>,
 }
 
 /// Login picker metadata. Only the local manager receives usernames; they are not
@@ -85,6 +88,16 @@ pub trait VaultProvider: Send + Sync {
     }
     fn update(&self, key: &str, field: &str, value: &str) -> Result<()>;
     fn add(&self, name: &str, value: &str, target: &AddTarget) -> Result<()>;
+    /// Rename an exposed item. Only Bitwarden, whose item ids stay put; elsewhere the name
+    /// is the provider key that leases and requests refer to.
+    fn rename(&self, _key: &str, _new_name: &str) -> Result<()> {
+        Err(crate::error::CoreError::invalid("only Bitwarden items can be renamed here"))
+    }
+    /// Where items named exactly `name` sit that this vault holds but does not expose
+    /// (Bitwarden: "collection Secrets", "personal vault"); for the operator only.
+    fn hidden_items_named(&self, _name: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
     /// Provider-specific extra line for the vault row (e.g. ".env: 3 lines skipped"). Default none.
     fn note(&self) -> Option<String> {
         None
@@ -157,6 +170,10 @@ pub struct BitwardenConfig {
     /// a locked vault can still show them.
     #[serde(default)]
     pub collection_names: BTreeMap<String, String>,
+    /// Agents see which exposed collections hold an item (`asm list --json`), and an
+    /// approved add reports the collection chosen. Default off.
+    #[serde(default)]
+    pub share_collection_names: bool,
 }
 
 impl BitwardenConfig {

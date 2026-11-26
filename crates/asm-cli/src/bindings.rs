@@ -102,3 +102,15 @@ pub(crate) fn environment_name(name: &str) -> bool {
 pub(crate) fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
+
+/// Quote a catalog name for the binding grammar, before shell quoting it.
+pub(crate) fn binding_escape(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(c, '\\' | '=' | ',' | ':') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}

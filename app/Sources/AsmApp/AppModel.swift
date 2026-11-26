@@ -29,6 +29,8 @@ final class AppModel {
     private(set) var vaults: [VaultItem] = []
     /// Login metadata can change without a visible change to the vault list or item count.
     private(set) var loginChoicesRevision: UInt64 = 0
+    /// Visible vault items sharing a name; agents must use a qualified name for them.
+    private(set) var nameConflicts: [NameConflictGroupItem] = []
     private(set) var generators: [GeneratorItem] = []
     private(set) var hasRecordedGcloudAccounts = false
     private(set) var sshTargets: [SshTargetItem] = []
@@ -176,6 +178,7 @@ final class AppModel {
                 if pending.contains(where: { $0.kind == .add }) {
                     try await refreshRequests()
                 }
+                nameConflicts = try await call { $0.nameConflicts() }
             case "generators":
                 gcloudOwnedAccountsRevision &+= 1
                 generators = try await call { try $0.listGenerators() }
@@ -381,6 +384,13 @@ final class AppModel {
 
     func syncVault(_ id: String) async -> String? {
         let error = await perform { try $0.syncVault(id) }
+        await refresh("vaults")
+        return error
+    }
+
+    /// Renames a Bitwarden item agents can see (Settings → Vaults → Name conflicts).
+    func renameSecret(vaultID: String, key: String, newName: String) async -> String? {
+        let error = await perform { try $0.renameSecret(vaultID: vaultID, key: key, newName: newName) }
         await refresh("vaults")
         return error
     }

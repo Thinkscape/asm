@@ -265,6 +265,7 @@ fn meta_for(class: Class, a: &Attrs) -> Option<(SecretMeta, Option<String>)> {
                 kind: SecretKind::Single,
                 fields: vec!["value".into()],
                 uri_hosts: vec![],
+                collections: vec![],
             }, None))
         }
         ItemKey::Internet { srvr, acct, .. } => {
@@ -278,6 +279,7 @@ fn meta_for(class: Class, a: &Attrs) -> Option<(SecretMeta, Option<String>)> {
                 kind: SecretKind::Login,
                 fields: vec!["username".into(), "password".into()],
                 uri_hosts,
+                collections: vec![],
             }, (!acct.is_empty()).then_some(acct)))
         }
     }

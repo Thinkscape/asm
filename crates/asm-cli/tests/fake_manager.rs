@@ -324,6 +324,18 @@ fn requests_handler(outcome: &'static str) -> Arc<Handler> {
                 "expires_at":asm_proto::time::fmt_unix(soon_expiry()),"status":"active"}]}),
         ),
         ("GET", "/v1/leases") => (200, json!({"leases":[]})),
+        ("GET", "/v1/health") => (200, json!({"name":"asm-manager","version":"0.1.0",
+            "capabilities": if outcome == "approve-add" { vec!["add_destination_v1"] } else { vec![] }})),
+        // Two items named DB_PASS in one vault; this host leased the first one earlier.
+        ("GET", "/v1/secrets") if outcome.starts_with("dup-") => (
+            200,
+            json!({"secrets":[
+                {"name":"DB_PASS~1a2b3c4d","vault":"work","kind":"login","fields":["username","password"],
+                 "lease":{"lease_id":LEASE,"mode":"sentinel","expires_at":null},
+                 "aliases":["work/DB_PASS~1a2b3c4d"],"item_name":"DB_PASS"},
+                {"name":"DB_PASS~9f8e7d6c","vault":"work","kind":"login","fields":["username","password"],"lease":null,
+                 "aliases":["work/DB_PASS~9f8e7d6c"],"item_name":"DB_PASS"}]}),
+        ),
         ("GET", "/v1/secrets") => (
             200,
             json!({"secrets":[{"name":"work/GitHub","vault":"work","kind":"login","fields":["username","password"],"lease":null}],"warnings":["other: locked"]}),
@@ -350,9 +362,14 @@ fn requests_handler(outcome: &'static str) -> Arc<Handler> {
                         "result":get_result_expiring("asm_0123456789012345678901234567890123456789",
                             &asm_proto::time::fmt_unix(soon_expiry()))}),
                 ),
-                "approve-get" => (
+                "approve-get" | "dup-get" => (
                     200,
                     json!({"request_id":REQ,"kind":"get","status":"approved","deny_reason":null,"result":get_result("asm_0123456789012345678901234567890123456789")}),
+                ),
+                "dup-update" => (
+                    200,
+                    json!({"request_id":REQ,"kind":"update","status":"approved","deny_reason":null,
+                        "result":{"name":"DB_PASS~1a2b3c4d","vault":"work"}}),
                 ),
                 // The manager is unreachable for two polls, then approves.
                 "flaky" if n < 2 => (502, Value::String("bad gateway".into())),
@@ -370,6 +387,11 @@ fn requests_handler(outcome: &'static str) -> Arc<Handler> {
                 "approve-write" => (
                     200,
                     json!({"request_id":REQ,"kind":"update","status":"approved","deny_reason":null,"result":{"name":"work/GitHub","vault":"work"}}),
+                ),
+                "approve-add" => (
+                    200,
+                    json!({"request_id":REQ,"kind":"add","status":"approved","deny_reason":null,
+                        "result":{"name":"DB, PASS","vault":"work","qualified_name":"work/DB, PASS","collection":"Infra"}}),
                 ),
                 "deny" => (
                     200,
@@ -551,6 +573,49 @@ fn update_and_add() {
     assert_eq!(out.status.code(), Some(2));
     let out = asm(&e, &["add", "NEW"], "");
     assert_eq!(out.status.code(), Some(2), "empty value is invalid");
+    // A manager without destination hints never receives one.
+    let posts = |f: &Fake| f.log.lock().unwrap().iter().filter(|(m, p, _)| m == "POST" && p == "/v1/requests").count();
+    let before = posts(&f);
+    let out = asm(&e, &["add", "--vault", "work", "NEW"], "v");
+    assert_ne!(out.status.code(), Some(0));
+    assert!(text(&out.stderr).contains("add_destination_v1"), "{}", text(&out.stderr));
+    assert_eq!(posts(&f), before);
+    let out = asm(&e, &["add", "--collection", "Infra", "NEW"], "v");
+    assert_eq!(out.status.code(), Some(2), "a collection needs its vault");
+    let out = asm(&e, &["add", "NEW"], "v");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "added work/GitHub to work; run asm get to use it\n");
+}
+
+#[test]
+fn add_suggests_a_destination_and_reports_where_it_went() {
+    let (f, e) = paired("approve-add");
+    let out = asm(&e, &["add", "--vault", " work ", "--collection", "Infra", "DB, PASS"], "v");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "added DB, PASS to work (collection Infra); request it as 'work/DB\\, PASS'\n");
+    let sent = f.log.lock().unwrap().iter()
+        .find(|(m, p, _)| m == "POST" && p == "/v1/requests").unwrap().2.clone();
+    assert_eq!((&sent["kind"], &sent["vault"], &sent["collection"]), (&json!("add"), &json!("work"), &json!("Infra")));
+}
+
+#[test]
+fn a_name_that_became_ambiguous_warns_when_the_lease_answers_it() {
+    let warning = "warning: DB_PASS is ambiguous now (work/DB_PASS~1a2b3c4d, work/DB_PASS~9f8e7d6c); \
+        asm used this host's lease on work/DB_PASS~1a2b3c4d. Request one of these names to choose.\n";
+    let (f, e) = paired("dup-get");
+    let out = asm(&e, &["get", "DB_PASS", "deploy the site"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).ends_with(warning), "{}", text(&out.stderr));
+    let sent = f.log.lock().unwrap().iter()
+        .find(|(m, p, _)| m == "POST" && p == "/v1/requests").unwrap().2.clone();
+    assert_eq!(sent["name"], "DB_PASS", "the manager decides with the host's leases");
+
+    let (_f, e) = paired("dup-update");
+    let out = asm(&e, &["update", "DB_PASS"], "new-value\n");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "updated DB_PASS~1a2b3c4d in work\n");
+    assert!(text(&out.stderr).ends_with(&warning.replace("on work/DB_PASS~1a2b3c4d", "on DB_PASS~1a2b3c4d")),
+        "{}", text(&out.stderr));
 }
 
 #[test]

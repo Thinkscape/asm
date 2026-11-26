@@ -187,8 +187,8 @@ private struct ApprovalBody: View {
                 context: context, name: name, vaultID: vaultID, vaultName: vault,
                 field: field, oldValue: oldValue, newValue: newValue
             )
-        case let .add(name, value, targets):
-            AddApproval(context: context, name: name, value: value, targets: targets)
+        case let .add(detail):
+            AddApproval(context: context, detail: detail)
         case let .login(detail):
             BrowserLoginApproval(context: context, detail: detail, durations: CoreBridge.leaseDurations, model: model)
         case let .ssh(detail):
@@ -2576,9 +2576,7 @@ enum ChangedRange {
 
 private struct AddApproval: View {
     let context: RequestContext
-    let name: String
-    let value: String
-    let targets: [AddTargetItem]
+    let detail: AddDetail
 
     /// Sentinel tag for "personal vault" in the collection picker.
     private static let personal = "\u{1}personal"
@@ -2588,10 +2586,59 @@ private struct AddApproval: View {
     @State private var collectionID = ""
     @State private var editingReason = false
 
+    private var name: String { detail.name }
+    private var value: String { detail.value }
+    private var targets: [AddTargetItem] { detail.targets }
     private var target: AddTargetItem? { targets.first { $0.vaultID == vaultID } }
     private var canAllow: Bool {
         guard context.armed, let target else { return false }
         return target.kind != .bitwarden || hasSelectedCollection(in: target)
+    }
+
+    /// Offered vaults the agent's vault hint names.
+    private var vaultMatches: [AddTargetItem] {
+        detail.suggestedVault.map { Self.matches($0, in: targets, name: \.vaultName) } ?? []
+    }
+
+    /// The offered vault the agent's hint names, when exactly one does.
+    private var hintedTarget: AddTargetItem? { vaultMatches.count == 1 ? vaultMatches[0] : nil }
+
+    /// The hinted vault when it is a destination the whole suggestion fits: a collection
+    /// hint names no destination in a vault without collections.
+    private var preselectedTarget: AddTargetItem? {
+        guard let hintedTarget, detail.suggestedCollection == nil || hintedTarget.kind == .bitwarden else { return nil }
+        return hintedTarget
+    }
+
+    /// Collections of the hinted Bitwarden vault the agent's collection hint names.
+    private var collectionMatches: [CollectionItem] {
+        guard let hint = detail.suggestedCollection, let hintedTarget, hintedTarget.kind == .bitwarden else { return [] }
+        return Self.matches(hint, in: hintedTarget.collections, name: \.name)
+    }
+
+    /// The agent's suggestion as "<vault>" or "<vault> / <collection>".
+    private var suggestion: String? {
+        guard let vault = detail.suggestedVault else { return nil }
+        guard let collection = detail.suggestedCollection else { return vault }
+        return "\(vault) / \(collection)"
+    }
+
+    /// Why the suggestion was not preselected; `nil` when it was.
+    private var suggestionNote: String? {
+        if detail.suggestedVault == nil { return nil }
+        if vaultMatches.count > 1 { return "Matches several destinations offered." }
+        if vaultMatches.isEmpty { return "Not among the destinations offered." }
+        if detail.suggestedCollection == nil { return nil }
+        if collectionMatches.count > 1 { return "The collection matches several collections offered." }
+        if collectionMatches.isEmpty { return "The collection is not among the destinations offered." }
+        return nil
+    }
+
+    /// Exact name matches, else case-insensitive ones.
+    private static func matches<T>(_ hint: String, in options: [T], name: (T) -> String) -> [T] {
+        let exact = options.filter { name($0) == hint }
+        if !exact.isEmpty { return exact }
+        return options.filter { name($0).caseInsensitiveCompare(hint) == .orderedSame }
     }
 
     var body: some View {
@@ -2626,8 +2673,28 @@ private struct AddApproval: View {
             .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             if targets.isEmpty {
                 Text("No vault can receive this secret.").foregroundStyle(.secondary)
+                if let suggestion {
+                    Text(verbatim: "Suggested by the agent: \(suggestion)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
             } else {
                 Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 8) {
+                    if let suggestion {
+                        GridRow {
+                            SectionLabel("Suggested")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(verbatim: suggestion)
+                                    .textSelection(.enabled)
+                                if let suggestionNote {
+                                    Text(verbatim: suggestionNote)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
                     GridRow {
                         SectionLabel("Save to")
                         Picker("Save to", selection: $vaultID) {
@@ -2659,6 +2726,22 @@ private struct AddApproval: View {
                     }
                 }
             }
+            if !detail.hiddenMatches.isEmpty {
+                Label {
+                    Text(verbatim: "Not exposed to agents, but already named \(name): \(detail.hiddenMatches.joined(separator: "; ")). Exposing them later makes the names collide.")
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
+                .font(.callout)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            if !detail.hiddenCheckErrors.isEmpty {
+                Text(verbatim: "Could not check for hidden items in: \(detail.hiddenCheckErrors.joined(separator: "; "))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         } details: {
             RequestMetaRows(context: context)
         } actions: {
@@ -2680,7 +2763,12 @@ private struct AddApproval: View {
             }
         }
         .onAppear {
-            if vaultID.isEmpty, let first = targets.first { select(first.vaultID) }
+            guard vaultID.isEmpty else { return }
+            if detail.suggestedVault == nil {
+                if let first = targets.first { select(first.vaultID) }
+            } else if let preselectedTarget {
+                select(preselectedTarget.vaultID)
+            }
         }
         .onChange(of: vaultID) { _, newValue in select(newValue) }
         .onChange(of: targets) { _, _ in
@@ -2702,6 +2790,12 @@ private struct AddApproval: View {
         vaultID = id
         guard let target = targets.first(where: { $0.vaultID == id }) else { return }
         if hasSelectedCollection(in: target) { return }
+        // An agent's collection hint preselects only its unique match, never a fallback.
+        if detail.suggestedCollection != nil {
+            let matches = target.vaultID == hintedTarget?.vaultID ? collectionMatches : []
+            collectionID = matches.count == 1 ? matches[0].id : ""
+            return
+        }
         collectionID = target.collections.first?.id ?? (target.personalAllowed ? Self.personal : "")
     }
 }

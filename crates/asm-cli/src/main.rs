@@ -73,12 +73,19 @@ enum Command {
         wait: Option<u64>,
         name: String,
     },
-    /// Add a new secret; the value is read from stdin.
+    /// Add a new secret; the value is read from stdin. The operator picks where it is
+    /// stored; --vault and --collection only suggest a destination.
     Add {
         /// Stop waiting for the operator after this many seconds (exit 4 while still
         /// pending). Default: until the request expires on the manager (typically 10 min).
         #[arg(long)]
         wait: Option<u64>,
+        /// Suggest the vault to store it in (a vault name from asm list).
+        #[arg(long)]
+        vault: Option<String>,
+        /// Suggest the Bitwarden collection, by name, in the suggested vault.
+        #[arg(long, requires = "vault")]
+        collection: Option<String>,
         name: String,
     },
     /// Show the proxy addresses, which one is reachable, and the CA files (information only).
@@ -160,7 +167,7 @@ fn main() {
         }
         Command::Exec(args) => exec::run(args),
         Command::Update { field, wait, name } => requests::update(field, wait, name),
-        Command::Add { wait, name } => requests::add(wait, name),
+        Command::Add { wait, vault, collection, name } => requests::add(wait, vault, collection, name),
         Command::ProxyInfo { json } => proxy::proxy_info(json),
         Command::ProxyEnv { shell, unset } => proxy::proxy_env(shell, unset),
         Command::Doctor { probe_url } => proxy::doctor(&probe_url),

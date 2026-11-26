@@ -9,7 +9,8 @@ use asm_proto::{ApiError, ErrorCode};
 use asm_proto::generators::{GenerationSelection, SourceKind};
 use asm_proto::ssh::{SshSignRequest, SshSignResponse, SshTargetsResponse};
 use asm_proto::wire::{
-    CAPABILITY_BROADER_LEASE_REUSE_V1, CAPABILITY_BROWSER_LOGIN_V2, CAPABILITY_SSH_LEASES_V2,
+    CAPABILITY_ADD_DESTINATION_V1, CAPABILITY_BROADER_LEASE_REUSE_V1, CAPABILITY_BROWSER_LOGIN_V2,
+    CAPABILITY_SSH_LEASES_V2,
     CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1,
     CAPABILITY_OPERATOR_SELECTED_GRANT_V1, CAPABILITY_OPERATOR_SELECTED_PROJECT_V1,
     CAPABILITY_SECRET_FIELDS_V1, GetResult, HealthResponse, LeaseBrief, LoginSitesResponse,
@@ -176,6 +177,7 @@ async fn health() -> Json<HealthResponse> {
             CAPABILITY_BROADER_LEASE_REUSE_V1.into(),
             CAPABILITY_BROWSER_LOGIN_V2.into(),
             CAPABILITY_SSH_LEASES_V2.into(),
+            CAPABILITY_ADD_DESTINATION_V1.into(),
         ],
     })
 }

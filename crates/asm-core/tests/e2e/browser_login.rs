@@ -26,6 +26,7 @@ impl asm_core::vault::VaultProvider for SiteLogin {
         Ok([("personal", "login.test"), ("site", "legacy.test")].map(|(key, host)| asm_core::vault::SecretMeta {
             key: key.into(), name: key.into(), kind: asm_proto::wire::SecretKind::Login,
             fields: vec!["username".into(), "password".into(), "totp".into()], uri_hosts: vec![host.into()],
+            collections: vec![],
         }).into())
     }
 

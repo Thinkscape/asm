@@ -1536,6 +1536,7 @@ impl asm_core::vault::VaultProvider for LoginFixture {
             kind: asm_proto::wire::SecretKind::Login,
             fields: vec!["username".into(), "password".into()],
             uri_hosts: vec!["http://127.0.0.1".into()],
+            collections: vec![],
         }])
     }
 

@@ -692,7 +692,7 @@ fn wire_privacy_vault_misses_add_targets_and_automatic_denial() {
         }
         fn list(&self) -> Result<Vec<SecretMeta>> {
             Ok(vec![SecretMeta { key: "KNOWN".into(), name: "KNOWN".into(),
-                kind: asm_proto::wire::SecretKind::Single, fields: vec!["value".into()], uri_hosts: vec![] }])
+                kind: asm_proto::wire::SecretKind::Single, fields: vec!["value".into()], uri_hosts: vec![], collections: vec![] }])
         }
         fn read(&self, _: &str) -> Result<Vec<(String, String)>> {
             if self.0.load(Ordering::SeqCst) {

@@ -208,10 +208,21 @@ pub(crate) struct UpdateDetail {
     pub new_value: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct AddDetail {
     pub name: String,
     pub value: String,
+    /// The agent's suggested destination (names, unvalidated); the operator decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+    /// Operator-only: where vaults hold unexposed items of this name, "<vault>: <where>".
+    #[serde(default)]
+    pub hidden_matches: Vec<String>,
+    /// Operator-only: vaults whose unexposed items could not be checked.
+    #[serde(default)]
+    pub hidden_check_errors: Vec<String>,
 }
 
 /// No vault item is attached to a pending browser request, even when only one matches.
@@ -493,6 +504,27 @@ fn accepts_add(vault: &VaultEntry, name: &str) -> bool {
         VaultConfig::EnvFile { .. } => is_env_key(name),
         VaultConfig::Keychain => true,
     }
+}
+
+/// A name for a new or renamed vault item: trimmed, 1–256 characters, no '/', no
+/// control characters.
+pub(crate) fn new_secret_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 256 {
+        return Err(CoreError::invalid("name must be 1–256 characters"));
+    }
+    if name.contains('/') {
+        return Err(CoreError::invalid("name must not contain '/'"));
+    }
+    validate_agent_text("name", name)?;
+    Ok(name.to_owned())
+}
+
+/// Whether a new item called `name` would share a name with a listed one or a generated
+/// output, or take a spelling (such as a duplicate's `name~<hash>`) that already resolves.
+pub(crate) fn name_taken(catalog: &super::catalog::SecretCatalog, name: &str) -> bool {
+    catalog.has_base_name(name)
+        || !matches!(catalog.resolve(name), Err(e) if e.code == asm_proto::ErrorCode::NotFound)
 }
 
 impl Core {
@@ -840,8 +872,8 @@ impl Core {
             RequestBody::Update {
                 name, field, value, ..
             } => self.create_update(host, &agent, address, &name, field, value),
-            RequestBody::Add { name, value, .. } => {
-                self.create_add(host, &agent, address, name, value)
+            RequestBody::Add { name, value, vault, collection, .. } => {
+                self.create_add(host, &agent, address, name, value, vault, collection)
             }
             RequestBody::Login { .. } => Err(CoreError::invalid(LEGACY_LOGIN)),
             RequestBody::BrowserLogin(login) => self.create_login(host, &agent, address, login),
@@ -1295,6 +1327,7 @@ impl Core {
         }).collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_add(
         &self,
         host: &HostRecord,
@@ -1302,29 +1335,52 @@ impl Core {
         address: &str,
         name: String,
         value: String,
+        vault: Option<String>,
+        collection: Option<String>,
     ) -> Result<RequestState> {
         validate_secret_value(&value)?;
-        let name = name.trim().to_string();
-        if name.is_empty() || name.chars().count() > 256 {
-            return Err(CoreError::invalid("name must be 1–256 characters"));
-        }
-        if name.contains('/') {
-            return Err(CoreError::invalid("name must not contain '/'"));
-        }
-        validate_agent_text("name", &name)?;
-        if self.secret_catalog()?.has_base_name(&name) {
+        let name = new_secret_name(&name)?;
+        if name_taken(&self.secret_catalog()?, &name) {
             return Err(CoreError::exists(format!(
                 "a secret named {name:?} already exists; use asm update"
             )));
         }
-        // Accept the request without probing writable targets. Only the operator sees
-        // which destinations, if any, can receive the value.
+        // Accept the request without probing writable targets: the destination hints are
+        // not checked here, and the agent's response never depends on them. Only the
+        // operator sees which destinations, if any, can receive the value.
         let hash = hash_hex(&value);
-        let detail = AddDetail { name, value };
-        let p = self.new_pending(host, agent, address, Detail::Add(detail.clone()));
-        self.push_pending(p, |q| {
-            matches!(&q.detail, Detail::Add(a) if a.name == detail.name && hash_hex(&a.value) == hash)
-        })
+        let same = |q: &Pending| matches!(&q.detail, Detail::Add(a) if a.name == name
+            && hash_hex(&a.value) == hash && a.vault == vault && a.collection == collection);
+        {
+            let b = lock(&self.book);
+            if let Some(q) = b.pending.iter().find(|q| q.host_id.as_deref() == Some(&host.id) && same(q)) {
+                return Ok(q.state_for(&q.id, RequestStatus::Pending));
+            }
+        }
+        let (hidden_matches, hidden_check_errors) = self.hidden_items_named(&name);
+        let detail = AddDetail { name: name.clone(), value, vault: vault.clone(), collection: collection.clone(),
+            hidden_matches, hidden_check_errors };
+        let p = self.new_pending(host, agent, address, Detail::Add(detail));
+        self.push_pending(p, same)
+    }
+
+    /// Operator-only diagnostics: unexposed items named `name` in every Bitwarden vault, and
+    /// the vaults that could not be checked (locked ones too). Never part of an
+    /// agent-visible response.
+    fn hidden_items_named(&self, name: &str) -> (Vec<String>, Vec<String>) {
+        let (mut matches, mut errors) = (Vec::new(), Vec::new());
+        for v in self.registry.all().into_iter().filter(|v| matches!(v.config, VaultConfig::Bitwarden(_))) {
+            let result = match v.provider.status() {
+                VaultStatus::Ready => v.provider.hidden_items_named(name).map_err(|e| e.message),
+                VaultStatus::Locked => Err("locked".to_owned()),
+                VaultStatus::Error(message) => Err(message),
+            };
+            match result {
+                Ok(places) => matches.extend(places.into_iter().map(|p| format!("{}: {p}", v.name))),
+                Err(message) => errors.push(format!("{}: {message}", v.name)),
+            }
+        }
+        (matches, errors)
     }
 
     /// `GET /requests/{id}`: the request's state. A raw result is returned once, then dropped.
@@ -1583,7 +1639,7 @@ impl Core {
                 Err(error) => Err(Fail::Keep(error)),
             },
             (Detail::Update(u), ffi::Decision::ApproveWrite { vault_id, .. }) => self
-                .approve_update(u, &vault_id)
+                .approve_update(&p, u, &vault_id)
                 .map(|r| Some(RequestResult::Write(r))),
             (
                 Detail::Add(a),
@@ -1592,7 +1648,7 @@ impl Core {
                     collection_id,
                 },
             ) => self
-                .approve_add(a, &vault_id, collection_id)
+                .approve_add(&p, a, &vault_id, collection_id)
                 .map(|r| Some(RequestResult::Write(r))),
             (Detail::Login(l), ffi::Decision::ApproveLogin { selection, duration_secs, fill_origins }) => self
                 .approve_login(&p, l, &selection, duration_secs, &fill_origins)
@@ -2120,8 +2176,21 @@ impl Core {
         Ok(())
     }
 
+    /// After waiting for `vault_writes`: the request must still be this decision's to carry
+    /// out, and its host must still be paired.
+    fn recheck_write_claim(&self, p: &Pending) -> std::result::Result<(), Fail> {
+        if !lock(&self.book).pending.iter().any(|q| q.id == p.id) {
+            return Err(Fail::Keep(CoreError::invalid("this request is no longer pending")));
+        }
+        if let Some(host_id) = p.host_id.as_deref() {
+            self.require_active_host(host_id)?;
+        }
+        Ok(())
+    }
+
     fn approve_update(
         &self,
+        p: &Pending,
         u: &UpdateDetail,
         vault_id: &str,
     ) -> std::result::Result<WriteResult, Fail> {
@@ -2131,14 +2200,18 @@ impl Core {
                 "an update is written to the secret's own vault",
             )));
         }
-        let entry = self
-            .registry
-            .get(&s.vault_id)
-            .ok_or_else(|| Fail::Deny("vault unavailable: vault was removed".into()))?;
-        entry
-            .provider
-            .update(&s.key, &u.field, &u.new_value)
-            .map_err(|e| Fail::Deny(format!("vault unavailable: {}", e.message)))?;
+        {
+            let _writes = lock(&self.vault_writes);
+            self.recheck_write_claim(p)?;
+            let entry = self
+                .registry
+                .get(&s.vault_id)
+                .ok_or_else(|| Fail::Deny("vault unavailable: vault was removed".into()))?;
+            entry
+                .provider
+                .update(&s.key, &u.field, &u.new_value)
+                .map_err(|e| Fail::Deny(format!("vault unavailable: {}", e.message)))?;
+        }
         let t = self.generation_now();
         let leases: Vec<LeaseRecord> = {
             let _authority = lock(&self.authorization);
@@ -2176,15 +2249,22 @@ impl Core {
         Ok(WriteResult {
             name: s.display.clone(),
             vault: s.vault_name.clone(),
+            qualified_name: None,
+            collection: None,
         })
     }
 
     fn approve_add(
         &self,
+        p: &Pending,
         a: &AddDetail,
         vault_id: &str,
         collection_id: Option<String>,
     ) -> std::result::Result<WriteResult, Fail> {
+        // One add (or other vault write) at a time: two approved adds of one name must
+        // not both pass the name check. Everything below is checked after the wait.
+        let writes = lock(&self.vault_writes);
+        self.recheck_write_claim(p)?;
         let entry = self.registry.get(vault_id).filter(|v| accepts_add(v, &a.name))
             .ok_or_else(|| Fail::Keep(CoreError::invalid("choose an available vault")))?;
         let collection_id = match &entry.config {
@@ -2199,21 +2279,43 @@ impl Core {
             },
             _ => None,
         };
-        if self.secret_catalog()?.has_base_name(&a.name) {
-            return Err(Fail::Deny(format!(
-                "a secret named {:?} already exists",
-                a.name
-            )));
+        let catalog = self.secret_catalog()?;
+        // A vault that could not be listed may hold the name already (the destination too).
+        if !catalog.unlisted.is_empty() {
+            return Err(Fail::Keep(CoreError::vault_unavailable(format!(
+                "could not list {}; try again", catalog.unlisted.join(", ")
+            ))));
+        }
+        if name_taken(&catalog, &a.name) {
+            return Err(Fail::Deny(format!("a secret named {:?} already exists", a.name)));
         }
         entry
             .provider
-            .add(&a.name, &a.value, &AddTarget { collection_id })
+            .add(&a.name, &a.value, &AddTarget { collection_id: collection_id.clone() })
             .map_err(|e| Fail::Deny(format!("vault unavailable: {}", e.message)))?;
+        let result = self.add_receipt(vault_id, &entry.name, &a.name, collection_id.as_deref());
+        drop(writes);
         self.notify(TOPIC_VAULTS);
-        Ok(WriteResult {
-            name: a.name.clone(),
-            vault: entry.name,
-        })
+        Ok(result)
+    }
+
+    /// What the agent learns about a committed add, from the destination as it is now.
+    /// Whatever cannot be checked is left out; the write is never repeated for it.
+    fn add_receipt(&self, vault_id: &str, vault_name: &str, name: &str, collection_id: Option<&str>) -> WriteResult {
+        let current = self.registry.get(vault_id);
+        let vault = current.as_ref().map_or(vault_name, |v| v.name.as_str()).to_owned();
+        // One item of that name in the destination: `<vault>/<name>` resolves to it.
+        let qualified_name = current.as_ref()
+            .and_then(|v| v.provider.list().ok())
+            .filter(|items| items.iter().filter(|s| s.name == name).count() == 1)
+            .map(|_| format!("{vault}/{name}"));
+        let collection = current.as_ref().zip(collection_id).and_then(|(v, id)| match &v.config {
+            VaultConfig::Bitwarden(b) if b.share_collection_names && b.collections.iter().any(|c| c == id) => {
+                v.provider.collections().ok()?.into_iter().find(|c| c.id == id).map(|c| c.name)
+            }
+            _ => None,
+        });
+        WriteResult { name: name.to_owned(), vault, qualified_name, collection }
     }
 
     // ---- snapshot ----
@@ -2406,6 +2508,10 @@ fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi
             targets: core.add_targets(&a.name),
             name: a.name,
             value: a.value,
+            suggested_vault: a.vault,
+            suggested_collection: a.collection,
+            hidden_matches: a.hidden_matches,
+            hidden_check_errors: a.hidden_check_errors,
         },
         Detail::Login(l) => ffi::RequestDetail::Login {
             site: l.site,
@@ -2499,7 +2605,7 @@ mod tests {
 
     fn request_add(core: &Core, host: &HostRecord, name: &str, value: &str) -> RequestState {
         core.create_request(host, "127.0.0.1", RequestBody::Add {
-            name: name.into(), value: value.into(), agent: String::new(),
+            name: name.into(), value: value.into(), agent: String::new(), vault: None, collection: None,
         }).unwrap()
     }
 
@@ -2550,6 +2656,39 @@ mod tests {
     }
 
     #[test]
+    fn a_write_queued_behind_another_does_not_outlive_its_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = open_manager(&tmp);
+        let output = tmp.path().join("secrets.env");
+        std::fs::write(&output, "TOKEN=old\n").unwrap();
+        let vault = core.save_vault(ffi::VaultDraft {
+            id: None, name: "test".into(),
+            config: ffi::VaultConfig::EnvFile { path: output.to_string_lossy().into_owned() },
+            client_secret: String::new(), master_password: String::new(),
+        }).unwrap();
+        let host = request_host(&core);
+        let update = core.create_request(&host, "127.0.0.1", RequestBody::Update {
+            name: "TOKEN".into(), field: None, value: "new".into(), agent: String::new(),
+        }).unwrap().request_id;
+
+        // Another vault write is in progress while the update is approved.
+        let writes = lock(&core.vault_writes);
+        let approving = std::thread::spawn({
+            let (core, update, vault_id) = (core.clone(), update.clone(), vault.id.clone());
+            move || core.resolve_request(&update, ffi::Decision::ApproveWrite { vault_id, collection_id: None })
+        });
+        while !lock(&core.book).pending.iter().any(|p| p.id == update && p.resolving) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        core.revoke_host(&host.id).unwrap();
+        drop(writes);
+
+        assert!(approving.join().unwrap().is_err());
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "TOKEN=old\n");
+        core.shutdown();
+    }
+
+    #[test]
     fn terminal_decisions_and_host_revocation_survive_reopen() {
         let tmp = tempfile::tempdir().unwrap();
         let mut core = open_manager(&tmp);
@@ -2560,7 +2699,7 @@ mod tests {
         core.cancel_request(&host.id, &cancelled).unwrap();
         let expired = {
             let mut pending = core.new_pending(&host, "", "127.0.0.1", Detail::Add(AddDetail {
-                name: "EXPIRED".into(), value: "test".into(),
+                name: "EXPIRED".into(), value: "test".into(), ..AddDetail::default()
             }));
             pending.created -= 10;
             pending.expires = core.generation_now() - 1;
@@ -2754,6 +2893,7 @@ mod tests {
                 key: key.into(), name: key.into(), kind,
                 fields: fields.iter().map(|f| f.to_string()).collect(),
                 uri_hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                collections: vec![],
             };
             let login = |key: &str, hosts: &[&str]| item(key, SecretKind::Login, &["username", "password"], hosts);
             Ok(vec![
