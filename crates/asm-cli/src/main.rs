@@ -48,13 +48,17 @@ enum Command {
         /// Unattended pairing code (asm-…); also read from $ASM_PAIRING_CODE.
         pairing_code: Option<String>,
     },
-    /// List the secrets you can request.
+    /// List the secrets you can request, or saved browser login origins with --sites.
     List {
-        /// Print the secret catalog as JSON.
+        /// List saved HTTPS origins from exposed password logins instead of secret names.
+        #[arg(long)]
+        sites: bool,
+        /// Print the secret catalog or login sites as JSON.
         #[arg(long)]
         json: bool,
     },
     /// Request a lease on a secret and write its files.
+    #[command(after_help = "Browser grant: asm get --login-url URL --reason TEXT [--site HTTPS_ORIGIN] [--account USERNAME_OR_EMAIL]")]
     Get(requests::GetArgs),
     /// Run a command with approved credentials in its environment, without token files.
     Exec(exec::ExecArgs),
@@ -100,7 +104,16 @@ enum Command {
     },
     /// Sign in to a website on the manager's Mac (the operator approves and the manager
     /// fills the vault login there) and receive the browser storage state.
+    #[command(after_help = "Usage example: asm login https://app.example/login --reason \"Sign in\" --account user@example.com")]
     Login(login::LoginArgs),
+    /// Refresh the one-time code for an existing browser login grant without another approval.
+    Totp {
+        /// Lease ID returned by `asm get --login-url`.
+        lease_id: String,
+        /// Print delivery metadata and the code file's path as JSON (not the code).
+        #[arg(long)]
+        json: bool,
+    },
     /// Set up browsers for login grants: route their HTTPS through asm's proxy router and
     /// trust the asm browser CA.
     #[command(subcommand)]
@@ -137,7 +150,8 @@ fn main() {
             manager,
             pairing_code,
         } => pair::run(&manager, pairing_code, force),
-        Command::List { json } => requests::list(json),
+        Command::List { sites: true, json } => login::list_sites(json),
+        Command::List { sites: false, json } => requests::list(json),
         Command::Get(args) => {
             if args.no_reaper {
                 reaper::disable();
@@ -154,6 +168,7 @@ fn main() {
         Command::Skill(cmd) => skill::run(cmd),
         Command::ProxyRouter(cmd) => router::run(cmd),
         Command::Login(args) => login::run(args),
+        Command::Totp { lease_id, json } => requests::totp(lease_id, json),
         Command::Browser(cmd) => browser::run(cmd),
         Command::Gh(cmd) => gh::run(cmd),
         Command::Ssh(cmd) => ssh::run(cmd),

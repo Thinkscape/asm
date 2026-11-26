@@ -412,11 +412,14 @@ fn request_detail(p: &Pending) -> Map<String, Value> {
         }
         Detail::Add(_) => {}
         Detail::Login(l) => {
-            d.insert("vault".into(), json!(l.secret.vault_name));
+            d.insert("mode".into(), json!(l.mode));
+            d.insert("site".into(), json!(l.site));
+            d.insert("account".into(), json!(l.account));
             d.insert("url".into(), json!(l.url));
             d.insert("fill_origins".into(), json!(l.fill_origins));
             d.insert("reason".into(), json!(l.reason));
         }
+        Detail::LegacyLogin {} => {}
         Detail::Ssh(s) => {
             d.insert("targets".into(), json!(s.targets.iter().map(|t| &t.name).collect::<Vec<_>>()));
             d.insert("access".into(), json!(s.access));
@@ -438,8 +441,7 @@ fn request_event(p: &Pending, kind: &'static str, summary: String, extra: Value)
         Detail::Get(g) => (Category::Requests, Some(g.target.display())),
         Detail::Update(u) => (Category::Requests, Some(u.secret.display.as_str())),
         Detail::Add(a) => (Category::Requests, Some(a.name.as_str())),
-        Detail::Login(l) => (Category::Requests, Some(l.secret.display.as_str())),
-        Detail::Ssh(_) | Detail::SshExtend(_) => (Category::Requests, None),
+        Detail::Login(_) | Detail::LegacyLogin {} | Detail::Ssh(_) | Detail::SshExtend(_) => (Category::Requests, None),
     };
     let mut d = request_detail(p);
     if let Value::Object(x) = extra {
@@ -490,7 +492,7 @@ pub(crate) fn requested(p: &Pending) -> Event {
             hosts_text(&g.requested_hosts),
             g.reason
         ),
-        Detail::Login(l) => format!("{} requested for {}: {}", p.summary(), l.url, l.reason),
+        Detail::Login(l) => format!("{} requested: {}", p.summary(), l.reason),
         _ => format!("{} requested", p.summary()),
     };
     request_event(p, "requested", summary, Value::Null)

@@ -117,7 +117,8 @@ final class CoreBridge: @unchecked Sendable {
             .approveGet(mode: raw ? .raw : .sentinel, durationSecs: durationSecs, hosts: hosts,
                         generation: generation.map(GenerationSelection.init))
         case let .approveWrite(vaultID, collectionID): .approveWrite(vaultId: vaultID, collectionId: collectionID)
-        case let .approveLogin(durationSecs, fillOrigins): .approveLogin(durationSecs: durationSecs, fillOrigins: fillOrigins)
+        case let .approveLogin(selection, durationSecs, fillOrigins):
+            .approveLogin(selection: LoginChoice(selection), durationSecs: durationSecs, fillOrigins: fillOrigins)
         case let .approveSsh(targets, durationSecs):
             .approveSsh(targets: targets.map { d in
                 SshTargetDecision(targetId: d.targetID, access: SshAccess(d.access), grants: d.grants, user: d.access.user)
@@ -130,6 +131,15 @@ final class CoreBridge: @unchecked Sendable {
 
     func listVaults() throws -> [VaultItem] {
         manager.listVaults().map(VaultItem.init)
+    }
+
+    func loginChoices() throws -> LoginChoicesItem {
+        let choices = try Self.mapped { try manager.loginChoices() }
+        return LoginChoicesItem(items: choices.items.map(LoginChoiceItem.init), unavailableVaults: choices.unavailableVaults)
+    }
+
+    static func registrableDomain(_ host: String) -> String? {
+        AsmCore.registrableDomain(host: host)
     }
 
     func saveVault(_ draft: VaultDraftItem) throws {
@@ -517,7 +527,7 @@ private extension PendingItem {
         case let .get(name, vaultID, vaultName, _, fields, reason, rawRequested, requestedHosts,
                       initialHosts, suggestedHosts, defaultDurationSecs, isGenerated, generatorChoices,
                       requestedGeneration, sentinelRequired, hasSubstitutableFields, operatorSelectedGrant,
-                      operatorSelectedGcloudProject, login):
+                      operatorSelectedGcloudProject):
             .get(GetDetail(
                 name: name, vaultID: vaultID, vaultName: vaultName, fields: fields, reason: reason, rawRequested: rawRequested,
                 requestedHosts: requestedHosts,
@@ -528,8 +538,7 @@ private extension PendingItem {
                 generatorChoices: generatorChoices.map(GeneratorApprovalChoiceItem.init),
                 requestedGeneration: requestedGeneration.map(GenerationRequestItem.init),
                 sentinelRequired: sentinelRequired, hasSubstitutableFields: hasSubstitutableFields,
-                operatorSelectedGrant: operatorSelectedGrant, operatorSelectedGcloudProject: operatorSelectedGcloudProject,
-                login: login?.url
+                operatorSelectedGrant: operatorSelectedGrant, operatorSelectedGcloudProject: operatorSelectedGcloudProject
             ))
         case let .update(name, vaultId, vaultName, field, oldValue, newValue):
             .update(name: name, vaultID: vaultId, vaultName: vaultName, field: field, oldValue: oldValue, newValue: newValue)
@@ -540,10 +549,8 @@ private extension PendingItem {
                     collections: t.collections.map(CollectionItem.init), personalAllowed: t.personalAllowed
                 )
             })
-        case let .login(name, vaultName, url, fillOrigins, reason, hasTotp):
-            .login(LoginDetail(
-                name: name, vaultName: vaultName, url: url, fillOrigins: fillOrigins, reason: reason, hasTotp: hasTotp
-            ))
+        case let .login(url, site, account, fillOrigins, reason, broker):
+            .login(LoginDetail(url: url, site: site, account: account, fillOrigins: fillOrigins, reason: reason, broker: broker))
         case let .ssh(reason, access, grants, user, targets, defaultDurationSecs, maxDurationSecs):
             .ssh(SshRequestItem(
                 reason: reason, access: SshAccessItem(access, user: user), grants: grants,
@@ -586,7 +593,24 @@ private extension RecentItem {
 
 private extension BrokerSessionItem {
     init(_ s: BrokerSessionInfo) {
-        self.init(requestID: s.requestId, url: s.url, hostLabel: s.hostLabel, startedAt: s.startedAt, status: s.status)
+        self.init(
+            requestID: s.requestId, url: s.url, account: s.account, hostLabel: s.hostLabel,
+            startedAt: s.startedAt, status: s.status
+        )
+    }
+}
+
+private extension LoginChoiceItem {
+    init(_ choice: LoginChoice) {
+        self.init(vaultID: choice.vaultId, key: choice.key, title: choice.title, vaultName: choice.vaultName,
+                  username: choice.username, savedHosts: choice.savedHosts, hasTotp: choice.hasTotp)
+    }
+}
+
+private extension LoginChoice {
+    init(_ choice: LoginChoiceItem) {
+        self.init(vaultId: choice.vaultID, key: choice.key, title: choice.title, vaultName: choice.vaultName,
+                  username: choice.username, savedHosts: choice.savedHosts, hasTotp: choice.hasTotp)
     }
 }
 

@@ -8,14 +8,15 @@ use asm_proto::error::ErrorCode;
 use asm_proto::generators::{
     GCLOUD_TOKEN_NAME, GITHUB_TOKEN_ALIAS, GITHUB_TOKEN_NAME, GcloudAccessGrant, GcloudAccessRequest,
     GcloudPermission, GcloudScopeRequest, GenerationGrant, GenerationRequest, GenerationSelection,
-    GithubPermission, GithubScopeRequest,
+    GithubPermission, GithubScopeRequest, SourceKind,
 };
 use asm_proto::names::{canonical_generated_output, generated_output};
 use asm_proto::rules::LoginTarget;
 use asm_proto::wire::{
-    CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, CAPABILITY_LOGIN_GRANT_V1,
-    GetResult, LeaseInfo, LeaseMode, LeaseStatus, LeasesResponse, LoginScope, MAX_POLL_WAIT_SECS, RequestBody,
-    RequestResult, RequestState, RequestStatus, RequestedMode, SecretsResponse, WriteResult,
+    BrowserLoginMode, BrowserLoginRequest, CAPABILITY_BROWSER_LOGIN_V2, CAPABILITY_GCLOUD_ACCESS_V1,
+    CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1, GetResult, LeaseInfo, LeaseMode, LeaseStatus, LeasesResponse,
+    LoginScope, MAX_POLL_WAIT_SECS, RequestBody, RequestResult, RequestState, RequestStatus, RequestedMode,
+    SecretsResponse, WriteResult,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -202,6 +203,10 @@ pub(crate) fn submit_with(
     if !asm_proto::crypto::is_uuid(&state.request_id) {
         return Err(CliError::failure("the manager sent an invalid request id"));
     }
+    let browser_kind = matches!(body, RequestBody::BrowserLogin(_)).then(|| body.kind());
+    if browser_kind.is_some_and(|kind| state.kind != kind) {
+        return Err(CliError::failure("the manager returned a different browser request kind"));
+    }
     let was_pending = state.status == RequestStatus::Pending;
     if was_pending && !poll {
         return Err(CliError::pending());
@@ -237,6 +242,9 @@ pub(crate) fn submit_with(
             Ok(s) => {
                 if s.request_id != state.request_id {
                     return Err(CliError::failure("the manager returned a decision for a different request"));
+                }
+                if browser_kind.is_some_and(|kind| s.kind != kind) {
+                    return Err(CliError::failure("the manager returned a different browser request kind"));
                 }
                 state = s;
                 backoff.reset();
@@ -545,14 +553,19 @@ pub struct GetArgs {
     /// Ask for a new generated authorization instead of reusing one.
     #[arg(long, conflicts_with_all = ["lease", "refresh"])]
     pub new_lease: bool,
-    /// Ask for a single-use login grant for this exact HTTPS form action (the URL the
-    /// login form submits to). NAME is then optional: the manager infers the vault
-    /// login from the URL's host.
+    /// Request a single-use login grant for this exact HTTPS password POST URL.
+    /// Requires --reason TEXT. The operator chooses the vault login.
     #[arg(long, value_name = "URL", conflicts_with_all = [
         "raw", "sentinel", "hosts", "lease", "refresh", "new_lease",
         "repositories", "project", "permissions", "gcloud_scopes",
     ])]
     pub login_url: Option<String>,
+    /// Requested username or email for --login-url; the operator chooses the login.
+    #[arg(long, value_name = "USERNAME_OR_EMAIL", requires = "login_url")]
+    pub account: Option<String>,
+    /// Saved HTTPS origin used to rank logins for --login-url; does not change the POST scope.
+    #[arg(long, value_name = "HTTPS_ORIGIN", requires = "login_url")]
+    pub site: Option<String>,
     /// Why you need access (instead of the REASON argument).
     #[arg(long = "reason", value_name = "TEXT", conflicts_with = "reason")]
     pub reason_flag: Option<String>,
@@ -564,9 +577,9 @@ pub struct GetArgs {
     pub reason: Option<String>,
 }
 
-pub fn get(a: GetArgs) -> Result<(), CliError> {
-    if let Some(url) = a.login_url.clone() {
-        return get_login(a, &url);
+pub fn get(mut a: GetArgs) -> Result<(), CliError> {
+    if let Some(url) = a.login_url.take() {
+        return get_login(a, url);
     }
     let (Some(name), Some(reason)) = (a.name.clone(), a.reason.clone().or(a.reason_flag.clone())) else {
         return Err(CliError::invalid("asm get needs NAME and REASON"));
@@ -781,23 +794,26 @@ fn print_get(json: bool, result: &GetResult, stored: &[crate::files::StoredFile]
     }
 }
 
-/// `asm get --login-url URL [ITEM] --reason TEXT`: a single-use login grant for one
-/// HTTPS form action, routed through asm by this machine's proxy router.
-fn get_login(a: GetArgs, url: &str) -> Result<(), CliError> {
-    let reason = a
-        .reason
-        .as_deref()
-        .or(a.reason_flag.as_deref())
-        .ok_or_else(|| CliError::invalid("--login-url needs a reason: --reason TEXT"))?;
-    let reason = asm_proto::rules::validate_reason(reason)?;
-    if let Some(name) = &a.name {
-        let binding = asm_proto::bindings::parse_binding(name)?;
-        if binding.field.is_some() || binding.destination.is_some() {
-            return Err(CliError::invalid("--login-url takes a whole login item"));
-        }
+/// `asm get --login-url URL --reason TEXT`: a single-use login grant for one
+/// HTTPS password POST endpoint, routed through asm by this machine's proxy router.
+fn get_login(a: GetArgs, url: String) -> Result<(), CliError> {
+    if a.name.is_some() || a.reason.is_some() {
+        return Err(crate::login::no_positional_item());
     }
-    let target = asm_proto::rules::parse_login_url(url)?;
-    let canonical = target.canonical_url();
+    let reason = a.reason_flag.ok_or_else(|| CliError::invalid("--login-url needs a reason: --reason TEXT"))?;
+    let reason = asm_proto::rules::validate_reason(&reason)?;
+    let target = asm_proto::rules::parse_login_url(&url)?;
+    let mut body = RequestBody::BrowserLogin(BrowserLoginRequest {
+        mode: BrowserLoginMode::Grant,
+        url,
+        site: a.site,
+        account: a.account,
+        reason,
+        extra_fill_origins: Vec::new(),
+        agent: crate::hostinfo::agent_label(),
+        client_capabilities: vec![CAPABILITY_BROWSER_LOGIN_V2.to_owned()],
+    });
+    body.canonicalize()?;
     let s = Session::open()?;
     let dir = s.secrets_dir()?;
     if crate::router::status()?.is_none() {
@@ -833,48 +849,11 @@ fn get_login(a: GetArgs, url: &str) -> Result<(), CliError> {
             ));
         }
     }
-    let capabilities = crate::bindings::require_capabilities(&s.api, false, false, Some(CAPABILITY_LOGIN_GRANT_V1))?;
+    crate::login::require_v2(&s.api)?;
     s.sync_leases()?;
-    let name = match &a.name {
-        None => String::new(),
-        Some(spec) => {
-            let entries = crate::bindings::catalog(&s.api)?;
-            let binding = asm_proto::bindings::parse_get_binding(spec, &entries)?;
-            match crate::bindings::resolve(binding.clone(), &entries) {
-                Ok(r) if r.generated_output.is_some() => {
-                    return Err(CliError::invalid("--login-url needs a vault login item"));
-                }
-                Ok(r) => r.request_name,
-                Err(e) if e.code == Some(ErrorCode::NotFound) => binding.source,
-                Err(e) => return Err(e),
-            }
-        }
-    };
-    if !name.is_empty() {
-        check_name(&name)?;
-    }
-    let mut client_capabilities = capabilities.client_capabilities(None, false, false);
-    client_capabilities.push(CAPABILITY_LOGIN_GRANT_V1.to_owned());
-    let mut body = RequestBody::Get {
-        name,
-        raw: false,
-        sentinel: false,
-        fields: None,
-        generation: None,
-        refresh: false,
-        refresh_from_version: None,
-        new_lease: false,
-        lease_id: None,
-        client_capabilities,
-        hosts: Vec::new(),
-        reason: reason.clone(),
-        agent: crate::hostinfo::agent_label(),
-        login: Some(LoginScope { url: canonical.clone() }),
-    };
-    body.canonicalize()?;
-    let result = submit_get(&s.api, &body, deadline(a.wait), None, capabilities)
-        .map_err(|e| if e.message == CliError::acquisition_elapsed().message { CliError::pending() } else { e })?;
-    let until = check_login_grant(&result, &canonical, &target.host)?;
+    let result = crate::login::submit_browser(&s.api, &body, a.wait)?;
+    let RequestBody::BrowserLogin(request) = &body else { unreachable!("constructed above") };
+    let until = check_login_grant(&result, &request.url, &target.host)?;
     let routed = route_barrier(&s, &target, until);
     let stored = dir.store(&result)?;
     crate::reaper::ensure_running(dir);
@@ -883,36 +862,84 @@ fn get_login(a: GetArgs, url: &str) -> Result<(), CliError> {
     }
     print_get(a.json, &result, &stored);
     routed?;
-    let totp = match result.files.iter().any(|f| f.field == "totp") {
-        true => {
-            let spec = match totp_item(&s, a.name.as_deref(), &result.lease_id) {
-                Some(item) => crate::bindings::shell_quote(&format!("{item}::totp")),
-                None => "<ITEM>::totp".to_owned(),
-            };
-            format!(
-                "; for a one-time code run: asm get {spec} --reason {}",
-                crate::bindings::shell_quote(&reason)
-            )
-        }
-        false => String::new(),
-    };
-    eprintln!("open or reload the login page now, type the username and the sentinel, submit once{totp}");
+    eprintln!("open or reload the login page now, type the username and the sentinel, submit once");
+    if result.files.iter().any(|f| f.field == "totp") {
+        eprintln!("for a one-time code run: asm totp {}", result.lease_id);
+    }
     Ok(())
 }
 
-/// The item spelling `asm get ITEM::totp` resolves: ITEM as the user gave it, else the
-/// catalog name the manager recorded on the lease (binding-escaped). `None` when the
-/// lease is not listed.
-fn totp_item(s: &Session, given: Option<&str>, lease_id: &str) -> Option<String> {
-    if let Some(name) = given {
-        return Some(name.to_owned());
+/// Fetch only the OTP for the exact existing grant; no approval or router setup.
+pub(crate) fn totp(mut lease_id: String, json: bool) -> Result<(), CliError> {
+    if !asm_proto::crypto::is_uuid(&lease_id) {
+        return Err(CliError::invalid("asm totp needs the lease ID returned by asm get --login-url"));
     }
-    let leases: LeasesResponse = s.api.get("/leases").ok()?;
-    leases
-        .leases
-        .into_iter()
-        .find(|l| l.lease_id == lease_id)
-        .map(|l| crate::bindings::binding_escape(&l.name))
+    lease_id.make_ascii_lowercase();
+    let s = Session::open()?;
+    let dir = s.secrets_dir()?;
+    crate::login::require_v2(&s.api)?;
+    let owned = s.sync_leases()?;
+    let lease = owned.leases.iter().find(|l| l.lease_id == lease_id).ok_or_else(|| {
+        CliError::from(asm_proto::error::ApiError::new(
+            ErrorCode::NotFound,
+            "login grant not found; request one with asm get --login-url URL --reason TEXT",
+        ))
+    })?;
+    let scope = lease.login.as_ref().filter(|_| {
+        lease.source_kind == SourceKind::Vault && lease.mode == LeaseMode::Sentinel && lease.generation.is_none()
+    })
+        .ok_or_else(|| CliError::invalid("asm totp requires a browser login grant from asm get --login-url"))?;
+    let target = asm_proto::rules::parse_login_url(&scope.url)
+        .map_err(|_| CliError::failure("the manager listed an invalid login grant scope"))?;
+    if target.canonical_url() != scope.url || lease.hosts != [target.host.as_str()] {
+        return Err(CliError::failure("the manager listed an invalid login grant scope"));
+    }
+    if lease.status != LeaseStatus::Active || live_expiry(lease.expires_at.as_deref()).is_none() {
+        return Err(CliError::denied(Some(
+            "login grant ended; request a new one with asm get --login-url URL --reason TEXT",
+        )));
+    }
+    if !lease.fields.iter().any(|field| field == "totp") {
+        return Err(CliError::invalid("this browser login grant does not include a one-time code"));
+    }
+
+    let result: GetResult = s.api.post(&format!("/login-grants/{lease_id}/totp"), &())?;
+    let wrong = || CliError::failure("the manager returned a different login grant or invalid one-time code");
+    let [file] = result.files.as_slice() else {
+        return Err(wrong());
+    };
+    if result.lease_id != lease_id
+        || result.mode != LeaseMode::Sentinel
+        || result.hosts != lease.hosts
+        || result.login.as_ref() != Some(scope)
+        || result.expires_at != lease.expires_at
+        || live_expiry(result.expires_at.as_deref()).is_none()
+        || result.generation.is_some()
+        || result.validate().is_err()
+        || !is_totp(file)
+    {
+        return Err(wrong());
+    }
+    // A static subset delivery updates only the returned field and preserves
+    // every other file and cleanup reservation for this grant.
+    let stored = dir.store(&result)?;
+    crate::reaper::ensure_running(dir);
+    for file in &stored {
+        file.delivery.report(&file.relative_path);
+    }
+    print_get(json, &result, &stored);
+    Ok(())
+}
+
+fn is_totp(file: &asm_proto::wire::ResultFile) -> bool {
+    file.field == "totp"
+        && file.substituted == Some(false)
+        && (6..=10).contains(&file.content.len())
+        && file.content.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn live_expiry(expires_at: Option<&str>) -> Option<i64> {
+    expires_at.and_then(asm_proto::time::parse_unix).filter(|&expiry| expiry > unix_now())
 }
 
 /// The approved grant must be exactly the one requested: this form action, sentinel
@@ -920,23 +947,22 @@ fn totp_item(s: &Session, given: Option<&str>, lease_id: &str) -> Option<String>
 /// username and one-time code. Returns the expiry (unix time).
 fn check_login_grant(r: &GetResult, url: &str, host: &str) -> Result<i64, CliError> {
     let wrong = || CliError::failure("the manager returned a different login grant than requested");
-    if r.login.as_ref().map(|l| l.url.as_str()) != Some(url)
+    if !asm_proto::crypto::is_uuid(&r.lease_id)
+        || r.login.as_ref().map(|l| l.url.as_str()) != Some(url)
         || r.mode != LeaseMode::Sentinel
         || r.hosts != [host]
         || r.generation.is_some()
+        || r.validate().is_err()
     {
         return Err(wrong());
     }
-    let until = r
-        .expires_at
-        .as_deref()
-        .and_then(asm_proto::time::parse_unix)
-        .ok_or_else(wrong)?;
-    let mut password = false;
+    let until = live_expiry(r.expires_at.as_deref()).ok_or_else(wrong)?;
+    let (mut password, mut username, mut totp) = (false, false, false);
     for f in &r.files {
         match (f.field.as_str(), f.substituted) {
-            ("password", Some(true)) => password = true,
-            ("username" | "totp", Some(false)) => {}
+            ("password", Some(true)) if !password && asm_proto::rules::is_sentinel(&f.content) => password = true,
+            ("username", Some(false)) if !username => username = true,
+            ("totp", Some(false)) if !totp && is_totp(f) => totp = true,
             _ => return Err(wrong()),
         }
     }
@@ -1010,6 +1036,7 @@ fn get_block(r: &GetResult, paths: &[PathBuf]) -> String {
     let expires = r.expires_at.as_deref().unwrap_or("never");
     let mut s = format!("mode: {mode}\nhosts: {hosts}\nexpires: {expires}\n");
     if let Some(login) = &r.login {
+        s.push_str(&format!("lease: {}\n", r.lease_id));
         s.push_str(&format!("login: {} (single use; routed through asm until {expires})\n", login.url));
     }
     if let Some(generation) = &r.generation {
@@ -1215,7 +1242,7 @@ mod tests {
         r.login = Some(LoginScope { url: "https://example.com/session".into() });
         assert_eq!(
             get_block(&r, &p),
-            "mode: sentinel\nhosts: api.github.com,*.githubusercontent.com\nexpires: 2026-11-16T12:34:56Z\nlogin: https://example.com/session (single use; routed through asm until 2026-11-16T12:34:56Z)\n/run/user/1000/asm/secrets/GITHUB_TOKEN\n"
+            "mode: sentinel\nhosts: api.github.com,*.githubusercontent.com\nexpires: 2026-11-16T12:34:56Z\nlease: l\nlogin: https://example.com/session (single use; routed through asm until 2026-11-16T12:34:56Z)\n/run/user/1000/asm/secrets/GITHUB_TOKEN\n"
         );
         r.login = None;
         r.mode = LeaseMode::Raw;
@@ -1232,12 +1259,16 @@ mod tests {
         let file = |field: &str, substituted| ResultFile {
             field: field.into(),
             relative_path: format!("work/Site.{field}"),
-            content: "x".into(),
+            content: match field {
+                "password" => "asm_0123456789012345678901234567890123456789",
+                "totp" => "012345",
+                _ => "user",
+            }.into(),
             substituted: Some(substituted),
         };
         let url = "https://login.example.test/session";
         let ok = GetResult {
-            lease_id: "l".into(),
+            lease_id: "11111111-2222-4333-8444-555555555555".into(),
             mode: LeaseMode::Sentinel,
             hosts: vec!["login.example.test".into()],
             expires_at: Some("2999-01-01T00:00:00Z".into()),
@@ -1260,6 +1291,9 @@ mod tests {
             GetResult { mode: LeaseMode::Raw, ..ok.clone() },
             GetResult { hosts: vec!["*.example.test".into()], ..ok.clone() },
             GetResult { expires_at: None, ..ok.clone() },
+            GetResult { expires_at: Some("2000-01-01T00:00:00Z".into()), ..ok.clone() },
+            GetResult { lease_id: "not-a-lease".into(), ..ok.clone() },
+            GetResult { files: vec![file("password", true), file("password", true)], ..ok.clone() },
             GetResult { files: vec![file("username", false), file("password", false)], ..ok.clone() },
             GetResult { files: vec![file("username", true), file("password", true)], ..ok.clone() },
             GetResult { files: vec![file("password", true), file("note", false)], ..ok.clone() },

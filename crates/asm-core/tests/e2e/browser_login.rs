@@ -14,7 +14,7 @@ const SITE_PASSWORD: &str = "site-password-0123456789";
 const BROWSER_CA_CN: &str = "Agents Secrets Manager Browser CA";
 const NO_ROUTE: &str = "asm: no active login grant routes this host through asm";
 
-/// One vault login (`site`) whose URI is on `login.test`.
+/// The selected account has an old saved domain; the current domain matches a different user.
 struct SiteLogin;
 
 impl asm_core::vault::VaultProvider for SiteLogin {
@@ -23,19 +23,27 @@ impl asm_core::vault::VaultProvider for SiteLogin {
     }
 
     fn list(&self) -> asm_core::error::Result<Vec<asm_core::vault::SecretMeta>> {
-        Ok(vec![asm_core::vault::SecretMeta {
-            key: "site".into(), name: "site".into(),
-            kind: asm_proto::wire::SecretKind::Login,
-            fields: vec!["username".into(), "password".into()],
-            uri_hosts: vec!["login.test".into()],
-        }])
+        Ok([("personal", "login.test"), ("site", "legacy.test")].map(|(key, host)| asm_core::vault::SecretMeta {
+            key: key.into(), name: key.into(), kind: asm_proto::wire::SecretKind::Login,
+            fields: vec!["username".into(), "password".into(), "totp".into()], uri_hosts: vec![host.into()],
+        }).into())
+    }
+
+    fn list_logins(&self) -> asm_core::error::Result<Vec<asm_core::vault::LoginMeta>> {
+        Ok(self.list()?.into_iter().map(|meta| asm_core::vault::LoginMeta {
+            username: Some(if meta.key == "site" { SITE_USER } else { "personal@login.test" }.into()), meta,
+        }).collect())
     }
 
     fn read(&self, key: &str) -> asm_core::error::Result<Vec<(String, String)>> {
+        if key == "personal" {
+            return Ok(vec![("username".into(), "personal@login.test".into()), ("password".into(), "personal-fixture".into()),
+                ("totp".into(), "000013".into())]);
+        }
         if key != "site" {
             return Err(asm_core::error::CoreError::not_found("unknown fixture item"));
         }
-        Ok(vec![("username".into(), SITE_USER.into()), ("password".into(), SITE_PASSWORD.into())])
+        Ok(vec![("username".into(), SITE_USER.into()), ("password".into(), SITE_PASSWORD.into()), ("totp".into(), "730012".into())])
     }
 
     fn update(&self, _: &str, _: &str, _: &str) -> asm_core::error::Result<()> {
@@ -47,8 +55,7 @@ impl asm_core::vault::VaultProvider for SiteLogin {
     }
 }
 
-/// Approves every `get` the way the operator approves a login grant: Proxied, 15
-/// minutes, the pre-filled hosts.
+/// Fixture operator: choose the requested identity even though another account has the exact host.
 struct LoginApprover {
     manager: OnceLock<Arc<Manager>>,
     busy: Mutex<()>,
@@ -61,13 +68,11 @@ impl LoginApprover {
         let Some(manager) = self.manager.get() else { return };
         let _busy = self.busy.lock().unwrap();
         for pending in manager.snapshot().pending {
-            let RequestDetail::Get { initial_hosts, .. } = &pending.detail else { continue };
-            let hosts = initial_hosts.iter().map(|h| h.normalized.clone()).collect();
-            match manager.resolve_request(pending.id, Decision::ApproveGet {
-                mode: asm_core::ffi::LeaseMode::Sentinel,
-                duration_secs: Some(900),
-                hosts,
-                generation: None,
+            let RequestDetail::Login { account: Some(account), broker: false, .. } = &pending.detail else { continue };
+            let choices = manager.login_choices().unwrap();
+            let selection = choices.items.into_iter().find(|c| c.username.as_ref() == Some(account)).unwrap();
+            match manager.resolve_request(pending.id, Decision::ApproveLogin {
+                selection, duration_secs: Some(900), fill_origins: Vec::new(),
             }) {
                 Ok(()) => self.details.lock().unwrap().push(pending.detail),
                 Err(error) => self.errors.lock().unwrap().push(error.to_string()),
@@ -249,12 +254,12 @@ fn claim_files(proxy_dir: &Path) -> Vec<PathBuf> {
 /// `asm get --login-url` with the reaper off; returns the JSON result.
 fn login_get(env: &Env, reason: &str) -> serde_json::Value {
     let out = env.run_env(
-        &["get", "--json", "--wait", "30", "--login-url", LOGIN_URL, "--reason", reason],
+        &["get", "--json", "--wait", "30", "--login-url", LOGIN_URL, "--account", SITE_USER,
+            "--site", "https://app.test", "--reason", reason],
         None,
         &[("ASM_NO_REAPER", "1")],
     );
     assert_eq!(out.code, 0, "login get failed: {}{}", out.stdout, out.stderr);
-    assert!(out.stderr.contains("type the username and the sentinel, submit once"), "{}", out.stderr);
     serde_json::from_str(&out.stdout).expect("get JSON")
 }
 
@@ -321,6 +326,11 @@ fn browser_login_grant_end_to_end() {
     let host_id = host["host_id"].as_str().unwrap().to_owned();
     let password = proxy_password(&sha256(host["token"].as_str().unwrap().as_bytes()));
 
+    let sites = env.run(&["list", "--sites", "--json"], None);
+    assert_eq!(sites.code, 0, "{}", sites.stderr);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&sites.stdout).unwrap(),
+        json!({"sites":["legacy.test","login.test"]}));
+
     let no_router = env.run(&["get", "--login-url", LOGIN_URL, "--reason", "sign in"], None);
     assert_ne!(no_router.code, 0);
     assert!(no_router.stderr.contains("no asm proxy-router on this machine"), "{}", no_router.stderr);
@@ -352,14 +362,13 @@ fn browser_login_grant_end_to_end() {
     {
         let details = approver.details.lock().unwrap();
         assert_eq!(details.len(), 1);
-        let RequestDetail::Get { name, login, sentinel_required, default_duration_secs, initial_hosts, fields, .. } = &details[0]
-            else { panic!("get approval expected") };
-        assert_eq!(name, "site", "the item is inferred from the URL host");
-        assert_eq!(login.as_ref().map(|l| l.url.as_str()), Some(LOGIN_URL));
-        assert!(*sentinel_required);
-        assert_eq!(*default_duration_secs, Some(900));
-        assert_eq!(initial_hosts.iter().map(|h| h.normalized.as_str()).collect::<Vec<_>>(), ["login.test"]);
-        assert_eq!(fields, &["username", "password"]);
+        let RequestDetail::Login { account, site, url, broker, fill_origins, .. } = &details[0]
+            else { panic!("operator selection expected") };
+        assert_eq!(account.as_deref(), Some(SITE_USER));
+        assert_eq!(site.as_deref(), Some("https://app.test"));
+        assert_eq!(url, LOGIN_URL);
+        assert!(!*broker);
+        assert!(fill_origins.is_empty(), "site hints must not widen the password destination");
     }
     assert_eq!(grant["login"]["url"], LOGIN_URL);
     assert_eq!(grant["mode"], "sentinel");
@@ -377,6 +386,7 @@ fn browser_login_grant_end_to_end() {
                 assert_eq!(file["delivery"], "raw");
                 assert_eq!(content, SITE_USER);
             }
+            "totp" => assert_eq!(content, "730012", "must not use the exact-host personal account"),
             other => panic!("unexpected login file {other}"),
         }
     }
@@ -388,6 +398,14 @@ fn browser_login_grant_end_to_end() {
     let lifetime = lease.expires_at.unwrap().duration_since(lease.created_at).unwrap();
     assert_eq!(lifetime, Duration::from_secs(900));
     assert_eq!(routed_hosts(&env), ["login.test:443"]);
+    let fresh = env.run_env(&["totp", &lease_id, "--json"], None, &[("ASM_NO_REAPER", "1")]);
+    assert_eq!(fresh.code, 0, "{}", fresh.stderr);
+    let receipt: serde_json::Value = serde_json::from_str(&fresh.stdout).unwrap();
+    let files = receipt["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["field"], "totp");
+    assert_eq!(std::fs::read_to_string(files[0]["path"].as_str().unwrap()).unwrap(), "730012");
+    assert_eq!(approver.details.lock().unwrap().len(), 1, "continuation must not queue an approval");
 
     // 2. A marked CONNECT gets a leaf from the browser CA, only for the granted site.
     let ca_pem = m.core().proxy.browser_ca_pem().unwrap();
@@ -444,6 +462,7 @@ fn browser_login_grant_end_to_end() {
     // 3. Revoking the lease withdraws the route within 2 s; the router then drops it.
     let revoked_at = Instant::now();
     m.revoke_lease(lease_id.clone()).unwrap();
+    assert_ne!(env.run(&["totp", &lease_id], None).code, 0, "ended grants must not issue codes");
     loop {
         let (_, status, body) = connect(proxy_port, "login.test:443", true, None);
         if status == 403 {

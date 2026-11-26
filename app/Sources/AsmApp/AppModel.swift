@@ -27,6 +27,8 @@ final class AppModel {
     /// A failed "Hand over session" or "Cancel", by request ID.
     private(set) var brokerErrors: [String: String] = [:]
     private(set) var vaults: [VaultItem] = []
+    /// Login metadata can change without a visible change to the vault list or item count.
+    private(set) var loginChoicesRevision: UInt64 = 0
     private(set) var generators: [GeneratorItem] = []
     private(set) var hasRecordedGcloudAccounts = false
     private(set) var sshTargets: [SshTargetItem] = []
@@ -169,6 +171,7 @@ final class AppModel {
                 hosts = try await call { try $0.listHosts() }
                 pairingCodes = try await call { try $0.listPairingCodes() }
             case "vaults":
+                loginChoicesRevision &+= 1
                 vaults = try await call { try $0.listVaults() }
                 if pending.contains(where: { $0.kind == .add }) {
                     try await refreshRequests()
@@ -318,6 +321,7 @@ final class AppModel {
             await refresh("requests")
             if let error, pending.contains(where: { $0.id == id }) {
                 requestResolutions[id] = .failed(error)
+                if case .approveLogin = decision { loginChoicesRevision &+= 1 }
             } else {
                 requestResolutions.removeValue(forKey: id)
             }
@@ -350,6 +354,10 @@ final class AppModel {
     }
 
     // MARK: Vaults
+
+    func loginChoices(for detail: LoginDetail) async throws -> LoginChoiceCatalog {
+        try await call { LoginChoiceCatalog(try $0.loginChoices(), detail: detail) }
+    }
 
     func connectBitwarden(_ draft: VaultDraftItem) async throws -> [CollectionItem] {
         try await call { try $0.bitwardenConnect(draft) }
@@ -614,6 +622,12 @@ final class AppModel {
     /// Opens Settings → Proxy (notification click, banner "Details…").
     func showProxyDetails() {
         showSettings(.proxy)
+    }
+
+    /// Recover access to a vault without dismissing the pending browser approval.
+    func showVaultSettings(unlock id: String? = nil) {
+        unlockingVaultID = id
+        showSettings(.vaults)
     }
 
     /// Opens Settings → SSH Targets with one target selected (approval panel link).

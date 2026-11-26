@@ -77,7 +77,7 @@ final class ApprovalPanelController {
     /// Use a fresh backing window at privacy boundaries. Never make a window
     /// containing old pairing codes or secret values shareable during a redraw.
     func prepare(for request: PendingItem?) -> Bool {
-        guard let panel, panel.sharingType != Self.sharingType(for: request) else { return false }
+        guard let panel, panel.sharingType != sharingType(for: request) else { return false }
         let visible = panel.isVisible
         panel.orderOut(nil)
         panel.contentViewController = nil
@@ -85,7 +85,9 @@ final class ApprovalPanelController {
         return visible
     }
 
-    private static func sharingType(for request: PendingItem?) -> NSWindow.SharingType {
+    private func sharingType(for request: PendingItem?) -> NSWindow.SharingType {
+        // A broker handover shows the requested identity alongside any pending request.
+        guard model.brokerSessions.isEmpty else { return .none }
         #if DEBUG
         // Design checks: SSH requests show no secret values, so a debug build started
         // with ASM_DEBUG_SHAREABLE_PANEL=1 lets screenshots include them.
@@ -119,7 +121,7 @@ final class ApprovalPanelController {
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
-        panel.sharingType = Self.sharingType(for: model.shownRequest)
+        panel.sharingType = sharingType(for: model.shownRequest)
         #if DEBUG
         // Optional self-rendering of capturable panels for debug layout checks.
         if ProcessInfo.processInfo.environment["ASM_DEBUG_SHAREABLE_PANEL"] == "1" {
@@ -218,11 +220,15 @@ private struct BrokerSessionRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Text(verbatim: session.url)
-                .font(.system(size: 12).monospaced())
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
+            LoginScopeValue(label: "Sign-in URL", value: session.url)
+            if let account = session.account {
+                LoginScopeValue(label: "Requested account (unverified)", value: account)
+                Text("Verify that Chrome is signed in to the requested account or the alias you approved before handing over the session.")
+                    .font(.callout)
+            } else {
+                Text("Verify the account signed in to Chrome before handing over the session.")
+                    .font(.callout)
+            }
             Text(verbatim: session.status)
                 .font(.callout)
                 .foregroundStyle(session.status.hasPrefix("paused") ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))

@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 
 use self::cdp::{CALL_TIMEOUT, Cdp, CdpError};
 use crate::manager::{Core, lock};
+use crate::manager::requests::SecretRef;
 
 /// A sign-in session ends unanswered after this long.
 pub(crate) const SESSION_SECS: u64 = 600;
@@ -51,24 +52,19 @@ pub(crate) fn find_chrome() -> Option<PathBuf> {
     CHROME_PATHS.iter().map(PathBuf::from).find(|p| p.is_file())
 }
 
-/// One-time codes are read from the vault when a code field is filled.
-pub(crate) struct TotpSource {
-    pub vault_id: String,
-    pub key: String,
-}
-
 /// An approved sign-in.
 pub(crate) struct SessionSpec {
     pub request_id: String,
     pub host_id: String,
     pub host_label: String,
+    pub account: Option<String>,
     pub url: String,
     pub export_host: String,
     pub export_origin: String,
     pub fill_origins: Vec<String>,
     pub username: Option<Zeroizing<String>>,
     pub password: Zeroizing<String>,
-    pub totp: Option<TotpSource>,
+    pub secret: SecretRef,
     /// Lifetime of the handed-over storage state.
     pub lease_secs: u64,
 }
@@ -87,6 +83,7 @@ pub(crate) struct SessionInfo {
     pub request_id: String,
     pub url: String,
     pub host_label: String,
+    pub account: Option<String>,
     pub started_at: i64,
     pub status: String,
 }
@@ -267,6 +264,7 @@ impl Broker {
                 request_id: spec.request_id.clone(),
                 url: spec.url.clone(),
                 host_label: spec.host_label.clone(),
+                account: spec.account.clone(),
                 started_at,
                 status: "opening the sign-in page".into(),
             }),
@@ -385,15 +383,13 @@ impl Runner {
             End::Outcome(_) => self.close(),
         }
         remove_profile(&self.profile);
-        let request_id = self.spec.request_id.clone();
-        let core = self.core.upgrade();
-        drop(self);
-        let Some(core) = core else { return };
-        if let End::Outcome(outcome) = end {
-            core.broker_finished(&request_id, outcome);
+        if let Some(core) = self.core.upgrade() {
+            if let End::Outcome(outcome) = end {
+                core.broker_finished(&self.spec.request_id, &self.spec.secret, outcome);
+            }
+            core.broker.remove(&self.spec.request_id);
+            core.notify(crate::manager::TOPIC_REQUESTS);
         }
-        core.broker.remove(&request_id);
-        core.notify(crate::manager::TOPIC_REQUESTS);
     }
 
     fn drive(&mut self) -> End {
@@ -558,7 +554,7 @@ impl Runner {
         self.world = Some(world);
         let mut kinds: Vec<&str> = fill::KINDS.iter().copied().filter(|k| match *k {
             "username" => self.spec.username.as_ref().is_some_and(|u| !u.is_empty()),
-            "totp" => self.spec.totp.is_some(),
+            "totp" => self.spec.secret.fields.iter().any(|f| f == "totp"),
             _ => true,
         }).collect();
         let totp_status = match &self.totp_retry {
@@ -618,19 +614,11 @@ impl Runner {
         }
     }
 
-    /// A fresh one-time code. The item's other values, read along with it, are zeroized.
+    /// Fetch a fresh code only for the approved item, without copying its password.
     fn totp_code(&self, core: &Core) -> Result<Zeroizing<String>, String> {
-        let source = self.spec.totp.as_ref().ok_or("no authenticator key")?;
+        let source = &self.spec.secret;
         let vault = core.registry.get(&source.vault_id).ok_or("vault was removed")?;
-        let values = vault.provider.read(&source.key).map_err(|e| e.message)?;
-        let mut code = None;
-        for (field, value) in values {
-            let value = Zeroizing::new(value);
-            if field == "totp" && code.is_none() {
-                code = Some(value);
-            }
-        }
-        code.ok_or_else(|| "the item has no authenticator key".to_owned())
+        vault.provider.read_totp(&source.key).map_err(|e| e.message)
     }
 
     /// The storage state: cookies valid for the export host or another approved fill

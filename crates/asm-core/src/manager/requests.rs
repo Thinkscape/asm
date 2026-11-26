@@ -15,7 +15,7 @@ use asm_proto::rules::{
 };
 use asm_proto::time::fmt_unix;
 use asm_proto::wire::{
-    CAPABILITY_LOGIN_BROKER_V1, GetResult, HostInfo, LeaseMode, LoginScope, RequestBody, RequestKind,
+    BrowserLoginMode, BrowserLoginRequest, GetResult, HostInfo, LeaseMode, LoginScope, RequestBody, RequestKind,
     RequestResult, RequestState, RequestStatus, ResultFile, SecretKind, WriteResult,
 };
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ use super::resume::SealedResume;
 use super::{
     Core, TOPIC_LEASES, TOPIC_REQUESTS, TOPIC_VAULTS, activity, lock, to_system_time,
 };
-use crate::broker::{self, SessionSpec, TotpSource, fill};
+use crate::broker::{self, SessionSpec, fill};
 use crate::error::{CoreError, REQUEST_UNAVAILABLE, Result};
 use crate::ffi;
 use crate::proxy::{LoginBinding, ProxyEntry};
@@ -40,8 +40,6 @@ use zeroize::Zeroizing;
 const DONE_KEEP_SECS: i64 = 3600;
 /// Longest login grant; also how long its site stays routed through asm.
 const LOGIN_MAX_SECS: u64 = 3600;
-/// Default login grant duration offered in the approval popup.
-const LOGIN_DEFAULT_SECS: u64 = 900;
 /// Default lifetime of a storage state handed over by the login broker.
 const BROKER_DEFAULT_SECS: u64 = 3600;
 /// Most extra origins the login broker may fill besides the requested site.
@@ -57,6 +55,7 @@ pub const REVEAL_SECS: i64 = 60;
 
 const BOOK_NAMESPACE: &str = "request-book-v1";
 const INTERRUPTED: &str = "Approval was interrupted. Verify whether the operation completed before deciding again.";
+const LEGACY_LOGIN: &str = "This browser login requires a new account selection. Upgrade the CLI and request it again.";
 
 #[derive(Default)]
 pub struct Book {
@@ -185,7 +184,7 @@ pub(crate) struct GetDetail {
     pub reason: String,
     pub initial: Vec<String>,
     pub suggestions: Vec<String>,
-    /// A single-use login grant for this canonical form action URL.
+    /// Decode v1 pending rows only; they are denied on restore, never approved as ordinary gets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login: Option<LoginScope>,
 }
@@ -215,14 +214,15 @@ pub(crate) struct AddDetail {
     pub value: String,
 }
 
-/// `asm login`: sign in with this vault login in a browser on the Mac and hand the
-/// agent the resulting storage state.
-#[derive(Clone, Serialize, Deserialize)]
+/// No vault item is attached to a pending browser request, even when only one matches.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LoginDetail {
-    pub secret: SecretRef,
-    /// The page the browser opens; its origin is the export origin.
+    pub mode: BrowserLoginMode,
+    pub site: Option<String>,
+    pub account: Option<String>,
+    /// Exact credential endpoint (grant) or sign-in page (broker).
     pub url: String,
-    /// Origins the broker may fill: the export origin first, then the extra ones.
+    /// Empty for grants; for brokers the export origin first, then allowed extras.
     pub fill_origins: Vec<String>,
     pub reason: String,
 }
@@ -232,6 +232,15 @@ impl LoginDetail {
     fn target(&self) -> Result<(String, u16)> {
         Ok(parse_https_url(&self.url)?)
     }
+}
+
+struct VaultDelivery<'a> {
+    wanted_fields: &'a [String],
+    reason: &'a str,
+    mode: LeaseMode,
+    duration_secs: Option<u64>,
+    hosts: Vec<String>,
+    login: Option<(LoginScope, LoginBinding)>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -248,7 +257,11 @@ pub(crate) enum Detail {
     Get(GetDetail),
     Update(UpdateDetail),
     Add(AddDetail),
+    #[serde(rename = "BrowserLogin")]
     Login(LoginDetail),
+    /// V1 selected an item before approval. Keep only the marker to retire the row.
+    #[serde(rename = "Login")]
+    LegacyLogin {},
     Ssh(SshDetail),
     SshExtend(SshExtendDetail),
 }
@@ -317,7 +330,7 @@ impl Pending {
             Detail::Get(_) => "get",
             Detail::Update(_) => "update",
             Detail::Add(_) => "add",
-            Detail::Login(_) => "login",
+            Detail::Login(_) | Detail::LegacyLogin {} => "login",
             Detail::Ssh(_) | Detail::SshExtend(_) => "ssh",
         }
     }
@@ -326,7 +339,8 @@ impl Pending {
         match self.detail {
             Detail::Update(_) => RequestKind::Update,
             Detail::Add(_) => RequestKind::Add,
-            Detail::Login(_) => RequestKind::Login,
+            Detail::Login(LoginDetail { mode: BrowserLoginMode::Grant, .. }) => RequestKind::Get,
+            Detail::Login(_) | Detail::LegacyLogin {} => RequestKind::Login,
             Detail::Ssh(_) | Detail::SshExtend(_) => RequestKind::Ssh,
             Detail::Pair { .. } | Detail::Get(_) => RequestKind::Get,
         }
@@ -342,7 +356,11 @@ impl Pending {
             ),
             Detail::Update(u) => format!("update {} ({})", u.secret.display, u.field),
             Detail::Add(a) => format!("add {}", a.name),
-            Detail::Login(l) => format!("login {}", l.secret.display),
+            Detail::Login(l) => format!("{} {}", match l.mode {
+                BrowserLoginMode::Grant => "login grant for",
+                BrowserLoginMode::Broker => "sign in to",
+            }, l.url),
+            Detail::LegacyLogin {} => "legacy browser login".to_owned(),
             Detail::Ssh(s) => format!(
                 "ssh {} ({})",
                 s.targets.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "),
@@ -631,6 +649,11 @@ impl Core {
         let _authority = lock(&self.authorization);
         for index in (0..book.pending.len()).rev() {
             let p = &book.pending[index];
+            if matches!(&p.detail, Detail::LegacyLogin {} | Detail::Get(GetDetail { login: Some(_), .. })) {
+                let id = p.id.clone();
+                self.end_pending_locked(&mut book, &id, RequestStatus::Denied, Some(LEGACY_LOGIN.into()), None, t, false)?;
+                continue;
+            }
             let revoked = p.host_id.as_deref().map(|id| self.host_is_active(id)).transpose()? == Some(false);
             if revoked || p.expires <= t {
                 let id = p.id.clone();
@@ -820,7 +843,8 @@ impl Core {
             RequestBody::Add { name, value, .. } => {
                 self.create_add(host, &agent, address, name, value)
             }
-            body @ RequestBody::Login { .. } => self.create_login(host, &agent, address, body),
+            RequestBody::Login { .. } => Err(CoreError::invalid(LEGACY_LOGIN)),
+            RequestBody::BrowserLogin(login) => self.create_login(host, &agent, address, login),
             body @ RequestBody::Ssh { .. } => self.create_ssh(host, &agent, address, body),
             body @ RequestBody::SshExtend { .. } => self.create_ssh_extend(host, &agent, address, body),
         }
@@ -853,8 +877,12 @@ impl Core {
 
     /// Push a pending request unless an equal one of the same host exists (re-attach).
     pub(crate) fn push_pending(&self, p: Pending, same: impl Fn(&Pending) -> bool) -> Result<RequestState> {
+        self.push_matching_pending(p, |current, _| same(current))
+    }
+
+    fn push_matching_pending(&self, p: Pending, same: impl Fn(&Pending, &Pending) -> bool) -> Result<RequestState> {
         let authority = lock(&self.authorization);
-        let (state, inserted) = self.attach_pending(p, |current, _| same(current))?;
+        let (state, inserted) = self.attach_pending(p, same)?;
         drop(authority);
         if inserted {
             self.bump();
@@ -908,9 +936,8 @@ impl Core {
             RequestedMode::Sentinel
         } else { RequestedMode::Default };
         let reason = validate_reason(reason)?;
-        if let Some(login) = login {
-            body.validate_get_capabilities(SourceKind::Vault)?;
-            return self.create_login_get(host, agent, address, name, login, mode, reason);
+        if login.is_some() {
+            return Err(CoreError::invalid(LEGACY_LOGIN));
         }
         let requested = normalize_host_patterns(hosts)?;
         if let Some(id) = lease_id {
@@ -960,87 +987,41 @@ impl Core {
         }
     }
 
-    /// A login grant: the vault login item (named or inferred from the URL's host)
-    /// with its username, a single-use password sentinel and its TOTP code. Never
-    /// served from an existing lease: each grant takes one approval.
-    #[allow(clippy::too_many_arguments)]
-    fn create_login_get(
-        &self, host: &HostRecord, agent: &str, address: &str, name: &str, login: &LoginScope,
-        mode: RequestedMode, reason: String,
+    fn create_login(
+        &self, host: &HostRecord, agent: &str, address: &str, request: BrowserLoginRequest,
     ) -> Result<RequestState> {
-        let target = parse_login_url(&login.url)?;
-        let named = self.login_item(host, name, &target.host)?;
-        let secret = SecretRef::from_named(&named);
-        let wanted_fields: Vec<String> = ["username", "password", "totp"].into_iter()
-            .filter(|f| secret.fields.iter().any(|have| have == f))
-            .map(str::to_owned).collect();
-        let detail = GetDetail {
-            target: GetTarget::Vault(secret), mode, wanted_fields, requested_hosts: Vec::new(), reason,
-            initial: vec![target.host], suggestions: Vec::new(), login: Some(login.clone()),
-        };
-        self.push_vault_get(host, agent, address, detail)
-    }
-
-    /// The vault login item of a login grant or `asm login`: `name`, or with an empty
-    /// name the one login item whose URI matches `url_host`. It must have a password.
-    fn login_item(&self, host: &HostRecord, name: &str, url_host: &str) -> Result<NamedSecret> {
-        let named = if name.is_empty() {
-            let mut candidates = self.vault_logins_for_host(url_host)?;
-            match candidates.len() {
-                0 => return Err(CoreError::invalid(format!(
-                    "no vault login item has a URI for {url_host}; pass ITEM"))),
-                1 => candidates.remove(0),
-                _ => {
-                    let names: Vec<&str> = candidates.iter().map(|n| n.display.as_str()).collect();
+        let BrowserLoginRequest { mode, url, site, account, reason, extra_fill_origins, .. } = request;
+        let (url, fill_origins) = match mode {
+            BrowserLoginMode::Grant => (url, Vec::new()),
+            BrowserLoginMode::Broker => {
+                let url = url.trim();
+                if url.len() > MAX_LOGIN_URL_BYTES || url.bytes().any(|b| !b.is_ascii_graphic()) {
                     return Err(CoreError::invalid(format!(
-                        "several vault logins match {url_host}: {}; pass ITEM", names.join(", "))));
+                        "URL must be printable ASCII without spaces, at most {MAX_LOGIN_URL_BYTES} bytes")));
                 }
-            }
-        } else {
-            match self.resolve_request_secret(&host.id, name)? {
-                CatalogMatch::Vault(named) => named,
-                CatalogMatch::Generated(_) => return Err(CoreError::invalid("login grants need a vault secret")),
+                let (host, port) = parse_https_url(url)?;
+                let origin = fill::origin(&host, port);
+                if extra_fill_origins.len() > MAX_EXTRA_FILL_ORIGINS {
+                    return Err(CoreError::invalid(format!("at most {MAX_EXTRA_FILL_ORIGINS} extra fill origins")));
+                }
+                let mut origins = Vec::with_capacity(extra_fill_origins.len() + 1);
+                origins.push(origin);
+                for extra in extra_fill_origins {
+                    let extra = fill::parse_fill_origin(&extra)?;
+                    if !origins.contains(&extra) {
+                        origins.push(extra);
+                    }
+                }
+                origins[1..].sort_unstable();
+                let suffix = url[8..].find(['/', '?', '#']).map_or("", |i| &url[8 + i..]);
+                let url = format!("{}{}{suffix}", origins[0], if suffix.starts_with('/') { "" } else { "/" });
+                (url, origins)
             }
         };
-        if named.meta.kind != SecretKind::Login || !named.meta.fields.iter().any(|f| f == "password") {
-            return Err(CoreError::invalid(format!(
-                "{} is not a vault login with a password; login grants need one", named.display)));
-        }
-        Ok(named)
-    }
-
-    /// `asm login`: the operator signs in on the Mac with a vault login filled into a
-    /// browser there, then hands the agent the site's storage state.
-    fn create_login(&self, host: &HostRecord, agent: &str, address: &str, body: RequestBody) -> Result<RequestState> {
-        let RequestBody::Login { name, url, reason, extra_fill_origins, client_capabilities, .. } = body
-            else { unreachable!() };
-        if !client_capabilities.iter().any(|c| c == CAPABILITY_LOGIN_BROKER_V1) {
-            return Err(CoreError::invalid(format!("request requires {CAPABILITY_LOGIN_BROKER_V1}; upgrade the CLI")));
-        }
-        let reason = validate_reason(&reason)?;
-        let url = url.trim().to_owned();
-        if url.len() > MAX_LOGIN_URL_BYTES || url.bytes().any(|b| !b.is_ascii_graphic()) {
-            return Err(CoreError::invalid(format!(
-                "URL must be printable ASCII without spaces, at most {MAX_LOGIN_URL_BYTES} bytes")));
-        }
-        let (url_host, port) = parse_https_url(&url)?;
-        let export_origin = fill::origin(&url_host, port);
-        if extra_fill_origins.len() > MAX_EXTRA_FILL_ORIGINS {
-            return Err(CoreError::invalid(format!("at most {MAX_EXTRA_FILL_ORIGINS} extra fill origins")));
-        }
-        let mut fill_origins = vec![export_origin];
-        for o in &extra_fill_origins {
-            let o = fill::parse_fill_origin(o)?;
-            if !fill_origins.contains(&o) {
-                fill_origins.push(o);
-            }
-        }
-        let named = self.login_item(host, &name, &url_host)?;
-        let detail = LoginDetail { secret: SecretRef::from_named(&named), url, fill_origins, reason };
-        let p = self.new_pending(host, agent, address, Detail::Login(detail.clone()));
-        self.push_pending(p, |q| matches!(&q.detail, Detail::Login(l)
-            if l.secret.vault_id == detail.secret.vault_id && l.secret.key == detail.secret.key
-                && l.url == detail.url && l.fill_origins == detail.fill_origins && l.reason == detail.reason))
+        let detail = LoginDetail { mode, url, site, account, fill_origins, reason: validate_reason(&reason)? };
+        let pending = self.new_pending(host, agent, address, Detail::Login(detail));
+        self.push_matching_pending(pending, |q, p| q.agent == p.agent
+            && matches!((&q.detail, &p.detail), (Detail::Login(a), Detail::Login(b)) if a == b))
     }
 
     /// Queue a vault GET, re-attaching to an equal pending request of the same host.
@@ -1083,9 +1064,8 @@ impl Core {
                         || wanted_fields.iter().all(|f| !substitutes(f))
                         || l.hosts == ["*"]
                         || requested.iter().all(|r| l.hosts.contains(r)))
-                    // A login grant's single-use password sentinel is never redelivered;
-                    // its plain fields (fresh TOTP codes) are.
-                    && (l.login.is_none() || wanted_fields.iter().all(|f| !substitutes(f)))
+                    // Only the dedicated lease-bound OTP endpoint may reuse a browser grant.
+                    && l.login.is_none()
             })
             .collect();
         // Longest-lived first (unlimited first).
@@ -1614,8 +1594,8 @@ impl Core {
             ) => self
                 .approve_add(a, &vault_id, collection_id)
                 .map(|r| Some(RequestResult::Write(r))),
-            (Detail::Login(l), ffi::Decision::ApproveLogin { duration_secs, fill_origins }) => self
-                .approve_login(&p, l, duration_secs, &fill_origins)
+            (Detail::Login(l), ffi::Decision::ApproveLogin { selection, duration_secs, fill_origins }) => self
+                .approve_login(&p, l, &selection, duration_secs, &fill_origins)
                 .map(|()| None),
             (Detail::Ssh(d), ffi::Decision::ApproveSsh { targets, duration_secs }) => self
                 .approve_ssh(&p, d, super::ssh::SshApproval { targets, duration_secs })
@@ -1755,30 +1735,16 @@ impl Core {
             let approval = GeneratedApproval::new(g, mode, duration_secs, &hosts)?;
             return self.approve_generated_get(p, g, approval, selection, None).map(|_| ());
         }
-        // A login grant: Proxied only, at most an hour, bound to the URL's host and to
-        // the requesting machine.
-        let login = match &g.login {
-            None => None,
-            Some(scope) => {
-                if mode != LeaseMode::Sentinel {
-                    return Err(Fail::Keep(CoreError::invalid("a login grant delivers a sentinel; choose Proxied")));
-                }
-                if !duration_secs.is_some_and(|d| d <= LOGIN_MAX_SECS) {
-                    return Err(Fail::Keep(CoreError::invalid("a login grant lasts at most 1 hour")));
-                }
-                Some(parse_login_url(&scope.url).map_err(CoreError::from)?)
-            }
-        };
+        let GetTarget::Vault(s) = &g.target else { unreachable!() };
         if g.mode == RequestedMode::Sentinel && mode == LeaseMode::Raw {
             return Err(Fail::Keep(CoreError::invalid("this request requires sentinel delivery")));
         }
         if generation.is_some() {
             return Err(Fail::Keep(CoreError::invalid("static secrets cannot select a generator")));
         }
-        let hosts = match (&login, mode) {
-            (Some(target), _) => vec![target.host.clone()],
-            (None, LeaseMode::Raw) => Vec::new(),
-            (None, LeaseMode::Sentinel) => {
+        let hosts = match mode {
+            LeaseMode::Raw => Vec::new(),
+            LeaseMode::Sentinel => {
                 let h = normalize_host_patterns(&hosts).map_err(CoreError::from)?;
                 if h.is_empty() && g.has_substitutable_fields() {
                     return Err(Fail::Keep(CoreError::invalid(
@@ -1792,23 +1758,30 @@ impl Core {
                 }
             }
         };
-        let host_id = p.host_id.clone().unwrap_or_default();
-        let binding = login.map(|t| LoginBinding { port: t.port, target: t.target, owner: host_id.clone() });
-        let GetTarget::Vault(s) = &g.target else { unreachable!() };
+        let delivery = VaultDelivery { wanted_fields: &g.wanted_fields, reason: &g.reason,
+            mode, duration_secs, hosts, login: None };
         let entry = self
             .registry
             .get(&s.vault_id)
             .ok_or_else(|| Fail::Deny("vault unavailable: vault was removed".into()))?;
-        let mut values = entry
+        let values = entry
             .provider
             .read(&s.key)
             .map_err(|e| Fail::Deny(format!("vault unavailable: {}", e.message)))?;
-        for field in &g.wanted_fields {
+        self.deliver_vault(p, s, values, delivery)
+    }
+
+    fn deliver_vault(
+        &self, p: &Pending, s: &SecretRef, mut values: super::Values, delivery: VaultDelivery<'_>,
+    ) -> std::result::Result<(), Fail> {
+        let VaultDelivery { wanted_fields, reason, mode, duration_secs, hosts, login } = delivery;
+        let host_id = p.host_id.clone().unwrap_or_default();
+        for field in wanted_fields {
             if !values.iter().any(|(f, _)| f == field) {
                 return Err(Fail::Keep(CoreError::vault_unavailable("an approved field is no longer available")));
             }
         }
-        values.retain(|(f, _)| g.wanted_fields.contains(f));
+        values.retain(|(f, _)| wanted_fields.contains(f));
         if values.is_empty() {
             return Err(Fail::Deny(
                 "vault unavailable: the secret has no fields".into(),
@@ -1835,7 +1808,7 @@ impl Core {
                     sentinel: sv.clone(),
                     value: value.clone(),
                     hosts: hosts.clone(),
-                    login: binding.clone(),
+                    login: login.as_ref().map(|(_, binding)| binding.clone()),
                 });
             }
             files.push(ResultFile {
@@ -1861,7 +1834,7 @@ impl Core {
             mode,
             fields,
             hosts: hosts.clone(),
-            reason: g.reason.clone(),
+            reason: reason.into(),
             agent: p.agent.clone(),
             created_at: t,
             expires_at,
@@ -1873,7 +1846,7 @@ impl Core {
             approval_order: None,
             credential_version: 0,
             requested_generation: None,
-            login: g.login.clone(),
+            login: login.as_ref().map(|(scope, _)| scope.clone()),
         };
         let result = RequestResult::Get(GetResult {
             lease_id,
@@ -1887,7 +1860,7 @@ impl Core {
             credential_expires_at: None,
             credential_version: None,
             generator_name: None,
-            login: g.login.clone(),
+            login: login.map(|(scope, _)| scope),
         });
         let event = activity::approved(p, Some(&result), t);
         let mut state = p.state_for(&p.id, RequestStatus::Approved);
@@ -1903,7 +1876,7 @@ impl Core {
                 return Err(Fail::Keep(CoreError::vault_unavailable("request ended before its lease was approved")));
             }
             // A login grant's host is not a remembered host choice for the item.
-            if !entries.is_empty() && g.login.is_none() {
+            if !entries.is_empty() && lease.login.is_none() {
                 self.store.replace_secret_hosts(&s.vault_id, &s.key, &lease.hosts)?;
             }
             self.store.insert_lease_with_request(&lease, &[row], &history)?;
@@ -1931,12 +1904,28 @@ impl Core {
         publication.map_err(Fail::Keep)
     }
 
-    /// Approve `asm login`: read the password and open the sign-in browser. The request
-    /// stays pending (claimed, so it neither expires nor takes another decision) until
-    /// the session ends in [`Core::broker_finished`]; the session's own timeout governs.
     fn approve_login(
-        &self, p: &Pending, l: &LoginDetail, duration_secs: Option<u64>, fill_origins: &[String],
+        &self, p: &Pending, l: &LoginDetail, selection: &ffi::LoginChoice,
+        duration_secs: Option<u64>, fill_origins: &[String],
     ) -> std::result::Result<(), Fail> {
+        let vault = self.registry.get(&selection.vault_id)
+            .ok_or_else(|| CoreError::vault_unavailable("the selected vault was removed"))?;
+        let named = self.resolve_login_choice(selection)?;
+        let mut secret = SecretRef::from_named(&named);
+        if l.mode == BrowserLoginMode::Grant {
+            if !fill_origins.is_empty() {
+                return Err(CoreError::invalid("a login grant does not allow extra fill origins").into());
+            }
+            if !duration_secs.is_some_and(|d| (1..=LOGIN_MAX_SECS).contains(&d)) {
+                return Err(CoreError::invalid("choose a login grant duration of at most 1 hour").into());
+            }
+            let target = parse_login_url(&l.url)?;
+            secret.fields.retain(|f| matches!(f.as_str(), "username" | "password" | "totp"));
+            let binding = LoginBinding { port: target.port, target: target.target, owner: p.host_id.clone().unwrap_or_default() };
+            let delivery = VaultDelivery { wanted_fields: &secret.fields, reason: &l.reason, mode: LeaseMode::Sentinel,
+                hosts: vec![target.host], duration_secs, login: Some((LoginScope { url: l.url.clone() }, binding)) };
+            return self.deliver_vault(p, &secret, self.read_selected_login(&vault, selection)?, delivery);
+        }
         let export_origin = l.fill_origins.first().cloned()
             .ok_or_else(|| CoreError::internal("sign-in request without an origin"))?;
         let mut approved = vec![export_origin.clone()];
@@ -1955,50 +1944,62 @@ impl Core {
         if self.broker.chrome().is_none() {
             return Err(Fail::Refuse(broker::NO_CHROME.into()));
         }
-        let s = &l.secret;
-        let entry = self.registry.get(&s.vault_id)
-            .ok_or_else(|| Fail::Deny("vault unavailable: vault was removed".into()))?;
-        let values = entry.provider.read(&s.key)
-            .map_err(|e| Fail::Deny(format!("vault unavailable: {}", e.message)))?;
-        let (mut username, mut password, mut has_totp) = (None, None, false);
+        let values = self.read_selected_login(&vault, selection)?;
+        let (mut username, mut password) = (None, None);
         for (field, value) in values {
             // Every value read is zeroized when dropped, used or not.
             let value = Zeroizing::new(value);
             match field.as_str() {
                 "username" => username = Some(value),
                 "password" => password = Some(value),
-                "totp" => has_totp = true,
                 _ => {}
             }
         }
         let password = password
             .ok_or_else(|| Fail::Keep(CoreError::vault_unavailable("an approved field is no longer available")))?;
+        let event = activity::broker_started(p, &approved);
         let spec = SessionSpec {
             request_id: p.id.clone(),
             host_id: p.host_id.clone().unwrap_or_default(),
             host_label: p.host_label.clone(),
+            account: l.account.clone(),
             url: l.url.clone(),
             export_host,
             export_origin,
-            fill_origins: approved.clone(),
+            fill_origins: approved,
             username,
             password,
-            totp: has_totp.then(|| TotpSource { vault_id: s.vault_id.clone(), key: s.key.clone() }),
+            secret,
             lease_secs: duration_secs.unwrap_or(BROKER_DEFAULT_SECS),
         };
         self.broker.start(spec, self.generation_now()).map_err(Fail::Refuse)?;
-        self.log(activity::broker_started(p, &approved));
+        self.log(event);
         self.notify(TOPIC_REQUESTS);
         Ok(())
     }
 
+    fn read_selected_login(&self, vault: &VaultEntry, choice: &ffi::LoginChoice) -> Result<super::Values> {
+        let mut values = vault.provider.read(&choice.key)
+            .map_err(|e| CoreError::vault_unavailable(e.message))?;
+        let username = values.iter().find(|(f, _)| f == "username")
+            .map(|(_, v)| v.as_str()).filter(|v| !v.is_empty());
+        if username != choice.username.as_deref()
+            || values.iter().any(|(f, _)| f == "totp") != choice.has_totp
+            || !self.registry.get(&choice.vault_id).is_some_and(|current| current.name == choice.vault_name
+                && std::sync::Arc::ptr_eq(&current.provider, &vault.provider)) {
+            for (_, value) in &mut values { zeroize::Zeroize::zeroize(value); }
+            return Err(CoreError::vault_unavailable("the selected login changed; review it again"));
+        }
+        Ok(values)
+    }
+
     /// End an approved sign-in: hand the storage state over, or deny. A request that
     /// already ended (cancelled by its host, host revoked) is left as it is.
-    pub(crate) fn broker_finished(&self, request_id: &str, outcome: broker::Outcome) {
+    pub(crate) fn broker_finished(&self, request_id: &str, secret: &SecretRef, outcome: broker::Outcome) {
         let result = match outcome {
             broker::Outcome::Deny(reason) => self.broker_deny(request_id, reason),
             broker::Outcome::HandOver { state, lease_secs } => {
-                let handed = self.broker_hand_over(request_id, &state, lease_secs);
+                let handed = self.broker_hand_over(request_id, secret, &state, lease_secs);
                 if let Err(e) = &handed {
                     log::error!("sign-in {request_id}: hand-over failed: {}", e.message);
                 }
@@ -2023,12 +2024,11 @@ impl Core {
     }
 
     /// Deliver the storage state once, as a raw lease of the login item.
-    fn broker_hand_over(&self, id: &str, state: &str, lease_secs: u64) -> Result<()> {
+    fn broker_hand_over(&self, id: &str, s: &SecretRef, state: &str, lease_secs: u64) -> Result<()> {
         let Some(p) = lock(&self.book).pending.iter().find(|p| p.id == id).cloned() else { return Ok(()) };
         let Detail::Login(l) = &p.detail else {
             return Err(CoreError::internal("a sign-in ended on a request of another kind"));
         };
-        let s = &l.secret;
         let path = relative_paths(s.prefixed.then_some(s.vault_name.as_str()), &s.base, s.kind, &[STORAGE_STATE_FIELD])
             .remove(0);
         let t = self.generation_now();
@@ -2247,7 +2247,7 @@ impl Core {
             }
         }
         let broker_sessions = broker_sessions.into_iter().map(|s| ffi::BrokerSessionInfo {
-            request_id: s.request_id, url: s.url, host_label: s.host_label,
+            request_id: s.request_id, url: s.url, account: s.account, host_label: s.host_label,
             started_at: to_system_time(s.started_at), status: s.status,
         }).collect();
         let recent = self
@@ -2382,7 +2382,7 @@ fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi
                 name, vault_id, vault_name, kind: kind.into(), fields: g.wanted_fields,
                 reason: g.reason, raw_requested: g.mode == RequestedMode::Raw
                     || (g.mode == RequestedMode::Default && matches!(g.target, GetTarget::Generated(_))),
-                sentinel_required: g.mode == RequestedMode::Sentinel || g.login.is_some(),
+                sentinel_required: g.mode == RequestedMode::Sentinel,
                 has_substitutable_fields,
                 generator_choices, requested_generation,
                 operator_selected_grant: matches!(&g.target, GetTarget::Generated(target) if target.operator_selected_grant),
@@ -2391,8 +2391,7 @@ fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi
                 requested_hosts: g.requested_hosts,
                 initial_hosts: g.initial.iter().map(|h| pattern_check(h)).collect(),
                 suggested_hosts: g.suggestions.iter().map(|h| pattern_check(h)).collect(),
-                default_duration_secs: if g.login.is_some() { Some(LOGIN_DEFAULT_SECS) } else { default_duration },
-                login: g.login.map(|l| ffi::LoginScopeInfo { url: l.url }),
+                default_duration_secs: default_duration,
             }
         },
         Detail::Update(u) => ffi::RequestDetail::Update {
@@ -2409,13 +2408,14 @@ fn pending_to_ffi(core: &Core, p: Pending, default_duration: Option<u64>) -> ffi
             value: a.value,
         },
         Detail::Login(l) => ffi::RequestDetail::Login {
-            has_totp: l.secret.fields.iter().any(|f| f == "totp"),
-            name: l.secret.display,
-            vault_name: l.secret.vault_name,
+            site: l.site,
+            account: l.account,
+            broker: l.mode == BrowserLoginMode::Broker,
             url: l.url,
             fill_origins: l.fill_origins,
             reason: l.reason,
         },
+        Detail::LegacyLogin {} => unreachable!("legacy pending logins are retired on restore"),
         Detail::Ssh(s) => core.ssh_approval_detail(&s, default_duration),
         Detail::SshExtend(e) => core.ssh_extend_approval_detail(&e, default_duration),
     };
@@ -2479,6 +2479,10 @@ mod tests {
     }
 
     pub(super) fn request_host(core: &Core) -> HostRecord {
+        request_host_with_proof(core, &[1; 32])
+    }
+
+    fn request_host_with_proof(core: &Core, proof: &[u8; 32]) -> HostRecord {
         let host = HostRecord {
             id: new_uuid_v4(),
             info: HostInfo { hostname: "request-host".into(), ..Default::default() },
@@ -2489,7 +2493,7 @@ mod tests {
             revoked_at: None,
             machine_hint: None,
         };
-        core.store.insert_host(&host, &[1; 32]).unwrap();
+        core.store.insert_host(&host, proof).unwrap();
         host
     }
 
@@ -2756,16 +2760,23 @@ mod tests {
                 item("Herokuapp", SecretKind::Login, &["username", "password", "totp"], &["the-internet.herokuapp.com"]),
                 login("SharedA", &["shared.test"]),
                 login("SharedB", &["shared.test"]),
+                login("ChangedUser", &["shared.test"]),
                 login("Exact", &["sso.exact.test"]),
                 login("Parent", &["exact.test", "parent.test"]),
                 item("Note", SecretKind::Single, &["notes"], &["note.test"]),
             ])
         }
+        fn list_logins(&self) -> Result<Vec<crate::vault::LoginMeta>> {
+            Ok(self.list()?.into_iter().filter(|m| m.kind == SecretKind::Login).map(|meta| {
+                crate::vault::LoginMeta { meta, username: Some("tomsmith".into()) }
+            }).collect())
+        }
         fn read(&self, key: &str) -> Result<Vec<(String, String)>> {
             if key == "Note" {
                 return Ok(vec![("notes".into(), "n".into())]);
             }
-            let mut values = vec![("username".into(), "tomsmith".into()), ("password".into(), "SuperSecretPassword!".into())];
+            let username = if key == "ChangedUser" { "another-user" } else { "tomsmith" };
+            let mut values = vec![("username".into(), username.into()), ("password".into(), "SuperSecretPassword!".into())];
             if key == "Herokuapp" {
                 let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 values.push(("totp".into(), format!("{n:06}")));
@@ -2825,76 +2836,148 @@ mod tests {
         core
     }
 
-    fn login_body(name: &str, url: &str) -> RequestBody {
-        serde_json::from_value(json!({
-            "kind": "get", "name": name, "login": {"url": url}, "reason": "sign in",
-            "client_capabilities": ["login_grant_v1"],
-        })).unwrap()
+    fn login_body(url: &str) -> RequestBody {
+        RequestBody::BrowserLogin(BrowserLoginRequest {
+            mode: BrowserLoginMode::Grant, url: url.into(), site: None, account: None,
+            reason: "sign in".into(), extra_fill_origins: Vec::new(), agent: String::new(),
+            client_capabilities: vec![asm_proto::wire::CAPABILITY_BROWSER_LOGIN_V2.into()],
+        })
     }
 
-    fn pending_get(core: &Core, id: &str) -> (String, Vec<String>, Option<ffi::LoginScopeInfo>, Option<u64>, bool, Vec<String>) {
-        let p = core.snapshot().pending.into_iter().find(|p| p.id == id).expect("pending request");
-        let ffi::RequestDetail::Get { name, fields, login, default_duration_secs, sentinel_required, initial_hosts, .. } = p.detail
-            else { panic!("not a get") };
-        (name, fields, login, default_duration_secs, sentinel_required,
-            initial_hosts.into_iter().map(|h| h.normalized).collect())
+    pub(super) fn choice(core: &Core, key: &str) -> ffi::LoginChoice {
+        core.login_choices().unwrap().items.into_iter().find(|c| c.key == key).unwrap()
     }
 
     #[test]
-    fn login_grants_infer_the_vault_item_from_the_url_host() {
+    fn browser_intents_reattach_only_within_requester_account_and_scope() {
         let tmp = tempfile::tempdir().unwrap();
         let core = open_login_manager(&tmp);
         let host = request_host(&core);
-        let login = |name: &str, url: &str| core.create_request(&host, "127.0.0.1", login_body(name, url));
-        assert_eq!(login("", "https://nothing.test/session").unwrap_err().message,
-            "no vault login item has a URI for nothing.test; pass ITEM");
-        assert_eq!(login("", "https://shared.test/session").unwrap_err().message,
-            "several vault logins match shared.test: SharedA, SharedB; pass ITEM");
-        let exact = login("", "https://sso.exact.test/session").unwrap();
-        assert_eq!(pending_get(&core, &exact.request_id).0, "Exact", "an exact host wins over parent domains");
-        let parent = login("", "https://sso.parent.test/session").unwrap();
-        assert_eq!(pending_get(&core, &parent.request_id).0, "Parent");
-        let named = login("SharedB", "https://shared.test/session").unwrap();
-        assert_eq!(pending_get(&core, &named.request_id).0, "SharedB");
-        assert!(login("Note", "https://note.test/session").unwrap_err().message.contains("not a vault login"));
-        let mut no_capability = login_body("", "https://sso.exact.test/session");
-        let RequestBody::Get { client_capabilities, .. } = &mut no_capability else { unreachable!() };
-        client_capabilities.clear();
-        assert!(core.create_request(&host, "127.0.0.1", no_capability).unwrap_err().message.contains("login_grant_v1"));
+        let other = request_host_with_proof(&core, &[2; 32]);
+        let RequestBody::BrowserLogin(base) = login_body(LOGIN_URL) else { unreachable!() };
+        let submit = |host: &HostRecord, intent| core.create_request(host, "127.0.0.1", RequestBody::BrowserLogin(intent)).unwrap();
+        let pending = submit(&host, base.clone());
+        assert_eq!(pending.kind, RequestKind::Get);
+        assert_eq!(submit(&host, base.clone()), pending);
+        assert_ne!(submit(&other, base.clone()).request_id, pending.request_id);
+        for different in [
+            BrowserLoginRequest { url: format!("{LOGIN_URL}?p=2"), ..base.clone() },
+            BrowserLoginRequest { account: Some("personal".into()), ..base.clone() },
+            BrowserLoginRequest { account: Some("work".into()), ..base.clone() },
+            BrowserLoginRequest { site: Some("https://app.test".into()), ..base.clone() },
+            BrowserLoginRequest { agent: "another".into(), ..base.clone() },
+            BrowserLoginRequest { reason: "different task".into(), ..base.clone() },
+            BrowserLoginRequest { mode: BrowserLoginMode::Broker, ..base.clone() },
+        ] {
+            let distinct = submit(&host, different.clone());
+            assert_ne!(distinct.request_id, pending.request_id);
+            assert_eq!(submit(&host, different), distinct);
+        }
+        assert_eq!(core.snapshot().pending.len(), 9);
+        for url in ["https://nothing.test/session", "https://sso.exact.test/session", "https://shared.test/session"] {
+            let state = core.create_request(&host, "127.0.0.1", login_body(url)).unwrap();
+            assert_eq!(state.status, RequestStatus::Pending);
+        }
+        for name in ["", "SharedA"] {
+            for body in [json!({"kind":"get","name":name,"reason":"why","login":{"url":LOGIN_URL}}),
+                         json!({"kind":"login","name":name,"reason":"why","url":LOGIN_URL})] {
+                let error = core.create_request(&host, "127.0.0.1", serde_json::from_value(body).unwrap()).unwrap_err();
+                assert!(error.message.to_lowercase().contains("upgrade"));
+            }
+        }
         core.shutdown();
     }
 
     #[test]
-    fn login_grant_binds_a_single_use_password_and_reuses_only_plain_fields() {
+    fn restart_retires_both_shapes_of_preselection_but_reattaches_v2_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut core = open_manager(&tmp);
+        let host = request_host(&core);
+        let new_request = core.create_request(&host, "127.0.0.1", login_body(LOGIN_URL)).unwrap();
+        let secret = json!({ "vault_id":"vault", "vault_name":"Vault", "key":"old-key", "kind":"login",
+            "fields":["username","password"], "display":"old title", "base":"old title", "prefixed":false });
+        let mut old_ids = Vec::new();
+        for detail in [
+            json!({ "Login": { "secret":secret, "url":LOGIN_URL, "fill_origins":[], "reason":"sign in" }}),
+            json!({ "Get": { "target":{"Vault":secret}, "mode":"Default", "wanted_fields":["username","password"],
+                "requested_hosts":[], "reason":"sign in", "initial":[], "suggestions":[], "login":{"url":LOGIN_URL} }}),
+        ] {
+            let id = new_uuid_v4();
+            let p = lock(&core.book).pending[0].clone();
+            let mut legacy = serde_json::to_value(p).unwrap();
+            legacy["id"] = json!(id);
+            legacy["detail"] = detail;
+            let row = core.resume.seal(BOOK_NAMESPACE, &id, &json!({ "Pending": legacy })).unwrap();
+            core.store.commit_request_book(&[row], None).unwrap();
+            old_ids.push(id);
+        }
+        core = reopen(core, &tmp);
+        assert_eq!(core.snapshot().pending.len(), 1);
+        assert_eq!(core.create_request(&host, "127.0.0.1", login_body(LOGIN_URL)).unwrap(), new_request);
+        for id in old_ids {
+            let state = core.request_state(&host.id, &id).unwrap();
+            assert_eq!((state.status, state.deny_reason.as_deref()), (RequestStatus::Denied, Some(LEGACY_LOGIN)));
+        }
+        core.shutdown();
+    }
+
+    #[test]
+    fn unavailable_renamed_or_changed_account_requires_new_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let core = open_login_manager(&tmp);
+        let host = request_host(&core);
+        let pending = core.create_request(&host, "127.0.0.1", login_body(LOGIN_URL)).unwrap();
+        let original = choice(&core, "SharedB");
+        let approve = |selection| core.resolve_request(&pending.request_id, ffi::Decision::ApproveLogin {
+            selection, duration_secs: Some(900), fill_origins: Vec::new(),
+        });
+        let mut vault = core.registry.remove("logins").unwrap().unwrap();
+        assert!(approve(original.clone()).is_err(), "removed since display");
+        vault.name = "Renamed".into();
+        core.registry.insert(vault);
+        assert!(approve(original).is_err(), "same stable key but displayed vault changed");
+        assert!(approve(choice(&core, "ChangedUser")).is_err(), "username changed between list and read");
+        assert!(core.store.leases_of_host(&host.id).unwrap().is_empty());
+        assert_eq!(core.request_state(&host.id, &pending.request_id).unwrap().status, RequestStatus::Pending);
+        approve(choice(&core, "SharedB")).unwrap();
+        let leases = core.store.leases_of_host(&host.id).unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!((leases[0].secret_key.as_str(), leases[0].vault_name.as_str()), ("SharedB", "Renamed"));
+        assert_eq!(leases[0].hosts, ["the-internet.herokuapp.com"], "saved hosts never broaden authority");
+        assert!(core.login_totp(&host.id, &[1; 32], &leases[0].id).is_err(), "no authenticator on the approved item");
+        core.shutdown();
+    }
+
+    #[test]
+    fn only_selected_login_can_issue_a_grant_and_generic_get_never_reuses_it() {
         const URL: &str = "https://the-internet.herokuapp.com/authenticate";
         let tmp = tempfile::tempdir().unwrap();
         let core = open_login_manager(&tmp);
         let host = request_host(&core);
-        let pending = core.create_request(&host, "127.0.0.1", login_body("", URL)).unwrap();
-        assert_eq!(core.create_request(&host, "127.0.0.1", login_body("", URL)).unwrap(), pending,
-            "an equal pending login grant is re-attached");
-        let (name, fields, scope, duration, sentinel_required, initial) = pending_get(&core, &pending.request_id);
-        assert_eq!(name, "Herokuapp");
-        assert_eq!(fields, ["username", "password", "totp"]);
-        assert_eq!(scope, Some(ffi::LoginScopeInfo { url: URL.into() }));
-        assert_eq!(duration, Some(900));
-        assert!(sentinel_required);
-        assert_eq!(initial, ["the-internet.herokuapp.com"]);
-
-        let approve = |mode, duration_secs| core.resolve_request(&pending.request_id, ffi::Decision::ApproveGet {
-            mode, duration_secs, hosts: vec!["*".into()], generation: None,
-        });
-        assert_eq!(approve(ffi::LeaseMode::Raw, Some(900)).unwrap_err().message,
-            "a login grant delivers a sentinel; choose Proxied");
-        assert_eq!(approve(ffi::LeaseMode::Sentinel, None).unwrap_err().message, "a login grant lasts at most 1 hour");
-        assert!(approve(ffi::LeaseMode::Sentinel, Some(3601)).is_err());
+        let pending = core.create_request(&host, "127.0.0.1", login_body(URL)).unwrap();
+        let p = core.snapshot().pending.pop().unwrap();
+        assert_eq!(p.detail, ffi::RequestDetail::Login { url: URL.into(), site: None, account: None,
+            fill_origins: Vec::new(), reason: "sign in".into(), broker: false });
+        assert!(core.resolve_request(&pending.request_id, ffi::Decision::ApproveGet {
+            mode: ffi::LeaseMode::Raw, duration_secs: Some(900), hosts: Vec::new(), generation: None,
+        }).is_err());
+        let selection = choice(&core, "Herokuapp");
+        let approve = |selection, duration_secs, fill_origins| core.resolve_request(&pending.request_id,
+            ffi::Decision::ApproveLogin { selection, duration_secs, fill_origins });
+        let mut stale = selection.clone();
+        stale.title.push_str(" (renamed)");
+        assert!(approve(stale, Some(900), Vec::new()).is_err());
+        for duration in [None, Some(0), Some(3601)] {
+            assert!(approve(selection.clone(), duration, Vec::new()).is_err());
+        }
+        assert!(approve(selection.clone(), Some(900), vec!["https://another.test".into()]).is_err());
         assert_eq!(core.request_state(&host.id, &pending.request_id).unwrap().status, RequestStatus::Pending);
 
-        approve(ffi::LeaseMode::Sentinel, Some(900)).unwrap();
+        approve(selection, Some(900), Vec::new()).unwrap();
         let state = core.request_state(&host.id, &pending.request_id).unwrap();
         let Some(RequestResult::Get(result)) = state.result else { panic!("missing login grant") };
         assert_eq!(result.login, Some(LoginScope { url: URL.into() }));
-        assert_eq!(result.hosts, ["the-internet.herokuapp.com"], "the grant ignores the operator's host choice");
+        assert_eq!(result.hosts, ["the-internet.herokuapp.com"]);
         let file = |f: &str| result.files.iter().find(|x| x.field == f).unwrap();
         assert_eq!((file("username").content.as_str(), file("username").substituted), ("tomsmith", Some(false)));
         assert!(asm_proto::rules::is_sentinel(&file("password").content));
@@ -2925,14 +3008,22 @@ mod tests {
             "kind": "get", "name": "Herokuapp", "fields": fields, "reason": "otp",
             "client_capabilities": ["secret_fields_v1"],
         })).unwrap()).unwrap();
-        let totp = get(json!(["totp"]));
-        assert_eq!(totp.status, RequestStatus::Approved, "one-time codes need no popup during the grant");
-        let Some(RequestResult::Get(reused)) = totp.result else { panic!("missing reused grant") };
+        assert_eq!(get(json!(["totp"])).status, RequestStatus::Pending);
+        assert_eq!(get(json!(["username"])).status, RequestStatus::Pending);
+        let reused = core.login_totp(&host.id, &[1; 32], &lease.id).unwrap();
         assert_eq!(reused.lease_id, lease.id);
         assert_eq!(reused.files.len(), 1);
+        assert_eq!((reused.files[0].field.as_str(), reused.files[0].substituted), ("totp", Some(false)));
+        assert_eq!(reused.files[0].relative_path, file("totp").relative_path);
+        assert_eq!(reused.login, result.login);
+        let other = request_host_with_proof(&core, &[2; 32]);
+        assert!(core.login_totp(&other.id, &[2; 32], &lease.id).is_err());
+        assert!(core.login_totp(&host.id, &[2; 32], &lease.id).is_err());
         assert_ne!(reused.files[0].content, first_code, "a fresh code");
         assert_eq!(get(json!(["password"])).status, RequestStatus::Pending, "the password sentinel is never redelivered");
         assert_eq!(get(json!(["password", "username"])).status, RequestStatus::Pending);
+        core.revoke_lease(&lease.id).unwrap();
+        assert!(core.login_totp(&host.id, &[1; 32], &lease.id).is_err());
         core.shutdown();
     }
 
@@ -2956,9 +3047,9 @@ mod tests {
 
     /// Approve a login grant for [`LOGIN_URL`] lasting `secs`; returns its lease.
     fn approve_login(core: &Core, host: &HostRecord, secs: u64) -> LeaseRecord {
-        let pending = core.create_request(host, "127.0.0.1", login_body("Herokuapp", LOGIN_URL)).unwrap();
-        core.resolve_request(&pending.request_id, ffi::Decision::ApproveGet {
-            mode: ffi::LeaseMode::Sentinel, duration_secs: Some(secs), hosts: Vec::new(), generation: None,
+        let pending = core.create_request(host, "127.0.0.1", login_body(LOGIN_URL)).unwrap();
+        core.resolve_request(&pending.request_id, ffi::Decision::ApproveLogin {
+            selection: choice(core, "Herokuapp"), duration_secs: Some(secs), fill_origins: Vec::new(),
         }).unwrap();
         let Some(RequestResult::Get(result)) = core.request_state(&host.id, &pending.request_id).unwrap().result
             else { panic!("missing login grant") };
@@ -3021,6 +3112,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "lease did not expire");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        assert!(core.login_totp(&host.id, &[1; 32], &lease.id).is_err());
         core.sync_proxy(false);
         {
             let proxy = lock(&core.proxy_state);

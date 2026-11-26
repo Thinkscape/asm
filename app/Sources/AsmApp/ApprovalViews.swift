@@ -190,7 +190,7 @@ private struct ApprovalBody: View {
         case let .add(name, value, targets):
             AddApproval(context: context, name: name, value: value, targets: targets)
         case let .login(detail):
-            LoginBrokerApproval(context: context, detail: detail, durations: CoreBridge.leaseDurations, model: model)
+            BrowserLoginApproval(context: context, detail: detail, durations: CoreBridge.leaseDurations, model: model)
         case let .ssh(detail):
             SshApproval(context: context, detail: detail, model: model)
         case let .sshExtend(detail):
@@ -1226,7 +1226,7 @@ private struct StaticGetApproval: View {
         self.model = model
         _hosts = State(initialValue: detail.initialHosts.map { HostEntry(pattern: $0.normalized, broad: $0.broad) })
         _duration = State(initialValue: detail.defaultDurationSecs ?? 0)
-        _mode = State(initialValue: detail.rawRequested && !detail.sentinelRequired && detail.login == nil ? .realValue : .proxied)
+        _mode = State(initialValue: detail.rawRequested && !detail.sentinelRequired ? .realValue : .proxied)
     }
 
     private var suggestions: [HostEntry] {
@@ -1239,14 +1239,11 @@ private struct StaticGetApproval: View {
     }
 
     private var approvedHosts: [String] {
-        guard mode == .proxied, detail.hasSubstitutableFields, detail.login == nil else { return [] }
+        guard mode == .proxied, detail.hasSubstitutableFields else { return [] }
         return anyHost ? ["*"] : hosts.map(\.pattern)
     }
 
     private var approvedHostsLine: String {
-        if detail.login != nil {
-            return detail.initialHosts.map(\.normalized).joined(separator: ", ")
-        }
         if mode == .realValue { return String(localized: "none (real value)") }
         if !detail.hasSubstitutableFields { return String(localized: "not required (plain fields)") }
         return anyHost ? String(localized: "any host") : hosts.map(\.pattern).joined(separator: ", ")
@@ -1256,31 +1253,19 @@ private struct StaticGetApproval: View {
         guard context.armed, armedMode == expected, mode == expected,
               !model.isResolving(context.request.id),
               !(detail.sentinelRequired && expected == .realValue) else { return false }
-        if detail.login != nil {
-            return expected == .proxied && duration > 0 && duration <= Self.loginMaxSeconds
-        }
         return expected == .realValue || !detail.hasSubstitutableFields || anyHost || !hosts.isEmpty
     }
-
-    /// A login grant lasts at most an hour (the manager enforces the same limit).
-    private static let loginMaxSeconds: UInt64 = 3600
 
     var body: some View {
         let expectedMode = mode
         let name = Text(verbatim: detail.name).fontWeight(.bold)
-        let subtitle = detail.login != nil ? Text("wants to sign in with \(name)")
-            : detail.rawRequested ? Text("wants the real value of \(name)") : Text("wants to use \(name)")
+        let subtitle = detail.rawRequested ? Text("wants the real value of \(name)") : Text("wants to use \(name)")
         ApprovalScaffold(error: context.error, footnote: nil) {
             ApprovalHeader(title: context.requesterTitle, subtitle: subtitle, queue: context.queue) { AppIconImage() }
         } content: {
             ReasonBlock(reason: detail.reason)
             VStack(alignment: .leading, spacing: 14) {
-                if let url = detail.login {
-                    let codes = detail.fields.contains("totp") ? String(localized: ", one-time codes") : ""
-                    Text("Sign-in: \(url) · username, single-use password\(codes) · routes this site through asm until the grant expires")
-                        .font(.callout)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else if mode == .proxied {
+                if mode == .proxied {
                     if detail.hasSubstitutableFields {
                         HostsSection(
                             hosts: $hosts, anyHost: $anyHost, editing: $editingHost,
@@ -1292,9 +1277,8 @@ private struct StaticGetApproval: View {
                             .font(.callout).foregroundStyle(.secondary)
                     }
                 }
-                GetDurationPicker(durations: durations, duration: $duration,
-                                  maxSeconds: detail.login != nil ? Self.loginMaxSeconds : nil)
-                if detail.sentinelRequired && detail.login == nil {
+                GetDurationPicker(durations: durations, duration: $duration)
+                if detail.sentinelRequired {
                     Text("The requester requires sentinel delivery. Real-value disclosure is disabled.")
                         .font(.callout)
                 }
@@ -1304,8 +1288,8 @@ private struct StaticGetApproval: View {
             InfoRow(label: "Fields", value: detail.fields.joined(separator: ", "))
             InfoRow(label: "Requested hosts", value: detail.requestedHosts.joined(separator: ", "))
             InfoRow(label: "Approved hosts", value: approvedHostsLine)
-            InfoRow(label: "Requested mode", value: detail.login != nil ? String(localized: "sign-in (single-use sentinel)")
-                : detail.rawRequested ? String(localized: "real value") : String(localized: "proxied (sentinel)"))
+            InfoRow(label: "Requested mode",
+                    value: detail.rawRequested ? String(localized: "real value") : String(localized: "proxied (sentinel)"))
             RequestMetaRows(context: context)
         } actions: {
             ApprovalActions(cannedReasons: ["host selection too open", "provide a better reason"],
@@ -1314,7 +1298,7 @@ private struct StaticGetApproval: View {
                 AllowSplitButton(
                     mode: $mode, enabled: canAllow(expectedMode),
                     isDefault: mode == .proxied && !hostFieldFocused && !editingReason,
-                    sentinelRequired: detail.sentinelRequired || detail.login != nil
+                    sentinelRequired: detail.sentinelRequired
                 ) {
                     guard canAllow(expectedMode) else { return }
                     context.resolve(.approveGet(
@@ -1323,9 +1307,7 @@ private struct StaticGetApproval: View {
                     ))
                 }
             }
-            if detail.login == nil {
-                ValueModeCaption(mode: mode, plainOnly: !detail.hasSubstitutableFields)
-            }
+            ValueModeCaption(mode: mode, plainOnly: !detail.hasSubstitutableFields)
         }
         .task(id: expectedMode) {
             guard !Task.isCancelled else { return }
@@ -1338,9 +1320,6 @@ private struct StaticGetApproval: View {
         }
         .onChange(of: detail.sentinelRequired) { _, required in
             if required { mode = .proxied }
-        }
-        .onChange(of: detail.login) { _, login in
-            if login != nil { mode = .proxied }
         }
     }
 
@@ -1358,107 +1337,6 @@ private struct StaticGetApproval: View {
         case let .failure(error):
             hostError = error.message
             return false
-        }
-    }
-}
-
-// MARK: - Sign in (asm login)
-
-private struct LoginBrokerApproval: View {
-    let context: RequestContext
-    let detail: LoginDetail
-    let durations: [LeaseDuration]
-    let model: AppModel
-
-    /// Extra fill origins the operator removed; the URL's own origin is always filled.
-    @State private var removed: Set<String> = []
-    @State private var duration: UInt64 = 3600
-    @State private var editingReason = false
-
-    private var exportOrigin: String { detail.fillOrigins.first ?? "" }
-
-    private var exportHost: String {
-        URL(string: exportOrigin)?.host() ?? exportOrigin
-    }
-
-    /// Hosts whose cookies are handed over: the URL's host and each kept extra origin's
-    /// host (sign-in services such as Clerk or Auth0 keep the session there).
-    private var exportHosts: String {
-        var hosts = [exportHost]
-        for origin in detail.fillOrigins.dropFirst() where !removed.contains(origin) {
-            let host = URL(string: origin)?.host() ?? origin
-            if !hosts.contains(host) { hosts.append(host) }
-        }
-        return hosts.joined(separator: ", ")
-    }
-
-    private var canAllow: Bool {
-        context.armed && duration > 0 && !model.isResolving(context.request.id)
-    }
-
-    var body: some View {
-        let name = Text(verbatim: detail.name).fontWeight(.bold)
-        ApprovalScaffold(error: context.error, footnote: nil) {
-            ApprovalHeader(title: context.requesterTitle, subtitle: Text("wants you to sign in with \(name)"),
-                           queue: context.queue) { AppIconImage() }
-        } content: {
-            ReasonBlock(reason: detail.reason)
-            VStack(alignment: .leading, spacing: 10) {
-                Text(verbatim: detail.url)
-                    .font(.system(size: 13).monospaced())
-                    .lineLimit(3)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                SectionLabel("Fills \(detail.name) on")
-                FlowLayout {
-                    ForEach(detail.fillOrigins.filter { !removed.contains($0) }, id: \.self) { origin in
-                        if origin == exportOrigin {
-                            Text(verbatim: origin)
-                                .font(.system(size: 13))
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 4)
-                                .background(.background.opacity(0.6), in: Capsule())
-                                .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
-                        } else {
-                            HostPill(warning: false, help: "Remove this origin", remove: { removed.insert(origin) }) {
-                                Text(verbatim: origin)
-                            }
-                        }
-                    }
-                }
-                Text("Exports cookies valid for \(exportHosts) and \(exportOrigin)'s localStorage")
-                    .font(.callout)
-                    .fixedSize(horizontal: false, vertical: true)
-                GetDurationPicker(durations: durations, duration: $duration, maxSeconds: .max)
-            }
-        } details: {
-            InfoRow(label: "Vault", value: detail.vaultName)
-            InfoRow(label: "Item", value: detail.name)
-            InfoRow(label: "URL", value: detail.url)
-            InfoRow(label: "Fills", value: detail.hasTotp
-                    ? String(localized: "username, password, one-time codes") : String(localized: "username, password"))
-            RequestMetaRows(context: context)
-        } actions: {
-            ApprovalActions(cannedReasons: ["provide a better reason"], armed: context.armed, escapeDenies: true,
-                            editingReason: $editingReason, deny: context.deny) {
-                Button("Allow") {
-                    guard canAllow else { return }
-                    context.resolve(.approveLogin(
-                        durationSecs: duration,
-                        fillOrigins: detail.fillOrigins.filter { !removed.contains($0) }
-                    ))
-                }
-                .buttonStyle(.panel)
-                .keyboardShortcut(editingReason ? nil : .defaultAction)
-                .disabled(!canAllow)
-            }
-            Text("Opens Chrome on this Mac and fills the login; it never submits. Sign in, then choose Hand over session.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

@@ -72,16 +72,48 @@ enum RequestDetail: Equatable, Sendable {
     case sshExtend(SshExtendRequestItem)
 }
 
-/// `asm login`: the operator signs in on this Mac with a vault login the manager fills
-/// into a browser; the agent receives the site's cookies and the URL origin's localStorage.
-struct LoginDetail: Equatable, Sendable {
-    var name: String
-    var vaultName: String
+/// The requester's account and site are hints, not the selected vault identity or an authorization.
+struct LoginDetail: Hashable, Sendable {
     var url: String
-    /// The URL's origin first (always filled), then extra origins the agent asked to fill.
+    var site: String?
+    var account: String?
+    /// For a broker request, the primary origin is first, followed by optional extra origins.
     var fillOrigins: [String]
     var reason: String
+    var broker: Bool
+}
+
+struct LoginChoiceItem: Identifiable, Equatable, Sendable {
+    struct ID: Hashable, Sendable {
+        var vaultID: String
+        var key: String
+    }
+
+    var id: ID { ID(vaultID: vaultID, key: key) }
+    var vaultID: String
+    var key: String
+    var title: String
+    var vaultName: String
+    var username: String?
+    var savedHosts: [String]
     var hasTotp: Bool
+
+    /// Match the core's bytewise equality rather than Swift String's canonical equivalence.
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        let sameUsername = switch (lhs.username, rhs.username) {
+        case (nil, nil): true
+        case let (left?, right?): left.utf8.elementsEqual(right.utf8)
+        default: false
+        }
+        return lhs.vaultID == rhs.vaultID && lhs.key.utf8.elementsEqual(rhs.key.utf8)
+            && lhs.title.utf8.elementsEqual(rhs.title.utf8) && lhs.vaultName.utf8.elementsEqual(rhs.vaultName.utf8)
+            && sameUsername && lhs.savedHosts == rhs.savedHosts && lhs.hasTotp == rhs.hasTotp
+    }
+}
+
+struct LoginChoicesItem: Equatable, Sendable {
+    var items: [LoginChoiceItem]
+    var unavailableVaults: [String]
 }
 
 /// An approved `asm login` whose sign-in browser is open.
@@ -89,6 +121,7 @@ struct BrokerSessionItem: Identifiable, Equatable, Sendable {
     var id: String { requestID }
     var requestID: String
     var url: String
+    var account: String?
     var hostLabel: String
     var startedAt: Date
     var status: String
@@ -131,9 +164,6 @@ struct GetDetail: Equatable, Sendable {
     var operatorSelectedGrant: Bool = false
     /// The paired client accepts a managed Google grant for a project other than the one it requested.
     var operatorSelectedGcloudProject: Bool = false
-    /// A single-use login grant for this form action URL: proxied delivery only, at most
-    /// one hour, and the site is routed through asm until it expires.
-    var login: String?
 }
 
 struct PendingItem: Identifiable, Equatable, Sendable {
@@ -1176,8 +1206,8 @@ enum DecisionItem: Sendable {
     case approvePair(name: String, replace: Bool)
     case approveGet(raw: Bool, durationSecs: UInt64?, hosts: [String], generation: GenerationSelectionItem?)
     case approveWrite(vaultID: String, collectionID: String?)
-    /// `durationSecs`: how long the handed-over session stays valid (`nil` = 1 hour).
-    case approveLogin(durationSecs: UInt64?, fillOrigins: [String])
+    /// `fillOrigins` is empty for a single-use grant.
+    case approveLogin(selection: LoginChoiceItem, durationSecs: UInt64?, fillOrigins: [String])
     /// One decision per approved target; a requested target left out is denied.
     case approveSsh(targets: [SshTargetDecisionItem], durationSecs: UInt64)
     case approveSshExtend(durationSecs: UInt64)

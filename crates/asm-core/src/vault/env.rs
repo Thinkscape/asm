@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use super::{AddTarget, SecretKind, SecretMeta, VaultProvider, VaultStatus};
+use super::{AddTarget, LoginMeta, SecretKind, SecretMeta, VaultProvider, VaultStatus};
 use crate::error::{CoreError, Result};
 
 /// One physical line of the file.
@@ -484,6 +484,14 @@ impl VaultProvider for EnvFileVault {
                 })
                 .collect())
         })
+    }
+
+    fn list_logins(&self) -> Result<Vec<LoginMeta>> {
+        Ok(Vec::new())
+    }
+
+    fn read_totp(&self, _key: &str) -> Result<zeroize::Zeroizing<String>> {
+        Err(CoreError::not_found(".env entries have no authenticator"))
     }
 
     fn read(&self, key: &str) -> Result<Vec<(String, String)>> {

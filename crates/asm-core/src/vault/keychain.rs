@@ -14,6 +14,8 @@
 //! queries them as numbers, which does not match such items; hence the raw `SecItem`
 //! queries with the attribute values exactly as listed.
 
+use std::collections::HashSet;
+
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::boolean::CFBoolean;
@@ -32,7 +34,7 @@ use security_framework_sys::item::{
 };
 use security_framework_sys::keychain_item::{SecItemCopyMatching, SecItemUpdate};
 
-use super::{AddTarget, SecretKind, SecretMeta, VaultProvider, VaultStatus, creds};
+use super::{AddTarget, LoginMeta, SecretKind, SecretMeta, VaultProvider, VaultStatus, creds};
 use crate::error::{CoreError, Result};
 
 const SEP: char = '\u{1f}';
@@ -239,7 +241,7 @@ fn search_attrs(class: Class, limit: Limit) -> Result<Vec<Attrs>> {
         .collect())
 }
 
-fn meta_for(class: Class, a: &Attrs) -> Option<SecretMeta> {
+fn meta_for(class: Class, a: &Attrs) -> Option<(SecretMeta, Option<String>)> {
     let key = ItemKey::from_attrs(class, a);
     let encoded = key.encode();
     // A separator inside an attribute would make the key ambiguous.
@@ -247,42 +249,53 @@ fn meta_for(class: Class, a: &Attrs) -> Option<SecretMeta> {
         return None;
     }
     let label = a.string("labl");
-    match &key {
+    match key {
         ItemKey::Generic { svce, .. } => {
             if svce == creds::SERVICE {
                 return None;
             }
             let name = if label.is_empty() {
-                svce.clone()
+                svce
             } else {
                 label
             };
-            Some(SecretMeta {
+            Some((SecretMeta {
                 key: encoded,
                 name,
                 kind: SecretKind::Single,
                 fields: vec!["value".into()],
                 uri_hosts: vec![],
-            })
+            }, None))
         }
-        ItemKey::Internet { srvr, .. } => {
-            let name = if label.is_empty() {
-                srvr.clone()
-            } else {
-                label
-            };
-            let uri_hosts = asm_proto::rules::normalize_host_pattern(srvr)
+        ItemKey::Internet { srvr, acct, .. } => {
+            let uri_hosts = asm_proto::rules::normalize_host_pattern(&srvr)
                 .map(|h| vec![h])
                 .unwrap_or_default();
-            Some(SecretMeta {
+            let name = if label.is_empty() { srvr } else { label };
+            Some((SecretMeta {
                 key: encoded,
                 name,
                 kind: SecretKind::Login,
                 fields: vec!["username".into(), "password".into()],
                 uri_hosts,
-            })
+            }, (!acct.is_empty()).then_some(acct)))
         }
     }
+}
+
+fn list_attributes<T>(classes: &[Class], project: impl Fn(SecretMeta, Option<String>) -> T) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for &class in classes {
+        for attrs in search_attrs(class, Limit::All)? {
+            if let Some((meta, username)) = meta_for(class, &attrs)
+                && !meta.name.is_empty() && seen.insert(meta.key.clone())
+            {
+                out.push(project(meta, username));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Find the item reference (`kSecValueRef`) of the item whose attributes match `key` exactly.
@@ -469,18 +482,15 @@ impl VaultProvider for KeychainVault {
     }
 
     fn list(&self) -> Result<Vec<SecretMeta>> {
-        let mut out = Vec::new();
-        for class in [Class::Generic, Class::Internet] {
-            for a in search_attrs(class, Limit::All)? {
-                if let Some(m) = meta_for(class, &a)
-                    && !m.name.is_empty()
-                    && !out.iter().any(|o: &SecretMeta| o.key == m.key)
-                {
-                    out.push(m);
-                }
-            }
-        }
-        Ok(out)
+        list_attributes(&[Class::Generic, Class::Internet], |meta, _| meta)
+    }
+
+    fn list_logins(&self) -> Result<Vec<LoginMeta>> {
+        list_attributes(&[Class::Internet], |meta, username| LoginMeta { meta, username })
+    }
+
+    fn read_totp(&self, _key: &str) -> Result<zeroize::Zeroizing<String>> {
+        Err(CoreError::not_found("keychain passwords have no authenticator"))
     }
 
     fn read(&self, key: &str) -> Result<Vec<(String, String)>> {
@@ -523,6 +533,20 @@ impl VaultProvider for KeychainVault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internet_login_label_comes_from_attributes_alone() {
+        let pair = |k, v| (CFString::new(k), CFString::new(v).as_CFType());
+        let attrs = Attrs(CFDictionary::from_CFType_pairs(&[
+            pair("srvr", "EXAMPLE.COM"), pair("acct", "UserAccount"), pair("labl", "Social"),
+        ]));
+        let (meta, username) = meta_for(Class::Internet, &attrs).unwrap();
+        assert_eq!(username.as_deref(), Some("UserAccount"));
+        assert_eq!(meta.name, "Social");
+        assert_eq!(meta.uri_hosts, ["example.com"]);
+        let (_, username) = meta_for(Class::Generic, &attrs).unwrap();
+        assert!(username.is_none());
+    }
 
     #[test]
     fn key_round_trip() {

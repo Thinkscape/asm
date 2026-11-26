@@ -9,11 +9,10 @@ use asm_proto::{ApiError, ErrorCode};
 use asm_proto::generators::{GenerationSelection, SourceKind};
 use asm_proto::ssh::{SshSignRequest, SshSignResponse, SshTargetsResponse};
 use asm_proto::wire::{
-    CAPABILITY_BROADER_LEASE_REUSE_V1, CAPABILITY_LOGIN_BROKER_V1, CAPABILITY_LOGIN_GRANT_V1,
-    CAPABILITY_SSH_LEASES_V2,
+    CAPABILITY_BROADER_LEASE_REUSE_V1, CAPABILITY_BROWSER_LOGIN_V2, CAPABILITY_SSH_LEASES_V2,
     CAPABILITY_GCLOUD_ACCESS_V1, CAPABILITY_GENERATED_CREDENTIALS_V1, CAPABILITY_GITHUB_EXPLICIT_SCOPE_V1,
     CAPABILITY_OPERATOR_SELECTED_GRANT_V1, CAPABILITY_OPERATOR_SELECTED_PROJECT_V1,
-    CAPABILITY_SECRET_FIELDS_V1, HealthResponse, LeaseBrief,
+    CAPABILITY_SECRET_FIELDS_V1, GetResult, HealthResponse, LeaseBrief, LoginSitesResponse,
     LeaseInfo, LeasesResponse, MANAGER_NAME, MAX_POLL_WAIT_SECS,
     PairPollQuery, PairRequest, PairResponse, ProxyInfo, RequestBody, RequestState, RequestStatus,
     RevealRequest, SecretsResponse, WaitQuery,
@@ -87,6 +86,8 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/pair/{pair_id}/reveal", post(pair_reveal))
         .route("/pair/{pair_id}", get(pair_poll))
         .route("/secrets", get(secrets))
+        .route("/login-sites", get(login_sites))
+        .route("/login-grants/{id}/totp", post(login_totp))
         .route("/requests", post(create_request))
         .route("/requests/{id}", get(get_request).delete(cancel_request))
         .route("/leases", get(leases))
@@ -173,8 +174,7 @@ async fn health() -> Json<HealthResponse> {
             CAPABILITY_OPERATOR_SELECTED_GRANT_V1.into(),
             CAPABILITY_OPERATOR_SELECTED_PROJECT_V1.into(),
             CAPABILITY_BROADER_LEASE_REUSE_V1.into(),
-            CAPABILITY_LOGIN_GRANT_V1.into(),
-            CAPABILITY_LOGIN_BROKER_V1.into(),
+            CAPABILITY_BROWSER_LOGIN_V2.into(),
             CAPABILITY_SSH_LEASES_V2.into(),
         ],
     })
@@ -276,6 +276,18 @@ async fn secrets(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<Secr
         Ok(SecretsResponse { secrets: catalog.wire_entries })
     }).await?;
     Ok(Json(r))
+}
+
+async fn login_sites(State(core): Shared, headers: HeaderMap) -> ApiResult<Json<LoginSitesResponse>> {
+    auth(&core, &headers).await?;
+    Ok(Json(blocking(move || core.login_sites()).await?))
+}
+
+async fn login_totp(
+    State(core): Shared, headers: HeaderMap, Path(id): Path<String>,
+) -> ApiResult<Json<GetResult>> {
+    let (host, proof) = auth(&core, &headers).await?;
+    Ok(Json(blocking(move || core.login_totp(&host.id, &proof, &id)).await?))
 }
 
 async fn create_request(

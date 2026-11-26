@@ -4,10 +4,14 @@ use std::collections::BTreeSet;
 
 use asm_proto::generators::{GenerationChoice, GenerationGrant, SourceKind};
 use asm_proto::names::resolve_catalog_name;
-use asm_proto::wire::{GeneratorOption, SecretEntry, SecretKind};
+use asm_proto::wire::{GeneratorOption, LoginSitesResponse, SecretEntry, SecretKind};
 
 use super::Core;
 use crate::error::{CoreError, Result};
+use crate::ffi::{LoginChoice, LoginChoices};
+use crate::store::VaultRecord;
+use crate::vault::{LoginMeta, VaultStatus};
+use crate::vault::registry::{Registry, VaultEntry};
 use crate::vault::names::{NamedSecret, VaultListing, compute_names};
 
 #[cfg(test)]
@@ -178,6 +182,87 @@ fn build_catalog(listings: &[VaultListing], choices: Vec<GenerationChoice>) -> S
     SecretCatalog { static_entries, generated, wire_entries, generated_group_by_wire_row, base_names }
 }
 
+/// Suggestions and discovery use DNS names, never wildcard patterns, URIs,
+/// or IP literals. Normalization does not add any parent or alias domains.
+fn literal_login_host(host: &mut String) -> bool {
+    host.make_ascii_lowercase();
+    if host.ends_with('.') { host.pop(); }
+    let Some(last) = host.rsplit('.').next() else { return false };
+    if last.bytes().all(|b| b.is_ascii_digit())
+        || last.strip_prefix("0x").is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return false;
+    }
+    host.len() <= 253 && host.split('.').all(|label| {
+        !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-')
+            && label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    })
+}
+
+fn vault_logins(entry: &VaultEntry) -> Result<Vec<LoginMeta>> {
+    if entry.provider.status() != VaultStatus::Ready {
+        return Err(CoreError::vault_unavailable("the selected vault is unavailable"));
+    }
+    let mut logins = entry.provider.list_logins()?;
+    logins.retain_mut(|login| {
+        if !login.meta.is_password_login() { return false }
+        login.meta.uri_hosts.retain_mut(literal_login_host);
+        login.meta.uri_hosts.sort_unstable();
+        login.meta.uri_hosts.dedup();
+        true
+    });
+    Ok(logins)
+}
+
+fn each_login(entries: Vec<VaultEntry>, mut visit: impl FnMut(&VaultEntry, LoginMeta), mut unavailable: impl FnMut(String)) {
+    for entry in entries {
+        match vault_logins(&entry) {
+            Ok(logins) => logins.into_iter().for_each(|login| visit(&entry, login)),
+            Err(_) => unavailable(entry.name),
+        }
+    }
+}
+
+fn picker_choice(entry: &VaultEntry, login: LoginMeta) -> LoginChoice {
+    LoginChoice {
+        vault_id: entry.id.clone(), vault_name: entry.name.clone(), key: login.meta.key,
+        title: login.meta.name, username: login.username.filter(|s| !s.is_empty()),
+        saved_hosts: login.meta.uri_hosts, has_totp: login.meta.fields.iter().any(|f| f == "totp"),
+    }
+}
+
+fn listed_login_choices(registry: &Registry, configured: Vec<VaultRecord>) -> LoginChoices {
+    let entries = registry.all();
+    // A provider that failed to start has a stored configuration but no registry entry.
+    let mut unavailable_vaults: Vec<_> = configured.into_iter()
+        .filter(|record| !entries.iter().any(|entry| entry.id == record.id))
+        .map(|record| record.name).collect();
+    let mut items = Vec::new();
+    each_login(entries, |entry, login| items.push(picker_choice(entry, login)), |name| unavailable_vaults.push(name));
+    unavailable_vaults.sort_unstable();
+    unavailable_vaults.dedup();
+    LoginChoices { items, unavailable_vaults }
+}
+
+fn listed_login_sites(registry: &Registry) -> LoginSitesResponse {
+    let mut sites = BTreeSet::new();
+    each_login(registry.all(), |_, login| sites.extend(login.meta.uri_hosts), |_| {});
+    LoginSitesResponse { sites: sites.into_iter().collect() }
+}
+
+fn revalidate_choice(registry: &Registry, selection: &LoginChoice) -> Result<()> {
+    let stale = || CoreError::invalid("the selected login changed or is no longer exposed; reload the picker and select it again");
+    let entry = registry.get(&selection.vault_id).ok_or_else(stale)?;
+    let mut current = vault_logins(&entry)?.into_iter().filter(|item| item.meta.key == selection.key);
+    if let Some(item) = current.next()
+        && current.next().is_none() && picker_choice(&entry, item) == *selection
+    {
+        Ok(())
+    } else {
+        Err(stale())
+    }
+}
+
 impl Core {
     pub(crate) fn secret_catalog(&self) -> Result<SecretCatalog> {
         let listings = self.registry.listings();
@@ -192,20 +277,30 @@ impl Core {
         Ok(build_catalog(&listings, choices))
     }
 
-    /// Vault login items listed to hosts (the `/secrets` catalog) with a URI for
-    /// `url_host`: exact host matches, else matches on a parent domain of it.
-    pub(crate) fn vault_logins_for_host(&self, url_host: &str) -> Result<Vec<NamedSecret>> {
-        let logins: Vec<NamedSecret> = self.secret_catalog()?.static_entries.into_iter()
-            .filter(|n| n.meta.kind == SecretKind::Login).collect();
-        let exact: Vec<NamedSecret> = logins.iter()
-            .filter(|n| n.meta.uri_hosts.iter().any(|h| h == url_host)).cloned().collect();
-        if !exact.is_empty() {
-            return Ok(exact);
-        }
-        let parents: Vec<&str> = url_host.match_indices('.').map(|(i, _)| &url_host[i + 1..])
-            .filter(|p| p.contains('.')).collect();
-        Ok(logins.into_iter()
-            .filter(|n| n.meta.uri_hosts.iter().any(|h| parents.contains(&h.as_str()))).collect())
+    pub(crate) fn login_choices(&self) -> Result<LoginChoices> {
+        Ok(listed_login_choices(&self.registry, self.store.list_vaults()?))
+    }
+
+    pub(crate) fn login_sites(&self) -> Result<LoginSitesResponse> {
+        Ok(listed_login_sites(&self.registry))
+    }
+
+    pub(crate) fn resolve_login_choice(&self, selection: &LoginChoice) -> Result<NamedSecret> {
+        // Keep duplicate-aware names and file paths from the normal catalog.
+        // They are delivery labels only: selection always uses the provider IDs.
+        let mut named = self.secret_catalog()?.static_entries.into_iter().find(|n|
+            n.vault_id == selection.vault_id && n.meta.key == selection.key
+                && n.vault_name == selection.vault_name && n.meta.name == selection.title
+                && n.meta.is_password_login()
+        ).ok_or_else(|| CoreError::invalid("the selected login is unavailable; reload the picker"))?;
+        revalidate_choice(&self.registry, selection)?;
+        named.meta.fields.retain(|f| match f.as_str() {
+            "password" => true,
+            "username" => selection.username.is_some(),
+            "totp" => selection.has_totp,
+            _ => false,
+        });
+        Ok(named)
     }
 }
 
@@ -214,6 +309,91 @@ mod tests {
     use super::*;
     use asm_proto::generators::{GCLOUD_TOKEN_NAME, GcloudAccessGrant, GcloudGrant, GithubGrant, GithubPermission, GithubRepository};
     use crate::vault::SecretMeta;
+    use crate::vault::{AddTarget, VaultConfig, VaultProvider};
+    use std::sync::Arc;
+
+    struct LoginVault {
+        status: VaultStatus,
+        listing: Result<Vec<LoginMeta>>,
+    }
+
+    impl VaultProvider for LoginVault {
+        fn status(&self) -> VaultStatus { self.status.clone() }
+        fn list_logins(&self) -> Result<Vec<LoginMeta>> {
+            assert_eq!(self.status, VaultStatus::Ready, "locked/error vaults are not queried");
+            self.listing.clone()
+        }
+        fn list(&self) -> Result<Vec<SecretMeta>> {
+            self.list_logins().map(|items| items.into_iter().map(|i| i.meta).collect())
+        }
+        fn read(&self, _: &str) -> Result<Vec<(String, String)>> { panic!("picker read a secret") }
+        fn update(&self, _: &str, _: &str, _: &str) -> Result<()> { unreachable!() }
+        fn add(&self, _: &str, _: &str, _: &AddTarget) -> Result<()> { unreachable!() }
+    }
+
+    fn login_vault(id: &str, name: &str, status: VaultStatus, listing: Result<Vec<LoginMeta>>) -> VaultEntry {
+        VaultEntry { id: id.into(), name: name.into(), config: VaultConfig::Keychain,
+            provider: Arc::new(LoginVault { status, listing }) }
+    }
+
+    fn social_login(username: &str, hosts: &[&str]) -> LoginMeta {
+        LoginMeta { username: Some(username.into()), meta: SecretMeta {
+            key: "id-shared-across-vaults".into(), name: "Social".into(), kind: SecretKind::Login,
+            fields: vec!["username".into(), "password".into(), "totp".into()],
+            uri_hosts: hosts.iter().map(|h| h.to_string()).collect(),
+        }}
+    }
+
+    #[test]
+    fn discovery_only_returns_literal_saved_hosts_of_exposed_password_logins() {
+        let registry = Registry::new();
+        let login = social_login("staff@private.test", &["Twitter.com", "login.twitter.com.", "*.x.com", "1.2.3.4", "x.com/path"]);
+        let mut no_password = social_login("omit", &["sso-only.example"]);
+        no_password.meta.fields = vec!["username".into()];
+        let mut note = social_login("omit", &["note.example"]);
+        note.meta.kind = SecretKind::Multi;
+        registry.insert(login_vault("1", "Work", VaultStatus::Ready, Ok(vec![login, no_password, note])));
+        registry.insert(login_vault("2", "Home", VaultStatus::Ready, Ok(vec![social_login("owner", &["twitter.com"])])));
+        registry.insert(login_vault("3", "Locked", VaultStatus::Locked, Ok(vec![social_login("private", &["locked.example"])])));
+        registry.insert(login_vault("4", "Broken", VaultStatus::Ready, Err(CoreError::internal("provider-private diagnostic"))));
+
+        let failed_start = VaultRecord { id: "5".into(), name: "Did not start".into(), config: VaultConfig::Keychain, position: 5 };
+        let choices = listed_login_choices(&registry, vec![failed_start]);
+        assert_eq!(choices.unavailable_vaults, ["Broken", "Did not start", "Locked"]);
+        assert_eq!(choices.items.len(), 2);
+        assert_eq!(choices.items[0].username.as_deref(), Some("staff@private.test"));
+        assert_eq!(choices.items[0].saved_hosts, ["login.twitter.com", "twitter.com"]);
+        assert!(choices.items[0].has_totp);
+        assert_eq!(serde_json::to_value(listed_login_sites(&registry)).unwrap(),
+            serde_json::json!({"sites": ["login.twitter.com", "twitter.com"]}));
+        let ordinary = build_catalog(&registry.listings(), vec![]);
+        assert!(!serde_json::to_string(&ordinary.wire_entries).unwrap().contains("staff@private.test"));
+    }
+
+    #[test]
+    fn approval_revalidates_stable_ids_and_every_reviewed_label() {
+        let registry = Registry::new();
+        let login = social_login("WorkAccount", &["twitter.com"]);
+        registry.insert(login_vault("1", "Work", VaultStatus::Ready, Ok(vec![login.clone()])));
+        registry.insert(login_vault("2", "Home", VaultStatus::Ready, Ok(vec![social_login("other", &["twitter.com"])])));
+        let selected = listed_login_choices(&registry, vec![]).items.remove(0);
+        assert!(revalidate_choice(&registry, &selected).is_ok());
+        for changed in [
+            LoginChoice { vault_id: "2".into(), ..selected.clone() },
+            LoginChoice { key: "new-key".into(), ..selected.clone() },
+            LoginChoice { vault_name: "renamed vault".into(), ..selected.clone() },
+            LoginChoice { title: "renamed login".into(), ..selected.clone() },
+            LoginChoice { username: Some("workaccount".into()), ..selected.clone() },
+            LoginChoice { saved_hosts: vec!["x.com".into()], ..selected.clone() },
+            LoginChoice { has_totp: false, ..selected.clone() },
+        ] {
+            assert!(revalidate_choice(&registry, &changed).is_err());
+        }
+        registry.insert(login_vault("1", "Work", VaultStatus::Locked, Ok(vec![login])));
+        assert!(revalidate_choice(&registry, &selected).is_err());
+        registry.insert(login_vault("1", "Work", VaultStatus::Ready, Ok(vec![])));
+        assert!(revalidate_choice(&registry, &selected).is_err());
+    }
 
     fn listing(names: &[&str]) -> Vec<VaultListing> {
         vec![VaultListing { vault_id: "vault-id".into(), vault_name: "vault".into(), secrets: names.iter().map(|name| SecretMeta {

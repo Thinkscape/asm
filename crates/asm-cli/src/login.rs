@@ -1,11 +1,12 @@
-//! `asm login URL [ITEM] --reason TEXT`: the operator signs in on the manager's Mac
-//! (the manager fills the vault login there) and hands this machine the resulting
-//! browser storage state (plan step 13).
+//! Operator-assisted browser sign-in and browser login site discovery.
 
+use crate::api::Api;
 use crate::error::CliError;
 use crate::requests::{Session, deadline, submit, unix_now};
-use asm_proto::error::ErrorCode;
-use asm_proto::wire::{CAPABILITY_LOGIN_BROKER_V1, GetResult, LeaseMode, RequestBody, RequestResult};
+use asm_proto::wire::{
+    BrowserLoginMode, BrowserLoginRequest, CAPABILITY_BROWSER_LOGIN_V2, GetResult, HealthResponse,
+    LeaseMode, LoginSitesResponse, RequestBody, RequestResult,
+};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -19,11 +20,15 @@ pub struct LoginArgs {
     /// HTTPS page to sign in on; cookies for its host and its origin's localStorage are
     /// handed over.
     pub url: String,
-    /// Vault login item (default: the one whose URI matches the site).
-    pub item: Option<String>,
-    /// Why you need to sign in (shown to the operator).
-    #[arg(long)]
-    pub reason: String,
+    /// Recognize the removed positional ITEM only to give migration guidance.
+    #[arg(hide = true)]
+    pub legacy_item: Option<String>,
+    /// Requested username or email; the operator chooses the login.
+    #[arg(long, value_name = "USERNAME_OR_EMAIL")]
+    pub account: Option<String>,
+    /// Why you need to sign in (shown to the operator; required).
+    #[arg(long, value_name = "TEXT")]
+    pub reason: Option<String>,
     /// Another origin the sign-in passes through: the vault login may be filled there and
     /// its host's cookies are handed over too. Pass the sign-in service's origin when it
     /// differs from the site (Clerk, Auth0: https://clerk.example.com). https://host[:port];
@@ -35,6 +40,47 @@ pub struct LoginArgs {
     pub wait: u64,
     #[arg(long)]
     pub json: bool,
+}
+
+pub(crate) fn no_positional_item() -> CliError {
+    CliError::invalid(
+        "browser sign-in no longer accepts a positional ITEM; omit it and optionally pass --account USERNAME_OR_EMAIL (the operator chooses the login)",
+    )
+}
+
+pub(crate) fn require_v2(api: &Api) -> Result<(), CliError> {
+    let health: HealthResponse = api.get("/health")?;
+    health.require_capability(CAPABILITY_BROWSER_LOGIN_V2).map_err(CliError::from)
+}
+
+pub(crate) fn submit_browser(
+    api: &Api,
+    body: &RequestBody,
+    wait: Option<u64>,
+) -> Result<GetResult, CliError> {
+    let (result, _) = submit(api, body, deadline(wait)).map_err(|e| {
+        if e.message == CliError::acquisition_elapsed().message { CliError::pending() } else { e }
+    })?;
+    let RequestResult::Get(result) = result else {
+        return Err(CliError::failure("the manager sent an unexpected result for a browser sign-in"));
+    };
+    Ok(result)
+}
+
+pub(crate) fn list_sites(json: bool) -> Result<(), CliError> {
+    let s = Session::open()?;
+    s.warn_secrets();
+    require_v2(&s.api)?;
+    s.sync_leases()?;
+    let response: LoginSitesResponse = s.api.get("/login-sites")?;
+    if json {
+        println!("{}", serde_json::to_string(&response).expect("serializes"));
+    } else {
+        for site in response.sites {
+            println!("{site}");
+        }
+    }
+    Ok(())
 }
 
 /// `https://host[:port]` (`:443` omitted) for an origin with nothing after the authority.
@@ -94,12 +140,13 @@ fn check_result(r: &GetResult) -> Result<Vec<String>, CliError> {
     };
     if !asm_proto::crypto::is_uuid(&r.lease_id)
         || r.mode != LeaseMode::Raw
+        || !r.hosts.is_empty()
         || r.generation.is_some()
         || r.login.is_some()
         || r.validate().is_err()
         || file.field != STORAGE_STATE
-        || file.substituted == Some(true)
-        || r.expires_at.as_deref().is_some_and(|t| asm_proto::time::parse_unix(t).is_none_or(|t| t <= unix_now()))
+        || file.substituted != Some(false)
+        || r.expires_at.as_deref().and_then(asm_proto::time::parse_unix).is_none_or(|t| t <= unix_now())
     {
         return Err(wrong());
     }
@@ -115,48 +162,29 @@ struct JsonLogin<'a> {
 }
 
 pub fn run(a: LoginArgs) -> Result<(), CliError> {
-    let reason = asm_proto::rules::validate_reason(&a.reason)?;
+    if a.legacy_item.is_some() {
+        return Err(no_positional_item());
+    }
+    let reason = a.reason.ok_or_else(|| CliError::invalid("asm login needs --reason TEXT"))?;
+    let reason = asm_proto::rules::validate_reason(&reason)?;
     asm_proto::rules::parse_https_url(&a.url)?;
     let extra_fill_origins = fill_origins(&a.fill_origins)?;
-    if let Some(item) = &a.item {
-        let binding = asm_proto::bindings::parse_binding(item)?;
-        if binding.field.is_some() || binding.destination.is_some() {
-            return Err(CliError::invalid("asm login takes a whole login item"));
-        }
-    }
-    let s = Session::open()?;
-    let dir = s.secrets_dir()?;
-    crate::bindings::require_capabilities(&s.api, false, false, Some(CAPABILITY_LOGIN_BROKER_V1))?;
-    s.sync_leases()?;
-    let name = match &a.item {
-        None => String::new(),
-        Some(spec) => {
-            let entries = crate::bindings::catalog(&s.api)?;
-            let binding = asm_proto::bindings::parse_get_binding(spec, &entries)?;
-            match crate::bindings::resolve(binding.clone(), &entries) {
-                Ok(r) if r.generated_output.is_some() => {
-                    return Err(CliError::invalid("asm login needs a vault login item"));
-                }
-                Ok(r) => r.request_name,
-                Err(e) if e.code == Some(ErrorCode::NotFound) => binding.source,
-                Err(e) => return Err(e),
-            }
-        }
-    };
-    let body = RequestBody::Login {
-        name,
-        url: a.url.clone(),
+    let mut body = RequestBody::BrowserLogin(BrowserLoginRequest {
+        mode: BrowserLoginMode::Broker,
+        url: a.url,
+        site: None,
+        account: a.account,
         reason,
         extra_fill_origins,
         agent: crate::hostinfo::agent_label(),
-        client_capabilities: vec![CAPABILITY_LOGIN_BROKER_V1.to_owned()],
-    };
-    let (result, _) = submit(&s.api, &body, deadline(Some(a.wait))).map_err(|e| {
-        if e.message == CliError::acquisition_elapsed().message { CliError::pending() } else { e }
-    })?;
-    let RequestResult::Get(result) = result else {
-        return Err(CliError::failure("the manager sent a write result for a sign-in"));
-    };
+        client_capabilities: vec![CAPABILITY_BROWSER_LOGIN_V2.to_owned()],
+    });
+    body.canonicalize()?;
+    let s = Session::open()?;
+    let dir = s.secrets_dir()?;
+    require_v2(&s.api)?;
+    s.sync_leases()?;
+    let result = submit_browser(&s.api, &body, Some(a.wait))?;
     let domains = check_result(&result)?;
     let stored = dir.store(&result)?;
     crate::reaper::ensure_running(dir);

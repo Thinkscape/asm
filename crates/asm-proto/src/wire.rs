@@ -31,10 +31,8 @@ pub const CAPABILITY_OPERATOR_SELECTED_GRANT_V1: &str = "operator_selected_grant
 pub const CAPABILITY_OPERATOR_SELECTED_PROJECT_V1: &str = "operator_selected_project_v1";
 /// An unpinned generated request can reuse an existing, possibly broader grant.
 pub const CAPABILITY_BROADER_LEASE_REUSE_V1: &str = "broader_lease_reuse_v1";
-/// Single-use login grants (`asm get --login-url`).
-pub const CAPABILITY_LOGIN_GRANT_V1: &str = "login_grant_v1";
-/// Operator-assisted sign-in handing over a browser storage state (`asm login`).
-pub const CAPABILITY_LOGIN_BROKER_V1: &str = "login_broker_v1";
+/// Operator-selected browser credentials, advisory site discovery and lease-bound OTP.
+pub const CAPABILITY_BROWSER_LOGIN_V2: &str = "browser_login_v2";
 /// SSH targets, SSH leases with per-host access and `/v1/ssh/*`.
 pub const CAPABILITY_SSH_LEASES_V2: &str = "ssh_leases_v2";
 /// Lease duration choices: label and seconds (`None` = unlimited).
@@ -333,6 +331,35 @@ pub struct SecretsResponse {
     pub secrets: Vec<SecretEntry>,
 }
 
+/// Advisory hostnames only. An unlisted site can still request a login.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginSitesResponse {
+    pub sites: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserLoginMode { Grant, Broker }
+
+/// Unselected intent. In particular, a caller cannot provide a vault item key or name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserLoginRequest {
+    pub mode: BrowserLoginMode,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    pub reason: String,
+    #[serde(default)]
+    pub extra_fill_origins: Vec<String>,
+    #[serde(default)]
+    pub agent: String,
+    #[serde(default)]
+    pub client_capabilities: Vec<String>,
+}
+
 /// The exact HTTPS form action a login grant is valid for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoginScope {
@@ -372,8 +399,7 @@ pub enum RequestBody {
         /// Proxy destination restrictions, not applicable to new generated requests.
         #[serde(default)]
         hosts: Vec<String>,
-        /// A single-use login grant for this form action; `name` may then be empty,
-        /// meaning "infer the vault login from the URL's host".
+        /// Recognize and reject pre-picker login requests rather than treating them as ordinary gets.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         login: Option<LoginScope>,
         reason: String,
@@ -394,8 +420,7 @@ pub enum RequestBody {
         #[serde(default)]
         agent: String,
     },
-    /// Operator-assisted sign-in: the manager fills a browser on the Mac and hands
-    /// the agent the resulting storage state. An empty `name` means "infer".
+    /// Recognize pre-picker clients so the manager can give upgrade guidance.
     Login {
         name: String,
         url: String,
@@ -407,6 +432,8 @@ pub enum RequestBody {
         #[serde(default)]
         client_capabilities: Vec<String>,
     },
+    #[serde(rename = "browser_login")]
+    BrowserLogin(BrowserLoginRequest),
     /// SSH access to enrolled targets (`kind: "ssh"`).
     Ssh {
         targets: Vec<String>,
@@ -440,6 +467,10 @@ impl RequestBody {
             RequestBody::Update { .. } => RequestKind::Update,
             RequestBody::Add { .. } => RequestKind::Add,
             RequestBody::Login { .. } => RequestKind::Login,
+            RequestBody::BrowserLogin(r) => match r.mode {
+                BrowserLoginMode::Grant => RequestKind::Get,
+                BrowserLoginMode::Broker => RequestKind::Login,
+            },
             RequestBody::Ssh { .. } | RequestBody::SshExtend { .. } => RequestKind::Ssh,
         }
     }
@@ -451,6 +482,7 @@ impl RequestBody {
             | RequestBody::Update { name, .. }
             | RequestBody::Add { name, .. }
             | RequestBody::Login { name, .. } => name,
+            RequestBody::BrowserLogin(_) => "",
             RequestBody::Ssh { .. } | RequestBody::SshExtend { .. } => "ssh",
         }
     }
@@ -458,6 +490,7 @@ impl RequestBody {
     /// The agent label.
     pub fn agent(&self) -> &str {
         match self {
+            RequestBody::BrowserLogin(r) => &r.agent,
             RequestBody::Get { agent, .. }
             | RequestBody::Update { agent, .. }
             | RequestBody::Add { agent, .. }
@@ -470,26 +503,43 @@ impl RequestBody {
     /// Canonicalize shared get syntax before target lookup. Source-specific
     /// authority checks (including unknown fields) still belong to the manager.
     pub fn canonicalize(&mut self) -> Result<(), ApiError> {
+        if let Self::BrowserLogin(r) = self {
+            if !r.client_capabilities.iter().any(|c| c == CAPABILITY_BROWSER_LOGIN_V2) {
+                return Err(ApiError::invalid("browser account selection requires browser_login_v2; upgrade the CLI"));
+            }
+            if let Some(account) = &r.account {
+                validate_agent_text("account", account)?;
+                if account.trim().is_empty() || account.trim() != account || account.chars().count() > 320 {
+                    return Err(ApiError::invalid("account must be 1–320 characters without surrounding whitespace"));
+                }
+            }
+            match r.mode {
+                BrowserLoginMode::Grant => {
+                    if !r.extra_fill_origins.is_empty() {
+                        return Err(ApiError::invalid("a login grant does not take fill origins"));
+                    }
+                    r.url = parse_login_url(&r.url)?.canonical_url();
+                    if let Some(site) = &mut r.site {
+                        let origin = parse_login_url(site)?;
+                        if origin.target != "/" {
+                            return Err(ApiError::invalid("site must be an HTTPS origin without a path or query"));
+                        }
+                        *site = origin.canonical_url();
+                        site.pop(); // canonical_url includes the root path
+                    }
+                }
+                BrowserLoginMode::Broker if r.site.is_some() =>
+                    return Err(ApiError::invalid("asm login uses its page URL as the requested site")),
+                BrowserLoginMode::Broker => {}
+            }
+        }
+        if matches!(self, Self::Login { .. } | Self::Get { login: Some(_), .. }) {
+            return Err(ApiError::invalid("upgrade the CLI and retry without ITEM; the operator chooses the browser login"));
+        }
         if let Self::Get {
-            raw, sentinel, fields, generation, refresh, new_lease, lease_id,
-            refresh_from_version, hosts, login, ..
+            raw, sentinel, fields, generation, refresh, new_lease, lease_id, refresh_from_version, ..
         } = self
         {
-            if let Some(login) = login {
-                let conflicts = [
-                    ("raw", *raw),
-                    ("fields", fields.is_some()),
-                    ("hosts", !hosts.is_empty()),
-                    ("generation", generation.is_some()),
-                    ("lease_id", lease_id.is_some()),
-                    ("refresh", *refresh),
-                    ("new_lease", *new_lease),
-                ];
-                if let Some((flag, _)) = conflicts.iter().find(|(_, set)| *set) {
-                    return Err(ApiError::invalid(format!("a login grant does not take {flag}")));
-                }
-                login.url = parse_login_url(&login.url)?.canonical_url();
-            }
             RequestedMode::from_flags(*raw, *sentinel)?;
             if *new_lease && (lease_id.is_some() || *refresh) {
                 return Err(ApiError::invalid("new_lease conflicts with lease_id and refresh"));
@@ -557,7 +607,7 @@ impl RequestBody {
     /// Negotiate only features that change request meaning, not arbitrary
     /// unknown JSON fields. Legacy static whole-item requests remain accepted.
     pub fn validate_get_capabilities(&self, source: SourceKind) -> Result<(), ApiError> {
-        if let Self::Get { fields, generation, sentinel, login, client_capabilities, .. } = self {
+        if let Self::Get { fields, generation, sentinel, client_capabilities, .. } = self {
             let require = |capability| {
                 if client_capabilities.iter().any(|c| c == capability) {
                     Ok(())
@@ -576,9 +626,6 @@ impl RequestBody {
             }
             if fields.is_some() || *sentinel {
                 require(CAPABILITY_SECRET_FIELDS_V1)?;
-            }
-            if login.is_some() {
-                require(CAPABILITY_LOGIN_GRANT_V1)?;
             }
         }
         Ok(())
@@ -1158,32 +1205,29 @@ mod tests {
     }
 
     #[test]
-    fn login_grants_canonicalize_the_url_and_reject_other_get_flags() {
-        let mut body = get_body(json!({"name":"","login":{"url":"https://Example.com:443/session?return_to=%2F"}}));
-        body.canonicalize().unwrap();
-        let RequestBody::Get { name, login, .. } = &body else { panic!() };
-        assert_eq!((name.as_str(), login.as_ref().unwrap().url.as_str()), ("", "https://example.com/session?return_to=%2F"));
-        assert!(body.validate_get_capabilities(SourceKind::Vault).unwrap_err().message.contains(CAPABILITY_LOGIN_GRANT_V1));
-        let RequestBody::Get { client_capabilities, .. } = &mut body else { panic!() };
-        client_capabilities.push(CAPABILITY_LOGIN_GRANT_V1.into());
-        body.validate_get_capabilities(SourceKind::Vault).unwrap();
-        for (flag, extra) in [
-            ("raw", json!({"raw":true})),
-            ("fields", json!({"fields":["password"]})),
-            ("hosts", json!({"hosts":["example.com"]})),
-            ("generation", json!({"generation":{"provider":"github_app","scope":{"repositories":["acme/web"],"permissions":{}}}})),
-            ("lease_id", json!({"lease_id":"l"})),
-            ("refresh", json!({"refresh":true})),
-            ("new_lease", json!({"new_lease":true})),
-        ] {
-            let mut extra = extra;
-            extra["login"] = json!({"url":"https://example.com/session"});
-            let err = get_body(extra).canonicalize().unwrap_err();
-            assert!(err.message.contains(flag), "{flag}: {}", err.message);
-        }
-        assert!(get_body(json!({"login":{"url":"http://example.com/session"}})).canonicalize().is_err());
-        let plain = serde_json::to_value(get_body(json!({}))).unwrap();
-        assert!(plain.get("login").is_none(), "absent login is not serialized for older managers");
+    fn browser_login_requires_operator_selection_and_keeps_site_out_of_the_post_url() {
+        let mut value = json!({"kind":"browser_login", "mode":"grant", "reason":"sign in",
+            "url":"https://IdP.example:443/session?return_to=%2F", "account":"team@example.com",
+            "site":"https://App.example/", "client_capabilities":[CAPABILITY_BROWSER_LOGIN_V2]});
+        let parse = |value: &serde_json::Value| -> Result<RequestBody, ApiError> {
+            let mut body: RequestBody = serde_json::from_value(value.clone()).unwrap();
+            body.canonicalize()?;
+            Ok(body)
+        };
+        let RequestBody::BrowserLogin(r) = parse(&value).unwrap() else { panic!() };
+        assert_eq!(r.url, "https://idp.example/session?return_to=%2F");
+        assert_eq!(r.site.as_deref(), Some("https://app.example"));
+        value["site"] = json!("https://app.example/login");
+        assert!(parse(&value).is_err());
+        value["site"] = serde_json::Value::Null;
+        value["account"] = json!("fake\u{202e}account");
+        assert!(parse(&value).is_err());
+        value["account"] = serde_json::Value::Null;
+        value["client_capabilities"] = json!([]);
+        assert!(parse(&value).is_err());
+        value["name"] = json!("Vault/Google");
+        assert!(serde_json::from_value::<RequestBody>(value).is_err());
+        assert!(get_body(json!({"login":{"url":"https://example.com/session"}})).canonicalize().is_err());
     }
 
     #[test]

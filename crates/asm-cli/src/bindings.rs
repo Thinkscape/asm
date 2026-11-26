@@ -102,31 +102,3 @@ pub(crate) fn environment_name(name: &str) -> bool {
 pub(crate) fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
-
-/// `name` as a binding source: backslash before `\`, `=`, `,` and `:`, so the grammar
-/// of `[DEST=]SOURCE[::FIELD]` reads it back as exactly `name`.
-pub(crate) fn binding_escape(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if matches!(c, '\\' | '=' | ',' | ':') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn escaped_names_parse_back() {
-        for name in ["work/Site", "GitHub (work)", "a=b, c::d\\e", "Site~1a2b3c4d"] {
-            let spec = format!("{}::totp", binding_escape(name));
-            let b = asm_proto::bindings::parse_binding(&spec).unwrap();
-            assert_eq!((b.source.as_str(), b.field.as_deref(), b.destination), (name, Some("totp"), None), "{spec}");
-        }
-        assert_eq!(binding_escape("work/Site"), "work/Site");
-    }
-}

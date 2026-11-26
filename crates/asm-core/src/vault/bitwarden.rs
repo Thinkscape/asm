@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use super::{
-    AddTarget, BitwardenConfig, BitwardenSecrets, CollectionInfo, SecretKind, SecretMeta,
+    AddTarget, BitwardenConfig, BitwardenSecrets, CollectionInfo, LoginMeta, SecretKind, SecretMeta,
     VaultConfig, VaultProvider, VaultStatus,
 };
 use crate::error::{CoreError, Result};
@@ -263,13 +263,13 @@ fn call_timeout(
     if code == 401 {
         return Err(CoreError::vault_unavailable(AUTH_REJECTED));
     }
-    let v: Value = serde_json::from_slice(&bytes).map_err(|_| {
+    let mut v: Value = serde_json::from_slice(&bytes).map_err(|_| {
         CoreError::vault_unavailable(format!(
             "bw serve answered HTTP {code} with a non-JSON body"
         ))
     })?;
     if (200..300).contains(&code) && v.get("success").and_then(Value::as_bool) == Some(true) {
-        Ok(v.get("data").cloned().unwrap_or(Value::Null))
+        Ok(v.get_mut("data").map(Value::take).unwrap_or(Value::Null))
     } else {
         let msg = v
             .get("message")
@@ -279,11 +279,9 @@ fn call_timeout(
     }
 }
 
-fn list_data(v: &Value) -> Vec<Value> {
-    v.get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
+fn list_data(v: &Value) -> Result<&[Value]> {
+    v.get("data").and_then(Value::as_array).map(Vec::as_slice)
+        .ok_or_else(|| CoreError::vault_unavailable("Bitwarden returned an invalid listing"))
 }
 
 /// Only UUID-shaped ids go into request paths.
@@ -331,17 +329,17 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 
 /// Exposed fields of an item in order: `(field name, where it lives, value)`. The value
 /// of [`Source::Totp`] is the authenticator key; it must be mapped before leaving.
-fn field_sources(item: &Value) -> Vec<(String, Source, String)> {
-    let mut out: Vec<(String, Source, String)> = Vec::new();
+fn field_sources(item: &Value) -> Vec<(String, Source, &str)> {
+    let mut out = Vec::new();
     let ty = item.get("type").and_then(Value::as_i64).unwrap_or(0);
     if ty != TYPE_LOGIN && ty != TYPE_SECURE_NOTE {
         return out;
     }
-    let push = |name: &str, src: Source, value: &str, out: &mut Vec<(String, Source, String)>| {
+    fn push<'a>(name: &str, src: Source, value: &'a str, out: &mut Vec<(String, Source, &'a str)>) {
         if !out.iter().any(|(n, _, _)| n == name) {
-            out.push((name.to_owned(), src, value.to_owned()));
+            out.push((name.to_owned(), src, value));
         }
-    };
+    }
     if ty == TYPE_LOGIN {
         if let Some(u) = non_empty(str_at(item, &["login", "username"])) {
             push("username", Source::Username, u, &mut out);
@@ -383,8 +381,7 @@ fn uri_host(uri: &str) -> Option<String> {
     let s = uri.trim();
     let rest = match s.split_once("://") {
         Some((scheme, rest)) => {
-            let scheme = scheme.to_ascii_lowercase();
-            if scheme != "http" && scheme != "https" {
+            if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
                 return None;
             }
             rest
@@ -392,12 +389,60 @@ fn uri_host(uri: &str) -> Option<String> {
         None => s,
     };
     let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.contains('\\') { return None; }
     let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     if hostport.starts_with('[') {
         return None;
     }
-    let host = hostport.split(':').next()?;
+    let host = match hostport.split_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().ok()? > 0 => host,
+        Some(_) => return None,
+        None => hostport,
+    };
     asm_proto::rules::normalize_host_pattern(host).ok()
+}
+
+fn saved_hosts(item: &Value, picker: bool) -> Vec<String> {
+    let mut hosts = Vec::new();
+    if let Some(uris) = item.pointer("/login/uris").and_then(Value::as_array) {
+        for u in uris {
+            // Regex matching rules are not literal saved sites.
+            if picker && u.get("match").and_then(Value::as_i64) == Some(4) {
+                continue;
+            }
+            if let Some(h) = u.get("uri").and_then(Value::as_str).and_then(uri_host)
+                && !hosts.contains(&h)
+            {
+                hosts.push(h);
+            }
+        }
+    }
+    hosts
+}
+
+/// The bulk listing already contains native login attributes. Keep only the
+/// username and presence flags; never copy a password, decode a seed, or read
+/// an item or a custom field for picker labels.
+fn map_login(item: &Value) -> Option<LoginMeta> {
+    if item.get("type")?.as_i64()? != TYPE_LOGIN || item.get("deletedDate").is_some_and(|v| !v.is_null()) {
+        return None;
+    }
+    let name = non_empty(item.get("name")?.as_str())?;
+    non_empty(str_at(item, &["login", "password"]))?;
+    let username = non_empty(str_at(item, &["login", "username"]));
+    let mut fields = Vec::with_capacity(3);
+    if username.is_some() { fields.push("username".into()); }
+    fields.push("password".into());
+    if non_empty(str_at(item, &["login", "totp"])).is_some() {
+        fields.push(TOTP_FIELD.into());
+    }
+    Some(LoginMeta {
+        meta: SecretMeta {
+            key: item.get("id")?.as_str()?.to_owned(), name: name.to_owned(), kind: SecretKind::Login,
+            fields, uri_hosts: saved_hosts(item, true),
+        },
+        username: username.map(str::to_owned),
+    })
 }
 
 fn map_item(item: &Value) -> Option<SecretMeta> {
@@ -415,16 +460,7 @@ fn map_item(item: &Value) -> Option<SecretMeta> {
     } else {
         SecretKind::Multi
     };
-    let mut uri_hosts: Vec<String> = Vec::new();
-    if let Some(uris) = item.pointer("/login/uris").and_then(Value::as_array) {
-        for u in uris {
-            if let Some(h) = u.get("uri").and_then(Value::as_str).and_then(uri_host)
-                && !uri_hosts.contains(&h)
-            {
-                uri_hosts.push(h);
-            }
-        }
-    }
+    let uri_hosts = saved_hosts(item, false);
     Some(SecretMeta {
         key: id.to_owned(),
         name: name.to_owned(),
@@ -500,12 +536,21 @@ fn field_values(item: &Value, now: u64) -> Vec<(String, String)> {
     field_sources(item)
         .into_iter()
         .filter_map(|(n, src, v)| match src {
-            Source::Totp => crate::totp::parse(&v)
+            Source::Totp => crate::totp::parse(v)
                 .ok()
                 .map(|key| (n, crate::totp::current_code(&key, now))),
-            _ => Some((n, v)),
+            _ => Some((n, v.to_owned())),
         })
         .collect()
+}
+
+fn native_totp(item: &Value, now: u64) -> Result<zeroize::Zeroizing<String>> {
+    let key = (item.get("type").and_then(Value::as_i64) == Some(TYPE_LOGIN)
+        && item.get("deletedDate").is_none_or(Value::is_null))
+        .then(|| non_empty(str_at(item, &["login", "totp"]))).flatten()
+        .and_then(|seed| crate::totp::parse(seed).ok())
+        .ok_or_else(|| CoreError::not_found("this login has no usable one-time code"))?;
+    Ok(zeroize::Zeroizing::new(crate::totp::current_code(&key, now)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1370,7 +1415,7 @@ impl BitwardenVault {
     /// Every collection the account can see (for the UI picker).
     pub fn collections(&self) -> Result<Vec<CollectionInfo>> {
         let data = self.request(&self.endpoint()?, "GET", "/list/object/collections", None)?;
-        Ok(list_data(&data)
+        Ok(list_data(&data)?
             .iter()
             .filter_map(|c| {
                 Some(CollectionInfo {
@@ -1387,6 +1432,19 @@ impl BitwardenVault {
                 })
             })
             .collect())
+    }
+
+    fn list_items<T>(&self, project: impl Fn(&Value) -> Option<T>) -> Result<Vec<T>> {
+        let data = self.request(&self.endpoint()?, "GET", "/list/object/items", None)?;
+        let cfg = self.cfg();
+        let mut seen = HashSet::new();
+        Ok(list_data(&data)?.iter()
+            .filter(|i| is_visible(i, &cfg))
+            .filter_map(|i| {
+                let key = i.get("id")?.as_str()?;
+                let item = project(i)?;
+                seen.insert(key).then_some(item)
+            }).collect())
     }
 
     fn fetch_visible(&self, endpoint: &(u32, Endpoint), key: &str) -> Result<Value> {
@@ -1434,15 +1492,11 @@ impl VaultProvider for BitwardenVault {
     }
 
     fn list(&self) -> Result<Vec<SecretMeta>> {
-        let data = self.request(&self.endpoint()?, "GET", "/list/object/items", None)?;
-        let mut seen = HashSet::new();
-        let cfg = self.cfg();
-        Ok(list_data(&data)
-            .iter()
-            .filter(|i| is_visible(i, &cfg))
-            .filter_map(map_item)
-            .filter(|m| seen.insert(m.key.clone()))
-            .collect())
+        self.list_items(map_item)
+    }
+
+    fn list_logins(&self) -> Result<Vec<LoginMeta>> {
+        self.list_items(map_login)
     }
 
     fn read(&self, key: &str) -> Result<Vec<(String, String)>> {
@@ -1457,6 +1511,13 @@ impl VaultProvider for BitwardenVault {
             ));
         }
         Ok(fields)
+    }
+
+    fn read_totp(&self, key: &str) -> Result<zeroize::Zeroizing<String>> {
+        let item = self.fetch_visible(&self.endpoint()?, key)?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| CoreError::internal("invalid system clock"))?.as_secs();
+        native_totp(&item, now)
     }
 
     fn update(&self, key: &str, field: &str, value: &str) -> Result<()> {
@@ -1809,16 +1870,39 @@ mod tests {
         assert_eq!(m.kind, SecretKind::Login);
         assert_eq!(m.fields, ["username", "password", "otp seed"]);
         assert_eq!(m.uri_hosts, ["github.com", "api.github.com"]);
-        let values: Vec<(String, String)> = field_sources(&item)
+        let values: Vec<_> = field_sources(&item)
             .into_iter()
             .map(|(n, _, v)| (n, v))
             .collect();
-        assert_eq!(values[1], ("password".to_owned(), "hunter2".to_owned()));
-        assert_eq!(values[2], ("otp seed".to_owned(), "JBSWY3DP".to_owned()));
+        assert_eq!(values[1], ("password".to_owned(), "hunter2"));
+        assert_eq!(values[2], ("otp seed".to_owned(), "JBSWY3DP"));
         assert!(
             !values.iter().any(|(n, _)| n == "totp"),
             "a custom field named totp is reserved and skipped"
         );
+    }
+
+    #[test]
+    fn picker_uses_only_native_login_attributes() {
+        let mut item = login_item();
+        item["login"]["uris"] = json!([
+            {"uri":"https://twitter.com"},
+            {"uri":"regex.example", "match":4},
+            {"uri":"https://user@port.example:*/"},
+        ]);
+        let login = map_login(&item).unwrap();
+        assert_eq!(login.username.as_deref(), Some("octocat"));
+        assert_eq!(login.meta.fields, ["username", "password"]);
+        assert_eq!(login.meta.uri_hosts, ["twitter.com"]);
+        assert!(native_totp(&item, 0).is_err(), "custom fields cannot impersonate an authenticator");
+        item["login"]["username"] = Value::Null;
+        item["fields"] = json!([{"name":"username","value":"hidden custom data","type":1},
+            {"name":"password","value":"also hidden","type":1}]);
+        let login = map_login(&item).unwrap();
+        assert_eq!(login.username, None);
+        assert_eq!(login.meta.fields, ["password"]);
+        item["login"]["password"] = Value::Null;
+        assert!(map_login(&item).is_none(), "a hidden custom field is not a login password");
     }
 
     #[test]
@@ -1835,12 +1919,14 @@ mod tests {
         );
         assert!(values.iter().all(|(_, v)| !v.contains("JBSWY3DPEHPK3PXP")));
         assert_eq!(values[2].1.len(), 6);
+        assert_eq!(native_totp(&item, 1_111_111_109).unwrap().as_str(), values[2].1);
         assert_eq!(
             set_field(&mut item, "totp", "123456").unwrap_err().code,
             asm_proto::ErrorCode::Invalid
         );
         item["login"]["totp"] = json!("steam://JBSWY3DP");
         assert_eq!(map_item(&item).unwrap().fields, ["username", "password", "otp seed"]);
+        assert!(native_totp(&item, 0).is_err());
     }
 
     #[test]

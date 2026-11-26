@@ -15,6 +15,7 @@ reinstalling and fixing failures are covered in `SETUP.md` next to this file.
 1. **Pair.** Run `asm doctor`. If unpaired, ask the operator to pair this machine with
    `asm pair <manager-host> [code]`. Pairing authorizes the host; `ASM_AGENT` is attribution
    and routing affinity, not isolation from another agent on the same host.
+   For a website sign-in, go directly to **Browser logins** below; ASM asks the operator to select the account.
 2. **Discover.** Run `asm list --json` for addressable names, aliases, fields and leases.
    Fields are exact metadata names, not JSONPath. Use qualified names when outputs collide.
 3. **Launch with credentials**, preferably without files:
@@ -174,7 +175,14 @@ then restart that browser. `asm browser status` shows what is installed. For per
 steps, reinstalling, the proxy router and fixing failures, read `SETUP.md` next to this file
 (`asm skill install --print-setup` prints it).
 
-Already signed in? Do nothing. Otherwise:
+Reuse an existing session only if it fits the task. When an identity matters, check the
+site's active account before acting; being signed in doesn't establish which user it is.
+
+Request a site, not a vault item. `asm list --sites --json` is optional discovery; even
+an unlisted site can request sign-in. On either login command, pass `--account <identity>`
+only when the task names one. Put descriptions such as "company account" in the reason.
+The operator chooses in ASM; don't ask the user to choose from vault titles. If denied,
+stop—don't retry without the requested account or switch to raw credentials.
 
 1. Find the URL the credentials are posted to. For a plain HTML form it is
    `document.querySelector('input[type=password]').form.action`. Most sites sign in with
@@ -184,17 +192,18 @@ Already signed in? Do nothing. Otherwise:
    network log after submitting once with a made-up email address and password (never the
    real username), and use that exact URL, query string included. The sentinel only works
    at that URL; sent anywhere else it is wasted and the site sees a wrong password.
-2. `asm get --login-url <that URL> --reason "<why>"` (pass the vault ITEM name when asked,
-   when several logins match, or when the API host differs from the item's site). It first
-   checks that the URL's host went through this machine's asm proxy router in the last 30
-   minutes, which step 1 does when the browser is set up. It prints the username, a
-   single-use password sentinel and, when the item has an authenticator key, a one-time code.
+2. Run `asm get --login-url <exact POST URL> --reason "<why>"`. If the site and the
+   password receiver differ, add `--site https://<site>` to identify the requesting
+   site. Only the POST URL is authorized. The command checks the POST host went through
+   the local proxy router in the last 30 minutes, then waits for account selection and
+   approval. Use its reported paths and lease ID; don't print the file contents in chat.
 3. Open or reload the login page, type the username and the sentinel, submit **once**.
-4. At a one-time-code prompt, run `asm get <ITEM>::totp --reason "<why>"` (no popup while
-   the grant lasts) and type the code.
+4. If you need a fresh one-time code at the OTP prompt, run `asm totp <LEASE_ID>` on
+   the browser's machine. Use the code from the reported file. An ended grant can't refresh it.
 5. A password field with `maxlength` under 44, or one input box per OTP digit: use
    `asm login <URL> --reason "<why>"` instead. The operator signs in on the Mac and you
-   receive a storage-state file to load into your browser tool. When the site signs in
+   receive a storage-state file to load into your browser tool. Keep the same `--account`
+   constraint if the task specified one. When the site signs in
    through a separate service host (the API URL from step 1 is on another host, such as
    `clerk.example.com`), add `--fill-origin https://<that host>` so its session cookies
    come along; without them the site signs you out again.

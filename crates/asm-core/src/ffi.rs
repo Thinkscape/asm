@@ -1101,10 +1101,10 @@ pub enum Decision {
         vault_id: String,
         collection_id: Option<String>,
     },
-    /// `asm login`: open the sign-in browser. `fill_origins`: the request's origins the
-    /// broker may fill (the operator may remove extra ones; the requested site's origin
-    /// is always included). `duration_secs: None` = 1 hour.
+    /// Approve one operator-selected credential. Grant mode takes no fill origins;
+    /// the broker permits only its page origin and explicitly requested extra origins.
     ApproveLogin {
+        selection: LoginChoice,
         duration_secs: Option<u64>,
         fill_origins: Vec<String>,
     },
@@ -1222,10 +1222,29 @@ pub struct AddTarget {
     pub personal_allowed: bool,
 }
 
-/// The exact HTTPS form action a login grant is valid for.
+/// A local picker row. Echoing the displayed metadata lets approval detect changes
+/// since review; it does not confer authority to access this key.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct LoginScopeInfo {
-    pub url: String,
+pub struct LoginChoice {
+    pub vault_id: String,
+    pub key: String,
+    pub title: String,
+    pub vault_name: String,
+    pub username: Option<String>,
+    pub saved_hosts: Vec<String>,
+    pub has_totp: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LoginChoices {
+    pub items: Vec<LoginChoice>,
+    pub unavailable_vaults: Vec<String>,
+}
+
+/// Used only to rank related hosts. The public suffix list includes private hosting zones.
+#[uniffi::export]
+pub fn registrable_domain(host: String) -> Option<String> {
+    psl::domain_str(&host).map(str::to_owned)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -1262,9 +1281,6 @@ pub enum RequestDetail {
         operator_selected_grant: bool,
         /// The requesting client can receive a managed Google grant for another project.
         operator_selected_gcloud_project: bool,
-        /// A single-use login grant for this form action (sentinel delivery, at most
-        /// one hour, routed through asm until it expires).
-        login: Option<LoginScopeInfo>,
     },
     Update {
         name: String,
@@ -1279,16 +1295,14 @@ pub enum RequestDetail {
         value: String,
         targets: Vec<AddTarget>,
     },
-    /// `asm login`: sign in on the Mac with this vault login; the agent receives the
-    /// site's cookies and `url`'s origin's localStorage.
+    /// Browser sign-in intent. No vault item is selected until the operator approves.
     Login {
-        name: String,
-        vault_name: String,
         url: String,
-        /// The requested site's origin first, then extra origins the agent asked to fill.
+        site: Option<String>,
+        account: Option<String>,
         fill_origins: Vec<String>,
         reason: String,
-        has_totp: bool,
+        broker: bool,
     },
     Ssh {
         reason: String,
@@ -1369,6 +1383,7 @@ pub struct RecentRequest {
 pub struct BrokerSessionInfo {
     pub request_id: String,
     pub url: String,
+    pub account: Option<String>,
     pub host_label: String,
     pub started_at: SystemTime,
     /// What the broker is doing (`paused: <origin> is not approved`, `filled …`).
@@ -1864,6 +1879,10 @@ impl Manager {
 
     pub fn snapshot(&self) -> Snapshot {
         self.core.snapshot()
+    }
+
+    pub fn login_choices(&self) -> FfiResult<LoginChoices> {
+        Ok(self.core.login_choices()?)
     }
 
     pub fn resolve_request(&self, id: String, decision: Decision) -> FfiResult<()> {

@@ -1,7 +1,7 @@
 //! `asm login`: request validation, the broker session lifecycle against a fake Chrome
 //! (this test binary speaking CDP on fds 3 and 4), and a real Chrome run gated by
 //! `ASM_TEST_CHROME=<path to the Chrome binary>`.
-use super::tests::{Logins, open_manager, request_host};
+use super::tests::{Logins, choice, open_manager, request_host};
 use super::*;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -135,11 +135,13 @@ fn wait_ended(core: &Core, id: &str) {
     wait_for("the session to end", || status(core, id).is_none());
 }
 
-fn login_body(name: &str, url: &str, extra: &[&str], reason: &str) -> RequestBody {
-    serde_json::from_value(json!({
-        "kind": "login", "name": name, "url": url, "reason": reason, "extra_fill_origins": extra,
-        "client_capabilities": [asm_proto::wire::CAPABILITY_LOGIN_BROKER_V1],
-    })).unwrap()
+fn login_body(account: &str, url: &str, extra: &[&str], reason: &str) -> RequestBody {
+    RequestBody::BrowserLogin(BrowserLoginRequest {
+        mode: BrowserLoginMode::Broker, url: url.into(), site: None,
+        account: (!account.is_empty()).then(|| account.to_owned()), reason: reason.into(),
+        extra_fill_origins: extra.iter().map(|o| (*o).to_owned()).collect(),
+        agent: String::new(), client_capabilities: vec![asm_proto::wire::CAPABILITY_BROWSER_LOGIN_V2.into()],
+    })
 }
 
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
@@ -152,6 +154,7 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
 
 fn approve(core: &Core, id: &str, duration_secs: Option<u64>, fill_origins: &[&str]) -> Result<()> {
     core.resolve_request(id, ffi::Decision::ApproveLogin {
+        selection: choice(core, "Exact"),
         duration_secs, fill_origins: fill_origins.iter().map(|o| o.to_string()).collect(),
     })
 }
@@ -161,20 +164,20 @@ fn status(core: &Core, id: &str) -> Option<String> {
 }
 
 #[test]
-fn login_requests_validate_capability_url_fill_origins_and_item() {
+fn login_requests_validate_capability_url_and_fill_origins_before_selection() {
     let tmp = tempfile::tempdir().unwrap();
     let (core, host) = broker_manager(&tmp, None);
-    let login = |name: &str, url: &str, extra: &[&str]| {
-        core.create_request(&host, "127.0.0.1", login_body(name, url, extra, "sign in"))
+    let login = |account: &str, url: &str, extra: &[&str]| {
+        core.create_request(&host, "127.0.0.1", login_body(account, url, extra, "sign in"))
     };
     fn error<T: std::fmt::Debug>(r: Result<T>) -> String {
         r.unwrap_err().message
     }
 
     let mut old_cli = login_body("", URL, &[], "sign in");
-    let RequestBody::Login { client_capabilities, .. } = &mut old_cli else { unreachable!() };
-    client_capabilities.clear();
-    assert!(error(core.create_request(&host, "127.0.0.1", old_cli)).contains("login_broker_v1"));
+    let RequestBody::BrowserLogin(request) = &mut old_cli else { unreachable!() };
+    request.client_capabilities.clear();
+    assert!(error(core.create_request(&host, "127.0.0.1", old_cli)).contains("browser_login_v2"));
     assert!(error(login("", "http://sso.exact.test/login", &[])).contains("https://"));
     assert_eq!(error(login("", "https://10.0.0.1/login", &[])), "login grants need a DNS host name");
     assert!(error(login("", "https://sso.exact.test/a b", &[])).contains("printable ASCII"));
@@ -182,32 +185,27 @@ fn login_requests_validate_capability_url_fill_origins_and_item() {
     assert!(error(login("", URL, &["http://idp.test"])).contains("fill origin"));
     let six = ["https://a.test", "https://b.test", "https://c.test", "https://d.test", "https://e.test", "https://f.test"];
     assert_eq!(error(login("", URL, &six)), "at most 5 extra fill origins");
-    assert_eq!(error(login("", "https://nothing.test/", &[])), "no vault login item has a URI for nothing.test; pass ITEM");
-    assert_eq!(error(login("", "https://shared.test/", &[])),
-        "several vault logins match shared.test: SharedA, SharedB; pass ITEM");
-    assert!(error(login("Note", URL, &[])).contains("not a vault login with a password"));
-
-    let inferred = login("", URL, &["https://IDP.test/", ORIGIN, &six[0]]).unwrap();
-    assert_eq!(inferred.kind, RequestKind::Login);
-    assert_eq!(login("", URL, &["https://IDP.test/", ORIGIN, &six[0]]).unwrap(), inferred, "an equal request re-attaches");
-    let named = login("Herokuapp", "https://the-internet.herokuapp.com/login", &[]).unwrap();
-    let snapshot = core.snapshot();
-    let detail = |id: &str| snapshot.pending.iter().find(|p| p.id == id).map(|p| (p.kind, p.detail.clone())).unwrap();
-    assert_eq!(detail(&inferred.request_id), (ffi::RequestKind::Login, ffi::RequestDetail::Login {
-        name: "Exact".into(), vault_name: "Logins".into(), url: URL.into(),
-        fill_origins: vec![ORIGIN.into(), "https://idp.test".into(), "https://a.test".into()],
-        reason: "sign in".into(), has_totp: false,
-    }));
-    let (_, ffi::RequestDetail::Login { has_totp, fill_origins, .. }) = detail(&named.request_id) else { panic!() };
-    assert!(has_totp);
-    assert_eq!(fill_origins, ["https://the-internet.herokuapp.com"]);
+    for url in ["https://nothing.test/", "https://shared.test/", URL] {
+        assert_eq!(login("", url, &[]).unwrap().status, RequestStatus::Pending);
+    }
+    let requested = login("personal", URL, &["https://IDP.test/", ORIGIN, six[0]]).unwrap();
+    assert_eq!(requested.kind, RequestKind::Login);
+    assert_eq!(login("personal", URL, &[six[0], "https://idp.test"]).unwrap(), requested,
+        "the set of requested origins is canonical");
+    assert_ne!(login("personal", URL, &[six[0]]).unwrap().request_id, requested.request_id);
+    let detail = core.snapshot().pending.into_iter().find(|p| p.id == requested.request_id).unwrap().detail;
+    assert_eq!(detail, ffi::RequestDetail::Login {
+        url: URL.into(), site: None, account: Some("personal".into()), broker: true,
+        fill_origins: vec![ORIGIN.into(), "https://a.test".into(), "https://idp.test".into()],
+        reason: "sign in".into(),
+    });
 
     // Approval checks before any browser starts.
-    assert!(error(approve(&core, &inferred.request_id, None, &["https://evil.test"])).contains("not a fill origin"));
-    assert_eq!(core.request_state(&host.id, &inferred.request_id).unwrap().status, RequestStatus::Pending);
+    assert!(error(approve(&core, &requested.request_id, None, &["https://evil.test"])).contains("not a fill origin"));
+    assert_eq!(core.request_state(&host.id, &requested.request_id).unwrap().status, RequestStatus::Pending);
     *lock(&core.broker.chrome_override) = Some(None);
-    assert_eq!(error(approve(&core, &inferred.request_id, None, &[])), broker::NO_CHROME);
-    let denied = core.request_state(&host.id, &inferred.request_id).unwrap();
+    assert_eq!(error(approve(&core, &requested.request_id, None, &[])), broker::NO_CHROME);
+    let denied = core.request_state(&host.id, &requested.request_id).unwrap();
     assert_eq!((denied.status, denied.deny_reason.as_deref()), (RequestStatus::Denied, Some(broker::NO_CHROME)));
     core.shutdown();
 }
@@ -216,7 +214,7 @@ fn login_requests_validate_capability_url_fill_origins_and_item() {
 fn approved_sign_in_stays_pending_then_hands_over_only_the_sites_storage() {
     let tmp = tempfile::tempdir().unwrap();
     let (core, host) = broker_manager(&tmp, Some((fake_chrome(tmp.path()), Vec::new())));
-    let id = core.create_request(&host, "127.0.0.1", login_body("", URL, &["https://idp.test"], "hand over"))
+    let id = core.create_request(&host, "127.0.0.1", login_body("work", URL, &["https://idp.test"], "hand over"))
         .unwrap().request_id;
     approve(&core, &id, Some(1800), &[]).unwrap();
     let profile = core.broker.profile_dir(&id);
@@ -226,6 +224,7 @@ fn approved_sign_in_stays_pending_then_hands_over_only_the_sites_storage() {
     assert_eq!(snapshot.broker_sessions.len(), 1);
     assert_eq!((snapshot.broker_sessions[0].url.as_str(), snapshot.broker_sessions[0].host_label.as_str()),
         (URL, "request-host"));
+    assert_eq!(snapshot.broker_sessions[0].account.as_deref(), Some("work"));
     wait_for("the fill loop", || status(&core, &id).as_deref() == Some("waiting for a sign-in form on https://sso.exact.test"));
     // Neither the request's own lifetime nor a second decision ends a live session.
     core.expire_requests(core.generation_now() + 100_000).unwrap();
@@ -256,6 +255,7 @@ fn approved_sign_in_stays_pending_then_hands_over_only_the_sites_storage() {
     }));
     let lease = core.store.get_lease(&result.lease_id).unwrap().unwrap();
     assert_eq!((lease.mode, lease.login.as_ref(), lease.hosts.len()), (LeaseMode::Raw, None, 0));
+    assert_eq!((lease.vault_id.as_str(), lease.secret_key.as_str()), ("logins", "Exact"));
     assert_eq!(lease.expires_at.unwrap() - lease.created_at, 1800);
     assert!(core.request_state(&host.id, &id).unwrap().result.is_none(), "delivered once");
 
@@ -474,7 +474,7 @@ fn real_chrome_fills_the_form_without_submitting_and_hands_over_the_sites_cookie
     let (core, host) = broker_manager(&tmp, Some((PathBuf::from(chrome), switches)));
     let url = format!("https://sso.login.test:{}/login", site.port);
     let origin = format!("https://sso.login.test:{}", site.port);
-    let id = core.create_request(&host, "127.0.0.1", login_body("Exact", &url, &[], "real chrome"))
+    let id = core.create_request(&host, "127.0.0.1", login_body("tomsmith", &url, &[], "real chrome"))
         .unwrap().request_id;
     approve(&core, &id, None, &[]).unwrap();
     let fields = "document.querySelector('[name=username]').value + '|' + document.querySelector('[name=password]').value";
@@ -522,7 +522,7 @@ fn real_chrome_never_fills_a_page_the_approved_one_navigates_to() {
     let evil = format!("evil.test:{}", site.port);
     let fields = "document.querySelector('[name=username]').value + '|' + document.querySelector('[name=password]').value";
     for path in ["/redirect-now", "/redirect-later"] {
-        let id = core.create_request(&host, "127.0.0.1", login_body("Exact", &format!("{approved}{path}"), &[], path))
+        let id = core.create_request(&host, "127.0.0.1", login_body("tomsmith", &format!("{approved}{path}"), &[], path))
             .unwrap().request_id;
         approve(&core, &id, None, &[]).unwrap();
         wait_for("the unapproved page", || core.broker.eval_in_page(&id,

@@ -2595,7 +2595,21 @@ fn legacy_static_github_spellings_remain_independent_without_generators() {
     );
 }
 
-const LOGIN_URL: &str = "https://login.example.test/session";
+const LOGIN_URL: &str = "https://login.example.test/session?return=%2Fhome";
+const LOGIN_EXPIRY: &str = "2999-01-01T00:00:00Z";
+const TOTP_PATH: &str = "/v1/login-grants/11111111-2222-4333-8444-555555555555/totp";
+
+fn active_login_lease(url: &str) -> Value {
+    json!({"lease_id":LEASE,"name":"work/Site","mode":"sentinel","hosts":["login.example.test"],
+        "expires_at":LOGIN_EXPIRY,"status":"active","fields":["username","password","totp"],
+        "login":{"url":url}})
+}
+
+fn otp_only_result(url: &str) -> Value {
+    json!({"lease_id":LEASE,"mode":"sentinel","hosts":["login.example.test"],"expires_at":LOGIN_EXPIRY,
+        "login":{"url":url},
+        "files":[{"field":"totp","relative_path":"work/Site.totp","content":"061234","substituted":false}]})
+}
 
 /// A fake manager proxy answering every CONNECT with `status`; records the heads.
 fn connect_answering(status: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
@@ -2624,20 +2638,9 @@ fn connect_answering(status: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
     (port, heads)
 }
 
-/// A manager that approves every login grant at once with `granted_url`; its proxy
-/// (requiring per-host credentials) answers marked CONNECTs with `proxy_status`.
+/// A v2 manager that approves a login grant at once, then refreshes its OTP;
+/// its proxy (requiring per-host credentials) answers marked CONNECTs with `proxy_status`.
 fn login_fixture(granted_url: &'static str, proxy_status: &'static str) -> (Fake, Env, u16, Arc<Mutex<Vec<String>>>) {
-    login_fixture_item(granted_url, proxy_status, "work/Site", "work/Site")
-}
-
-/// [`login_fixture`] for the item `name` (catalog spelling) whose files are
-/// `<file_base>.<field>`; `GET /leases` lists the grant once it was approved.
-fn login_fixture_item(
-    granted_url: &'static str,
-    proxy_status: &'static str,
-    name: &'static str,
-    file_base: &'static str,
-) -> (Fake, Env, u16, Arc<Mutex<Vec<String>>>) {
     let (proxy_port, heads) = connect_answering(proxy_status);
     let ca = rcgen::generate_simple_self_signed(vec!["proxy ca".into()]).unwrap();
     let ca_hash = asm_proto::crypto::sha256_hex(ca.cert.der());
@@ -2646,18 +2649,16 @@ fn login_fixture_item(
     let f = start(Arc::new(move |method, path, _body| match (method, path) {
         ("GET", "/v1/health") => (
             200,
-            json!({"name":"asm-manager","version":"0.7.0","capabilities":["secret_fields_v1","login_grant_v1"]}),
+            json!({"name":"asm-manager","version":"0.8.0","capabilities":["browser_login_v2"]}),
         ),
         ("GET", "/v1/leases") if granted.load(std::sync::atomic::Ordering::SeqCst) => (
             200,
-            json!({"leases":[{"lease_id":LEASE,"name":name,"mode":"sentinel","hosts":["login.example.test"],
-                "expires_at":"2999-01-01T00:00:00Z","status":"active","fields":["username","password","totp"],
-                "login":{"url":granted_url}}]}),
+            json!({"leases":[active_login_lease(granted_url)]}),
         ),
         ("GET", "/v1/leases") => (200, json!({"leases":[]})),
-        ("GET", "/v1/secrets") => (
+        ("POST", TOTP_PATH) if granted.load(std::sync::atomic::Ordering::SeqCst) => (
             200,
-            json!({"secrets":[{"name":name,"vault":"work","kind":"login","fields":["username","password","totp"],"lease":null}]}),
+            otp_only_result(granted_url),
         ),
         ("GET", "/v1/proxy-info") => (
             200,
@@ -2669,11 +2670,11 @@ fn login_fixture_item(
             (
                 200,
                 json!({"request_id":REQ,"kind":"get","status":"approved","deny_reason":null,"result":{
-                    "lease_id":LEASE,"mode":"sentinel","hosts":["login.example.test"],"expires_at":"2999-01-01T00:00:00Z",
+                    "lease_id":LEASE,"mode":"sentinel","hosts":["login.example.test"],"expires_at":LOGIN_EXPIRY,
                     "login":{"url":granted_url},
-                    "files":[{"field":"username","relative_path":format!("{file_base}.username"),"content":"octocat","substituted":false},
-                             {"field":"password","relative_path":format!("{file_base}.password"),"content":"asm_0123456789012345678901234567890123456789","substituted":true},
-                             {"field":"totp","relative_path":format!("{file_base}.totp"),"content":"123456","substituted":false}]}}),
+                    "files":[{"field":"username","relative_path":"work/Site.username","content":"octocat","substituted":false},
+                             {"field":"password","relative_path":"work/Site.password","content":"asm_0123456789012345678901234567890123456789","substituted":true},
+                             {"field":"totp","relative_path":"work/Site.totp","content":"123456","substituted":false}]}}),
             )
         }
         _ => (
@@ -2737,8 +2738,8 @@ fn router_status(e: &Env) -> Value {
 
 #[test]
 fn get_login_url_validates_arguments_before_contacting_the_manager() {
-    let e = env();
-    let url = "https://login.example.test/session";
+    let (f, e, _, _) = login_fixture(LOGIN_URL, "200 Connection established");
+    let url = LOGIN_URL;
     for conflict in [
         vec!["--raw"],
         vec!["--sentinel"],
@@ -2757,28 +2758,42 @@ fn get_login_url_validates_arguments_before_contacting_the_manager() {
         assert_eq!(out.status.code(), Some(2), "{conflict:?}");
         assert!(text(&out.stderr).contains("cannot be used with"), "{conflict:?}: {}", text(&out.stderr));
     }
+    for args in [
+        vec!["get", "--login-url", url, "work/Site", "--reason", "r"],
+        vec!["get", "--login-url", url, "work/Site::password", "--reason", "r"],
+        vec!["get", "--login-url", url, "work/Site", "why"],
+        vec!["get", "--login-url", url, "work/Site"],
+    ] {
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = text(&out.stderr);
+        assert!(stderr.contains("no longer accepts a positional ITEM"), "{stderr}");
+        assert!(stderr.contains("--account USERNAME_OR_EMAIL"), "{stderr}");
+    }
     for (args, message) in [
-        (vec!["get", "--login-url", url, "work/Site::password", "--reason", "r"], "invalid: --login-url takes a whole login item"),
-        (vec!["get", "--login-url", url, "DEST=work/Site", "--reason", "r"], "invalid: --login-url takes a whole login item"),
         (vec!["get", "--login-url", "http://login.example.test/session", "--reason", "r"], "invalid: login URL must start with https://"),
         (vec!["get", "--login-url", url], "invalid: --login-url needs a reason: --reason TEXT"),
+        (vec!["get", "--login-url", url, "--reason", "r", "--site", "https://app.example.test/path"], "invalid: site must be an HTTPS origin without a path or query"),
+        (vec!["get", "--login-url", url, "--reason", "r", "--site", "http://app.example.test"], "invalid: login URL must start with https://"),
+        (vec!["get", "--login-url", url, "--reason", "r", "--account", ""], "invalid: account must be 1–320 characters without surrounding whitespace"),
     ] {
         let out = asm(&e, &args, "");
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert_eq!(text(&out.stderr).trim(), message, "{args:?}");
     }
-    // A positional reason and --reason conflict; without --login-url both NAME and
-    // REASON stay required.
+    // Non-browser get still takes NAME and REASON and forbids browser-only flags.
     for args in [
-        vec!["get", "--login-url", url, "work/Site", "why", "--reason", "why"],
         vec!["get", "work/Site", "why", "--reason", "why"],
         vec!["get", "work/Site"],
         vec!["get", "--reason", "why"],
+        vec!["get", "work/Site", "why", "--site", "https://app.example.test"],
+        vec!["get", "work/Site", "why", "--account", "a@example.test"],
     ] {
         let out = asm(&e, &args, "");
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(text(&out.stderr).contains("Usage: asm get"), "{args:?}: {}", text(&out.stderr));
     }
+    assert!(f.log.lock().unwrap().is_empty(), "invalid arguments never reached the manager");
     // --reason also serves ordinary gets.
     let (f, e) = paired("approve-get");
     let out = asm(&e, &["get", "--hosts", "api.example.com", "work/GitHub", "--reason", "deploy the site"], "");
@@ -2825,26 +2840,28 @@ fn get_login_url_grants_routes_and_prints_the_login() {
     router.visit("login.example.test:443");
     let out = asm(
         &e,
-        &["get", "--json", "--login-url", "https://Login.Example.test:443/session", "--reason", "sign in"],
+        &["get", "--json", "--login-url", "https://Login.Example.test:443/session?return=%2Fhome",
+          "--site", "https://App.Example.test:443", "--account", "octocat@example.test", "--reason", "sign in"],
         "",
     );
     assert!(out.status.success(), "{}", text(&out.stderr));
     let sent = posted(&f);
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0]["name"], "");
-    assert_eq!(sent[0]["login"], json!({"url": LOGIN_URL}));
-    assert_eq!((sent[0]["raw"].clone(), sent[0]["sentinel"].clone()), (json!(false), json!(false)));
-    assert!(sent[0]["client_capabilities"].as_array().unwrap().contains(&json!("login_grant_v1")));
+    assert_eq!(sent[0], json!({
+        "kind":"browser_login","mode":"grant","url":LOGIN_URL,"site":"https://app.example.test",
+        "account":"octocat@example.test","reason":"sign in","extra_fill_origins":[],
+        "agent":"test-agent","client_capabilities":["browser_login_v2"]
+    }));
 
     let j: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(j["login"], json!({"url": LOGIN_URL}));
+    assert_eq!(j["lease_id"], LEASE);
     assert_eq!(j["files"].as_array().unwrap().len(), 3);
     assert_eq!(std::fs::read_to_string(e.secrets.join("work/Site.username")).unwrap(), "octocat");
     let stderr = text(&out.stderr);
-    assert!(
-        stderr.contains("open or reload the login page now, type the username and the sentinel, submit once; for a one-time code run: asm get 'work/Site::totp' --reason 'sign in'"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("open or reload the login page now, type the username and the sentinel, submit once"), "{stderr}");
+    assert!(stderr.contains(&format!("for a one-time code run: asm totp {LEASE}")), "{stderr}");
+    assert!(!f.log.lock().unwrap().iter().any(|(_, path, _)| path == "/v1/secrets"));
 
     // The barrier probed the manager proxy with the marker and this host's credentials,
     // then handed the route to the router.
@@ -2865,33 +2882,174 @@ fn get_login_url_grants_routes_and_prints_the_login() {
     assert_eq!(saved["routes"][0]["proxy"], format!("127.0.0.1:{proxy_port}"));
 }
 
-/// An inferred item's one-time-code hint names it as the catalog does (from the
-/// lease), never by its sanitized file name.
 #[test]
-fn get_login_url_totp_hint_uses_the_leased_item_name() {
-    let (_f, e, _, _) =
-        login_fixture_item(LOGIN_URL, "200 Connection established", "work/GitHub (work): a=b", "work/GitHub__work___a_b");
+fn totp_refreshes_only_the_existing_grants_code_without_a_popup() {
+    let (f, e, _, _) = login_fixture(LOGIN_URL, "200 Connection established");
+    {
+        let router = start_router(&e);
+        router.visit("login.example.test:443");
+        let out = asm(&e, &["get", "--login-url", LOGIN_URL, "--reason", "sign in"], "");
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert!(text(&out.stdout).contains(&format!("lease: {LEASE}")));
+    } // The OTP command works without a running router.
+    let password = e.secrets.join("work/Site.password");
+    let username = e.secrets.join("work/Site.username");
+    let totp = e.secrets.join("work/Site.totp");
+    let before = std::fs::read(&password).unwrap();
+    assert_eq!(std::fs::read_to_string(&totp).unwrap(), "123456");
+
+    f.log.lock().unwrap().clear();
+    let out = asm(&e, &["totp", LEASE, "--json"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let j: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(j["lease_id"], LEASE);
+    assert_eq!(j["login"], json!({"url": LOGIN_URL}));
+    assert_eq!(j["files"].as_array().unwrap().len(), 1);
+    assert_eq!(j["files"][0]["path"], totp.to_str().unwrap());
+    assert_eq!(j["files"][0]["delivery"], "raw");
+    assert!(!text(&out.stdout).contains("061234"));
+    assert!(!text(&out.stderr).contains("061234"));
+    assert_eq!(std::fs::read_to_string(&totp).unwrap(), "061234");
+    assert_eq!(std::fs::read_to_string(&username).unwrap(), "octocat");
+    assert_eq!(std::fs::read(&password).unwrap(), before);
+    let log = f.log.lock().unwrap();
+    assert_eq!(log.iter().map(|(met, path, _)| (met.as_str(), path.as_str())).collect::<Vec<_>>(),
+        [("GET", "/v1/health"), ("GET", "/v1/leases"), ("POST", TOTP_PATH)]);
+    drop(log);
+
+    let manifest = read_json(&e.secrets.join(".leases.json"));
+    assert_eq!(manifest[LEASE]["paths"], json!(["work/Site.username", "work/Site.password", "work/Site.totp"]));
+}
+
+fn otp_fixture(lease: Option<Value>, result: Value) -> (Fake, Env) {
+    let f = start(Arc::new(move |method, path, _body| match (method, path) {
+        ("GET", "/v1/health") => (200, json!({"name":"asm-manager","version":"0.8.0","capabilities":["browser_login_v2"]})),
+        ("GET", "/v1/leases") => (200, json!({"leases":lease.iter().collect::<Vec<_>>()})),
+        ("POST", TOTP_PATH) => (200, result.clone()),
+        _ => (404, json!({"error":{"code":"not_found","message":format!("{method} {path}")}})),
+    }));
+    let e = env();
+    write_host_json(&e, &f);
+    (f, e)
+}
+
+#[test]
+fn totp_refuses_different_lease_metadata_or_extra_material() {
+    for (pointer, value) in [
+        ("/lease_id", json!(GCLOUD_LEASE)),
+        ("/mode", json!("raw")),
+        ("/hosts/0", json!("other.example.test")),
+        ("/login/url", json!("https://login.example.test/different?return=%2Fhome")),
+        ("/expires_at", json!("2998-01-01T00:00:00Z")),
+        ("/expires_at", Value::Null),
+        ("/files", json!([])),
+        ("/files", json!([
+            {"field":"totp","relative_path":"work/Site.totp","content":"123456","substituted":false},
+            {"field":"password","relative_path":"work/Site.password","content":"not a code","substituted":false}
+        ])),
+        ("/files/0/field", json!("password")),
+        ("/files/0/substituted", json!(true)),
+        ("/files/0/content", json!("not a code")),
+        ("/files/0/relative_path", json!("../Site.totp")),
+    ] {
+        let mut result = otp_only_result(LOGIN_URL);
+        *result.pointer_mut(pointer).unwrap() = value;
+        let (f, e) = otp_fixture(Some(active_login_lease(LOGIN_URL)), result);
+        let out = asm(&e, &["totp", LEASE, "--json"], "");
+        assert!(!out.status.success(), "{pointer}: {}", text(&out.stderr));
+        assert!(out.stdout.is_empty(), "{pointer}");
+        assert!(!e.secrets.join("work").exists(), "{pointer}");
+        assert!(!e.secrets.parent().unwrap().join("Site.totp").exists(), "{pointer}");
+        assert!(f.log.lock().unwrap().iter().any(|(method, path, _)| method == "POST" && path == TOTP_PATH));
+    }
+}
+
+#[test]
+fn totp_requires_a_live_browser_grant() {
+    let mut revoked = active_login_lease(LOGIN_URL);
+    revoked["status"] = json!("revoked");
+    let mut expired = active_login_lease(LOGIN_URL);
+    expired["expires_at"] = json!("2000-01-01T00:00:00Z");
+    let mut ordinary = active_login_lease(LOGIN_URL);
+    ordinary["login"] = Value::Null;
+    for lease in [None, Some(revoked), Some(expired), Some(ordinary)] {
+        let (f, e) = otp_fixture(lease, otp_only_result(LOGIN_URL));
+        let out = asm(&e, &["totp", "work/Site"], "");
+        assert_eq!(out.status.code(), Some(2));
+        assert!(f.log.lock().unwrap().is_empty());
+
+        let out = asm(&e, &["totp", LEASE], "");
+        assert!(!out.status.success(), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("asm get --login-url"));
+        assert!(!f.log.lock().unwrap().iter().any(|(method, _, _)| method == "POST"));
+    }
+}
+
+#[test]
+fn totp_does_not_post_for_a_grant_without_a_code() {
+    let mut lease = active_login_lease(LOGIN_URL);
+    lease["fields"] = json!(["username", "password"]);
+    let (f, e) = otp_fixture(Some(lease), otp_only_result(LOGIN_URL));
+    let out = asm(&e, &["totp", LEASE], "");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out.stderr).contains("does not include a one-time code"));
+    assert!(!f.log.lock().unwrap().iter().any(|(method, _, _)| method == "POST"));
+}
+
+#[test]
+fn list_sites_uses_only_the_dedicated_site_catalog() {
+    let sites = ["https://app.example.test", "https://login.example.test:8443"];
+    let f = start(Arc::new(move |method, path, _body| match (method, path) {
+        ("GET", "/v1/health") => (200, json!({"name":"asm-manager","version":"0.8.0","capabilities":["browser_login_v2"]})),
+        ("GET", "/v1/leases") => (200, json!({"leases":[]})),
+        ("GET", "/v1/login-sites") => (200, json!({"sites":sites})),
+        _ => (404, json!({"error":{"code":"not_found","message":format!("{method} {path}")}})),
+    }));
+    let e = env();
+    write_host_json(&e, &f);
+    let plain = asm(&e, &["list", "--sites"], "");
+    assert!(plain.status.success(), "{}", text(&plain.stderr));
+    assert_eq!(text(&plain.stdout).lines().collect::<Vec<_>>(), sites);
+    let out = asm(&e, &["list", "--sites", "--json"], "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), json!({"sites":sites}));
+    assert_eq!(f.log.lock().unwrap().iter().filter(|(_, path, _)| path == "/v1/login-sites").count(), 2);
+}
+
+#[test]
+fn browser_commands_require_v2_without_falling_back() {
+    let f = start(Arc::new(|method, path, _body| match (method, path) {
+        ("GET", "/v1/health") => (200, json!({
+            "name":"asm-manager","version":"0.7.0","capabilities":["login_grant_v1","login_broker_v1"]
+        })),
+        _ => (404, json!({"error":{"code":"not_found","message":format!("{method} {path}")}})),
+    }));
+    let e = env();
+    write_host_json(&e, &f);
     let router = start_router(&e);
     router.visit("login.example.test:443");
-    let out = asm(&e, &["get", "--login-url", LOGIN_URL, "--reason", "sign in"], "");
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(e.secrets.join("work/GitHub__work___a_b.totp").exists());
-    let stderr = text(&out.stderr);
-    assert!(
-        stderr.contains(r"; for a one-time code run: asm get 'work/GitHub (work)\: a\=b::totp' --reason 'sign in'"),
-        "{stderr}"
-    );
-    // That spelling is the one asm get resolves.
-    let b = asm_proto::bindings::parse_binding(r"work/GitHub (work)\: a\=b::totp").unwrap();
-    assert_eq!((b.source.as_str(), b.field.as_deref()), ("work/GitHub (work): a=b", Some("totp")));
+    for args in [
+        vec!["get", "--login-url", LOGIN_URL, "--reason", "sign in"],
+        vec!["login", LOGIN_URL, "--reason", "sign in"],
+        vec!["list", "--sites"],
+        vec!["totp", LEASE],
+    ] {
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(text(&out.stderr).contains("manager does not support browser_login_v2; upgrade the manager"));
+        assert!(out.stdout.is_empty());
+    }
+    let log = f.log.lock().unwrap();
+    assert_eq!(log.len(), 4);
+    assert!(log.iter().all(|(method, path, _)| method == "GET" && path == "/v1/health"));
 }
 
 #[test]
 fn get_login_url_refuses_a_different_grant() {
-    let (_f, e, _, _) = login_fixture("https://login.example.test/other", "200 Connection established");
+    let (_f, e, _, _) = login_fixture("https://login.example.test/session?return=%2Fother", "200 Connection established");
     let router = start_router(&e);
     router.visit("login.example.test:443");
-    let out = asm(&e, &["get", "--login-url", LOGIN_URL, "work/Site", "sign in"], "");
+    let out = asm(&e, &["get", "--login-url", LOGIN_URL, "--reason", "sign in"], "");
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         text(&out.stderr).trim(),
@@ -3014,7 +3172,7 @@ fn browser_fixture(browser_ca: Option<String>) -> (Fake, Env, Arc<Mutex<Option<S
     let ca = Arc::new(Mutex::new(browser_ca));
     let served = ca.clone();
     let f = start(Arc::new(move |method, path, _body| match (method, path) {
-        ("GET", "/v1/health") => (200, json!({"name":"asm-manager","version":"0.8.0","capabilities":["login_grant_v1"]})),
+        ("GET", "/v1/health") => (200, json!({"name":"asm-manager","version":"0.8.0","capabilities":["browser_login_v2"]})),
         ("GET", "/v1/leases") => (200, json!({"leases":[]})),
         ("GET", "/v1/proxy-info") => {
             let mut info = json!({"port":1,"hints":["127.0.0.1"],"ca_sha256":"ab"});
@@ -3590,12 +3748,8 @@ const STORAGE_STATE: &str = r#"{"cookies":[{"name":"sid","value":"s3cr3t","domai
 /// A manager approving `asm login` at once with `result`.
 fn login_broker(result: Value) -> (Fake, Env) {
     let f = start(Arc::new(move |method, path, _body| match (method, path) {
-        ("GET", "/v1/health") => (200, json!({"name":"asm-manager","version":"0.8.0","capabilities":["login_broker_v1"]})),
+        ("GET", "/v1/health") => (200, json!({"name":"asm-manager","version":"0.8.0","capabilities":["browser_login_v2"]})),
         ("GET", "/v1/leases") => (200, json!({"leases":[]})),
-        ("GET", "/v1/secrets") => (
-            200,
-            json!({"secrets":[{"name":"work/Site","vault":"work","kind":"login","fields":["username","password"],"lease":null}]}),
-        ),
         ("POST", "/v1/requests") => (
             200,
             json!({"request_id":REQ,"kind":"login","status":"approved","deny_reason":null,"result":result.clone()}),
@@ -3643,28 +3797,31 @@ fn login_hands_over_the_storage_state() {
     let body = &posted(&f)[0];
     assert_eq!(
         *body,
-        json!({"kind":"login","name":"","url":"https://the-internet.example.test/login","reason":"broker test",
-            "extra_fill_origins":["https://sso.example.test"],"agent":"test-agent","client_capabilities":["login_broker_v1"]})
+        json!({"kind":"browser_login","mode":"broker","url":"https://the-internet.example.test/login","reason":"broker test",
+            "extra_fill_origins":["https://sso.example.test"],"agent":"test-agent","client_capabilities":["browser_login_v2"]})
     );
 
-    // With ITEM and --json.
-    let out = asm(&e, &["login", "https://the-internet.example.test/login", "work/Site", "--reason", "again", "--json"], "");
+    let out = asm(&e, &["login", "https://the-internet.example.test/login", "--account", "person@example.test", "--reason", "again", "--json"], "");
     assert!(out.status.success(), "{}", text(&out.stderr));
     let j: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(j["path"], path.to_str().unwrap());
     assert_eq!(j["cookie_domains"], json!(["the-internet.example.test", ".example.test"]));
     assert_eq!(j["lease_id"], LEASE);
-    assert_eq!(posted(&f)[1]["name"], "work/Site");
+    assert_eq!(posted(&f)[1]["account"], "person@example.test");
+    assert!(!f.log.lock().unwrap().iter().any(|(_, path, _)| path == "/v1/secrets"));
 }
 
 #[test]
 fn login_refuses_other_result_shapes() {
     let state = |field: &str| json!({"field":field,"relative_path":format!("work/Site.{field}"),"content":STORAGE_STATE,"substituted":false});
+    let mut non_expiring = storage_state_result("raw", json!([state("storage-state")]));
+    non_expiring["expires_at"] = Value::Null;
     for result in [
         storage_state_result("sentinel", json!([state("storage-state")])),
         storage_state_result("raw", json!([state("password")])),
         storage_state_result("raw", json!([state("storage-state"), state("username")])),
         storage_state_result("raw", json!([])),
+        non_expiring,
     ] {
         let (_f, e) = login_broker(result.clone());
         let out = asm(&e, &["login", "https://the-internet.example.test/login", "--reason", "r"], "");
@@ -3685,6 +3842,30 @@ fn login_refuses_other_result_shapes() {
 }
 
 #[test]
+fn broker_rejects_a_polled_result_for_the_other_browser_mode() {
+    let f = start(Arc::new(|method, path, _body| match (method, path) {
+        ("GET", "/v1/health") => (200, json!({"name":"asm-manager","version":"0.8.0","capabilities":["browser_login_v2"]})),
+        ("GET", "/v1/leases") => (200, json!({"leases":[]})),
+        ("POST", "/v1/requests") => (202, json!({"request_id":REQ,"kind":"login","status":"pending"})),
+        ("GET", path) if path.starts_with("/v1/requests/") => (
+            200,
+            json!({"request_id":REQ,"kind":"get","status":"approved","result":
+                storage_state_result("raw", json!([{"field":"storage-state","relative_path":"work/Site.storage-state",
+                    "content":STORAGE_STATE,"substituted":false}]))
+            }),
+        ),
+        _ => (404, json!({"error":{"code":"not_found","message":format!("{method} {path}")}})),
+    }));
+    let e = env();
+    write_host_json(&e, &f);
+    let out = asm(&e, &["login", LOGIN_URL, "--reason", "sign in"], "");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("different browser request kind"));
+    assert!(!e.secrets.join("work").exists());
+    assert_eq!(posted(&f).len(), 1);
+}
+
+#[test]
 fn login_validates_arguments_before_posting() {
     let (f, e) = login_broker(Value::Null);
     let six: Vec<String> = (0..6).map(|i| format!("https://s{i}.example.test")).collect();
@@ -3696,15 +3877,28 @@ fn login_validates_arguments_before_posting() {
         (vec!["login", "http://a.example.test/", "--reason", "r"], "invalid: URL must start with https://"),
         (vec!["login", "https://a.example.test/", "--reason", "r", "--fill-origin", "https://b.example.test/login"], "invalid: --fill-origin \"https://b.example.test/login\" must be https://host[:port]"),
         (vec!["login", "https://a.example.test/", "--reason", "r", "--fill-origin", "http://b.example.test"], "invalid: --fill-origin \"http://b.example.test\" must be https://host[:port]"),
-        (vec!["login", "https://a.example.test/", "work/Site::password", "--reason", "r"], "invalid: asm login takes a whole login item"),
+        (vec!["login", "https://a.example.test/", "--reason", "r", "--account", " "], "invalid: account must be 1–320 characters without surrounding whitespace"),
         (many, "invalid: at most 5 --fill-origin values"),
     ] {
         let out = asm(&e, &args, "");
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert_eq!(text(&out.stderr).trim(), message, "{args:?}");
     }
-    let out = asm(&e, &["login", "https://a.example.test/"], "");
+    let out = asm(&e, &["login", "https://a.example.test/", "--reason", "r", "--site", "https://a.example.test"], "");
     assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out.stderr).contains("unexpected argument '--site'"));
+    let out = asm(&e, &["login", "https://a.example.test/"], "");
+    assert_eq!(text(&out.stderr).trim(), "invalid: asm login needs --reason TEXT");
+    assert_eq!(out.status.code(), Some(2));
+    for args in [
+        vec!["login", "https://a.example.test/", "work/Site", "--reason", "r"],
+        vec!["login", "https://a.example.test/", "work/Site"],
+    ] {
+        let out = asm(&e, &args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(text(&out.stderr).contains("no longer accepts a positional ITEM"));
+        assert!(text(&out.stderr).contains("--account USERNAME_OR_EMAIL"));
+    }
     assert!(f.log.lock().unwrap().is_empty());
 }
 

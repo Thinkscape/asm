@@ -24,6 +24,7 @@ use crate::vault::{VaultConfig, creds};
 
 pub mod activity;
 pub mod admin;
+mod browser_otp;
 pub(crate) mod catalog;
 pub mod api;
 pub mod firewall;

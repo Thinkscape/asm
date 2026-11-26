@@ -28,6 +28,21 @@ pub struct SecretMeta {
     pub uri_hosts: Vec<String>,
 }
 
+/// Login picker metadata. Only the local manager receives usernames; they are not
+/// ordinary catalog fields. A missing or empty username means there is no label.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LoginMeta {
+    pub meta: SecretMeta,
+    pub username: Option<String>,
+}
+
+impl SecretMeta {
+    pub(crate) fn is_password_login(&self) -> bool {
+        self.kind == SecretKind::Login && !self.name.is_empty()
+            && self.fields.iter().any(|f| f == "password")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "message", rename_all = "snake_case")]
 pub enum VaultStatus {
@@ -46,8 +61,28 @@ pub struct AddTarget {
 pub trait VaultProvider: Send + Sync {
     fn status(&self) -> VaultStatus;
     fn list(&self) -> Result<Vec<SecretMeta>>;
+    /// Exposed password logins, in one provider enumeration. Labels must come
+    /// from listing attributes, never from per-item value reads.
+    fn list_logins(&self) -> Result<Vec<LoginMeta>> {
+        Ok(self.list()?.into_iter().filter(SecretMeta::is_password_login)
+            .map(|meta| LoginMeta { meta, username: None }).collect())
+    }
     /// `(field, value)` pairs in field order.
     fn read(&self, key: &str) -> Result<Vec<(String, String)>>;
+    /// Read a fresh code for an already selected login. Providers with native
+    /// authenticators override this to avoid materializing unrelated fields.
+    fn read_totp(&self, key: &str) -> Result<zeroize::Zeroizing<String>> {
+        use zeroize::{Zeroize, Zeroizing};
+        let mut code = None;
+        for (field, mut value) in self.read(key)? {
+            if field == "totp" && code.is_none() && !value.is_empty() {
+                code = Some(Zeroizing::new(value));
+            } else {
+                value.zeroize();
+            }
+        }
+        code.ok_or_else(|| crate::error::CoreError::not_found("this login has no one-time code"))
+    }
     fn update(&self, key: &str, field: &str, value: &str) -> Result<()>;
     fn add(&self, name: &str, value: &str, target: &AddTarget) -> Result<()>;
     /// Provider-specific extra line for the vault row (e.g. ".env: 3 lines skipped"). Default none.
